@@ -7,6 +7,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "platform.h"
 
 /*
  * the kernel's page table.
@@ -27,19 +28,31 @@ kvmmake(void)
   memset(kpgtbl, 0, PGSIZE);
 
   // uart registers
-  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+  kvmmap(kpgtbl, plat.uart_base, plat.uart_base, PGSIZE, PTE_R | PTE_W);
 
-  // virtio mmio disk interface
-  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+  // virtio mmio disk interfaces
+  for (int i = 0; i < plat.nvirtio; i++)
+    kvmmap(kpgtbl, plat.virtio_base[i], plat.virtio_base[i], PGSIZE, PTE_R | PTE_W);
 
-  // PLIC
-  kvmmap(kpgtbl, PLIC, PLIC, 0x4000000, PTE_R | PTE_W);
+  // interrupt controller(s)
+  if (plat.intc_kind == INTC_PLIC) {
+    kvmmap(kpgtbl, plat.plic_base, plat.plic_base, plat.plic_size, PTE_R | PTE_W);
+  } else {
+    kvmmap(kpgtbl, plat.aplic_m_base, plat.aplic_m_base, plat.aplic_size, PTE_R | PTE_W);
+    kvmmap(kpgtbl, plat.aplic_s_base, plat.aplic_s_base, plat.aplic_size, PTE_R | PTE_W);
+    if (plat.intc_kind == INTC_IMSIC)
+      kvmmap(kpgtbl, plat.imsic_s_base, plat.imsic_s_base, plat.imsic_s_size, PTE_R | PTE_W);
+  }
+
+  // CLINT, for inter-processor interrupts (msip)
+  kvmmap(kpgtbl, plat.clint_base, plat.clint_base, 0x10000, PTE_R | PTE_W);
 
   // map kernel text executable and read-only.
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
 
-  // map kernel data and the physical RAM we'll make use of.
-  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP - (uint64)etext,
+  // map kernel data and all of physical RAM (the part above
+  // plat.host_top is the hypervisor's pool for guest memory).
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, plat.ram_end - (uint64)etext,
          PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to

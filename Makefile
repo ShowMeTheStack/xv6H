@@ -28,7 +28,28 @@ OBJS = \
   $K/sysfile.o \
   $K/kernelvec.o \
   $K/plic.o \
-  $K/virtio_disk.o
+  $K/virtio_disk.o \
+  $K/fdt.o \
+  $K/platform.o \
+  $K/mvec.o \
+  $K/intc.o \
+  $K/aplic.o \
+  $K/imsic.o \
+  $K/hyp.o \
+  $K/hypvec.o \
+  $K/hypcsr.o \
+  $K/hypmmio.o \
+  $K/vic.o \
+  $K/vuart.o \
+  $K/vvirtio.o \
+  $K/vclint.o \
+  $K/vplic.o \
+  $K/vaplic.o \
+  $K/vimsic.o \
+  $K/fdtgen.o \
+  $K/syshyp.o \
+  $K/fpu.o \
+  $K/hypsbi.o
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
 # perhaps in /opt/riscv/bin
@@ -65,7 +86,9 @@ DETFLAGS = -ffile-prefix-map=$(CURDIR)=.
 
 CFLAGS = -Wall -Werror -Wno-unknown-attributes -O -fno-omit-frame-pointer -ggdb -gdwarf-2
 CFLAGS += $(DETFLAGS)
-CFLAGS += -march=rv64gc
+CFLAGS += -march=rv64gc$(MARCH_EXTRA)
+# the kernel uses hypervisor-extension instructions and CSR names.
+KMARCH = -march=rv64gch_zicsr_zifencei
 CFLAGS += -std=gnu99
 CFLAGS += -MD
 CFLAGS += -mcmodel=medany
@@ -89,6 +112,12 @@ CFLAGS += -fno-pie -nopie
 endif
 
 LDFLAGS = -z max-page-size=4096
+
+$K/%.o: $K/%.c
+	$(CC) $(CFLAGS) $(KMARCH) -c -o $@ $<
+
+$K/%.o: $K/%.S
+	$(CC) $(CFLAGS) $(KMARCH) -c -o $@ $<
 
 $K/kernel: $(OBJS) $K/kernel.ld
 	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) 
@@ -150,16 +179,57 @@ UPROGS=\
 	$U/_forphan\
 	$U/_dorphan\
 	$U/_sync\
+	$U/_vmm\
+	$U/_cp\
 
-fs.img: mkfs/mkfs README $(UPROGS)
-	mkfs/mkfs fs.img README $(UPROGS)
+# ---- guest images ----
+# everything a guest needs lives in the host file system (fs.img):
+#   /kernel        stripped copy of this kernel (the default guest kernel)
+#   /diskN.img     guest disk images: copies of guest/disk.img, an xv6 file
+#                  system with the user programs (GUESTDISKS of them)
+#   /badguest      hostile test guest, /hello and /hello.bin: a non-xv6 guest
+#   $(HOSTFILES)   any extra files you name (basenames must be <= 14 chars),
+#                  e.g. make fs.img HOSTFILES="mykernel.elf myfs.img"
+# HOSTFS_MB sizes the host image (files up to 128 MB are supported).
+HOSTFS_MB ?= 64
+GUESTDISKS ?= 3
+GUESTFS_BLOCKS ?= 4000
+HOSTFILES ?=
+
+guest/kernel: $K/kernel
+	$(OBJCOPY) -S $K/kernel guest/kernel
+
+guest/disk.img: mkfs/mkfs README $(UPROGS)
+	mkfs/mkfs -s $(GUESTFS_BLOCKS) guest/disk.img README $(UPROGS)
+
+GUESTDISKIDX = $(shell i=0; while [ $$i -lt $(GUESTDISKS) ]; do echo $$i; i=$$((i+1)); done)
+GUESTDISKIMGS = $(foreach k,$(GUESTDISKIDX),guest/disk$(k).img)
+guest/disk%.img: guest/disk.img
+	cp guest/disk.img $@
+
+# a guest that is not xv6: linked at 0x80400000, also as a raw binary.
+guest/hello: guest/hello.c guest/hello.S guest/hello.ld
+	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
+	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/hello.ld -o guest/hello \
+	  guest/hello.S guest/hello.c
+guest/hello.bin: guest/hello
+	$(OBJCOPY) -O binary guest/hello guest/hello.bin
+
+# a hostile test guest (see guest/badguest.c), used by test-hyp.py.
+guest/badguest: guest/badguest.c guest/badentry.S guest/badguest.ld
+	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
+	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/badguest.ld -o guest/badguest \
+	  guest/badentry.S guest/badguest.c
+
+fs.img: mkfs/mkfs README $(UPROGS) guest/kernel guest/badguest guest/hello guest/hello.bin $(GUESTDISKIMGS) $(HOSTFILES)
+	mkfs/mkfs -s $$(( $(HOSTFS_MB) * 1024 )) fs.img README guest/kernel guest/badguest guest/hello guest/hello.bin $(GUESTDISKIMGS) $(UPROGS) $(HOSTFILES)
 
 -include kernel/*.d user/*.d
 
 clean: 
 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
 	*/*.o */*.d */*.asm */*.sym \
-	$K/kernel fs.img \
+	$K/kernel fs.img test-fs.img guest/kernel guest/badguest guest/hello guest/hello.bin guest/disk*.img \
 	mkfs/mkfs .gdbinit \
         $U/usys.S \
 	$(UPROGS)
@@ -173,10 +243,33 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
 ifndef CPUS
 CPUS := 3
 endif
+# RAM: the host keeps HOSTMEM_MB (default 128) for itself; the rest is
+# handed out to guest VMs.
+MEM ?= 1G
+# interrupt controller: plic | aplic | imsic  (qemu -machine virt,aia=...)
+INTC ?= plic
+AIA_GUESTS ?= 2
+ifeq ($(INTC),plic)
+AIAOPT = aia=none
+else ifeq ($(INTC),aplic)
+AIAOPT = aia=aplic
+else ifeq ($(INTC),imsic)
+AIAOPT = aia=aplic-imsic,aia-guests=$(AIA_GUESTS)
+else
+$(error INTC must be plic, aplic, or imsic)
+endif
 
-QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+# HYP=0 hides the hypervisor extension from the CPU: plain xv6, no guests.
+HYP ?= 1
+ifeq ($(HYP),0)
+CPUOPT = -cpu rv64,h=false
+else
+CPUOPT = -cpu rv64
+endif
+QEMUOPTS = -machine virt,$(AIAOPT) $(CPUOPT) -bios none -kernel $K/kernel -m $(MEM) -smp $(CPUS) -nographic
 QEMUOPTS += -global virtio-mmio.force-legacy=false
-QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
+FSIMG ?= fs.img
+QEMUOPTS += -drive file=$(FSIMG),if=none,format=raw,id=x0
 QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
 
 qemu: check-qemu-version $K/kernel fs.img
@@ -202,3 +295,7 @@ check-qemu-version:
 .PHONY: fmt
 fmt:
 	clang-format -i $(wildcard kernel/*.[ch] user/*.[ch] mkfs/*.c)
+
+# print the qemu command line (used by test-hyp.py)
+qemucmd: $K/kernel fs.img
+	@echo $(QEMU) $(QEMUOPTS)

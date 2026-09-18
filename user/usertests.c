@@ -7,6 +7,7 @@
 #include "kernel/syscall.h"
 #include "kernel/memlayout.h"
 #include "kernel/riscv.h"
+#include "kernel/hwinfo.h"
 
 //
 // Tests xv6 system calls.  usertests without arguments runs them all
@@ -18,6 +19,9 @@
 //
 
 #define BUFSZ ((MAXOPBLOCKS + 2) * BSIZE)
+// writebig: enough blocks to reach the doubly-indirect level, but far
+// fewer than MAXFILE (which is now larger than most file systems).
+#define BIGBLOCKS (MAXFILE < 1000 ? MAXFILE : 1000)
 
 char buf[BUFSZ];
 
@@ -590,7 +594,7 @@ writebig(char *s)
     exit(1);
   }
 
-  for (i = 0; i < MAXFILE; i++) {
+  for (i = 0; i < BIGBLOCKS; i++) {
     ((int *)buf)[0] = i;
     if (write(fd, buf, BSIZE) != BSIZE) {
       printf("%s: error: write big file failed i=%d\n", s, i);
@@ -610,7 +614,7 @@ writebig(char *s)
   for (;;) {
     i = read(fd, buf, BSIZE);
     if (i == 0) {
-      if (n != MAXFILE) {
+      if (n != BIGBLOCKS) {
         printf("%s: read only %d blocks from big", s, n);
         exit(1);
       }
@@ -2934,6 +2938,137 @@ unlinkcwd(char *s)
   }
 }
 
+
+//
+// floating point: F and D arithmetic, state across context switches,
+// and fcsr persistence.
+//
+
+static long
+dtol(double d)
+{
+  return (long)d;
+}
+
+void
+fptest(char *s)
+{
+  volatile double a = 1.5, b = 2.25;
+  volatile float f = 0.5f;
+  double c = a * b + f; // 3.875
+  if (dtol(c * 1000) != 3875) {
+    printf("%s: double arithmetic wrong\n", s);
+    exit(1);
+  }
+  double r = __builtin_sqrt(2.0);
+  if (dtol(r * 1000000) != 1414213) {
+    printf("%s: sqrt wrong\n", s);
+    exit(1);
+  }
+  volatile float g = f / 3.0f;
+  if ((int)(g * 1000000) != 166666) {
+    printf("%s: float arithmetic wrong\n", s);
+    exit(1);
+  }
+  long big = 1L << 40;
+  volatile double d = (double)big;
+  if (dtol(d) != big) {
+    printf("%s: conversion wrong\n", s);
+    exit(1);
+  }
+  double sum = 0;
+  for (int i = 0; i < 1000; i++)
+    sum += 0.001;
+  if (dtol(sum * 1000000 + 0.5) != 1000000) {
+    printf("%s: accumulation wrong\n", s);
+    exit(1);
+  }
+  volatile double neg = -7.75;
+  if (dtol(neg * -4) != 31 || dtol(__builtin_fabs(neg) * 4) != 31) {
+    printf("%s: sign handling wrong\n", s);
+    exit(1);
+  }
+}
+
+// several processes keep distinct values in FP registers across many
+// context switches; a lost or leaked register shows up as a wrong sum.
+void
+fpfork(char *s)
+{
+  int n = 4;
+  for (int k = 0; k < n; k++) {
+    int pid = fork();
+    if (pid < 0) {
+      printf("%s: fork failed\n", s);
+      exit(1);
+    }
+    if (pid == 0) {
+      volatile double base = 1.0 + k * 0.25;
+      double acc = 0, acc2 = 0;
+      float facc = 0;
+      for (int i = 0; i < 4000; i++) {
+        acc += base;
+        acc2 += base * 0.5;
+        facc += 0.25f;
+        if (i % 200 == 0)
+          pause(1);
+      }
+      if (dtol(acc * 4) != dtol(base * 4000 * 4) || dtol(acc2 * 8) != dtol(base * 2000 * 8) ||
+          (int)facc != 1000) {
+        printf("%s: child %d: fp state corrupted\n", s, k);
+        exit(1);
+      }
+      exit(0);
+    }
+  }
+  for (int k = 0; k < n; k++) {
+    int st;
+    wait(&st);
+    if (st != 0) {
+      printf("%s: child failed\n", s);
+      exit(1);
+    }
+  }
+}
+
+// fcsr (rounding mode, exception flags) belongs to the process.
+void
+fpcsr(char *s)
+{
+  uint64 frm, fflags;
+  asm volatile("fsrm %0, %1" : "=r"(frm) : "r"(2L)); // round down
+  pause(2);
+  asm volatile("frrm %0" : "=r"(frm));
+  if (frm != 2) {
+    printf("%s: rounding mode lost across a context switch (%ld)\n", s, frm);
+    exit(1);
+  }
+  volatile double x = 1.0, y = 3.0;
+  asm volatile("fsflags %0, %1" : "=r"(fflags) : "r"(0L));
+  volatile double z = x / y; // inexact
+  (void)z;
+  asm volatile("frflags %0" : "=r"(fflags));
+  if (!(fflags & 1)) {
+    printf("%s: inexact flag not set\n", s);
+    exit(1);
+  }
+  int pid = fork();
+  if (pid == 0) {
+    // the child inherits fcsr; changing it must not affect the parent.
+    asm volatile("fsrm %0, %1" : "=r"(frm) : "r"(0L));
+    asm volatile("fsflags %0, %1" : "=r"(fflags) : "r"(0L));
+    exit(0);
+  }
+  wait(0);
+  asm volatile("frrm %0" : "=r"(frm));
+  asm volatile("frflags %0" : "=r"(fflags));
+  if (frm != 2 || !(fflags & 1)) {
+    printf("%s: fcsr changed by child\n", s);
+    exit(1);
+  }
+  asm volatile("fsrm %0, %1" : "=r"(frm) : "r"(0L));
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -3005,6 +3140,9 @@ struct test {
   {lazy_sbrk, "lazy_sbrk"},
   {partial_write, "partial_write"},
   {unlinkcwd, "unlinkcwd"},
+  {fptest, "fptest"},
+  {fpfork, "fpfork"},
+  {fpcsr, "fpcsr"},
   {0, 0},
 };
 

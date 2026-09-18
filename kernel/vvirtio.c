@@ -1,0 +1,333 @@
+//
+// virtual virtio-mmio block device (virtio 1.x "modern" mmio transport,
+// legacy-style split virtqueue), backed by a disk image file in the
+// host file system (vm->disk_ip), read and written through the inode.
+//
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "sleeplock.h"
+#include "proc.h"
+#include "defs.h"
+#include "fs.h"
+#include "file.h"
+#include "virtio.h"
+#include "platform.h"
+#include "hyp.h"
+
+#define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
+#define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
+#define VIRTIO_MMIO_CONFIG_GENERATION   0x0fc
+
+#define VIRTIO_BLK_T_FLUSH 4
+#define VIRTIO_BLK_S_OK    0
+#define VIRTIO_BLK_S_IOERR 1
+#define VIRTIO_BLK_S_UNSUPP 2
+
+#define MAXQ 256
+
+struct gdesc {
+  uint64 addr;
+  uint32 len;
+  uint16 flags;
+  uint16 next;
+};
+
+// ---- guest memory helpers ----
+
+static int
+rd16(struct vm *vm, uint64 gpa, uint16 *v)
+{
+  return vm_copyin(vm, v, gpa, 2);
+}
+
+static int
+wr16(struct vm *vm, uint64 gpa, uint16 v)
+{
+  return vm_copyout(vm, gpa, &v, 2);
+}
+
+// ---- request processing ----
+
+// transfer len bytes between guest memory at gpa and the disk image
+// file at sector, through the bounce page. returns 0 on success.
+static int
+xfer(struct vm *vm, struct vvirtio *b, uint64 sector, uint64 gpa, uint32 len, int write)
+{
+  struct inode *ip = vm->disk_ip;
+  uint64 off = sector * 512;
+  if (ip == 0 || len == 0 || (len % 512) != 0 || off + len > b->capacity * 512)
+    return -1;
+  while (len > 0) {
+    uint32 n = len > PGSIZE ? PGSIZE : len;
+    if (write) {
+      if (vm_copyin(vm, b->bounce, gpa, n) < 0)
+        return -1;
+      begin_op();
+      ilock(ip);
+      int r = writei(ip, 0, (uint64)b->bounce, off, n);
+      iunlock(ip);
+      end_op();
+      if (r != n)
+        return -1;
+    } else {
+      ilock(ip);
+      int r = readi(ip, 0, (uint64)b->bounce, off, n);
+      iunlock(ip);
+      if (r != n)
+        return -1;
+      if (vm_copyout(vm, gpa, b->bounce, n) < 0)
+        return -1;
+    }
+    off += n;
+    gpa += n;
+    len -= n;
+  }
+  return 0;
+}
+
+// handle the descriptor chain starting at head; returns the number of
+// bytes written into guest buffers (for the used ring), or -1 if the
+// chain itself is malformed.
+static int
+do_request(struct vm *vm, struct vvirtio *b, uint16 head)
+{
+  struct gdesc d;
+  struct virtio_blk_req req;
+  uint32 num = b->queue_num;
+  uint16 idx = head;
+  int n = 0, written = 0;
+  uint8 status = VIRTIO_BLK_S_OK;
+  uint64 status_gpa = 0;
+  uint64 sector = 0;
+  int type = -1;
+
+  for (;;) {
+    if (idx >= num || n++ > 512)
+      return -1;
+    if (vm_copyin(vm, &d, b->desc + 16 * idx, sizeof(d)) < 0)
+      return -1;
+    int last = !(d.flags & VRING_DESC_F_NEXT);
+    if (type < 0) {
+      // first descriptor: the request header, device-readable.
+      if (d.len < sizeof(req) || (d.flags & VRING_DESC_F_WRITE) ||
+          vm_copyin(vm, &req, d.addr, sizeof(req)) < 0)
+        return -1;
+      type = req.type;
+      sector = req.sector;
+    } else if (last) {
+      // last descriptor: the status byte, device-writable.
+      if (d.len < 1 || !(d.flags & VRING_DESC_F_WRITE))
+        return -1;
+      status_gpa = d.addr;
+    } else {
+      // data buffer.
+      if (status == VIRTIO_BLK_S_OK) {
+        if (type == VIRTIO_BLK_T_IN) {
+          if (!(d.flags & VRING_DESC_F_WRITE) ||
+              xfer(vm, b, sector, d.addr, d.len, 0) < 0)
+            status = VIRTIO_BLK_S_IOERR;
+          else
+            written += d.len;
+        } else if (type == VIRTIO_BLK_T_OUT) {
+          if ((d.flags & VRING_DESC_F_WRITE) ||
+              xfer(vm, b, sector, d.addr, d.len, 1) < 0)
+            status = VIRTIO_BLK_S_IOERR;
+        } else if (type == VIRTIO_BLK_T_FLUSH) {
+          // nothing to do: the host disk is written through.
+        } else {
+          status = VIRTIO_BLK_S_UNSUPP;
+        }
+        sector += d.len / 512;
+      }
+    }
+    if (last)
+      break;
+    idx = d.next;
+  }
+  if (status_gpa == 0)
+    return -1;
+  if (vm_copyout(vm, status_gpa, &status, 1) < 0)
+    return -1;
+  return written + 1;
+}
+
+static void
+process_queue(struct vm *vm, struct vvirtio *b)
+{
+  acquiresleep(&b->qlock);
+  if (!b->queue_ready || b->queue_num == 0 || b->queue_num > MAXQ) {
+    releasesleep(&b->qlock);
+    return;
+  }
+  uint32 num = b->queue_num;
+  int any = 0;
+  for (;;) {
+    uint16 avail_idx, head, used_idx;
+    if (rd16(vm, b->avail + 2, &avail_idx) < 0)
+      break;
+    if (avail_idx == b->last_avail)
+      break;
+    if (rd16(vm, b->avail + 4 + 2 * (b->last_avail % num), &head) < 0)
+      break;
+    int len = do_request(vm, b, head);
+    if (len < 0) {
+      printk("hyp: vm %d: malformed virtio request (head %d)\n", vm->id, head);
+      len = 0;
+    }
+    // used ring entry: {id, len}
+    if (rd16(vm, b->used + 2, &used_idx) < 0)
+      break;
+    uint32 elem[2] = {head, (uint32)len};
+    if (vm_copyout(vm, b->used + 4 + 8 * (used_idx % num), elem, 8) < 0)
+      break;
+    __sync_synchronize();
+    if (wr16(vm, b->used + 2, used_idx + 1) < 0)
+      break;
+    b->last_avail++;
+    any = 1;
+  }
+  releasesleep(&b->qlock);
+
+  if (any) {
+    acquire(&vm->lock);
+    b->intr_status |= 1;
+    vic_set_level(vm, G_VIRTIO_IRQ, 1);
+    release(&vm->lock);
+  }
+}
+
+// ---- mmio transport ----
+
+static int
+vvirtio_read(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 *val)
+{
+  struct vvirtio *b = &vm->blk;
+  uint64 v = 0;
+
+  if (off >= VIRTIO_MMIO_CONFIG) {
+    // config space: u64 capacity in sectors at offset 0.
+    uint64 cfg = off - VIRTIO_MMIO_CONFIG;
+    if (cfg < 8)
+      v = (b->capacity >> (8 * cfg)) & ((size == 8) ? ~0UL : (1UL << (8 * size)) - 1);
+    *val = v;
+    return 0;
+  }
+  if (size != 4)
+    return -1;
+
+  acquire(&vm->lock);
+  switch (off) {
+  case VIRTIO_MMIO_MAGIC_VALUE: v = 0x74726976; break;
+  case VIRTIO_MMIO_VERSION: v = 2; break;
+  case VIRTIO_MMIO_DEVICE_ID: v = b->capacity ? 2 : 0; break;
+  case VIRTIO_MMIO_VENDOR_ID: v = 0x554d4551; break;
+  case VIRTIO_MMIO_DEVICE_FEATURES:
+    // sel 1 bit 0 = VIRTIO_F_VERSION_1; nothing else.
+    v = (b->device_features_sel == 1) ? 1 : 0;
+    break;
+  case VIRTIO_MMIO_QUEUE_NUM_MAX: v = (b->queue_sel == 0) ? MAXQ : 0; break;
+  case VIRTIO_MMIO_QUEUE_READY: v = (b->queue_sel == 0) ? b->queue_ready : 0; break;
+  case VIRTIO_MMIO_INTERRUPT_STATUS: v = b->intr_status; break;
+  case VIRTIO_MMIO_STATUS: v = b->status; break;
+  case VIRTIO_MMIO_CONFIG_GENERATION: v = 0; break;
+  default: v = 0; break;
+  }
+  release(&vm->lock);
+  *val = v;
+  return 0;
+}
+
+static int
+vvirtio_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
+{
+  struct vvirtio *b = &vm->blk;
+
+  if (off == VIRTIO_MMIO_QUEUE_NOTIFY) {
+    if (val == 0)
+      process_queue(vm, b);
+    return 0;
+  }
+  if (size != 4)
+    return -1;
+
+  acquire(&vm->lock);
+  switch (off) {
+  case VIRTIO_MMIO_DEVICE_FEATURES_SEL: b->device_features_sel = val; break;
+  case VIRTIO_MMIO_DRIVER_FEATURES_SEL: b->driver_features_sel = val; break;
+  case VIRTIO_MMIO_DRIVER_FEATURES:
+    if (b->driver_features_sel == 0)
+      b->driver_features = (b->driver_features & ~0xffffffffUL) | val;
+    else if (b->driver_features_sel == 1)
+      b->driver_features = (b->driver_features & 0xffffffffUL) | (val << 32);
+    break;
+  case VIRTIO_MMIO_QUEUE_SEL: b->queue_sel = val; break;
+  case VIRTIO_MMIO_QUEUE_NUM:
+    if (b->queue_sel == 0)
+      b->queue_num = val;
+    break;
+  case VIRTIO_MMIO_QUEUE_READY:
+    if (b->queue_sel == 0) {
+      b->queue_ready = val & 1;
+      b->last_avail = 0;
+    }
+    break;
+  case VIRTIO_MMIO_INTERRUPT_ACK:
+    b->intr_status &= ~val;
+    vic_set_level(vm, G_VIRTIO_IRQ, b->intr_status != 0);
+    break;
+  case VIRTIO_MMIO_STATUS:
+    b->status = val;
+    if (val == 0) {
+      // reset
+      b->queue_ready = 0;
+      b->queue_num = 0;
+      b->last_avail = 0;
+      b->intr_status = 0;
+      b->driver_features = 0;
+      vic_set_level(vm, G_VIRTIO_IRQ, 0);
+    }
+    break;
+  case VIRTIO_MMIO_QUEUE_DESC_LOW:
+    if (b->queue_sel == 0) b->desc = (b->desc & ~0xffffffffUL) | val;
+    break;
+  case VIRTIO_MMIO_QUEUE_DESC_HIGH:
+    if (b->queue_sel == 0) b->desc = (b->desc & 0xffffffffUL) | (val << 32);
+    break;
+  case VIRTIO_MMIO_DRIVER_DESC_LOW:
+    if (b->queue_sel == 0) b->avail = (b->avail & ~0xffffffffUL) | val;
+    break;
+  case VIRTIO_MMIO_DRIVER_DESC_HIGH:
+    if (b->queue_sel == 0) b->avail = (b->avail & 0xffffffffUL) | (val << 32);
+    break;
+  case VIRTIO_MMIO_DEVICE_DESC_LOW:
+    if (b->queue_sel == 0) b->used = (b->used & ~0xffffffffUL) | val;
+    break;
+  case VIRTIO_MMIO_DEVICE_DESC_HIGH:
+    if (b->queue_sel == 0) b->used = (b->used & 0xffffffffUL) | (val << 32);
+    break;
+  default:
+    break;
+  }
+  release(&vm->lock);
+  return 0;
+}
+
+void
+vvirtio_init(struct vm *vm)
+{
+  struct vvirtio *b = &vm->blk;
+  memset(b, 0, sizeof(*b));
+  initsleeplock(&b->qlock, "vvirtio");
+  b->bounce = kalloc();
+  b->capacity = 0;
+  if (vm->disk_ip) {
+    ilock(vm->disk_ip);
+    b->capacity = vm->disk_ip->size / 512;
+    iunlock(vm->disk_ip);
+  }
+  vm_add_dev(vm, G_VIRTIO_BASE, 0x1000, vvirtio_read, vvirtio_write, 0);
+}

@@ -102,6 +102,15 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_vm_create(void);
+extern uint64 sys_vm_ctl(void);
+extern uint64 sys_vm_stats(void);
+extern uint64 sys_hwinfo(void);
+extern uint64 sys_vm_run(void);
+extern uint64 sys_vm_destroy(void);
+extern uint64 sys_vm_cons(void);
+extern uint64 sys_vm_info(void);
+extern uint64 sys_consraw(void);
 extern uint64 sys_sync(void);
 
 // An array mapping syscall numbers from syscall.h
@@ -129,6 +138,15 @@ static uint64 (*syscalls[])(void) = {
   [SYS_link]    = sys_link,
   [SYS_mkdir]   = sys_mkdir,
   [SYS_close]   = sys_close,
+  [SYS_vm_create]  = sys_vm_create,
+  [SYS_vm_ctl]     = sys_vm_ctl,
+  [SYS_vm_stats]   = sys_vm_stats,
+  [SYS_hwinfo]     = sys_hwinfo,
+  [SYS_vm_run]     = sys_vm_run,
+  [SYS_vm_destroy] = sys_vm_destroy,
+  [SYS_vm_cons]    = sys_vm_cons,
+  [SYS_vm_info]    = sys_vm_info,
+  [SYS_consraw]    = sys_consraw,
   [SYS_sync]    = sys_sync,
   // clang-format on
 };

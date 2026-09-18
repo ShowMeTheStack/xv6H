@@ -25,7 +25,8 @@
 // Disk layout:
 // [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
 
-int nbitmap = FSSIZE / BPB + 1;
+int fssize = FSSIZE;
+int nbitmap;
 int ninodeblocks = NINODES / IPB + 1;
 int nlog = LOGBLOCKS + 1; // Header followed by LOGBLOCKS data blocks.
 int nmeta;   // Number of meta blocks (boot, sb, nlog, inode, bitmap)
@@ -80,8 +81,19 @@ main(int argc, char *argv[])
 
   static_assert(sizeof(int) == 4, "Integers must be 4 bytes!");
 
+  // mkfs [-s blocks] fs.img files...
+  if (argc >= 3 && strcmp(argv[1], "-s") == 0) {
+    fssize = atoi(argv[2]);
+    if (fssize < 100 || fssize > 4000000) {
+      fprintf(stderr, "mkfs: bad size %s\n", argv[2]);
+      exit(1);
+    }
+    argv += 2;
+    argc -= 2;
+  }
+  nbitmap = fssize / BPB + 1;
   if (argc < 2) {
-    fprintf(stderr, "Usage: mkfs fs.img files...\n");
+    fprintf(stderr, "Usage: mkfs [-s blocks] fs.img files...\n");
     exit(1);
   }
 
@@ -94,10 +106,10 @@ main(int argc, char *argv[])
 
   // 1 fs block = 1 disk sector
   nmeta = 2 + nlog + ninodeblocks + nbitmap;
-  nblocks = FSSIZE - nmeta;
+  nblocks = fssize - nmeta;
 
   sb.magic = FSMAGIC;
-  sb.size = xint(FSSIZE);
+  sb.size = xint(fssize);
   sb.nblocks = xint(nblocks);
   sb.ninodes = xint(NINODES);
   sb.nlog = xint(nlog);
@@ -107,11 +119,11 @@ main(int argc, char *argv[])
 
   printf(
     "nmeta %d (boot, super, log blocks %u, inode blocks %u, bitmap blocks %u) blocks %d total %d\n",
-    nmeta, nlog, ninodeblocks, nbitmap, nblocks, FSSIZE);
+    nmeta, nlog, ninodeblocks, nbitmap, nblocks, fssize);
 
   freeblock = nmeta; // the first free block that we can allocate
 
-  for (i = 0; i < FSSIZE; i++)
+  for (i = 0; i < fssize; i++)
     wsect(i, zeroes);
 
   memset(buf, 0, sizeof(buf));
@@ -132,12 +144,11 @@ main(int argc, char *argv[])
   iappend(rootino, &de, sizeof(de));
 
   for (i = 2; i < argc; i++) {
-    // get rid of "user/"
-    char *shortname;
-    if (strncmp(argv[i], "user/", 5) == 0)
-      shortname = argv[i] + 5;
-    else
-      shortname = argv[i];
+    // get rid of any directory prefix ("user/", "guest/", ...)
+    char *shortname = argv[i];
+    for (char *p = argv[i]; *p; p++)
+      if (*p == '/')
+        shortname = p + 1;
 
     assert(index(shortname, '/') == 0);
 
@@ -241,16 +252,19 @@ void
 balloc(int used)
 {
   uchar buf[BSIZE];
-  int i;
+  int i, b;
 
   printf("balloc: first %d blocks have been allocated\n", used);
-  assert(used < BPB);
-  bzero(buf, BSIZE);
-  for (i = 0; i < used; i++) {
-    buf[i / 8] = buf[i / 8] | (0x1 << (i % 8));
+  assert(used < fssize);
+  // one bitmap block covers BPB blocks; mark the used ones in each.
+  for (b = 0; b * BPB < used; b++) {
+    bzero(buf, BSIZE);
+    for (i = 0; i < BPB && b * BPB + i < used; i++) {
+      buf[i / 8] = buf[i / 8] | (0x1 << (i % 8));
+    }
+    printf("balloc: write bitmap block at sector %d\n", sb.bmapstart + b);
+    wsect(sb.bmapstart + b, buf);
   }
-  printf("balloc: write bitmap block at sector %d\n", sb.bmapstart);
-  wsect(sb.bmapstart, buf);
 }
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -276,7 +290,7 @@ iappend(uint inum, void *xp, int n)
         din.addrs[fbn] = xint(freeblock++);
       }
       x = xint(din.addrs[fbn]);
-    } else {
+    } else if (fbn < NDIRECT + NINDIRECT) {
       if (xint(din.addrs[NDIRECT]) == 0) {
         din.addrs[NDIRECT] = xint(freeblock++);
       }
@@ -286,6 +300,26 @@ iappend(uint inum, void *xp, int n)
         wsect(xint(din.addrs[NDIRECT]), (char *)indirect);
       }
       x = xint(indirect[fbn - NDIRECT]);
+    } else {
+      // doubly indirect
+      uint bn = fbn - NDIRECT - NINDIRECT;
+      uint d = bn / (NINDIRECT * NINDIRECT);
+      uint r = bn % (NINDIRECT * NINDIRECT);
+      uint dind[NINDIRECT];
+      if (xint(din.addrs[NDIRECT + 1 + d]) == 0) {
+        din.addrs[NDIRECT + 1 + d] = xint(freeblock++);
+      }
+      rsect(xint(din.addrs[NDIRECT + 1 + d]), (char *)dind);
+      if (dind[r / NINDIRECT] == 0) {
+        dind[r / NINDIRECT] = xint(freeblock++);
+        wsect(xint(din.addrs[NDIRECT + 1 + d]), (char *)dind);
+      }
+      rsect(xint(dind[r / NINDIRECT]), (char *)indirect);
+      if (indirect[r % NINDIRECT] == 0) {
+        indirect[r % NINDIRECT] = xint(freeblock++);
+        wsect(xint(dind[r / NINDIRECT]), (char *)indirect);
+      }
+      x = xint(indirect[r % NINDIRECT]);
     }
     n1 = min(n, (fbn + 1) * BSIZE - off);
     rsect(x, buf);

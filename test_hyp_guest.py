@@ -1,0 +1,359 @@
+#
+# guest tests for test-hyp.py: boot xv6 (and other payloads) as guests of
+# xv6 and exercise them. every guest is two files in the host file system.
+#
+import re, time
+
+DETACH = "\x1d"
+
+
+def boot_host(QEMU, intc, cpus, log, **kw):
+    q = QEMU(intc=intc, cpus=cpus, log=log, **kw)
+    q.expect(r"hyp: hypervisor extension present", 40)
+    q.expect(r"init: starting sh", 40)
+    q.expect(r"\$ ", 10)
+    return q
+
+
+def start_guest(q, args="", timeout=60):
+    """vmm start ... (attached) and wait for the xv6 guest's shell prompt."""
+    q.send("vmm start %s\n" % args)
+    m = q.expect(r"vm (\d+)[^:]*: (\d+) vcpu", 20)
+    vmid = int(m.group(1))
+    q.expect(r"xv6 kernel is booting", timeout)
+    q.expect(r"init: starting sh", timeout)
+    q.expect(r"\$ ", 10)
+    return vmid
+
+
+def detach(q):
+    q.send(DETACH)
+    q.expect(r"\[detached from vm \d+\]", 10)
+    q.expect(r"\$ ", 10)
+
+
+def attach(q, vm):
+    q.send("vmm attach %s\n" % vm)
+    q.expect(r"\[attached to vm ", 10)
+
+
+def host_stats(q):
+    q.send("vmm stats\n")
+    m = q.expect(r"free guest memory: (\d+) MB, ipis: (\d+)", 10)
+    q.expect(r"\$ ", 5)
+    return int(m.group(1)), int(m.group(2))
+
+
+def vm_ls(q):
+    """returns the text of vmm ls."""
+    mark = q.mark()
+    q.send("vmm ls\n")
+    q.expect(r"\n(no vms|ID NAME.*?)\n(?=\$ )", 10)
+    q.expect(r"\$ ", 5)
+    return q.output_since(mark)
+
+
+def kill_vm(q, vm):
+    q.send("vmm kill %s\n" % vm)
+    q.expect(r"vm \d+ killed", 20)
+    q.expect(r"\$ ", 10)
+
+
+def assert_gone(q, vmid):
+    txt = vm_ls(q)
+    assert not re.search(r"^%d  " % vmid, txt, re.M), txt
+
+
+def t_guest_boot(QEMU, intc, cpus, log):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        free0, _ = host_stats(q)
+        vmid = start_guest(q, "-n first")
+        q.send("echo guest-says-hi\n")
+        q.expect(r"\nguest-says-hi", 10)
+        q.expect(r"\$ ", 5)
+        q.send("ls\n")
+        q.expect(r"usertests", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        lst = vm_ls(q)
+        assert re.search(r"^0  first +running +1 +128 +/kernel +/disk0.img", lst, re.M), lst
+        free1, _ = host_stats(q)
+        assert free1 == free0 - 128 - 2, (free0, free1)
+        # the same disk cannot be used twice, a name cannot be reused.
+        q.send("vmm start -d -f /disk0.img\n")
+        q.expect(r"cannot create vm", 10)
+        q.expect(r"\$ ", 5)
+        q.send("vmm start -d -n first -f /disk1.img\n")
+        q.expect(r"already exists", 10)
+        q.expect(r"\$ ", 5)
+        kill_vm(q, "first")
+        assert_gone(q, vmid)
+        free2, _ = host_stats(q)
+        assert free2 == free0, (free0, free2)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_guest_usertests(QEMU, intc, cpus, log, vcpus=1, extra=""):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        t0 = time.time()
+        vmid = start_guest(q, "-c %d %s" % (vcpus, extra))
+        m = q.mark()
+        q.send("usertests -q\n")
+        q.expect(r"ALL TESTS PASSED|FAILED|panic", 1200)
+        out = q.output_since(m)
+        assert "ALL TESTS PASSED" in out, out[-3000:]
+        n = len(re.findall(r"test .*: OK", out))
+        print("    guest usertests: %d tests OK in %.0fs" % (n, time.time() - t0))
+        q.expect(r"\$ ", 30)
+        detach(q)
+        q.send("vmm info %d\n" % vmid)
+        m = q.expect(r"exits (\d+): mmio (\d+), csr (\d+), wfi sleeps (\d+), injected (\d+)", 10)
+        print("    exits %s (mmio %s, csr %s, wfi %s, injected %s)" % tuple(g.decode() for g in m.groups()))
+        q.expect(r"\$ ", 5)
+        kill_vm(q, vmid)
+        assert_gone(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_parallel(QEMU, intc, cpus, log, nguests=3, vcpus=2):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        t0 = time.time()
+        ids = []
+        for i in range(nguests):
+            vmid = start_guest(q, "-n g%d -c %d -f /disk%d.img" % (i, vcpus, i))
+            q.send("usertests -q\n")
+            q.expect(r"usertests starting", 20)
+            detach(q)
+            ids.append(vmid)
+        print("    %d guests running usertests concurrently" % nguests)
+        for i, vmid in enumerate(ids):
+            attach(q, "g%d" % i)
+            m = q.mark()
+            q.expect(r"ALL TESTS PASSED|FAILED|panic", 1500)
+            out = q.output_since(m)
+            assert "ALL TESTS PASSED" in out, "vm %d: %s" % (vmid, out[-2000:])
+            q.expect(r"\$ ", 60)
+            detach(q)
+            print("    vm %d passed (%.0fs)" % (vmid, time.time() - t0))
+        q.send("vmm kill --all\n")
+        for vmid in ids:
+            q.expect(r"vm \d+ killed", 30)
+        q.expect(r"\$ ", 10)
+        assert "no vms" in vm_ls(q)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_disk_isolation(QEMU, intc, cpus, log):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        a = start_guest(q, "-n a -f /disk0.img")
+        q.send("echo secret-of-vm-a > marker\n")
+        q.expect(r"\$ ", 10)
+        q.send("cat marker\n")
+        q.expect(r"\nsecret-of-vm-a", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        b = start_guest(q, "-n b -f /disk1.img")
+        q.send("cat marker\n")
+        q.expect(r"cannot open marker", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        kill_vm(q, "a")
+        kill_vm(q, "b")
+        # the disk file persists: a new VM on /disk0.img sees the file.
+        a2 = start_guest(q, "-f /disk0.img")
+        q.send("cat marker\n")
+        q.expect(r"\nsecret-of-vm-a", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        kill_vm(q, a2)
+    finally:
+        q.close()
+
+
+def t_clone(QEMU, intc, cpus, log):
+    """cp a disk image in the host, boot from the copy, changes stay in the copy."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        q.send("cp /disk2.img /clone.img\n")
+        q.expect(r"\$ ", 120)
+        c = start_guest(q, "-n clone -f /clone.img")
+        q.send("echo in-the-clone > marker\n")
+        q.expect(r"\$ ", 10)
+        detach(q)
+        kill_vm(q, "clone")
+        c2 = start_guest(q, "-f /clone.img")
+        q.send("cat marker\n")
+        q.expect(r"\nin-the-clone", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        kill_vm(q, c2)
+        o = start_guest(q, "-f /disk2.img")
+        q.send("cat marker\n")
+        q.expect(r"cannot open marker", 10)
+        q.expect(r"\$ ", 5)
+        detach(q)
+        kill_vm(q, o)
+    finally:
+        q.close()
+
+
+def t_lifecycle(QEMU, intc, cpus, log):
+    """names, pause/resume, restart, ps, kill --all."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        start_guest(q, "-n web -c 2")
+        detach(q)
+        q.send("vmm start -n db -f /disk1.img -d\n")
+        q.expect(r"vm 1 db: 1 vcpu", 10)
+        q.expect(r"\$ ", 5)
+        lst = vm_ls(q)
+        assert re.search(r"^0  web +running +2", lst, re.M) and re.search(r"^1  db +running +1", lst, re.M), lst
+        # pause: the guest stops responding; resume: it answers.
+        q.send("vmm pause web\n")
+        q.expect(r"vm 0 paused", 10)
+        q.expect(r"\$ ", 5)
+        assert re.search(r"^0  web +paused", vm_ls(q), re.M)
+        attach(q, "web")
+        q.send("echo while-paused\n")
+        try:
+            q.expect(r"\nwhile-paused", 3)
+            raise AssertionError("paused guest answered")
+        except TimeoutError:
+            pass
+        detach(q)
+        q.send("vmm resume web\n")
+        q.expect(r"vm 0 resumed", 10)
+        q.expect(r"\$ ", 5)
+        attach(q, "web")
+        q.expect(r"\nwhile-paused", 10) # the typed line is processed now
+        q.send("echo after-resume\n")
+        q.expect(r"\nafter-resume", 10)
+        detach(q)
+        # ps shows the guest's processes
+        q.send("vmm ps db\n")
+        q.expect(r"sleep +init", 10)
+        q.expect(r"\$ ", 10)
+        # restart keeps the configuration
+        q.send("vmm restart db\n")
+        q.expect(r"vm 1 killed", 20)
+        q.expect(r"vm (\d+) db: 1 vcpu\(s\), 128 MB, kernel /kernel, disk /disk1.img", 10)
+        q.expect(r"\$ ", 5)
+        attach(q, "db")
+        q.expect(r"init: starting sh", 30)
+        detach(q)
+        q.send("vmm kill --all\n")
+        q.expect(r"vm \d+ killed", 20)
+        q.expect(r"vm \d+ killed", 20)
+        q.expect(r"\$ ", 10)
+        assert "no vms" in vm_ls(q)
+        q.send("vmm kill --all\n")
+        q.expect(r"no vms", 10)
+        q.expect(r"\$ ", 5)
+    finally:
+        q.close()
+
+
+def t_hello(QEMU, intc, cpus, log):
+    """a guest that is not xv6: ELF at 0x80400000 with 3 vcpus, then the same
+    code as a raw binary."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        free0, _ = host_stats(q)
+        for args in ("-k /hello -f none -c 3", "-k /hello.bin -f none -r 0x80400000 -c 3"):
+            q.send("vmm start %s\n" % args)
+            q.expect(r"vm (\d+): 3 vcpu", 10)
+            q.expect(r"hello: running at 0x0000000080400000, hart 0, dtb at 0x0000000087ff0000", 20)
+            q.expect(r"hello: device tree ok, \d+ bytes", 5)
+            q.expect(r"hello: sbi console works", 5)
+            q.expect(r"hello: sbi spec version call returned 0", 5)
+            q.expect(r"hello: 3 hart\(s\) total", 10)
+            q.expect(r"hello: done", 5)
+            # the guest shut itself down through SBI: vmm returns to the shell.
+            q.send("\n")
+            q.expect(r"\$ ", 20)
+            assert "no vms" in vm_ls(q)
+        free1, _ = host_stats(q)
+        assert free1 == free0, (free0, free1)
+        # loading outside guest RAM is refused
+        q.send("vmm start -k /hello.bin -f none -r 0x10000000 -d\n")
+        q.expect(r"cannot create vm", 10)
+        q.expect(r"\$ ", 5)
+        q.send("vmm start -k /nonexistent -d\n")
+        q.expect(r"cannot create vm", 10)
+        q.expect(r"\$ ", 5)
+    finally:
+        q.close()
+
+
+def t_malicious(QEMU, intc, cpus, log):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        free0, _ = host_stats(q)
+        q.send("vmm start -k /badguest -f none\n")
+        q.expect(r"vm (\d+): 1 vcpu", 20)
+        q.expect(r"badguest: hello", 20)
+        q.expect(r"badguest: done, shutting down", 30)
+        q.send("\n")
+        q.expect(r"\$ ", 20)
+        assert "no vms" in vm_ls(q)
+        free1, _ = host_stats(q)
+        assert free1 == free0, (free0, free1)
+        vmid = start_guest(q)
+        q.send("echo still-fine\n")
+        q.expect(r"\nstill-fine", 10)
+        detach(q)
+        kill_vm(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_churn(QEMU, intc, cpus, log, rounds=4):
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        free0, _ = host_stats(q)
+        for r in range(rounds):
+            vmid = start_guest(q, "-c 2")
+            q.send("echo round-%d\n" % r)
+            q.expect(r"\nround-%d" % r, 10)
+            detach(q)
+            kill_vm(q, vmid)
+        free1, _ = host_stats(q)
+        assert free1 == free0, (free0, free1)
+    finally:
+        q.close()
+
+
+def tests(modes, cpus, log, QEMU, usertests_ok):
+    t = []
+    for m in modes:
+        t.append(("guest-boot-%s" % m, lambda m=m: t_guest_boot(QEMU, m, cpus, log)))
+        t.append(("guest-usertests-%s" % m, lambda m=m: t_guest_usertests(QEMU, m, cpus, log)))
+        t.append(("guest-smp-usertests-%s" % m, lambda m=m: t_guest_usertests(QEMU, m, cpus, log, 2)))
+        if m == "imsic":
+            t.append(("guest-smp-usertests-imsic-soft", lambda m=m: t_guest_usertests(QEMU, m, cpus, log, 2, "-s")))
+        t.append(("guest-parallel-%s" % m, lambda m=m: t_parallel(QEMU, m, cpus, log)))
+        t.append(("guest-disk-isolation-%s" % m, lambda m=m: t_disk_isolation(QEMU, m, cpus, log)))
+        t.append(("guest-clone-%s" % m, lambda m=m: t_clone(QEMU, m, cpus, log)))
+        t.append(("guest-lifecycle-%s" % m, lambda m=m: t_lifecycle(QEMU, m, cpus, log)))
+        t.append(("guest-hello-%s" % m, lambda m=m: t_hello(QEMU, m, cpus, log)))
+        t.append(("guest-churn-%s" % m, lambda m=m: t_churn(QEMU, m, cpus, log)))
+        t.append(("guest-malicious-%s" % m, lambda m=m: t_malicious(QEMU, m, cpus, log)))
+    # host configurations: a single hart, and more harts than the default.
+    t.append(("guest-smp-on-1-hart-plic", lambda: t_guest_usertests(QEMU, "plic", 1, log, 2)))
+    t.append(("guest-parallel-on-4-harts-imsic", lambda: t_parallel(QEMU, "imsic", 4, log, 3, 2)))
+    return t

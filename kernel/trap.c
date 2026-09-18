@@ -5,6 +5,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "platform.h"
+#include "intc.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -173,10 +175,33 @@ clockintr()
     release(&tickslock);
   }
 
+  // let the hypervisor wake guests whose virtual timers expired.
+  hyp_tick();
+
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth
-  // of a second.
-  w_stimecmp(r_time() + 1000000);
+  // of a second; an idle guest's timer may need to fire sooner.
+  uint64 now = r_time();
+  uint64 next = hyp_next_deadline(now + 1000000);
+  if (next < now + 100)
+    next = now + 100;
+  w_stimecmp(next);
+}
+
+// dispatch one external interrupt identity from the interrupt controller.
+static void
+extintr(int irq)
+{
+  int idx;
+  if (plat.intc_kind == INTC_IMSIC && irq == IMSIC_IPI_ID) {
+    ipi_handle();
+  } else if (irq == plat.uart_irq) {
+    uartintr();
+  } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
+    virtio_disk_intr(idx);
+  } else {
+    printk("unexpected interrupt irq=%d\n", irq);
+  }
 }
 
 // check if it's an external interrupt or software interrupt,
@@ -190,30 +215,30 @@ devintr()
   uint64 scause = r_scause();
 
   if (scause == 0x8000000000000009L) {
-    // this is a supervisor external interrupt, via PLIC.
-
-    // irq indicates which device interrupted.
-    int irq = plic_claim();
-
-    if (irq == UART0_IRQ) {
-      uartintr();
-    } else if (irq == VIRTIO0_IRQ) {
-      virtio_disk_intr();
-    } else if (irq) {
-      printk("unexpected interrupt irq=%d\n", irq);
+    // this is a supervisor external interrupt, via the PLIC/APLIC/IMSIC.
+    // irq indicates which device interrupted. the controller may have
+    // several pending; drain them.
+    int irq;
+    while ((irq = intc_claim()) != 0) {
+      extintr(irq);
+      // the PLIC allows each device to raise at most one
+      // interrupt at a time; tell it the device is
+      // now allowed to interrupt again.
+      intc_complete(irq);
     }
-
-    // the PLIC allows each device to raise at most one
-    // interrupt at a time; tell the PLIC the device is
-    // now allowed to interrupt again.
-    if (irq)
-      plic_complete(irq);
-
+    return 1;
+  } else if (scause == 0x8000000000000001L) {
+    // supervisor software interrupt: an IPI from another hart.
+    ipi_handle();
     return 1;
   } else if (scause == 0x8000000000000005L) {
     // timer interrupt.
     clockintr();
     return 2;
+  } else if (scause == 0x800000000000000cL) {
+    // supervisor guest external interrupt (IMSIC guest file).
+    hyp_sgei();
+    return 1;
   } else {
     return 0;
   }

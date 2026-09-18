@@ -21,6 +21,7 @@ void            bunpin(struct buf*);
 // console.c
 void            consoleinit(void);
 void            consoleintr(int);
+void            consoleraw(int);
 void            consputc(int);
 
 // exec.c
@@ -171,16 +172,23 @@ int             copyinstr(pagetable_t, uint64, char *, uint64, uint64);
 int             ismapped(pagetable_t, uint64);
 uint64          vmfault(pagetable_t, uint64, uint64, int);
 
-// plic.c
-void            plicinit(void);
-void            plicinithart(void);
-int             plic_claim(void);
-void            plic_complete(int);
-
 // virtio_disk.c
 void            virtio_disk_init(void);
 void            virtio_disk_rw(struct buf *, int);
-void            virtio_disk_intr(void);
+void            virtio_disk_intr(int);
+int             virtio_disk_present(int);
+int             virtio_disk_count(void);
+uint64          virtio_disk_capacity(int);
+
+// trap.c
+int             devintr(void);
+
+// hyp.c
+void            hypinit(void);
+void            hypinithart(void);
+void            hyp_tick(void);
+uint64          hyp_next_deadline(uint64);
+void            hyp_sgei(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x) / sizeof((x)[0]))

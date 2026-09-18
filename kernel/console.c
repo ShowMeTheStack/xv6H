@@ -53,7 +53,22 @@ struct {
   uint r; // Read index
   uint w; // Write index
   uint e; // Edit index
+  int raw; // raw mode: no echo, no line editing, wake per byte
 } cons;
+
+// switch the console between cooked (line-edited, echoed) and raw mode.
+void
+consoleraw(int on)
+{
+  acquire(&cons.lock);
+  cons.raw = on;
+  if (on) {
+    // discard any partially edited line.
+    cons.w = cons.e;
+    wakeup(&cons.r);
+  }
+  release(&cons.lock);
+}
 
 //
 // user write() system calls to the console go here.
@@ -109,6 +124,18 @@ consoleread(int user_dst, uint64 dst, int n)
 
     c = cons.buf[cons.r++ % INPUT_BUF_SIZE];
 
+    if (cons.raw) {
+      // raw mode: hand over whatever has arrived, byte by byte.
+      cbuf = c;
+      if (either_copyout(user_dst, dst, &cbuf, 1) == -1)
+        break;
+      dst++;
+      --n;
+      if (cons.r == cons.w)
+        break;
+      continue;
+    }
+
     if (c == C('D')) { // end-of-file
       if (n < target) {
         // Save ^D for next time, to make sure
@@ -147,6 +174,16 @@ void
 consoleintr(int c)
 {
   acquire(&cons.lock);
+
+  if (cons.raw) {
+    if (c != 0 && cons.e - cons.r < INPUT_BUF_SIZE) {
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
+      cons.w = cons.e;
+      wakeup(&cons.r);
+    }
+    release(&cons.lock);
+    return;
+  }
 
   switch (c) {
   case C('P'): // Print process list.

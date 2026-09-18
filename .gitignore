@@ -10,3 +10,14 @@ _*
 /user/usys.S
 .gdbinit
 TAGS
+guest*.img
+guest/kernel
+guest/badguest
+guest/*.o
+test-hyp.log
+guest/disk*.img
+guest/hello
+guest/hello.bin
+test-fs.img
+linux/Image*
+linux/linux.img

@@ -42,6 +42,25 @@ w_mepc(uint64 x)
 // Supervisor Status Register, sstatus
 
 #define SSTATUS_SPP  (1L << 8) // Previous mode, 1=Supervisor, 0=User
+#define SSTATUS_FS_MASK    (3L << 13) // floating-point unit state
+#define SSTATUS_FS_OFF     (0L << 13)
+#define SSTATUS_FS_INITIAL (1L << 13)
+#define SSTATUS_FS_CLEAN   (2L << 13)
+#define SSTATUS_FS_DIRTY   (3L << 13)
+
+static inline uint64
+r_fcsr()
+{
+  uint64 x;
+  asm volatile("csrr %0, fcsr" : "=r"(x));
+  return x;
+}
+
+static inline void
+w_fcsr(uint64 x)
+{
+  asm volatile("csrw fcsr, %0" : : "r"(x));
+}
 #define SSTATUS_SPIE (1L << 5) // Supervisor Previous Interrupt Enable
 #define SSTATUS_UPIE (1L << 4) // User Previous Interrupt Enable
 #define SSTATUS_SIE  (1L << 1) // Supervisor Interrupt Enable
@@ -98,6 +117,50 @@ w_sip(uint64 x)
 // Supervisor Interrupt Enable
 #define SIE_SEIE (1L << 9) // external
 #define SIE_STIE (1L << 5) // timer
+#define SIE_SSIE (1L << 1) // software
+#define SIP_SSIP (1L << 1)
+
+static inline void
+c_sip(uint64 x)
+{
+  asm volatile("csrc sip, %0" : : "r"(x));
+}
+
+static inline void
+s_sip(uint64 x)
+{
+  asm volatile("csrs sip, %0" : : "r"(x));
+}
+
+// misa: which extensions does this hart have?
+static inline uint64
+r_misa()
+{
+  uint64 x;
+  asm volatile("csrr %0, misa" : "=r"(x));
+  return x;
+}
+
+// machine trap vector and scratch
+static inline void
+w_mtvec(uint64 x)
+{
+  asm volatile("csrw mtvec, %0" : : "r"(x));
+}
+
+static inline void
+w_mscratch(uint64 x)
+{
+  asm volatile("csrw mscratch, %0" : : "r"(x));
+}
+
+static inline uint64
+r_mip()
+{
+  uint64 x;
+  asm volatile("csrr %0, mip" : "=r"(x));
+  return x;
+}
 static inline uint64
 r_sie()
 {
@@ -114,6 +177,7 @@ w_sie(uint64 x)
 
 // Machine-mode Interrupt Enable
 #define MIE_STIE (1L << 5) // supervisor timer
+#define MIE_MSIE (1L << 3) // machine software
 static inline uint64
 r_mie()
 {

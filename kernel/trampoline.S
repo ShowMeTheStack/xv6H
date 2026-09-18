@@ -72,6 +72,49 @@ uservec:
         csrr t0, sscratch
         sd t0, 112(a0)
 
+        # floating-point registers: save them only if the process used
+        # the FPU since they were last restored (sstatus.FS == Dirty).
+        csrr t0, sstatus
+        srli t0, t0, 13
+        andi t0, t0, 3
+        li t1, 3
+        bne t0, t1, fp_saved
+        fsd f0, 288(a0)
+        fsd f1, 296(a0)
+        fsd f2, 304(a0)
+        fsd f3, 312(a0)
+        fsd f4, 320(a0)
+        fsd f5, 328(a0)
+        fsd f6, 336(a0)
+        fsd f7, 344(a0)
+        fsd f8, 352(a0)
+        fsd f9, 360(a0)
+        fsd f10, 368(a0)
+        fsd f11, 376(a0)
+        fsd f12, 384(a0)
+        fsd f13, 392(a0)
+        fsd f14, 400(a0)
+        fsd f15, 408(a0)
+        fsd f16, 416(a0)
+        fsd f17, 424(a0)
+        fsd f18, 432(a0)
+        fsd f19, 440(a0)
+        fsd f20, 448(a0)
+        fsd f21, 456(a0)
+        fsd f22, 464(a0)
+        fsd f23, 472(a0)
+        fsd f24, 480(a0)
+        fsd f25, 488(a0)
+        fsd f26, 496(a0)
+        fsd f27, 504(a0)
+        fsd f28, 512(a0)
+        fsd f29, 520(a0)
+        fsd f30, 528(a0)
+        fsd f31, 536(a0)
+        csrr t1, fcsr
+        sd t1, 544(a0)
+fp_saved:
+
         # initialize kernel stack pointer, from p->trapframe->kernel_sp
         ld sp, 8(a0)
 
@@ -112,6 +155,52 @@ userret:
         sfence.vma zero, zero
 
         li a0, TRAPFRAME
+
+        # restore the floating-point state (zeros for a process that never
+        # used the FPU), then mark it Clean so an untouched FPU is not saved
+        # again at the next trap.
+        li t0, 0x6000
+        csrc sstatus, t0
+        li t0, 0x2000
+        csrs sstatus, t0
+        fld f0, 288(a0)
+        fld f1, 296(a0)
+        fld f2, 304(a0)
+        fld f3, 312(a0)
+        fld f4, 320(a0)
+        fld f5, 328(a0)
+        fld f6, 336(a0)
+        fld f7, 344(a0)
+        fld f8, 352(a0)
+        fld f9, 360(a0)
+        fld f10, 368(a0)
+        fld f11, 376(a0)
+        fld f12, 384(a0)
+        fld f13, 392(a0)
+        fld f14, 400(a0)
+        fld f15, 408(a0)
+        fld f16, 416(a0)
+        fld f17, 424(a0)
+        fld f18, 432(a0)
+        fld f19, 440(a0)
+        fld f20, 448(a0)
+        fld f21, 456(a0)
+        fld f22, 464(a0)
+        fld f23, 472(a0)
+        fld f24, 480(a0)
+        fld f25, 488(a0)
+        fld f26, 496(a0)
+        fld f27, 504(a0)
+        fld f28, 512(a0)
+        fld f29, 520(a0)
+        fld f30, 528(a0)
+        fld f31, 536(a0)
+        ld t1, 544(a0)
+        csrw fcsr, t1
+        li t0, 0x6000
+        csrc sstatus, t0
+        li t0, 0x4000
+        csrs sstatus, t0
 
         # restore all but a0 from TRAPFRAME
         ld ra, 40(a0)

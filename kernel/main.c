@@ -3,6 +3,8 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "defs.h"
+#include "platform.h"
+#include "intc.h"
 
 volatile static int started = 0;
 
@@ -16,18 +18,25 @@ main()
     printk("\n");
     printk("xv6 kernel is booting\n");
     printk("\n");
+    printk("platform: %s, ram %ld MB (host %ld MB), %d cpus, intc %s, %d virtio slots%s\n",
+           plat.is_guest ? "xv6h guest" : "qemu virt",
+           plat.ram_size / (1024 * 1024), (plat.host_top - plat.ram_base) / (1024 * 1024),
+           plat.ncpu,
+           plat.intc_kind == INTC_PLIC ? "plic" : plat.intc_kind == INTC_APLIC ? "aplic" : "aplic-msi+imsic",
+           plat.nvirtio, plat.has_h ? ", hypervisor ext" : "");
     kinit();            // physical page allocator
     kvminit();          // create kernel page table
     kvminithart();      // turn on paging
     procinit();         // process table
     trapinit();         // trap vectors
     trapinithart();     // install kernel trap vector
-    plicinit();         // set up interrupt controller
-    plicinithart();     // ask PLIC for device interrupts
+    intc_init();        // set up interrupt controller
+    intc_inithart();    // ask it for device interrupts
     binit();            // buffer cache
     iinit();            // inode table
     fileinit();         // file table
-    virtio_disk_init(); // emulated hard disk
+    virtio_disk_init(); // emulated hard disk(s)
+    hypinit();          // hypervisor (if the H extension is present)
     userinit();         // first user process
 
     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
@@ -36,9 +45,10 @@ main()
       ;
 
     printk("hart %d starting\n", cpuid());
-    kvminithart();  // turn on paging
-    trapinithart(); // install kernel trap vector
-    plicinithart(); // ask PLIC for device interrupts
+    kvminithart();   // turn on paging
+    trapinithart();  // install kernel trap vector
+    intc_inithart(); // ask interrupt controller for device interrupts
+    hypinithart();   // hypervisor CSRs
   }
 
   scheduler();

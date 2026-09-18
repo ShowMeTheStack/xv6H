@@ -21,3 +21,12 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_sync   22
+#define SYS_vm_create  23
+#define SYS_vm_ctl     24
+#define SYS_vm_run     25
+#define SYS_vm_destroy 26
+#define SYS_vm_cons    27
+#define SYS_vm_info    28
+#define SYS_consraw    29
+#define SYS_vm_stats   30
+#define SYS_hwinfo     31

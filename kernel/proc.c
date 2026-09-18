@@ -131,6 +131,7 @@ found:
     release(&p->lock);
     return 0;
   }
+  memset(p->trapframe, 0, sizeof(*p->trapframe));
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);

@@ -37,9 +37,16 @@
 #define PLIC_SPRIORITY(hart) (PLIC + 0x201000 + (hart) * 0x2000)
 #define PLIC_SCLAIM(hart)    (PLIC + 0x201004 + (hart) * 0x2000)
 
-// the kernel expects there to be RAM
-// for use by the kernel and user pages
-// from physical address 0x80000000 to PHYSTOP.
+// qemu's AIA interrupt controllers (-machine virt,aia=aplic-imsic).
+#define APLIC_M   0x0c000000L
+#define APLIC_S   0x0d000000L
+#define IMSIC_M   0x24000000L
+#define IMSIC_S   0x28000000L
+
+// the kernel expects there to be RAM for use by the kernel and user
+// pages from physical address 0x80000000 to plat.host_top (the device
+// tree says how much RAM there is; see platform.c). PHYSTOP is only
+// the size a guest gets by default.
 #define KERNBASE 0x80000000L
 #define PHYSTOP  (KERNBASE + 128 * 1024 * 1024)
 
