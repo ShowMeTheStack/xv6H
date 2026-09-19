@@ -29,6 +29,8 @@ struct vmconfig {
   int flags;
   uint64 load_addr;        // VMF_RAW: guest-physical load address
   char bootargs[128];      // kernel command line (device tree /chosen/bootargs)
+  int net;                 // 0: no address configuration, 1: dhcp, 2: static
+  uint32 ip, mask, gw, dns; // static configuration (host byte order)
 };
 
 enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
@@ -42,6 +44,7 @@ enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
 
 struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
+  int resident_mb;        // guest RAM actually backed by host memory
   struct vmconfig cfg;
   uint64 entry;
   uint64 disk_sectors;
@@ -50,6 +53,12 @@ struct vminfo {
   uint64 pc, last_cause, last_gpa;
   int running_hart, idle, mmode;
   uint64 vsatp, vstvec, vsepc, vscause, vsstatus, vstval, sp, ra, vsie, vstimecmp;
+  uint64 scounteren, senvcfg, hcounteren;
+  // vcpu 1 (if any): pc, last cause, idle, hsm state, exits, injected VSEIP state
+  uint64 pc1, cause1, exits1;
+  int idle1, hsm1, hart1;
+  uint64 eie0_0, eip0_0, eie0_1, eip0_1;
+  int deliv0, deliv1, thr0, thr1;
 };
 
 #endif

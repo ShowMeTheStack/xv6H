@@ -27,14 +27,12 @@ uservec:
         # user page table.
         #
 
-        # save user a0 in sscratch so
-        # a0 can be used to get at TRAPFRAME.
-        csrw sscratch, a0
-
-        # each process has a separate p->trapframe memory area,
-        # but it's mapped to the same virtual address
-        # (TRAPFRAME) in every process's user page table.
-        li a0, TRAPFRAME
+        # the kernel left the trapframe's virtual address in sscratch
+        # (usertrapret); swap it with a0, parking user a0 in sscratch.
+        # each process has a separate p->trapframe memory area, mapped at
+        # the same virtual address (plat.maxva - 2 pages) in every user
+        # page table.
+        csrrw a0, sscratch, a0
         
         # save the user registers in TRAPFRAME
         sd ra, 40(a0)
@@ -154,7 +152,8 @@ userret:
         csrw satp, a0
         sfence.vma zero, zero
 
-        li a0, TRAPFRAME
+        # the trapframe's virtual address (usertrapret put it in sscratch)
+        csrr a0, sscratch
 
         # restore the floating-point state (zeros for a process that never
         # used the FPU), then mark it Clean so an untouched FPU is not saved

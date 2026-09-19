@@ -8,6 +8,7 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "fdt.h"
+#include "defs.h"
 #include "platform.h"
 
 struct platform plat;
@@ -107,6 +108,9 @@ finalize(struct nodeacc *n)
     plat.uart_irq = n->nirq ? n->irqs[0] : 0;
   } else if (fdt_strlist_has(n->compat, n->compat_len, "virtio,mmio")) {
     add_virtio(n->reg[0], n->nirq ? n->irqs[0] : 0);
+  } else if (fdt_strlist_has(n->compat, n->compat_len, "google,goldfish-rtc")) {
+    plat.rtc_base = n->reg[0];
+    plat.rtc_irq = n->nirq ? n->irqs[0] : 0;
   } else if (fdt_strlist_has(n->compat, n->compat_len, "riscv,clint0") ||
              fdt_strlist_has(n->compat, n->compat_len, "sifive,clint0")) {
     plat.clint_base = n->reg[0];
@@ -154,6 +158,40 @@ parse(const void *fdt)
           plat.guest_id = fdt32(item.data);
         continue;
       }
+      if (item.depth == 1 && acc.pending && fdt_name_is(acc.name, "cpus") &&
+          streq(item.prop, "timebase-frequency") && item.len >= 4) {
+        plat.timebase = fdt32(item.data);
+        continue;
+      }
+      if (item.depth == 2 && acc.pending && fdt_name_is(acc.name, "cpu@") && streq(item.prop, "mmu-type")) {
+        const char *m = item.data;
+        int v = 39;
+        if (fdt_strlist_has(m, item.len, "riscv,sv57"))
+          v = 57;
+        else if (fdt_strlist_has(m, item.len, "riscv,sv48"))
+          v = 48;
+        if (plat.mmu_max == 0 || v < plat.mmu_max)
+          plat.mmu_max = v; // the least capable hart decides
+        continue;
+      }
+      if (item.depth == 1 && acc.pending && fdt_name_is(acc.name, "chosen") && streq(item.prop, "bootargs")) {
+        uint32 n = item.len;
+        if (n > sizeof(plat.bootargs) - 1)
+          n = sizeof(plat.bootargs) - 1;
+        for (uint32 i = 0; i < n; i++)
+          plat.bootargs[i] = ((const char *)item.data)[i];
+        plat.bootargs[n] = 0;
+        continue;
+      }
+      if (item.depth == 1 && acc.pending && fdt_name_is(acc.name, "chosen")) {
+        if (streq(item.prop, "xv6h,ip") && item.len >= 16) {
+          plat.net_ip = fdt32(item.data);
+          plat.net_mask = fdt32((const char *)item.data + 4);
+          plat.net_gw = fdt32((const char *)item.data + 8);
+          plat.net_dns = fdt32((const char *)item.data + 12);
+        }
+        continue;
+      }
       if (!acc.pending)
         continue;
       if (streq(item.prop, "compatible")) {
@@ -194,6 +232,25 @@ parse(const void *fdt)
   }
 }
 
+// does the host's command line contain the word w?
+int
+plat_bootarg(const char *w)
+{
+  const char *s = plat.bootargs;
+  int n = strlen(w);
+  while (*s) {
+    while (*s == ' ')
+      s++;
+    const char *e = s;
+    while (*e && *e != ' ')
+      e++;
+    if (e - s == n && memcmp(s, w, n) == 0)
+      return 1;
+    s = e;
+  }
+  return 0;
+}
+
 static void
 defaults(void)
 {
@@ -232,9 +289,17 @@ platform_init(uint64 fdt_pa)
     defaults();
 
   plat.ram_end = plat.ram_base + plat.ram_size;
-  plat.host_top = plat.ram_base + HOSTMEM;
-  if (plat.host_top > plat.ram_end)
-    plat.host_top = plat.ram_end;
+
+  // paging mode: Sv48 when the hardware has it and the command line does
+  // not say "sv39"; Sv39 cannot direct-map RAM beyond 256 GiB.
+  if (plat.mmu_max == 0)
+    plat.mmu_max = 39;
+  plat.mmu_levels = (plat.mmu_max >= 48 && !plat_bootarg("sv39")) ? 4 : 3;
+  plat.maxva = plat.mmu_levels == 4 ? (1UL << 47) : (1UL << 38);
+  if (plat.mmu_levels == 3 && plat.ram_end > (1UL << 38)) {
+    plat.ram_end = 1UL << 38;
+    plat.ram_size = plat.ram_end - plat.ram_base;
+  }
   if (plat.ncpu <= 0 || plat.ncpu > NCPU)
     plat.ncpu = NCPU;
   if (plat.clint_base == 0)
@@ -243,6 +308,16 @@ platform_init(uint64 fdt_pa)
 
   plat.misa = r_misa();
   plat.has_h = (plat.misa >> 7) & 1;
+  plat.has_v = (plat.misa >> 21) & 1;
+  if (plat.has_v) {
+    // vlenb is only readable with the vector unit enabled (mstatus.VS).
+    uint64 ms = r_mstatus();
+    w_mstatus(ms | MSTATUS_VS_INITIAL);
+    plat.vlenb = r_vlenb();
+    w_mstatus(ms);
+    if (plat.vlenb * 32 > 4096)
+      plat.has_v = 0; // a register file larger than a page: unsupported
+  }
 
   __sync_synchronize();
   plat.ready = 1;

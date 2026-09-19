@@ -7,7 +7,14 @@
 #include "kernel/syscall.h"
 #include "kernel/memlayout.h"
 #include "kernel/riscv.h"
+#include "kernel/sysconf.h"
+#include "kernel/time.h"
 #include "kernel/hwinfo.h"
+
+// the paging mode, and so the top of the address space, is chosen at boot.
+#undef MAXVA
+#define MAXVA ((uint64)sysconf(_SC_XV6_MAXVA))
+#define TRAPFRAME ((uint64)sysconf(_SC_XV6_TRAPFRAME))
 
 //
 // Tests xv6 system calls.  usertests without arguments runs them all
@@ -1070,10 +1077,14 @@ mem(char *s)
   int pid;
 
   if ((pid = fork()) == 0) {
+    // allocate until malloc fails, or 256 MB on a machine too large to
+    // exhaust (the point is the allocator's bookkeeping, not the size).
+    long budget = 256L * 1024 * 1024;
     m1 = 0;
-    while ((m2 = malloc(10001)) != 0) {
+    while (budget > 0 && (m2 = malloc(10001)) != 0) {
       *(char **)m2 = m1;
       m1 = m2;
+      budget -= 10001;
     }
     while (m1) {
       m2 = *(char **)m1;
@@ -2011,13 +2022,18 @@ sbrkbasic(char *s)
   int i, pid, xstatus;
   char *c, *a, *b;
 
-  // does sbrk() return the expected failure value?
+  // does sbrk() return the expected failure value? an int's worth of
+  // sbrk() cannot exceed the RAM of a machine with 2 GB or more, where
+  // the allocation simply succeeds.
+  int plenty = (uint64)sysconf(_SC_PHYS_PAGES) * PGSIZE >= 2UL * TOOMUCH;
   pid = fork();
   if (pid < 0) {
     printf("fork failed in sbrkbasic\n");
     exit(1);
   }
   if (pid == 0) {
+    if (plenty)
+      exit(0);
     a = sbrk(TOOMUCH);
     if (a == (char *)SBRK_ERROR) {
       // it's OK if this fails.
@@ -2178,7 +2194,6 @@ MAXVAplus(char *s)
 void
 sbrkfail(char *s)
 {
-  enum { BIG = 100 * 1024 * 1024 };
   int i, xstatus;
   int fds[2];
   char scratch;
@@ -2186,6 +2201,16 @@ sbrkfail(char *s)
   int pids[10];
   int pid;
   int failed;
+
+  // ten children each take a quarter of RAM: some must be refused. on a
+  // machine with more than 4 GB this would touch too much memory for the
+  // test to be worth it; the failure path is checked on small ones.
+  uint64 phys = (uint64)sysconf(_SC_PHYS_PAGES) * PGSIZE;
+  if (phys > 4UL * 1024 * 1024 * 1024) {
+    printf("%s: %ld MB of RAM, not exhausting it\n", s, phys >> 20);
+    return;
+  }
+  int BIG = (int)(phys / 4);
 
   failed = 0;
   if (pipe(fds) != 0) {
@@ -2234,12 +2259,14 @@ sbrkfail(char *s)
     exit(1);
   }
   if (pid == 0) {
-    // allocate a lot of memory. this should produce an error
-    a = sbrk(10 * BIG);
-    if (a == (char *)SBRK_ERROR) {
-      exit(0);
+    // allocate more than the machine has, a quarter at a time: this
+    // must produce an error before the tenth step.
+    for (i = 0; i < 10; i++) {
+      a = sbrk(BIG);
+      if (a == (char *)SBRK_ERROR)
+        exit(0);
     }
-    printf("%s: allocate a lot of memory succeeded %d\n", s, 10 * BIG);
+    printf("%s: allocating more than RAM succeeded\n", s);
     exit(1);
   }
   wait(&xstatus);
@@ -2306,6 +2333,36 @@ bsstest(char *s)
   }
 }
 
+// the clocks: realtime is a plausible date and monotonic never goes back.
+void
+clocktest(char *s)
+{
+  struct timespec a, b;
+  if (clock_gettime(CLOCK_REALTIME, &a) < 0) {
+    printf("%s: no real-time clock\n", s);
+    exit(1);
+  }
+  if (a.sec < 1700000000L || a.nsec < 0 || a.nsec >= 1000000000L) { // after Nov 2023
+    printf("%s: implausible time %ld.%ld\n", s, a.sec, a.nsec);
+    exit(1);
+  }
+  if (clock_gettime(CLOCK_MONOTONIC, &a) < 0) {
+    printf("%s: no monotonic clock\n", s);
+    exit(1);
+  }
+  for (int i = 0; i < 1000; i++) {
+    if (clock_gettime(CLOCK_MONOTONIC, &b) < 0 || b.sec < a.sec || (b.sec == a.sec && b.nsec < a.nsec)) {
+      printf("%s: monotonic clock went backwards\n", s);
+      exit(1);
+    }
+    a = b;
+  }
+  if (clock_gettime(2, &a) >= 0 || clock_gettime(CLOCK_REALTIME, (struct timespec *)0xffffffff00000000UL) >= 0) {
+    printf("%s: bad arguments accepted\n", s);
+    exit(1);
+  }
+}
+
 // does exec return an error if the arguments
 // are larger than a page? or does it write
 // below the stack and wreck the instructions/data?
@@ -2319,7 +2376,8 @@ bigargtest(char *s)
   if (pid == 0) {
     static char *args[MAXARG];
     int i;
-    char big[400];
+    // MAXARG-1 of these overflow the user stack, whatever its size.
+    char big[(USERSTACK * PGSIZE) / (MAXARG - 1) + 16];
     memset(big, ' ', sizeof(big));
     big[sizeof(big) - 1] = '\0';
     for (i = 0; i < MAXARG - 1; i++)
@@ -3069,6 +3127,189 @@ fpcsr(char *s)
   asm volatile("fsrm %0, %1" : "=r"(frm) : "r"(0L));
 }
 
+
+//
+// vector extension: arithmetic, state across context switches, vl/vtype/
+// vcsr persistence; without V the instructions must be reported as illegal.
+//
+
+static int
+have_v(void)
+{
+  struct hwinfo hi;
+  return hwinfo(&hi) == 0 && hi.has_v;
+}
+
+void
+vtest(char *s)
+{
+  static int a[300], b[300], c[300];
+  if (!have_v()) {
+    // no vector unit: a vector instruction must kill the process.
+    int pid = fork();
+    if (pid == 0) {
+      asm volatile(".option push\n.option arch, +v\nvsetvli x0, x0, e8, m1, ta, ma\n.option pop\n");
+      exit(0);
+    }
+    int st;
+    wait(&st);
+    if (st != -1) {
+      printf("%s: vector instruction without V not reported as illegal (%d)\n", s, st);
+      exit(1);
+    }
+    return;
+  }
+  for (int i = 0; i < 300; i++) {
+    a[i] = i * i;
+    b[i] = 1000 - i;
+  }
+  int *p = a, *q = b, *d = c;
+  long n = 300;
+  while (n > 0) {
+    long vl;
+    asm volatile(".option push\n.option arch, +v\n"
+                 "vsetvli %0, %1, e32, m1, ta, ma\n"
+                 "vle32.v v1, (%2)\n"
+                 "vle32.v v2, (%3)\n"
+                 "vadd.vv v3, v1, v2\n"
+                 "vse32.v v3, (%4)\n"
+                 ".option pop\n"
+                 : "=r"(vl) : "r"(n), "r"(p), "r"(q), "r"(d) : "memory");
+    if (vl <= 0 || vl > n) {
+      printf("%s: bad vl %ld\n", s, vl);
+      exit(1);
+    }
+    p += vl;
+    q += vl;
+    d += vl;
+    n -= vl;
+  }
+  for (int i = 0; i < 300; i++) {
+    if (c[i] != a[i] + b[i]) {
+      printf("%s: vadd wrong at %d\n", s, i);
+      exit(1);
+    }
+  }
+}
+
+// each child keeps its own pattern in v0..v7 across many context switches.
+void
+vfork(char *s)
+{
+  if (!have_v())
+    return;
+  int n = 4;
+  for (int k = 0; k < n; k++) {
+    int pid = fork();
+    if (pid < 0) {
+      printf("%s: fork failed\n", s);
+      exit(1);
+    }
+    if (pid == 0) {
+      static unsigned char pat[1024], back[1024];
+      for (int i = 0; i < 1024; i++)
+        pat[i] = (unsigned char)(i * (k + 3) + k);
+      long vl;
+      asm volatile(".option push\n.option arch, +v\n"
+                   "vsetvli %0, %1, e8, m8, ta, ma\n"
+                   "vle8.v v0, (%2)\n"
+                   ".option pop\n"
+                   : "=r"(vl) : "r"(1024L), "r"(pat) : "memory");
+      for (int i = 0; i < 20; i++) {
+        pause(1);
+        asm volatile(".option push\n.option arch, +v\nvse8.v v0, (%0)\n.option pop\n" : : "r"(back) : "memory");
+        for (long j = 0; j < vl; j++) {
+          if (back[j] != pat[j]) {
+            printf("%s: child %d: vector state corrupted (round %d)\n", s, k, i);
+            exit(1);
+          }
+        }
+        uint64 vlnow;
+        asm volatile("csrr %0, vl" : "=r"(vlnow));
+        if (vlnow != (uint64)vl) {
+          printf("%s: child %d: vl changed\n", s, k);
+          exit(1);
+        }
+      }
+      exit(0);
+    }
+  }
+  for (int k = 0; k < n; k++) {
+    int st;
+    wait(&st);
+    if (st != 0) {
+      printf("%s: child failed\n", s);
+      exit(1);
+    }
+  }
+}
+
+// vcsr (rounding mode / saturation flag) and vtype belong to the process.
+void
+vcsrtest(char *s)
+{
+  if (!have_v())
+    return;
+  uint64 v;
+  asm volatile("csrw vcsr, %0" : : "r"(4L)); // vxrm (bits 2:1) = 2 (rdn)
+  pause(2);
+  asm volatile("csrr %0, vcsr" : "=r"(v));
+  if ((v & 6) != 4) {
+    printf("%s: vcsr lost across a context switch (%ld)\n", s, v);
+    exit(1);
+  }
+  long vl;
+  asm volatile(".option push\n.option arch, +v\nvsetvli %0, %1, e16, m2, ta, ma\n.option pop\n" : "=r"(vl) : "r"(7L));
+  pause(2);
+  uint64 vtype, vlnow;
+  asm volatile("csrr %0, vtype" : "=r"(vtype));
+  asm volatile("csrr %0, vl" : "=r"(vlnow));
+  if (vlnow != 7 || (vtype & 0x38) != 0x08 || (vtype & 7) != 1) {
+    printf("%s: vl/vtype lost across a context switch (%ld, 0x%lx)\n", s, vlnow, vtype);
+    exit(1);
+  }
+  int pid = fork();
+  if (pid == 0) {
+    asm volatile("csrw vcsr, %0" : : "r"(0L));
+    asm volatile(".option push\n.option arch, +v\nvsetvli x0, x0, e8, m1, ta, ma\n.option pop\n");
+    exit(0);
+  }
+  wait(0);
+  asm volatile("csrr %0, vcsr" : "=r"(v));
+  asm volatile("csrr %0, vl" : "=r"(vlnow));
+  if ((v & 6) != 4 || vlnow != 7) {
+    printf("%s: vector csrs changed by child\n", s);
+    exit(1);
+  }
+  asm volatile("csrw vcsr, %0" : : "r"(0L));
+}
+
+// the standalone floating-point and vector programs must all succeed.
+void
+fpvexec(char *s)
+{
+  static char *progs[] = {"fpbench", "mandel", "vecbench", 0};
+  for (int i = 0; progs[i]; i++) {
+    int pid = fork();
+    if (pid < 0) {
+      printf("%s: fork failed\n", s);
+      exit(1);
+    }
+    if (pid == 0) {
+      char *argv[] = {progs[i], "2", 0};
+      exec(progs[i], argv);
+      printf("%s: exec %s failed\n", s, progs[i]);
+      exit(1);
+    }
+    int st;
+    wait(&st);
+    if (st != 0) {
+      printf("%s: %s failed (%d)\n", s, progs[i], st);
+      exit(1);
+    }
+  }
+}
+
 struct test {
   void (*f)(char *);
   char *s;
@@ -3125,6 +3366,7 @@ struct test {
   {validatetest, "validatetest"},
   {bsstest, "bsstest"},
   {bigargtest, "bigargtest"},
+  {clocktest, "clocktest"},
   {argptest, "argptest"},
   {stacktest, "stacktest"},
   {nowrite, "nowrite"},
@@ -3143,6 +3385,10 @@ struct test {
   {fptest, "fptest"},
   {fpfork, "fpfork"},
   {fpcsr, "fpcsr"},
+  {vtest, "vtest"},
+  {vfork, "vfork"},
+  {vcsrtest, "vcsrtest"},
+  {fpvexec, "fpvexec"},
   {0, 0},
 };
 
@@ -3288,6 +3534,10 @@ badwrite(char *s)
 void
 execout(char *s)
 {
+  if ((uint64)sysconf(_SC_PHYS_PAGES) * PGSIZE > 4UL * 1024 * 1024 * 1024) {
+    printf("%s: too much RAM to exhaust, skipping\n", s);
+    return;
+  }
   for (int avail = 0; avail < 15; avail++) {
     int pid = fork();
     if (pid < 0) {
@@ -3565,17 +3815,9 @@ runtests(struct test *tests, char *justone, int continuous)
 int
 countfree()
 {
-  int n = 0;
-  uint64 sz0 = (uint64)sbrk(0);
-  while (1) {
-    char *a = sbrk(PGSIZE);
-    if (a == SBRK_ERROR) {
-      break;
-    }
-    n += 1;
-  }
-  sbrk(-((uint64)sbrk(0) - sz0));
-  return n;
+  // the kernel's count of free pages (exhausting a 512 GiB machine with
+  // sbrk() to count them would take, and commit, all of it).
+  return (int)sysconf(_SC_AVPHYS_PAGES);
 }
 
 int

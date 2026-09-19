@@ -33,7 +33,7 @@ static void
 usage(void)
 {
   fprintf(2, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
-             "                 [-a bootargs] [-H] [-s] [-d]\n"
+             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-d]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats\n");
   exit(1);
@@ -115,29 +115,47 @@ static void
 attach(int id)
 {
   struct vminfo vi;
-  if (getinfo(id, &vi) < 0 || vi.state == VM_FREE) {
+  if (getinfo(id, &vi) < 0) {
     fprintf(2, "vmm: no vm %d\n", id);
     exit(1);
   }
+  if (vi.state == VM_FREE) {
+    // already gone (a short-lived guest): show what it left in its console.
+    char buf[128];
+    int n;
+    while ((n = vm_cons(id, VMCONS_READ, buf, sizeof(buf))) > 0)
+      write(1, buf, n);
+    printf("[vm %d has exited]\n", id);
+    return;
+  }
   printf("[attached to vm %d%s%s, Ctrl-] to detach]\n", id, vi.cfg.name[0] ? " " : "", vi.cfg.name);
   consraw(1);
-  int reader = fork();
-  if (reader == 0)
-    output_loop(id);
-  char c;
-  while (read(0, &c, 1) == 1) {
-    if (c == DETACH_CHAR)
-      break;
-    if (vm_cons(id, VMCONS_WRITE, &c, 1) < 0)
-      break;
-    if (getinfo(id, &vi) < 0 || vi.state == VM_FREE)
-      break;
+  int writer = fork();
+  if (writer == 0) {
+    // keystrokes go to the guest; Ctrl-] asks the reader below to stop.
+    char c;
+    while (read(0, &c, 1) == 1) {
+      if (c == DETACH_CHAR) {
+        vm_cons(id, VMCONS_DETACH, 0, 0);
+        break;
+      }
+      if (vm_cons(id, VMCONS_WRITE, &c, 1) < 0)
+        break;
+    }
+    exit(0);
   }
-  vm_cons(id, VMCONS_DETACH, 0, 0);
-  kill(reader);
+  // guest output until the VM ends or a detach is requested.
+  char buf[128];
+  int n;
+  while ((n = vm_cons(id, VMCONS_READ, buf, sizeof(buf))) > 0)
+    write(1, buf, n);
+  kill(writer);
   wait(0);
   consraw(0);
-  printf("\n[detached from vm %d]\n", id);
+  if (getinfo(id, &vi) == 0 && vi.state == VM_FREE)
+    printf("\n[vm %d has exited]\n", id);
+  else
+    printf("\n[detached from vm %d]\n", id);
 }
 
 // create and start a VM from cfg; returns its id.
@@ -175,6 +193,88 @@ setstr(char *dst, int max, char *src)
     exit(1);
   }
   memmove(dst, src, n + 1);
+}
+
+static void
+append_bootarg(struct vmconfig *cfg, char *w)
+{
+  int len = strlen(cfg->bootargs), n = strlen(w);
+  if (len + n + 2 > sizeof(cfg->bootargs)) {
+    fprintf(2, "vmm: bootargs too long\n");
+    exit(1);
+  }
+  if (len)
+    cfg->bootargs[len++] = ' ';
+  memmove(cfg->bootargs + len, w, n + 1);
+}
+
+// -i dhcp | IP/PREFIX[,GW[,DNS]]: the guest's address configuration.
+// an xv6 guest reads it from its device tree; a Linux guest gets the
+// equivalent ip= kernel parameter.
+static void
+parse_net(struct vmconfig *cfg, char *spec)
+{
+  if (strcmp(spec, "dhcp") == 0) {
+    cfg->net = 1;
+    return;
+  }
+  char buf[64], *p = buf, *q;
+  setstr(buf, sizeof(buf), spec);
+  q = strchr(p, ',');
+  if (q)
+    *q++ = 0;
+  char *slash = strchr(p, '/');
+  int prefix = 24;
+  if (slash) {
+    *slash = 0;
+    prefix = atoi(slash + 1);
+  }
+  if (parse_ip(p, &cfg->ip) < 0 || prefix < 1 || prefix > 30) {
+    fprintf(2, "vmm: bad address '%s'\n", spec);
+    exit(1);
+  }
+  cfg->mask = ~0U << (32 - prefix);
+  cfg->gw = (cfg->ip & cfg->mask) | 2; // qemu's user-mode gateway is .2
+  cfg->dns = (cfg->ip & cfg->mask) | 3; // and its dns forwarder .3
+  if (q) {
+    p = q;
+    q = strchr(p, ',');
+    if (q)
+      *q++ = 0;
+    if (parse_ip(p, &cfg->gw) < 0) {
+      fprintf(2, "vmm: bad gateway '%s'\n", p);
+      exit(1);
+    }
+    if (q && parse_ip(q, &cfg->dns) < 0) {
+      fprintf(2, "vmm: bad dns '%s'\n", q);
+      exit(1);
+    }
+  }
+  cfg->net = 2;
+}
+
+static void
+net_bootargs(struct vmconfig *cfg)
+{
+  if (cfg->net == 1) {
+    append_bootarg(cfg, "ip=dhcp");
+  } else if (cfg->net == 2) {
+    char a[16], g[16], m[16], d[16], arg[96];
+    ip2str(cfg->ip, a);
+    ip2str(cfg->gw, g);
+    ip2str(cfg->mask, m);
+    ip2str(cfg->dns, d);
+    // ip=<client>:<server>:<gw>:<netmask>:<hostname>:<device>:<autoconf>:<dns0>
+    int n = 0;
+    char *parts[] = {"ip=", a, "::", g, ":", m, "::eth0:none:", d};
+    for (int i = 0; i < 8; i++) {
+      int k = strlen(parts[i]);
+      memmove(arg + n, parts[i], k);
+      n += k;
+    }
+    arg[n] = 0;
+    append_bootarg(cfg, arg);
+  }
 }
 
 static void
@@ -233,6 +333,9 @@ start(int argc, char *argv[])
         len += n;
         cfg.bootargs[len] = 0;
       }
+    } else if (strcmp(a, "-i") == 0 && v) {
+      parse_net(&cfg, v);
+      i++;
     } else if (strcmp(a, "-H") == 0) {
       cfg.flags |= VMF_HSM;
     } else if (strcmp(a, "-s") == 0) {
@@ -249,6 +352,7 @@ start(int argc, char *argv[])
     fprintf(2, "vmm: a vm named '%s' already exists\n", cfg.name);
     exit(1);
   }
+  net_bootargs(&cfg);
 
   int id = launch(&cfg);
   if (id < 0)
@@ -295,8 +399,8 @@ info(int id)
   struct vminfo vi;
   if (getinfo(id, &vi) < 0)
     exit(1);
-  printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB, intc %s%s\n", id, vi.cfg.name,
-         states[vi.state % 5], vi.nvcpu, vi.mem_mb, intcs[vi.intc % 3],
+  printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB (%d MB resident), intc %s%s\n", id, vi.cfg.name,
+         states[vi.state % 5], vi.nvcpu, vi.mem_mb, vi.resident_mb, intcs[vi.intc % 3],
          vi.imsic_hw ? " (hardware guest files)" : "");
   printf("  kernel %s%s entry 0x%lx, disk %s (%ld sectors)%s\n", vi.cfg.kernel,
          (vi.cfg.flags & VMF_RAW) ? " (raw)" : "", vi.entry,
@@ -304,6 +408,15 @@ info(int id)
          (vi.cfg.flags & VMF_HSM) ? ", hsm boot" : "");
   if (vi.cfg.bootargs[0])
     printf("  bootargs: %s\n", vi.cfg.bootargs);
+  if (vi.cfg.net == 1) {
+    printf("  net: dhcp\n");
+  } else if (vi.cfg.net == 2) {
+    char a[16], m[16], g[16], d[16];
+    printf("  net: static %s mask %s gw %s dns %s\n", ip2str(vi.cfg.ip, a), ip2str(vi.cfg.mask, m),
+           ip2str(vi.cfg.gw, g), ip2str(vi.cfg.dns, d));
+  } else {
+    printf("  net: guest default (xv6: dhcp)\n");
+  }
   printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld\n", vi.exits, vi.mmio, vi.csr,
          vi.wfi, vi.injected);
   printf("  vcpu0: pc 0x%lx last cause 0x%lx gpa 0x%lx hart %d idle %d mmode %d\n", vi.pc,
@@ -312,6 +425,14 @@ info(int id)
          vi.vsatp, vi.vstvec, vi.vsepc, vi.vscause, vi.vsstatus, vi.vstval);
   printf("         sp 0x%lx ra 0x%lx vsie 0x%lx vstimecmp 0x%lx\n", vi.sp, vi.ra, vi.vsie,
          vi.vstimecmp);
+  printf("         scounteren 0x%lx senvcfg 0x%lx hcounteren 0x%lx\n", vi.scounteren, vi.senvcfg,
+         vi.hcounteren);
+  printf("         imsic0: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n", vi.deliv0, vi.thr0, vi.eie0_0, vi.eip0_0);
+  if (vi.nvcpu > 1)
+    printf("  vcpu1: pc 0x%lx last cause 0x%lx exits %ld idle %d hsm %d hart %d\n"
+           "         imsic1: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n",
+           vi.pc1, vi.cause1, vi.exits1, vi.idle1, vi.hsm1, vi.hart1, vi.deliv1, vi.thr1, vi.eie0_1,
+           vi.eip0_1);
 }
 
 static void
@@ -323,7 +444,7 @@ stats(void)
     fprintf(2, "vmm: vm_stats failed\n");
     exit(1);
   }
-  printf("free guest memory: %ld MB, ipis: %ld, exits:", s[0] * 2, s[1]);
+  printf("free guest memory: %ld MB, ipis: %ld, exits:", s[0], s[1]);
   for (int i = 0; i < MAXVM; i++)
     if (s[2 + i])
       printf(" vm%d=%ld", i, s[2 + i]);

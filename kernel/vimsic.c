@@ -112,6 +112,24 @@ vimsic_seip(struct vcpu *v)
   return top_id(&v->imsic) != 0;
 }
 
+// software model: with hstatus.VGEIN = 0 a pending VSEIP shows up in
+// vstopi only if hvictl names it (IID 9 with a priority), which is what
+// an AIA-aware guest reads to find the interrupt. keep hvip and hvictl
+// together. runs on the vcpu's own hart.
+#define HVICTL_VSEIP ((9L << 16) | (1L << 8) | 1)
+
+static void
+soft_vseip(int on)
+{
+  if (on) {
+    csr_write(CSR_HVICTL, HVICTL_VSEIP);
+    csr_set(CSR_HVIP, HVIP_VSEIP);
+  } else {
+    csr_clear(CSR_HVIP, HVIP_VSEIP);
+    csr_write(CSR_HVICTL, 0);
+  }
+}
+
 // deliver identity eiid to a vcpu. caller holds vm->lock.
 void
 vimsic_send(struct vcpu *v, int eiid)
@@ -228,6 +246,10 @@ vimsic_csr(struct vcpu *v, uint32 inst)
     }
     }
   }
+  // the external interrupt line follows the file's state at once: we are
+  // on this vcpu's hart, in its exit path, so hvip is its own. (hardware
+  // would drop VSEIP when the file empties; the software model must.)
+  soft_vseip(top_id(im) != 0);
   release(&v->vm->lock);
   if (rc < 0)
     return -1;
@@ -267,7 +289,9 @@ vimsic_enter(struct vcpu *v)
 
   if (!v->vm->imsic_hw || gf.geilen == 0) {
     v->vgein = 0;
-    return top_id(im) ? HVIP_VSEIP : 0;
+    int on = top_id(im) != 0;
+    csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
+    return on ? HVIP_VSEIP : 0;
   }
 
   int hart = cpuid();
@@ -275,8 +299,11 @@ vimsic_enter(struct vcpu *v)
   if (g == 0) {
     // no free guest file on this hart: run with the software model.
     v->vgein = 0;
-    return top_id(im) ? HVIP_VSEIP : 0;
+    int on = top_id(im) != 0;
+    csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
+    return on ? HVIP_VSEIP : 0;
   }
+  csr_write(CSR_HVICTL, 0); // the guest file reports its own interrupts
   im->hwfile = g;
   im->hwhart = hart;
   v->vgein = g;

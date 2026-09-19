@@ -143,18 +143,27 @@ prop_reg(struct fdtw *w, uint64 base, uint64 size)
 
 #define CPU_PHANDLE(i) (10 + (i))
 
+// build the guest's device tree and copy it into guest RAM at gpa.
+// the structure block gets a page of its own and the strings block
+// another, and the blob is copied out in three pieces, so no contiguous
+// host buffer is needed. returns the blob's size, or -1.
 int
-hyp_make_dtb(struct vm *vm, char *buf, int max)
+hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
 {
   struct fdtw w;
-  char *scratch = kalloc();
-  if (scratch == 0)
+  char *stpage = kalloc(), *sspage = kalloc();
+  if (stpage == 0 || sspage == 0) {
+    if (stpage)
+      kfree(stpage);
+    if (sspage)
+      kfree(sspage);
     return -1;
+  }
   memset(&w, 0, sizeof(w));
-  w.st = scratch;
-  w.stmax = 3072;
-  w.ss = scratch + 3072;
-  w.ssmax = 1024;
+  w.st = stpage;
+  w.stmax = PGSIZE;
+  w.ss = sspage;
+  w.ssmax = PGSIZE;
 
   uint32 cells[32];
   char name[32];
@@ -177,6 +186,11 @@ hyp_make_dtb(struct vm *vm, char *buf, int max)
   if (vm->cfg.bootargs[0])
     prop_str(&w, "bootargs", vm->cfg.bootargs);
   prop_str(&w, "stdout-path", "/soc/serial@10000000");
+  if (vm->cfg.net == 2) {
+    // static address for an xv6 guest: ip, mask, gateway, dns.
+    uint32 ipc[4] = {vm->cfg.ip, vm->cfg.mask, vm->cfg.gw, vm->cfg.dns};
+    prop_cells(&w, "xv6h,ip", ipc, 4);
+  }
   node_end(&w);
 
   // cpus
@@ -199,10 +213,31 @@ hyp_make_dtb(struct vm *vm, char *buf, int max)
     prop_u32(&w, "reg", i);
     prop_str(&w, "status", "okay");
     prop_str(&w, "compatible", "riscv");
-    prop_str(&w, "riscv,isa", "rv64imafdc_zicsr_zifencei_sstc");
-    prop_str(&w, "riscv,isa-base", "rv64i");
-    prop(&w, "riscv,isa-extensions", "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0sstc\0", 32);
-    prop_str(&w, "mmu-type", "riscv,sv39");
+    // the ISA as this guest may use it; in IMSIC mode the AIA CSRs
+    // (Ssaia/Smaia) are part of it, or Linux's IMSIC driver refuses.
+    {
+      char isa[96], ext[128];
+      int n = 0, e = 0;
+      const char *base = plat.has_v ? "rv64imafdcv_zicsr_zifencei_sstc" : "rv64imafdc_zicsr_zifencei_sstc";
+      const char *exts = plat.has_v ? "i\0m\0a\0f\0d\0c\0v\0zicsr\0zifencei\0sstc\0"
+                                    : "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0sstc\0";
+      int extlen = plat.has_v ? 34 : 32;
+      for (const char *p = base; *p; p++)
+        isa[n++] = *p;
+      memmove(ext, exts, extlen);
+      e = extlen;
+      if (vm->vic_kind == VIC_IMSIC) {
+        memmove(isa + n, "_smaia_ssaia", 12);
+        n += 12;
+        memmove(ext + e, "smaia\0ssaia\0", 12);
+        e += 12;
+      }
+      isa[n] = 0;
+      prop_str(&w, "riscv,isa", isa);
+      prop_str(&w, "riscv,isa-base", "rv64i");
+      prop(&w, "riscv,isa-extensions", ext, e);
+    }
+    prop_str(&w, "mmu-type", plat.mmu_max >= 48 ? "riscv,sv48" : "riscv,sv39");
     node_begin(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 1);
     prop_empty(&w, "interrupt-controller");
@@ -360,23 +395,43 @@ hyp_make_dtb(struct vm *vm, char *buf, int max)
   prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
   node_end(&w);
 
+  if (rtc_present()) {
+    node_begin(&w, "rtc@101000");
+    prop_str(&w, "compatible", "google,goldfish-rtc");
+    prop_reg(&w, G_RTC_BASE, 0x1000);
+    prop_u32(&w, "interrupt-parent", ic_phandle);
+    cells[0] = G_RTC_IRQ;
+    cells[1] = 4;
+    prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
+    node_end(&w);
+  }
+
+  if (vm->vnet.present) {
+    node_begin(&w, "virtio_mmio@10002000");
+    prop_str(&w, "compatible", "virtio,mmio");
+    prop_reg(&w, G_VNET_BASE, 0x1000);
+    prop_u32(&w, "interrupt-parent", ic_phandle);
+    cells[0] = G_VNET_IRQ;
+    cells[1] = 4;
+    prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
+    node_end(&w);
+  }
+
   node_end(&w); // soc
   node_end(&w); // root
   put32(&w, FDT_END);
-
-  if (w.err) {
-    kfree(scratch);
-    return -1;
-  }
 
   // assemble: header (40) + reserve map (16, empty) + struct + strings.
   int off_struct = 56;
   int off_strings = off_struct + w.stpos;
   int total = off_strings + w.sspos;
-  if (total > max) {
-    kfree(scratch);
+  if (w.err || total > max) {
+    printk("hyp: guest device tree too large (%d bytes, max %d)\n", total, max);
+    kfree(stpage);
+    kfree(sspage);
     return -1;
   }
+  char buf[56];
   memset(buf, 0, 56);
   be32(buf + 0, FDT_MAGIC);
   be32(buf + 4, total);
@@ -388,8 +443,11 @@ hyp_make_dtb(struct vm *vm, char *buf, int max)
   be32(buf + 28, 0);      // boot_cpuid_phys
   be32(buf + 32, w.sspos); // size_dt_strings
   be32(buf + 36, w.stpos); // size_dt_struct
-  memmove(buf + off_struct, w.st, w.stpos);
-  memmove(buf + off_strings, w.ss, w.sspos);
-  kfree(scratch);
-  return total;
+  int ret = total;
+  if (vm_copyout(vm, gpa, buf, 56) < 0 || vm_copyout(vm, gpa + off_struct, w.st, w.stpos) < 0 ||
+      vm_copyout(vm, gpa + off_strings, w.ss, w.sspos) < 0)
+    ret = -1;
+  kfree(stpage);
+  kfree(sspage);
+  return ret;
 }

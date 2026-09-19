@@ -58,7 +58,10 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
   switch (csr) {
   case CSR_MHARTID:    *val = v->id; return 0;
   case CSR_MISA:       *val = plat.misa & ~(1L << 7); return 0; // no nested H
-  case CSR_MSTATUS:    *val = v->m_mstatus; return 0;
+  case CSR_MSTATUS:
+    *val = (v->m_mstatus & ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK)) |
+           (v->vsstatus & (SSTATUS_FS_MASK | SSTATUS_VS_MASK));
+    return 0;
   case CSR_MEDELEG:    *val = v->m_medeleg; return 0;
   case CSR_MIDELEG:    *val = v->m_mideleg; return 0;
   case CSR_MIE:        *val = v->m_mie; return 0;
@@ -85,7 +88,12 @@ static int
 mcsr_write(struct vcpu *v, int csr, uint64 val)
 {
   switch (csr) {
-  case CSR_MSTATUS:    v->m_mstatus = val; return 0;
+  case CSR_MSTATUS:
+    v->m_mstatus = val;
+    // the FS and VS fields are the real ones: reflect them in vsstatus.
+    v->vsstatus = (v->vsstatus & ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK)) |
+                  (val & (SSTATUS_FS_MASK | SSTATUS_VS_MASK));
+    return 0;
   case CSR_MEDELEG:    v->m_medeleg = val; return 0;
   case CSR_MIDELEG:    v->m_mideleg = val; return 0;
   case CSR_MIE:        v->m_mie = val; return 0;

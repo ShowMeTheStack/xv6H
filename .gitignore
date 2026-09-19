@@ -18,6 +18,11 @@ test-hyp.log
 guest/disk*.img
 guest/hello
 guest/hello.bin
-test-fs.img
+test-fs*.img
 linux/Image*
 linux/linux.img
+guest/fdguest
+guest/vguest
+tls/obj/
+tls/libbearssl.a
+user/tls_date.h

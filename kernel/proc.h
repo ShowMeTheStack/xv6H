@@ -76,6 +76,7 @@ struct trapframe {
   /* 280 */ uint64 t6;
   /* 288 */ uint64 fregs[32];   // f0..f31 (F/D)
   /* 544 */ uint64 fcsr;
+  /* 552 */ uint64 vcsrs[4];    // vstart, vtype, vl, vcsr (V extension)
 };
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
@@ -99,6 +100,7 @@ struct proc {
   uint64 sz;                   // Size of process memory (bytes)
   pagetable_t pagetable;       // User page table
   struct trapframe *trapframe; // data page for trampoline.S
+  char *vstate;                // vector registers v0..v31 (32 * vlenb bytes), or 0
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory

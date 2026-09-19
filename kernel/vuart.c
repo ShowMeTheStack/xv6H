@@ -222,9 +222,17 @@ vm_cons_read(struct vm *vm, int user, uint64 dst, int n)
     n = sizeof(buf);
 
   acquire(&vm->lock);
+  if (vm->cons_detach_req) {
+    vm->cons_detach_req = 0;
+    vm->cons_attached = 0;
+    release(&vm->lock);
+    return -1;
+  }
   vm->cons_attached = 1;
   while (cring_empty(&vm->cons_out)) {
-    if (killed(myproc()) || vm->state == VM_FREE) {
+    if (killed(myproc()) || vm->state == VM_FREE || vm->cons_detach_req) {
+      vm->cons_detach_req = 0;
+      vm->cons_attached = 0;
       release(&vm->lock);
       return -1;
     }

@@ -106,6 +106,16 @@ extern uint64 sys_vm_create(void);
 extern uint64 sys_vm_ctl(void);
 extern uint64 sys_vm_stats(void);
 extern uint64 sys_hwinfo(void);
+extern uint64 sys_socket(void);
+extern uint64 sys_bind(void);
+extern uint64 sys_connect(void);
+extern uint64 sys_listen(void);
+extern uint64 sys_accept(void);
+extern uint64 sys_sendto(void);
+extern uint64 sys_recvfrom(void);
+extern uint64 sys_netinfo(void);
+extern uint64 sys_clock_gettime(void);
+extern uint64 sys_sysconf(void);
 extern uint64 sys_vm_run(void);
 extern uint64 sys_vm_destroy(void);
 extern uint64 sys_vm_cons(void);
@@ -142,6 +152,16 @@ static uint64 (*syscalls[])(void) = {
   [SYS_vm_ctl]     = sys_vm_ctl,
   [SYS_vm_stats]   = sys_vm_stats,
   [SYS_hwinfo]     = sys_hwinfo,
+  [SYS_socket]     = sys_socket,
+  [SYS_bind]       = sys_bind,
+  [SYS_connect]    = sys_connect,
+  [SYS_listen]     = sys_listen,
+  [SYS_accept]     = sys_accept,
+  [SYS_sendto]     = sys_sendto,
+  [SYS_recvfrom]   = sys_recvfrom,
+  [SYS_netinfo]    = sys_netinfo,
+  [SYS_clock_gettime] = sys_clock_gettime,
+  [SYS_sysconf]    = sys_sysconf,
   [SYS_vm_run]     = sys_vm_run,
   [SYS_vm_destroy] = sys_vm_destroy,
   [SYS_vm_cons]    = sys_vm_cons,

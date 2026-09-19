@@ -21,7 +21,34 @@ volatile int panicked = 0;  // spinning forever at end of a panic
 // lock to avoid interleaving concurrent printk's.
 static struct {
   struct spinlock lock;
+  char buf[256]; // the message being formatted (under lock)
+  int n;
 } pr;
+
+// append to the message; while panicking (no lock, other cpus may be
+// in the middle of their own message) write straight through.
+static void
+pputc(int c)
+{
+  if (panicking) {
+    consputc(c);
+    return;
+  }
+  pr.buf[pr.n++] = c;
+  if (pr.n == sizeof(pr.buf)) {
+    consputs(pr.buf, pr.n);
+    pr.n = 0;
+  }
+}
+
+static void
+pflush(void)
+{
+  if (pr.n > 0) {
+    consputs(pr.buf, pr.n);
+    pr.n = 0;
+  }
+}
 
 static char digits[] = "0123456789abcdef";
 
@@ -46,17 +73,17 @@ printint(long long xx, int base, int sign)
     buf[i++] = '-';
 
   while (--i >= 0)
-    consputc(buf[i]);
+    pputc(buf[i]);
 }
 
 static void
 printptr(uint64 x)
 {
   int i;
-  consputc('0');
-  consputc('x');
+  pputc('0');
+  pputc('x');
   for (i = 0; i < (sizeof(uint64) * 2); i++, x <<= 4)
-    consputc(digits[x >> (sizeof(uint64) * 8 - 4)]);
+    pputc(digits[x >> (sizeof(uint64) * 8 - 4)]);
 }
 
 // Print to the console.
@@ -73,7 +100,7 @@ printk(char *fmt, ...)
   va_start(ap, fmt);
   for (i = 0; (cx = fmt[i] & 0xff) != 0; i++) {
     if (cx != '%') {
-      consputc(cx);
+      pputc(cx);
       continue;
     }
     i++;
@@ -110,23 +137,24 @@ printk(char *fmt, ...)
     } else if (c0 == 'p') {
       printptr(va_arg(ap, uint64));
     } else if (c0 == 'c') {
-      consputc(va_arg(ap, uint));
+      pputc(va_arg(ap, uint));
     } else if (c0 == 's') {
       if ((s = va_arg(ap, char *)) == 0)
         s = "(null)";
       for (; *s; s++)
-        consputc(*s);
+        pputc(*s);
     } else if (c0 == '%') {
-      consputc('%');
+      pputc('%');
     } else if (c0 == 0) {
       break;
     } else {
       // Print unknown % sequence to draw attention.
-      consputc('%');
-      consputc(c0);
+      pputc('%');
+      pputc(c0);
     }
   }
   va_end(ap);
+  pflush();
 
   if (panicking == 0)
     release(&pr.lock);

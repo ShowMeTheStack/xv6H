@@ -11,7 +11,7 @@
 #define NBUF        (MAXOPBLOCKS * 3) // size of disk block cache
 #define FSSIZE      4000              // size of file system in blocks
 #define MAXPATH     128               // maximum file path name
-#define USERSTACK   1                 // user stack pages
+#define USERSTACK   8                 // user stack pages (TLS needs a few)
 #define NVIRTIO     8                 // virtio-mmio slots on qemu virt
 #ifndef HOSTMEM_MB
 #define HOSTMEM_MB  128               // RAM the host kernel keeps for itself

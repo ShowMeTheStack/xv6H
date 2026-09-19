@@ -48,7 +48,7 @@ struct {
   struct spinlock lock;
 
   // input circular buffer
-#define INPUT_BUF_SIZE 128
+#define INPUT_BUF_SIZE 512
   char buf[INPUT_BUF_SIZE];
   uint r; // Read index
   uint w; // Write index
@@ -68,6 +68,13 @@ consoleraw(int on)
     wakeup(&cons.r);
   }
   release(&cons.lock);
+}
+
+// a whole kernel message, in one burst.
+void
+consputs(const char *s, int n)
+{
+  uartputs_sync(s, n);
 }
 
 //

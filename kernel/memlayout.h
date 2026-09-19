@@ -44,7 +44,7 @@
 #define IMSIC_S   0x28000000L
 
 // the kernel expects there to be RAM for use by the kernel and user
-// pages from physical address 0x80000000 to plat.host_top (the device
+// pages from physical address 0x80000000 to the page database at the top of RAM (the device
 // tree says how much RAM there is; see platform.c). PHYSTOP is only
 // the size a guest gets by default.
 #define KERNBASE 0x80000000L
@@ -52,11 +52,18 @@
 
 // map the trampoline page to the highest address,
 // in both user and kernel space.
-#define TRAMPOLINE (MAXVA - PGSIZE)
+// the paging mode is chosen at boot (Sv48 or Sv39), so the top of the
+// address space, and with it the trampoline, trapframe and kernel stack
+// addresses, are runtime values (plat.maxva). kernel code only.
+#ifdef KERNEL
+#define TRAMPOLINE (plat.maxva - PGSIZE)
+#endif
 
 // map kernel stacks beneath the trampoline,
 // each surrounded by invalid guard pages.
+#ifdef KERNEL
 #define KSTACK(p) (TRAMPOLINE - ((p) + 1) * 2 * PGSIZE)
+#endif
 
 // User memory layout.
 // Address zero first:
@@ -67,4 +74,6 @@
 //   ...
 //   TRAPFRAME (p->trapframe, used by the trampoline)
 //   TRAMPOLINE (the same page as in the kernel)
+#ifdef KERNEL
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+#endif

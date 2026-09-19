@@ -69,6 +69,11 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+# /dev/console did not exist when the kernel started us: attach to it now.
+exec </dev/console >/dev/console 2>&1
+# the kernel configured eth0 from ip=... on the command line (dhcp or
+# static); its name server is in /proc/net/pnp, in resolv.conf format.
+ln -sf /proc/net/pnp /etc/resolv.conf
 echo "xv6h-linux: init running on $(uname -m), $(nproc) cpu(s)"
 echo "xv6h-linux: ready"
 exec /sbin/init
@@ -80,6 +85,8 @@ ttyS0::respawn:/bin/sh -l
 ttyS0::ctrlaltdel:/sbin/reboot
 TAB
   echo "marker-in-initramfs" > $root/etc/marker
+  # the TLS client built by linux/build-https.sh, if present.
+  [ -x $OUT/https ] && cp $OUT/https $root/bin/https || true
   echo "export PS1='linux# '" > $root/etc/profile
   ( cd $root && find . | cpio -o -H newc --quiet | gzip -9 > $2 )
 }
@@ -116,7 +123,22 @@ CONFIG_NR_CPUS=8
 CONFIG_RISCV_SBI_CPUIDLE=n
 CONFIG_CPU_IDLE=n
 CONFIG_PCI=n
-CONFIG_NET=n
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_IP_PNP=y
+CONFIG_IP_PNP_DHCP=y
+CONFIG_UNIX=y
+CONFIG_PACKET=y
+CONFIG_VIRTIO_NET=y
+CONFIG_RTC_CLASS=y
+CONFIG_RTC_DRV_GOLDFISH=y
+CONFIG_RTC_HCTOSYS=y
+CONFIG_RTC_HCTOSYS_DEVICE="rtc0"
+CONFIG_RTC_SYSTOHC=n
+CONFIG_IPV6=n
+CONFIG_WIRELESS=n
+CONFIG_BT=n
+CONFIG_NETFILTER=n
 CONFIG_USB_SUPPORT=n
 CONFIG_DRM=n
 CONFIG_SOUND=n
@@ -126,9 +148,7 @@ CONFIG_MODULES=n
 CONFIG_DEBUG_INFO_NONE=y
 CONFIG_KASAN=n
 CONFIG_FTRACE=n
-CONFIG_VIRTIO_NET=n
 CONFIG_VIRTIO_PCI=n
-CONFIG_RTC_CLASS=n
 CONFIG_BLK_DEV_INITRD=y
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y

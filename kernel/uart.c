@@ -43,6 +43,12 @@
 static struct sleeplock tx_lock;
 static int tx_chan; // &tx_chan is the "wait channel"
 
+// held while a burst of characters goes to the uart, by write() and by
+// printk() alike, so that a kernel message from one cpu does not land in
+// the middle of a line a process is printing on another (the hypervisor
+// reports guest faults while the attached console relays guest output).
+static struct spinlock tx_spin;
+
 extern volatile int panicking; // from printk.c
 extern volatile int panicked;  // from printk.c
 
@@ -72,6 +78,7 @@ uartinit(void)
   WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
 
   initsleeplock(&tx_lock, "uart");
+  initlock(&tx_spin, "uart_tx");
 }
 
 // transmit buf[] to the uart. it blocks if the
@@ -85,15 +92,39 @@ uartwrite(char buf[], int n)
   int i = 0;
   while (i < n) {
     sleep_prepare(&tx_chan);
-    if (ReadReg(LSR) & LSR_TX_IDLE) {
+    // as many characters as the uart takes right now, in one burst.
+    acquire(&tx_spin);
+    int wrote = 0;
+    while (i < n && (ReadReg(LSR) & LSR_TX_IDLE)) {
       WriteReg(THR, buf[i]);
       i += 1;
-    } else {
-      sleep();
+      wrote += 1;
     }
+    release(&tx_spin);
+    if (wrote == 0)
+      sleep();
   }
 
   releasesleep(&tx_lock);
+}
+
+// write a whole message synchronously, as one burst: for printk().
+void
+uartputs_sync(const char *s, int n)
+{
+  if (panicked) {
+    for (;;)
+      ;
+  }
+  if (panicking == 0)
+    acquire(&tx_spin); // a panicking cpu must not wait for anyone
+  for (int i = 0; i < n; i++) {
+    while ((ReadReg(LSR) & LSR_TX_IDLE) == 0)
+      ;
+    WriteReg(THR, s[i]);
+  }
+  if (panicking == 0)
+    release(&tx_spin);
 }
 
 // write a byte to the uart without using

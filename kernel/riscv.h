@@ -47,6 +47,21 @@ w_mepc(uint64 x)
 #define SSTATUS_FS_INITIAL (1L << 13)
 #define SSTATUS_FS_CLEAN   (2L << 13)
 #define SSTATUS_FS_DIRTY   (3L << 13)
+#define SSTATUS_VS_MASK    (3L << 9) // vector unit state
+#define SSTATUS_VS_OFF     (0L << 9)
+#define SSTATUS_VS_INITIAL (1L << 9)
+#define SSTATUS_VS_CLEAN   (2L << 9)
+#define SSTATUS_VS_DIRTY   (3L << 9)
+#define MSTATUS_VS_INITIAL (1L << 9)
+
+// bytes per vector register (V extension); readable only with VS on.
+static inline uint64
+r_vlenb()
+{
+  uint64 x;
+  asm volatile("csrr %0, 0xc22" : "=r"(x));
+  return x;
+}
 
 static inline uint64
 r_fcsr()
@@ -239,6 +254,28 @@ w_mideleg(uint64 x)
   asm volatile("csrw mideleg, %0" : : "r"(x));
 }
 
+// Supervisor Scratch register, for the trampoline: the trapframe's address.
+static inline void
+w_sscratch(uint64 x)
+{
+  asm volatile("csrw sscratch, %0" : : "r" (x));
+}
+
+static inline uint64
+r_sscratch()
+{
+  uint64 x;
+  asm volatile("csrr %0, sscratch" : "=r" (x));
+  return x;
+}
+
+// Supervisor counter enable: user access to cycle, time, instret.
+static inline void
+w_scounteren(uint64 x)
+{
+  asm volatile("csrw scounteren, %0" : : "r" (x));
+}
+
 // Supervisor Trap-Vector Base Address
 // low two bits are mode.
 static inline void
@@ -308,8 +345,11 @@ w_pmpaddr0(uint64 x)
 
 // use riscv's sv39 page table scheme.
 #define SATP_SV39 (8L << 60)
+#define SATP_SV48 (9L << 60)
 
-#define MAKE_SATP(pagetable) (SATP_SV39 | (((uint64)pagetable) >> 12))
+// every page table (kernel and user) has plat.mmu_levels levels: Sv48 or Sv39.
+#define MAKE_KSATP(pagetable, levels) (((levels) == 4 ? SATP_SV48 : SATP_SV39) | (((uint64)pagetable) >> 12))
+#define MAKE_SATP(pagetable) MAKE_KSATP(pagetable, plat.mmu_levels)
 
 // supervisor address translation and protection;
 // holds the address of the page table.
@@ -478,4 +518,5 @@ typedef uint64 *pagetable_t; // 512 PTEs
 // MAXVA is actually one bit less than the max allowed by
 // Sv39, to avoid having to sign-extend virtual addresses
 // that have the high bit set.
-#define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
+// the Sv48 bound; the effective one is plat.maxva (Sv39: 1L << 38).
+#define MAXVA (1L << (9 + 9 + 9 + 9 + 12 - 1))

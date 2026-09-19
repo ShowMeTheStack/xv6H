@@ -10,6 +10,9 @@ _start:
         add sp, sp, t0
         la t0, hello_trap
         csrw stvec, t0
+        # enable the FPU and (if present) the vector unit for C code
+        li t0, (1 << 13) | (1 << 9)
+        csrs sstatus, t0
         call hello_main
 1:      wfi
         j 1b

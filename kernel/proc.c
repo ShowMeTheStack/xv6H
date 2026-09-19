@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "platform.h"
 
 struct cpu cpus[NCPU];
 
@@ -132,6 +133,14 @@ found:
     return 0;
   }
   memset(p->trapframe, 0, sizeof(*p->trapframe));
+  if (plat.has_v) {
+    if ((p->vstate = kalloc()) == 0) {
+      freeproc(p);
+      release(&p->lock);
+      return 0;
+    }
+    memset(p->vstate, 0, PGSIZE);
+  }
 
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
@@ -159,6 +168,9 @@ freeproc(struct proc *p)
   if (p->trapframe)
     kfree((void *)p->trapframe);
   p->trapframe = 0;
+  if (p->vstate)
+    kfree(p->vstate);
+  p->vstate = 0;
   if (p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -278,6 +290,8 @@ kfork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+  if (p->vstate)
+    memmove(np->vstate, p->vstate, PGSIZE);
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;

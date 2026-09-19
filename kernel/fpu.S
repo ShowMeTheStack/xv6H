@@ -75,3 +75,52 @@ fp_restore:
         fld f30, 240(a0)
         fld f31, 248(a0)
         ret
+
+        #
+        # vector register save/restore (V extension):
+        #   vec_save(char *regs, uint64 csrs[4])
+        #   vec_restore(char *regs, uint64 csrs[4])
+        # regs holds v0..v31 (32 * vlenb bytes); csrs = vstart, vtype, vl, vcsr.
+        # sstatus.VS must be on.
+        #
+        .option push
+        .option arch, +v
+.globl vec_save
+vec_save:
+        csrr t0, vstart
+        csrr t1, vtype
+        csrr t2, vl
+        csrr t3, vcsr
+        sd t0, 0(a1)
+        sd t1, 8(a1)
+        sd t2, 16(a1)
+        sd t3, 24(a1)
+        vsetvli t4, x0, e8, m8, ta, ma
+        vse8.v v0, (a0)
+        add a0, a0, t4
+        vse8.v v8, (a0)
+        add a0, a0, t4
+        vse8.v v16, (a0)
+        add a0, a0, t4
+        vse8.v v24, (a0)
+        ret
+
+.globl vec_restore
+vec_restore:
+        vsetvli t4, x0, e8, m8, ta, ma
+        vle8.v v0, (a0)
+        add a0, a0, t4
+        vle8.v v8, (a0)
+        add a0, a0, t4
+        vle8.v v16, (a0)
+        add a0, a0, t4
+        vle8.v v24, (a0)
+        ld t0, 0(a1)
+        ld t1, 8(a1)
+        ld t2, 16(a1)
+        ld t3, 24(a1)
+        vsetvl x0, t2, t1
+        csrw vstart, t0
+        csrw vcsr, t3
+        ret
+        .option pop

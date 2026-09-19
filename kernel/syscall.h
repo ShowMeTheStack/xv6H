@@ -30,3 +30,13 @@
 #define SYS_consraw    29
 #define SYS_vm_stats   30
 #define SYS_hwinfo     31
+#define SYS_socket     32
+#define SYS_bind       33
+#define SYS_connect    34
+#define SYS_listen     35
+#define SYS_accept     36
+#define SYS_sendto     37
+#define SYS_recvfrom   38
+#define SYS_netinfo    39
+#define SYS_clock_gettime 40
+#define SYS_sysconf    41

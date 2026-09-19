@@ -21,6 +21,7 @@
 #define CSR_HTINST     0x64a
 #define CSR_HGATP      0x680
 #define CSR_HGEIP      0xe12
+#define CSR_HVICTL     0x609
 #define CSR_VSSTATUS   0x200
 #define CSR_VSIE       0x204
 #define CSR_VSTVEC     0x205
@@ -97,6 +98,10 @@
 #define G_UART_IRQ   10
 #define G_VIRTIO_BASE 0x10001000L
 #define G_VIRTIO_IRQ 1
+#define G_VNET_BASE  0x10002000L
+#define G_VNET_IRQ   2
+#define G_RTC_BASE   0x101000L
+#define G_RTC_IRQ    11
 #define G_CLINT_BASE 0x02000000L
 #define G_PLIC_BASE  0x0c000000L
 #define G_PLIC_SIZE  0x600000L
@@ -105,9 +110,11 @@
 #define G_IMSIC_M    0x24000000L
 #define G_IMSIC_S    0x28000000L
 
+#define HGATP_MODE_SV48X4 (9L << 60)
 #define HCHUNK       (2L * 1024 * 1024) // guest RAM granule (G-stage megapage)
-#define VM_MAXCHUNKS 256                 // 512 MB per VM at most
-#define VM_DTB_MAX   4096
+#define HCHUNK_ORDER 9                   // as a buddy order
+#define VM_MAXMEM    (256UL << 30)       // 256 GiB per VM at most
+#define VM_DTB_MAX   0x10000
 
 enum vic_kind { VIC_PLIC = 0, VIC_APLIC = 1, VIC_IMSIC = 2 };
 
@@ -127,7 +134,7 @@ struct vdev {
   int (*write)(struct vm *, struct vdev *, uint64 off, int size, uint64 val);
   void *priv;
 };
-#define VM_MAXDEV 8
+#define VM_MAXDEV 12
 
 #define CRING 8192
 struct cring {
@@ -151,6 +158,22 @@ struct vvirtio {
   uint64 capacity;          // sectors (0: no disk)
   struct sleeplock qlock;   // serializes queue processing
   char *bounce;             // one page for data transfers
+};
+
+struct vq_state {
+  uint32 num, ready;
+  uint64 desc, avail, used;
+  uint16 last_avail;
+};
+
+struct vvnet {
+  int present;
+  uint8 mac[6];
+  uint32 device_features_sel, driver_features_sel;
+  uint32 queue_sel;
+  struct vq_state q[2];     // 0: receive, 1: transmit
+  uint32 intr_status, status;
+  uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
 };
 
 #define VPLIC_NIRQ 32
@@ -209,9 +232,13 @@ struct vcpu {
   // VS CSRs, saved on exit and restored on entry.
   uint64 vsstatus, vsie, vstvec, vsscratch, vsepc, vscause, vstval, vsatp, vstimecmp;
   uint64 scounteren, senvcfg; // shared supervisor CSRs (no VS copies)
+  uint64 vsiselect;           // AIA indirect-register selector (per hart)
   // floating-point state: f0..f31, fcsr.
   uint64 fregs[32];
   uint64 fcsr;
+  // vector state: a page holding v0..v31, plus vstart/vtype/vl/vcsr.
+  char *vstate;
+  uint64 vcsrs[4];
   int vssip;              // virtual supervisor software interrupt pending
   volatile int ssip_req;  // vclint asked for VSSIP since the last entry
   int vgein;              // hardware guest interrupt file (0 = none)
@@ -247,7 +274,8 @@ struct vm {
 
   uint64 ram_size;
   int nchunks;
-  uint64 chunk[VM_MAXCHUNKS]; // host physical address of each 2 MB chunk
+  uint64 *chunk;          // host physical address of each 2 MB chunk, 0 until touched
+  uint64 resident;        // bytes of guest RAM currently backed
   uint64 ptchunk;         // 2 MB chunk holding the G-stage page tables
   uint64 ptnext;          // next free page in ptchunk
   uint64 *hgatp_root;     // 16 KB, 16 KB-aligned
@@ -257,6 +285,8 @@ struct vm {
   int imsic_hw;           // use hardware guest interrupt files
   struct vuart uart;
   struct vvirtio blk;
+  struct vvnet vnet;
+  uint64 rtc_latch;       // virtual RTC: TIME_HIGH latched by a TIME_LOW read
   struct vplic plic;
   struct vaplic aplic;
   uint32 clint_msip[NVCPU];
@@ -266,6 +296,7 @@ struct vm {
 
   struct cring cons_out, cons_in;
   int cons_attached;
+  int cons_detach_req;    // a detach was requested: the next read returns -1
 
   uint64 dtb_gpa;
 };
@@ -281,6 +312,7 @@ int vm_destroy(struct vm *vm);
 int vm_pause(struct vm *vm);
 int vm_resume(struct vm *vm);
 int vm_gpa2hpa(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len);
+int vm_touch(struct vm *vm, uint64 gpa); // back the chunk holding gpa, if it is guest RAM
 int vm_copyin(struct vm *vm, void *dst, uint64 gpa, uint64 n);
 int vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n);
 void vcpu_kick(struct vcpu *v);
@@ -325,6 +357,19 @@ int vm_cons_getc(struct vm *vm);
 // vvirtio.c
 void vvirtio_init(struct vm *vm);
 
+// vrtc.c
+void vrtc_init(struct vm *vm);
+
+// vvnet.c / bridge.c
+struct mbuf;
+void vvnet_init(struct vm *vm);
+void vvnet_rx(struct vm *vm, struct mbuf *m);
+void bridgeinit(void);
+void bridge_rx_uplink(struct mbuf *m);
+int bridge_tx_host(struct mbuf *m);
+void bridge_tx_guest(struct vm *from, struct mbuf *m);
+extern uint64 bridge_guest_blocked;
+
 // vclint.c
 void vclint_init(struct vm *vm);
 
@@ -345,12 +390,8 @@ int vimsic_geilen(void);
 void vimsic_exit(struct vcpu *v);
 void vimsic_sgei(void);
 
-// fpu.S
-void fp_save(uint64 *area);
-void fp_restore(uint64 *area);
-
 // fdtgen.c
-int hyp_make_dtb(struct vm *vm, char *buf, int max);
+int hyp_make_dtb(struct vm *vm, uint64 gpa, int max);
 
 // cring helpers
 static inline int

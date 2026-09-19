@@ -29,6 +29,7 @@ void
 trapinithart(void)
 {
   w_stvec((uint64)kernelvec);
+  w_scounteren(7); // user programs may read cycle, time and instret
 }
 
 //
@@ -52,6 +53,11 @@ usertrap(void)
 
   // save user program counter.
   p->trapframe->epc = r_sepc();
+
+  // the vector registers are saved here rather than in the trampoline
+  // (nothing in the kernel touches them); only if the process used them.
+  if (p->vstate && (r_sstatus() & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY)
+    vec_save(p->vstate, p->trapframe->vcsrs);
 
   if (r_scause() == 8) {
     // system call
@@ -111,6 +117,7 @@ prepare_return(void)
 
   // send syscalls, interrupts, and exceptions to uservec in trampoline.S
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+  w_sscratch(TRAPFRAME); // the trampoline finds the trapframe here
   w_stvec(trampoline_uservec);
 
   // set up trapframe values that uservec will need when
@@ -119,6 +126,14 @@ prepare_return(void)
   p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
   p->trapframe->kernel_trap = (uint64)usertrap;
   p->trapframe->kernel_hartid = r_tp(); // hartid for cpuid()
+
+  // restore the process's vector state (zeros for a process that never
+  // used it) and mark the unit Clean.
+  if (p->vstate) {
+    w_sstatus((r_sstatus() & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL);
+    vec_restore(p->vstate, p->trapframe->vcsrs);
+    w_sstatus((r_sstatus() & ~SSTATUS_VS_MASK) | SSTATUS_VS_CLEAN);
+  }
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
@@ -177,6 +192,8 @@ clockintr()
 
   // let the hypervisor wake guests whose virtual timers expired.
   hyp_tick();
+  if (cpuid() == 0)
+    net_timer();
 
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth
@@ -199,6 +216,7 @@ extintr(int irq)
     uartintr();
   } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
     virtio_disk_intr(idx);
+    virtio_net_intr(idx);
   } else {
     printk("unexpected interrupt irq=%d\n", irq);
   }

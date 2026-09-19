@@ -23,6 +23,8 @@
 #include "stat.h"
 #include "platform.h"
 #include "intc.h"
+#include "imsic.h"
+#include "page.h"
 #include "hyp.h"
 
 struct vm vms[NVM];
@@ -35,68 +37,37 @@ void kernelvec(void);
 _Static_assert(__builtin_offsetof(struct vcpu, hostctx) == 256, "vcpu layout");
 _Static_assert(__builtin_offsetof(struct vcpu, host_tp) == 368, "vcpu layout");
 
-// ---- guest memory pool: 2 MB chunks above plat.host_top ----
+// ---- guest memory: 2 MB chunks from the buddy allocator, on demand ----
 
-#define POOL_MAXCHUNKS 2048 // 4 GB
-static struct {
-  struct spinlock lock;
-  uint64 base, end;
-  int nchunks, nfree;
-  char used[POOL_MAXCHUNKS];
-} pool;
+static void gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa);
 
-static void
-hpool_init(void)
-{
-  initlock(&pool.lock, "hpool");
-  pool.base = (plat.host_top + HCHUNK - 1) & ~(HCHUNK - 1);
-  pool.end = plat.ram_end & ~(HCHUNK - 1);
-  if (pool.end <= pool.base) {
-    pool.nchunks = 0;
-    return;
-  }
-  pool.nchunks = (pool.end - pool.base) / HCHUNK;
-  if (pool.nchunks > POOL_MAXCHUNKS)
-    pool.nchunks = POOL_MAXCHUNKS;
-  pool.nfree = pool.nchunks;
-}
-
-static uint64
-hpool_alloc(void)
-{
-  acquire(&pool.lock);
-  for (int i = 0; i < pool.nchunks; i++) {
-    if (!pool.used[i]) {
-      pool.used[i] = 1;
-      pool.nfree--;
-      release(&pool.lock);
-      uint64 pa = pool.base + (uint64)i * HCHUNK;
-      memset((void *)pa, 0, HCHUNK);
-      return pa;
-    }
-  }
-  release(&pool.lock);
-  return 0;
-}
-
-static void
-hpool_free(uint64 pa)
-{
-  if (pa < pool.base || pa >= pool.end || (pa & (HCHUNK - 1)))
-    panic("hpool_free");
-  int i = (pa - pool.base) / HCHUNK;
-  acquire(&pool.lock);
-  if (!pool.used[i])
-    panic("hpool_free: not used");
-  pool.used[i] = 0;
-  pool.nfree++;
-  release(&pool.lock);
-}
-
+// back the 2 MB chunk holding gpa, if gpa is guest RAM and the chunk is not
+// backed yet. returns 0 when the chunk is backed (now or before), 1 when
+// gpa is not guest RAM, -1 when no memory could be had.
 int
-hpool_free_chunks(void)
+vm_touch(struct vm *vm, uint64 gpa)
 {
-  return pool.nfree;
+  if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
+    return 1;
+  int k = (gpa - G_RAM_BASE) / HCHUNK;
+  if (vm->chunk[k])
+    return 0;
+  // allocate and zero outside the lock; another vcpu may win the race.
+  void *pa = kalloc_guest(HCHUNK_ORDER);
+  if (pa == 0)
+    return -1;
+  memset(pa, 0, HCHUNK);
+  acquire(&vm->lock);
+  if (vm->chunk[k] == 0) {
+    vm->chunk[k] = (uint64)pa;
+    vm->resident += HCHUNK;
+    gstage_map_chunk(vm, G_RAM_BASE + (uint64)k * HCHUNK, (uint64)pa);
+    pa = 0;
+  }
+  release(&vm->lock);
+  if (pa)
+    kfree_order(pa, HCHUNK_ORDER);
+  return 0;
 }
 
 // ---- init ----
@@ -114,10 +85,9 @@ hypinit(void)
     printk("hyp: no hypervisor extension; guests disabled\n");
     return;
   }
-  hpool_init();
   hypinithart();
-  printk("hyp: hypervisor extension present, guest pool %d MB (%d chunks), %d guest interrupt files/hart\n",
-         pool.nchunks * 2, pool.nchunks, vimsic_geilen());
+  printk("hyp: hypervisor extension present, %ld MB free for guests, %s G-stage, %d guest interrupt files/hart\n",
+         (kmem_free_pages() >> 8), plat.mmu_levels == 4 ? "sv48x4" : "sv39x4", vimsic_geilen());
 }
 
 // per-hart hypervisor CSR setup (every hart calls this from main()).
@@ -147,7 +117,7 @@ hypinithart(void)
   vimsic_hartinit();
 }
 
-// ---- G-stage page tables (Sv39x4) ----
+// ---- G-stage page tables (Sv48x4 when the host runs Sv48, else Sv39x4) ----
 
 static uint64 *
 pt_page(struct vm *vm)
@@ -159,22 +129,28 @@ pt_page(struct vm *vm)
   return p;
 }
 
-// map one 2 MB guest-physical chunk to host physical hpa.
+// map one 2 MB guest-physical chunk to host physical hpa (vm->lock held,
+// or the VM not yet running). the root has 2048 entries (11 index bits):
+// Sv48x4 walks root(bits 39..49) -> level 2 -> level 1 leaf; Sv39x4 walks
+// root(bits 30..40) -> level 1 leaf.
 static void
 gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa)
 {
-  uint64 vpn2 = (gpa >> 30) & 0x7ff; // 11 bits: the root has 2048 entries
-  uint64 vpn1 = (gpa >> 21) & 0x1ff;
-  uint64 *root = vm->hgatp_root;
-  uint64 *l1;
-  if (root[vpn2] & PTE_V) {
-    l1 = (uint64 *)PTE2PA(root[vpn2]);
-  } else {
-    l1 = pt_page(vm);
-    root[vpn2] = PA2PTE(l1) | PTE_V;
+  uint64 *t = vm->hgatp_root;
+  int top = (plat.mmu_levels == 4) ? 3 : 2;
+  for (int l = top; l > 1; l--) {
+    uint64 idx = (l == top) ? ((gpa >> (12 + 9 * l)) & 0x7ff) : PX(l, gpa);
+    uint64 *next;
+    if (t[idx] & PTE_V) {
+      next = (uint64 *)PTE2PA(t[idx]);
+    } else {
+      next = pt_page(vm);
+      t[idx] = PA2PTE(next) | PTE_V;
+    }
+    t = next;
   }
   // G-stage leaf PTEs must have U set; preset A and D.
-  l1[vpn1] = PA2PTE(hpa) | PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | (1L << 6) | (1L << 7);
+  t[PX(1, gpa)] = PA2PTE(hpa) | PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | (1L << 6) | (1L << 7);
 }
 
 int
@@ -185,6 +161,8 @@ vm_gpa2hpa(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
   uint64 off = gpa - G_RAM_BASE;
   int k = off / HCHUNK;
   uint64 in = off % HCHUNK;
+  if (vm->chunk[k] == 0 && vm_touch(vm, gpa) != 0)
+    return -1;
   *hpa = vm->chunk[k] + in;
   *len = HCHUNK - in;
   return 0;
@@ -237,16 +215,32 @@ vm_lookup(int id)
 static void
 vm_free_resources(struct vm *vm)
 {
-  for (int i = 0; i < vm->nchunks; i++)
-    if (vm->chunk[i])
-      hpool_free(vm->chunk[i]);
+  // the switch may still hold frames for this VM: from now on its NIC
+  // drops them instead of writing into memory that is about to be freed.
+  // (callers hold vm->lock, as vvnet_rx does.)
+  vm->vnet.present = 0;
+  vm->vnet.q[0].ready = 0;
+  vm->vnet.q[1].ready = 0;
+  if (vm->chunk) {
+    for (int i = 0; i < vm->nchunks; i++)
+      if (vm->chunk[i])
+        kfree_order((void *)vm->chunk[i], HCHUNK_ORDER);
+    kfree((void *)vm->chunk);
+    vm->chunk = 0;
+  }
   vm->nchunks = 0;
+  vm->resident = 0;
   if (vm->ptchunk)
-    hpool_free(vm->ptchunk);
+    kfree_order((void *)vm->ptchunk, HCHUNK_ORDER);
   vm->ptchunk = 0;
   if (vm->blk.bounce)
     kfree(vm->blk.bounce);
   vm->blk.bounce = 0;
+  for (int i = 0; i < NVCPU; i++) {
+    if (vm->vcpu[i].vstate)
+      kfree(vm->vcpu[i].vstate);
+    vm->vcpu[i].vstate = 0;
+  }
 }
 
 // release the disk image file; must not hold spinlocks (may sleep).
@@ -277,7 +271,11 @@ disk_in_use(struct vm *self, struct inode *ip)
 static void
 vcpu_reset(struct vcpu *v, struct vm *vm, int id)
 {
+  char *vstate = v->vstate;
   memset(v, 0, sizeof(*v));
+  v->vstate = vstate;
+  if (vstate)
+    memset(vstate, 0, PGSIZE);
   v->vm = vm;
   v->id = id;
   v->running_hart = -1;
@@ -287,6 +285,7 @@ vcpu_reset(struct vcpu *v, struct vm *vm, int id)
   v->priv = 1;               // VS mode
   v->in_mmode = 1;           // running the guest's machine-mode boot code
   v->vstimecmp = ~0L;
+  v->scounteren = 7; // as firmware would: user access to cycle, time, instret
   v->last_hart = -1;
   // with VMF_HSM only vcpu 0 boots; the others wait for SBI hart_start.
   v->hsm_state = ((vm->cfg.flags & VMF_HSM) && id != 0) ? HSM_STOPPED : HSM_STARTED;
@@ -302,6 +301,9 @@ vcpu_hsm_start(struct vcpu *v, uint64 addr, uint64 opaque)
   memset(v->regs, 0, sizeof(v->regs));
   memset(v->fregs, 0, sizeof(v->fregs));
   v->fcsr = 0;
+  memset(v->vcsrs, 0, sizeof(v->vcsrs));
+  if (v->vstate)
+    memset(v->vstate, 0, PGSIZE);
   v->pc = addr;
   v->regs[10] = v->id;
   v->regs[11] = opaque;
@@ -318,7 +320,7 @@ vcpu_hsm_start(struct vcpu *v, uint64 addr, uint64 opaque)
   v->vstimecmp = ~0L;
   v->vssip = 0;
   v->ssip_req = 0;
-  v->scounteren = 0;
+  v->scounteren = 7;
   v->senvcfg = 0;
   v->hsm_state = HSM_STARTED;
   wakeup(v);
@@ -347,8 +349,7 @@ vm_create(struct vmconfig *cfg)
   uint64 mem_bytes = (uint64)cfg->mem_mb * 1024 * 1024;
   if (nvcpu < 1 || nvcpu > NVCPU)
     return -1;
-  if (mem_bytes < 8 * HCHUNK || (mem_bytes % HCHUNK) != 0 ||
-      mem_bytes / HCHUNK > VM_MAXCHUNKS)
+  if (mem_bytes < 8 * HCHUNK || (mem_bytes % HCHUNK) != 0 || mem_bytes > VM_MAXMEM)
     return -1;
   if (cfg->kernel[0] == 0)
     return -1;
@@ -376,21 +377,29 @@ vm_create(struct vmconfig *cfg)
   vm->nvcpu = nvcpu;
   vm->ram_size = mem_bytes;
   vm->nchunks = mem_bytes / HCHUNK;
+  vm->resident = 0;
 
-  vm->ptchunk = hpool_alloc();
+  // the chunk table: one host address per 2 MB of guest RAM, filled in as
+  // the guest touches its memory (vm_touch).
+  {
+    uint64 bytes = (uint64)vm->nchunks * sizeof(uint64);
+    int order = 0;
+    while (((uint64)PGSIZE << order) < bytes)
+      order++;
+    vm->chunk = kalloc_order(order);
+    if (vm->chunk == 0)
+      goto fail;
+    memset(vm->chunk, 0, (uint64)PGSIZE << order);
+  }
+
+  vm->ptchunk = (uint64)kalloc_guest(HCHUNK_ORDER);
   if (vm->ptchunk == 0)
     goto fail;
+  memset((void *)vm->ptchunk, 0, HCHUNK);
   vm->hgatp_root = (uint64 *)vm->ptchunk; // 16 KB, 2 MB aligned
   vm->ptnext = vm->ptchunk + 4 * PGSIZE;
-  vm->hgatp = HGATP_MODE_SV39X4 | ((uint64)(id + 1) << HGATP_VMID_SHIFT) |
-              (vm->ptchunk >> 12);
-
-  for (int i = 0; i < vm->nchunks; i++) {
-    vm->chunk[i] = hpool_alloc();
-    if (vm->chunk[i] == 0)
-      goto fail;
-    gstage_map_chunk(vm, G_RAM_BASE + (uint64)i * HCHUNK, vm->chunk[i]);
-  }
+  vm->hgatp = (plat.mmu_levels == 4 ? HGATP_MODE_SV48X4 : HGATP_MODE_SV39X4) |
+              ((uint64)(id + 1) << HGATP_VMID_SHIFT) | (vm->ptchunk >> 12);
 
   // the guest device tree sits in the last 64 KB of guest RAM.
   vm->dtb_gpa = G_RAM_BASE + vm->ram_size - 0x10000;
@@ -423,14 +432,19 @@ vm_create(struct vmconfig *cfg)
   vclint_init(vm);
   vic_init(vm);
   vvirtio_init(vm);
+  vvnet_init(vm);
+  vrtc_init(vm);
   if (vm->blk.bounce == 0)
     goto fail;
 
   if (vm_load(vm) < 0)
     goto fail;
 
-  for (int i = 0; i < nvcpu; i++)
+  for (int i = 0; i < nvcpu; i++) {
+    if (plat.has_v && (vm->vcpu[i].vstate = kalloc()) == 0)
+      goto fail;
     vcpu_reset(&vm->vcpu[i], vm, i);
+  }
 
   return id;
 
@@ -553,14 +567,9 @@ done:
   if (ret < 0)
     return -1;
 
-  // device tree.
-  char *dtb = kalloc();
-  if (dtb == 0)
-    return -1;
-  int n = hyp_make_dtb(vm, dtb, PGSIZE);
-  if (n <= 0 || vm_copyout(vm, vm->dtb_gpa, dtb, n) < 0)
+  // device tree, in the 64 KB reserved at the top of guest RAM.
+  if (hyp_make_dtb(vm, vm->dtb_gpa, VM_DTB_MAX) <= 0)
     ret = -1;
-  kfree(dtb);
   return ret;
 }
 
@@ -620,6 +629,7 @@ vm_destroy(struct vm *vm)
     struct inode *ip = vm->disk_ip;
     vm->disk_ip = 0;
     vm->state = VM_FREE;
+    wakeup(&vm->cons_out);
     release(&vm->lock);
     vm_put_disk(ip);
     return 0;
@@ -673,8 +683,9 @@ vcpu_inject(struct vcpu *v, uint64 cause, uint64 tval)
   v->pc = v->vstvec & ~3L;
   v->priv = 1;
   v->injected++;
-  if (cause == EXC_ILLEGAL && v->injected <= 3)
-    printk("hyp: vm %d vcpu %d: illegal instruction 0x%lx at guest pc 0x%lx passed to guest\n",
+  // a guest without a trap vector cannot handle this: say so once or twice.
+  if (cause == EXC_ILLEGAL && v->vstvec == 0 && v->injected <= 3)
+    printk("hyp: vm %d vcpu %d: illegal instruction 0x%lx at guest pc 0x%lx, guest has no trap vector\n",
            v->vm->id, v->id, tval, v->vsepc);
 }
 
@@ -708,6 +719,8 @@ vcpu_enter(struct vcpu *v)
   csr_write(CSR_VSTVAL, v->vstval);
   csr_write(CSR_VSATP, v->vsatp);
   csr_write(CSR_VSTIMECMP, v->vstimecmp);
+  if (plat.intc_kind == INTC_IMSIC)
+    csr_write(CSR_VSISELECT, v->vsiselect);
   csr_write(CSR_HVIP, hvip);
 
   int hart = cpuid();
@@ -744,6 +757,11 @@ vcpu_enter(struct vcpu *v)
   w_fcsr(v->fcsr);
   ss = r_sstatus();
   ss = (ss & ~SSTATUS_FS_MASK) | SSTATUS_FS_CLEAN;
+  if (v->vstate) {
+    w_sstatus((ss & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL);
+    vec_restore(v->vstate, v->vcsrs);
+    ss = (r_sstatus() & ~SSTATUS_VS_MASK) | SSTATUS_VS_CLEAN;
+  }
   ss &= ~(SSTATUS_SPP | SSTATUS_SPIE);
   if (v->priv)
     ss |= SSTATUS_SPP;
@@ -776,13 +794,24 @@ vcpu_enter(struct vcpu *v)
   v->vsatp = csr_read(CSR_VSATP);
   v->vstimecmp = csr_read(CSR_VSTIMECMP);
   v->vssip = (csr_read(CSR_HVIP) & HVIP_VSSIP) ? 1 : 0;
+  if (plat.intc_kind == INTC_IMSIC)
+    v->vsiselect = csr_read(CSR_VSISELECT);
   v->scounteren = csr_read(0x106);
+  csr_write(0x106, 7); // back to the host's setting
   v->senvcfg = csr_read(0x10a);
   // the guest touched the FPU (hardware marks HS sstatus.FS Dirty too).
-  if ((r_sstatus() & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY) {
+  // FP/vector state is saved if either the HS view or the guest's own
+  // vsstatus says Dirty: hardware marks both for instructions, but qemu
+  // marks only vsstatus on fcsr/vcsr writes.
+  uint64 hs_st = r_sstatus();
+  if ((hs_st & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY ||
+      (v->vsstatus & SSTATUS_FS_MASK) == SSTATUS_FS_DIRTY) {
     v->fcsr = r_fcsr();
     fp_save(v->fregs);
   }
+  if (v->vstate && ((hs_st & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY ||
+                    (v->vsstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY))
+    vec_save(v->vstate, v->vcsrs);
   v->exits++;
 
   acquire(&vm->lock);
@@ -889,8 +918,22 @@ handle_exit(struct vcpu *v)
     break;
   case EXC_LOAD_GPF:
   case EXC_STORE_GPF:
-    inst = hyp_fetch(v, v->pc);
+  case EXC_INST_GPF: {
+    // guest RAM is backed on first touch; a fault inside RAM just needs
+    // the chunk (before intr_on: the fetch below must stay on this hart).
+    uint64 gpa = (htval << 2) | (stval & 3);
+    int t = vm_touch(v->vm, gpa);
+    if (t == 0)
+      return 0;
+    if (t < 0) {
+      printk("hyp: vm %d: out of memory backing guest RAM at gpa 0x%lx; halting the vm\n", v->vm->id, gpa);
+      vm_halt(v->vm);
+      return -1;
+    }
+    if (scause != EXC_INST_GPF)
+      inst = hyp_fetch(v, v->pc);
     break;
+  }
   }
 
   intr_on();
@@ -901,6 +944,10 @@ handle_exit(struct vcpu *v)
   case EXC_VIRT_INST:
     if (inst == 0x10500073) { // wfi
       vcpu_idle(v);
+      v->pc += 4;
+      return 0;
+    }
+    if (inst == 0x00d00073 || inst == 0x01d00073) { // wrs.nto / wrs.sto (Zawrs)
       v->pc += 4;
       return 0;
     }
@@ -1003,6 +1050,7 @@ vm_run(struct vm *vm, int vcpuid)
     ip = vm->disk_ip;
     vm->disk_ip = 0;
     vm->state = VM_FREE;
+    wakeup(&vm->cons_out); // an attached console reader sees the end
   }
   release(&vm->lock);
   vm_put_disk(ip);
@@ -1015,7 +1063,7 @@ void
 hyp_stats(uint64 *out, int n)
 {
   if (n > 0)
-    out[0] = pool.nfree;
+    out[0] = kmem_free_pages() >> 8; // MB
   if (n > 1) {
     uint64 t = 0;
     for (int i = 0; i < NCPU; i++)

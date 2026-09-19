@@ -44,13 +44,25 @@ def host_stats(q):
     return int(m.group(1)), int(m.group(2))
 
 
+def wait_free(q, free0, timeout=10):
+    """a killed VM's memory comes back when its last vcpu has left the
+    guest, shortly after 'vm killed': wait for the free count to return
+    to the baseline, and return the final value."""
+    end = time.time() + timeout
+    while True:
+        free1, _ = host_stats(q)
+        if free1 == free0 or time.time() > end:
+            return free1
+        time.sleep(0.5)
+
+
 def vm_ls(q):
     """returns the text of vmm ls."""
-    mark = q.mark()
     q.send("vmm ls\n")
-    q.expect(r"\n(no vms|ID NAME.*?)\n(?=\$ )", 10)
+    q.expect(r"vmm ls", 5)
+    m = q.expect(r"(no vms|ID NAME.*?)\n(?=\$ )", 10)
     q.expect(r"\$ ", 5)
-    return q.output_since(mark)
+    return m.group(1).decode()
 
 
 def kill_vm(q, vm):
@@ -79,7 +91,9 @@ def t_guest_boot(QEMU, intc, cpus, log):
         lst = vm_ls(q)
         assert re.search(r"^0  first +running +1 +128 +/kernel +/disk0.img", lst, re.M), lst
         free1, _ = host_stats(q)
-        assert free1 == free0 - 128 - 2, (free0, free1)
+        # guest RAM is backed as the guest touches it: a booted xv6 guest
+        # holds a few chunks of its 128 MB plus its 2 MB of page tables.
+        assert 2 <= free0 - free1 <= 130, (free0, free1)
         # the same disk cannot be used twice, a name cannot be reused.
         q.send("vmm start -d -f /disk0.img\n")
         q.expect(r"cannot create vm", 10)
@@ -238,9 +252,11 @@ def t_lifecycle(QEMU, intc, cpus, log):
         q.expect(r"vm 0 resumed", 10)
         q.expect(r"\$ ", 5)
         attach(q, "web")
-        q.expect(r"\nwhile-paused", 10) # the typed line is processed now
+        q.expect(r"while-paused", 10) # the typed line is processed now
+        q.expect(r"\$ ", 10)
         q.send("echo after-resume\n")
-        q.expect(r"\nafter-resume", 10)
+        q.expect(r"after-resume\r?\n", 10)
+        q.expect(r"\$ ", 10)
         detach(q)
         # ps shows the guest's processes
         q.send("vmm ps db\n")
@@ -282,10 +298,10 @@ def t_hello(QEMU, intc, cpus, log):
             q.expect(r"hello: 3 hart\(s\) total", 10)
             q.expect(r"hello: done", 5)
             # the guest shut itself down through SBI: vmm returns to the shell.
-            q.send("\n")
+            q.expect(r"\[vm \d+ has exited\]", 20)
             q.expect(r"\$ ", 20)
             assert "no vms" in vm_ls(q)
-        free1, _ = host_stats(q)
+        free1 = wait_free(q, free0)
         assert free1 == free0, (free0, free1)
         # loading outside guest RAM is refused
         q.send("vmm start -k /hello.bin -f none -r 0x10000000 -d\n")
@@ -298,6 +314,44 @@ def t_hello(QEMU, intc, cpus, log):
         q.close()
 
 
+def t_fdv_guests(QEMU, intc, cpus, log, vec=1):
+    """bare-metal guests using the FPU and the vector unit (state across
+    vcpu exits); with VEC=0 the vector guest must notice the absence."""
+    q = boot_host(QEMU, intc, cpus, log, vec=vec)
+    try:
+        q.send("vmm start -k /fdguest -f none\n")
+        q.expect(r"fdguest: basel\*10000 = 16448", 30)
+        q.expect(r"fdguest: after wfi fs0\*1000 = 12345678", 10)
+        q.expect(r"fdguest: ok", 10)
+        q.expect(r"\[vm \d+ has exited\]", 20)
+        q.expect(r"\$ ", 20)
+        q.send("vmm start -k /vguest -f none\n")
+        if vec:
+            q.expect(r"vguest: vlen \d+ bits", 30)
+            q.expect(r"vguest: vadd ok", 10)
+            q.expect(r"vguest: state across wfi ok", 10)
+            q.expect(r"vguest: ok", 10)
+        else:
+            q.expect(r"vguest: no vector extension", 30)
+        q.expect(r"\[vm \d+ has exited\]", 20)
+        q.expect(r"\$ ", 20)
+        assert "no vms" in vm_ls(q)
+        # the standalone programs, on the host and in a guest
+        for prog in ("fpbench 3", "vecbench 3", "mandel q"):
+            q.send(prog + "\n")
+            q.expect(r"(fpbench|vecbench|mandel): (ok|no vector extension)", 60)
+            q.expect(r"\$ ", 10)
+        vmid = start_guest(q)
+        for prog in ("fpbench 2", "vecbench 2", "mandel q"):
+            q.send(prog + "\n")
+            q.expect(r"(fpbench|vecbench|mandel): (ok|no vector extension)", 90)
+            q.expect(r"\$ ", 10)
+        detach(q)
+        kill_vm(q, vmid)
+    finally:
+        q.close()
+
+
 def t_malicious(QEMU, intc, cpus, log):
     q = boot_host(QEMU, intc, cpus, log)
     try:
@@ -306,10 +360,10 @@ def t_malicious(QEMU, intc, cpus, log):
         q.expect(r"vm (\d+): 1 vcpu", 20)
         q.expect(r"badguest: hello", 20)
         q.expect(r"badguest: done, shutting down", 30)
-        q.send("\n")
+        q.expect(r"\[vm \d+ has exited\]", 20)
         q.expect(r"\$ ", 20)
         assert "no vms" in vm_ls(q)
-        free1, _ = host_stats(q)
+        free1 = wait_free(q, free0)
         assert free1 == free0, (free0, free1)
         vmid = start_guest(q)
         q.send("echo still-fine\n")
@@ -332,7 +386,7 @@ def t_churn(QEMU, intc, cpus, log, rounds=4):
             q.expect(r"\nround-%d" % r, 10)
             detach(q)
             kill_vm(q, vmid)
-        free1, _ = host_stats(q)
+        free1 = wait_free(q, free0)
         assert free1 == free0, (free0, free1)
     finally:
         q.close()
@@ -353,6 +407,8 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
         t.append(("guest-hello-%s" % m, lambda m=m: t_hello(QEMU, m, cpus, log)))
         t.append(("guest-churn-%s" % m, lambda m=m: t_churn(QEMU, m, cpus, log)))
         t.append(("guest-malicious-%s" % m, lambda m=m: t_malicious(QEMU, m, cpus, log)))
+        t.append(("guest-fd-vector-%s" % m, lambda m=m: t_fdv_guests(QEMU, m, cpus, log)))
+    t.append(("guest-fd-vector-novec-plic", lambda: t_fdv_guests(QEMU, "plic", cpus, log, vec=0)))
     # host configurations: a single hart, and more harts than the default.
     t.append(("guest-smp-on-1-hart-plic", lambda: t_guest_usertests(QEMU, "plic", 1, log, 2)))
     t.append(("guest-parallel-on-4-harts-imsic", lambda: t_parallel(QEMU, "imsic", 4, log, 3, 2)))

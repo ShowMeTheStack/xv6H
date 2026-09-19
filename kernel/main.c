@@ -18,12 +18,14 @@ main()
     printk("\n");
     printk("xv6 kernel is booting\n");
     printk("\n");
-    printk("platform: %s, ram %ld MB (host %ld MB), %d cpus, intc %s, %d virtio slots%s\n",
+    printk("platform: %s, ram %ld MB, %s paging, %d cpus, intc %s, %d virtio slots%s\n",
            plat.is_guest ? "xv6h guest" : "qemu virt",
-           plat.ram_size / (1024 * 1024), (plat.host_top - plat.ram_base) / (1024 * 1024),
+           plat.ram_size / (1024 * 1024), plat.mmu_levels == 4 ? "sv48" : "sv39",
            plat.ncpu,
            plat.intc_kind == INTC_PLIC ? "plic" : plat.intc_kind == INTC_APLIC ? "aplic" : "aplic-msi+imsic",
            plat.nvirtio, plat.has_h ? ", hypervisor ext" : "");
+    if (plat.has_v)
+      printk("vector extension: vlen %ld bits\n", plat.vlenb * 8);
     kinit();            // physical page allocator
     kvminit();          // create kernel page table
     kvminithart();      // turn on paging
@@ -36,6 +38,9 @@ main()
     iinit();            // inode table
     fileinit();         // file table
     virtio_disk_init(); // emulated hard disk(s)
+    rtcinit();          // the real-time clock
+    bridgeinit();       // software switch between host, guests and the NIC
+    netinit();          // network device and stack
     hypinit();          // hypervisor (if the H extension is present)
     userinit();         // first user process
 

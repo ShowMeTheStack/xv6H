@@ -23,6 +23,7 @@ void            consoleinit(void);
 void            consoleintr(int);
 void            consoleraw(int);
 void            consputc(int);
+void            consputs(const char *, int);
 
 // exec.c
 int             kexec(char*, char**);
@@ -151,6 +152,7 @@ void            uartinit(void);
 void            uartintr(void);
 void            uartwrite(char [], int);
 void            uartputc_sync(int);
+void            uartputs_sync(const char *, int);
 
 // vm.c
 void            kvminit(void);
@@ -182,6 +184,30 @@ uint64          virtio_disk_capacity(int);
 
 // trap.c
 int             devintr(void);
+
+// kalloc.c (the rest is in page.h)
+void *          kalloc_order(int);
+void            kfree_order(void *, int);
+void *          kalloc_guest(int);
+uint64          kmem_free_pages(void);
+
+// rtc.c
+void            rtcinit(void);
+int             rtc_present(void);
+uint64          clock_realtime_ns(void);
+uint64          clock_monotonic_ns(void);
+
+// net.c / virtio_net.c
+void            netinit(void);
+void            net_timer(void);
+void            virtio_net_intr(int);
+void            bridgeinit(void);
+
+// fpu.S
+void            fp_save(uint64 *);
+void            fp_restore(uint64 *);
+void            vec_save(char *, uint64 *);
+void            vec_restore(char *, uint64 *);
 
 // hyp.c
 void            hypinit(void);
