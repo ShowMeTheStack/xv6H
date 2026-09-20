@@ -44,14 +44,15 @@ def host_stats(q):
     return int(m.group(1)), int(m.group(2))
 
 
-def wait_free(q, free0, timeout=10):
+def wait_free(q, free0, timeout=20):
     """a killed VM's memory comes back when its last vcpu has left the
-    guest, shortly after 'vm killed': wait for the free count to return
-    to the baseline, and return the final value."""
+    guest, shortly after 'vm killed', and the blocks it wrote to its disk
+    are reclaimable only once kflushd has put them on the disk. wait for
+    the free count to return to the baseline, and return what it reached."""
     end = time.time() + timeout
     while True:
         free1, _ = host_stats(q)
-        if free1 == free0 or time.time() > end:
+        if free1 >= free0 or time.time() > end:
             return free1
         time.sleep(0.5)
 
@@ -103,7 +104,7 @@ def t_guest_boot(QEMU, intc, cpus, log):
         q.expect(r"\$ ", 5)
         kill_vm(q, "first")
         assert_gone(q, vmid)
-        free2, _ = host_stats(q)
+        free2 = wait_free(q, free0)
         assert free2 == free0, (free0, free2)
         q.send("echo host-ok\n")
         q.expect(r"\nhost-ok", 10)
@@ -175,6 +176,12 @@ def t_disk_isolation(QEMU, intc, cpus, log):
         a = start_guest(q, "-n a -f /disk0.img")
         q.send("echo secret-of-vm-a > marker\n")
         q.expect(r"\$ ", 10)
+        # the guest's file system is journalled: what it wrote is in its
+        # own cache until it syncs, and killing the VM is pulling the
+        # power. a guest that wants its data keeps it the way any system
+        # does.
+        q.send("sync\n")
+        q.expect(r"\$ ", 20)
         q.send("cat marker\n")
         q.expect(r"\nsecret-of-vm-a", 10)
         q.expect(r"\$ ", 5)
@@ -206,6 +213,8 @@ def t_clone(QEMU, intc, cpus, log):
         c = start_guest(q, "-n clone -f /clone.img")
         q.send("echo in-the-clone > marker\n")
         q.expect(r"\$ ", 10)
+        q.send("sync\n")   # see t_disk_isolation: killing a VM is a power cut
+        q.expect(r"\$ ", 20)
         detach(q)
         kill_vm(q, "clone")
         c2 = start_guest(q, "-f /clone.img")

@@ -9,6 +9,7 @@
 #   ./test-hyp.py linux             # Linux guests (needs linux/Image, see linux/build.sh)
 #   ./test-hyp.py net               # networking: host, guests, TLS, egress policy
 #   ./test-hyp.py mm                # memory: allocator, Sv48/Sv39, 16G and 512G hosts, on-demand guests
+#   ./test-hyp.py proc              # processes: thousands at once, pid wraparound, everything reaped
 #   ./test-hyp.py all               # everything
 #
 import argparse, os, re, select, shutil, subprocess, sys, time
@@ -112,6 +113,7 @@ def t_native(intc, cpus, log, hyp=1, vec=1, vlen=128):
         q.expect(r"init: starting sh", 30)
         q.expect(r"\$ ", 10)
         q.cmd_("echo native-ok")
+        assert re.search(r"kthread: ok \(100 switches\)", q.buf.decode(errors="replace")), "kernel threads did not report"
         if not hyp:
             q.send("vmm start -d\n")
             q.expect(r"cannot create vm", 10)
@@ -119,6 +121,89 @@ def t_native(intc, cpus, log, hyp=1, vec=1, vlen=128):
         out = usertests_ok(q)
         n = len(re.findall(r"test .*: OK", out))
         print("    usertests: %d tests OK" % n)
+    finally:
+        q.close()
+
+
+# the C library's own tests, and the two that check the numerics.
+def t_libc(log):
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        for prog, want in (("libctest", r"libctest: (\d+) checks, 0 failures"),
+                           ("mathtest", r"math: (\d+) tests, 0 failures"),
+                           ("fltest", r"float: (\d+) tests, 0 failures"),
+                           ("regextest", r"regex: (\d+) checks, 0 failures"),
+                           ("wctest", r"wctest: (\d+) checks, 0 failures"),
+                           ("editest", r"editline: (\d+) checks, 0 failures"),
+                           ("sh /shtest", r"shtest: (\d+) checks, 0 failures")):
+            m = q.mark()
+            q.send(prog + "\n")
+            q.expect(r"\d+ (?:checks|tests), \d+ failures?\r?\n|panic|FAIL", 600)
+            out = q.output_since(m)
+            assert re.search(want, out), out[-3000:]
+            print("    %s: %s" % (prog, re.search(want, out).group(0)))
+            q.expect(r"\$ ", 30)
+    finally:
+        q.close()
+
+
+def t_fsbench(log):
+    """the file system benchmark runs to the end and reports every
+    phase. what the numbers mean is in bench/RESULTS.md; what this test
+    is for is that none of the phases has stopped working, which is how
+    a file system regression shows up before anyone reads a number."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        m = q.mark()
+        q.send("fsbench -s 4 -n 40\n")
+        q.expect(r"fsbench: done|panic", 600)
+        out = q.output_since(m)
+        assert "fsbench: done" in out, out[-2000:]
+        phases = {m2.group(1): (float(m2.group(2)), float(m2.group(3)))
+                  for m2 in re.finditer(r"fsbench: (\w+)=[\d.]+ secs=([\d.]+) rate=([\d.]+)",
+                                        out)}
+        for want in ("seqwrite", "seqread", "randread", "randwrite", "fsyncsmall", "metadata",
+                     "bigdir", "mixed"):
+            assert want in phases, (want, out[-2000:])
+            secs, rate = phases[want]
+            assert rate > 0, (want, secs, rate)
+        print("    " + "  ".join("%s %.0f" % (k, v[1]) for k, v in sorted(phases.items())))
+        q.expect(r"\$ ", 30)
+    finally:
+        q.close()
+
+
+def t_tty(log):
+    """the console as a terminal: Ctrl-C reaches the foreground job and
+    not the shell, Ctrl-Z stops it, and the shell survives both."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 40)
+        q.expect(r"\$ ", 10)
+        # Ctrl-C kills the foreground job, the shell comes back
+        q.send("loopsig\n")
+        q.expect(r"ready", 20)
+        q.send("\x03")
+        q.expect(r"\$ ", 20)
+        q.cmd_("echo alive-after-intr")
+        assert "alive-after-intr" in q.output_since(q.mark() - 200)
+        # Ctrl-Z stops it; the shell reports the stop and carries on
+        q.send("loopsig\n")
+        q.expect(r"ready", 20)
+        q.send("\x1a")
+        q.expect(r"[Ss]topped", 20)   # the shell says "Stopped", the way bash does
+        q.expect(r"\$ ", 20)
+        m = q.mark()
+        q.cmd_("echo alive-after-stop")
+        assert "alive-after-stop" in q.output_since(m), q.output_since(m)
+        # the shell still runs commands after all of that
+        m = q.mark()
+        q.cmd_("echo done")
+        assert "done" in q.output_since(m), q.output_since(m)
     finally:
         q.close()
 
@@ -224,6 +309,9 @@ def main():
             tests.append(("native-vlen-512", lambda: t_native("plic", args.cpus, log, vlen=512)))
             tests.append(("hostfiles-build", lambda: t_hostfiles(log)))
             tests.append(("clock", lambda: t_clock(log, have_linux)))
+            tests.append(("tty", lambda: t_tty(log)))
+            tests.append(("libc", lambda: t_libc(log)))
+            tests.append(("fsbench", lambda: t_fsbench(log)))
     if args.suite in ("guest", "all"):
         import test_hyp_guest  # milestone 2+
         tests += test_hyp_guest.tests(modes, args.cpus, log, QEMU, usertests_ok)
@@ -235,6 +323,9 @@ def main():
     if args.suite in ("mm", "all"):
         import test_hyp_mm
         tests += test_hyp_mm.tests(modes, args.cpus, log, QEMU, have_linux)
+    if args.suite in ("proc", "all"):
+        import test_hyp_proc
+        tests += test_hyp_proc.tests(modes, args.cpus, log, QEMU)
 
     if args.test:
         tests = [t for t in tests if args.test in t[0]]

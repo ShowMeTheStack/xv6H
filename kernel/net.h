@@ -1,3 +1,6 @@
+#ifndef XV6_NET_H
+#define XV6_NET_H
+#include "types.h"
 //
 // networking: packet buffers, protocol headers, configuration.
 //
@@ -181,3 +184,4 @@ int sock_icmp_rx(struct mbuf *m, uint32 src, uint16 id);
 // tcp.c
 void tcp_rx(struct mbuf *m, uint32 src, uint32 dst);
 void tcp_timer(void);
+#endif

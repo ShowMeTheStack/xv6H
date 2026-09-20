@@ -8,17 +8,20 @@ main(int argc, char *argv[])
 {
   struct timespec ts;
   if (clock_gettime(CLOCK_REALTIME, &ts) < 0) {
-    fprintf(2, "date: no real-time clock\n");
+    fprintf(stderr, "date: no real-time clock\n");
     exit(1);
   }
   if (argc > 1 && strcmp(argv[1], "-s") == 0) {
-    printf("%ld\n", ts.sec);
+    printf("%ld\n", ts.tv_sec);
   } else if (argc > 1) {
-    fprintf(2, "usage: date [-s]\n");
+    fprintf(stderr, "usage: date [-s]\n");
     exit(1);
   } else {
-    char buf[32];
-    printf("%s\n", ctime_r(ts.sec, buf));
+    char buf[64];
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    strftime(buf, sizeof(buf), "%a %b %e %H:%M:%S %Z %Y", &tm);
+    printf("%s\n", buf);
   }
   exit(0);
 }

@@ -112,8 +112,15 @@ sys_vm_info(void)
   argint(0, &vmid);
   argaddr(1, &addr);
   struct vm *vm = vm_lookup(vmid);
-  if (vm == 0)
-    return -1;
+  if (vm == 0) {
+    // a slot never used: it exists, and it is free.
+    if (vmid < 0 || vmid >= NVM)
+      return -1;
+    memset(&info, 0, sizeof(info));
+    info.id = vmid;
+    info.state = VM_FREE;
+    return copyout(myproc()->mm, addr, (char *)&info, sizeof(info)) < 0 ? -1 : 0;
+  }
   memset(&info, 0, sizeof(info));
   info.id = vm->id;
   info.state = vm->state;

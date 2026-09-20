@@ -91,10 +91,15 @@ def t_mm_16g(QEMU, intc, cpus, log):
         q.send("usertests -q\n")
         g.detach(q)
         g.start_guest(q, "-n b -m 6144 -c 2 -f /disk1.img", 90)
-        assert "ALL TESTS PASSED" in run(q, "usertests -q", 900)
+        # two guests of six gigabytes each, running usertests at the
+        # same time: every page either of them touches is a fault the
+        # host has to back, and every file it writes goes through the
+        # guest's journal and then the host's. on a build box running
+        # the other suites beside this one, fifteen minutes each.
+        assert "ALL TESTS PASSED" in run(q, "usertests -q", 1800)
         g.detach(q)
         g.attach(q, "a")
-        q.expect(r"ALL TESTS PASSED", 900)
+        q.expect(r"ALL TESTS PASSED", 1800)
         q.expect(r"\$ ", 10)
         g.detach(q)
         out = run(q, "vmm info a")

@@ -11,12 +11,13 @@
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
+#include "blk.h"
+#include "errno.h"
 #include "param.h"
 #include "memlayout.h"
 #include "spinlock.h"
 #include "sleeplock.h"
 #include "fs.h"
-#include "buf.h"
 #include "virtio.h"
 #include "platform.h"
 
@@ -250,9 +251,9 @@ free_chain(struct disk *d, int i)
 // allocate three descriptors (they need not be contiguous).
 // disk transfers always use three descriptors.
 static int
-alloc3_desc(struct disk *d, int *idx)
+allocn_desc(struct disk *d, int *idx, int n)
 {
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < n; i++) {
     idx[i] = alloc_desc(d);
     if (idx[i] < 0) {
       for (int j = 0; j < i; j++)
@@ -263,41 +264,41 @@ alloc3_desc(struct disk *d, int *idx)
   return 0;
 }
 
-// submit one read or write of len bytes (a multiple of 512) at the
-// given 512-byte sector, and wait for it to complete. returns the
-// device's status byte (0 = ok).
+// submit one read or write of `npages` pages, starting at the given
+// 512-byte sector, and wait for it to complete. returns the device's
+// status byte (0 = ok).
+//
+// the pages go in one request rather than one request each. a request
+// costs a notification, an interrupt and a round trip through the
+// device whatever it carries, so reading a megabyte as 256 requests
+// costs 256 of those and reading it as eight costs eight. this is what
+// makes readahead worth doing: the blocks a reader is about to want
+// arrive in the same request as the one it is waiting for.
 static int
-disk_submit(struct disk *d, uint64 sector, void *data, uint32 len, int write)
+disk_submit_pages(struct disk *d, uint64 sector, void **pages, int npages, int write)
 {
   volatile int done = 0;
+  int idx[2 + BIO_MAXPAGES];
+  int ndesc = npages + 2;
+
+  if (npages < 1 || npages > BIO_MAXPAGES)
+    return -1;
 
   acquire(&d->vdisk_lock);
 
-  // the spec's Section 5.2 says that legacy block operations use
-  // three descriptors: one for type/reserved/sector, one for the
-  // data, one for a 1-byte status result.
-
-  // allocate the three descriptors.
-  int idx[3];
-  while (1) {
-    if (alloc3_desc(d, idx) == 0) {
-      break;
-    }
+  // the spec's Section 5.2: a block request is a chain of one
+  // descriptor for type/reserved/sector, one or more for the data, and
+  // one for a one-byte status result.
+  while (allocn_desc(d, idx, ndesc) != 0) {
     sleep_prepare(&d->free[0]);
     release(&d->vdisk_lock);
     sleep();
     acquire(&d->vdisk_lock);
   }
 
-  // format the three descriptors.
-  // qemu's virtio-blk.c reads them.
-
   struct virtio_blk_req *buf0 = &d->ops[idx[0]];
 
-  if (write)
-    buf0->type = VIRTIO_BLK_T_OUT; // write the disk
-  else
-    buf0->type = VIRTIO_BLK_T_IN; // read the disk
+  buf0->type = write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
   buf0->reserved = 0;
   buf0->sector = sector;
 
@@ -306,20 +307,22 @@ disk_submit(struct disk *d, uint64 sector, void *data, uint32 len, int write)
   d->desc[idx[0]].flags = VRING_DESC_F_NEXT;
   d->desc[idx[0]].next = idx[1];
 
-  d->desc[idx[1]].addr = (uint64)data;
-  d->desc[idx[1]].len = len;
-  if (write)
-    d->desc[idx[1]].flags = 0; // device reads data
-  else
-    d->desc[idx[1]].flags = VRING_DESC_F_WRITE; // device writes data
-  d->desc[idx[1]].flags |= VRING_DESC_F_NEXT;
-  d->desc[idx[1]].next = idx[2];
+  for (int i = 0; i < npages; i++) {
+    int k = idx[1 + i];
+    d->desc[k].addr = (uint64)pages[i];
+    d->desc[k].len = PGSIZE;
+    // the device reads the data on a write and writes it on a read
+    d->desc[k].flags = write ? 0 : VRING_DESC_F_WRITE;
+    d->desc[k].flags |= VRING_DESC_F_NEXT;
+    d->desc[k].next = idx[2 + i];
+  }
 
+  int last = idx[ndesc - 1];
   d->info[idx[0]].status = 0xff; // device writes 0 on success
-  d->desc[idx[2]].addr = (uint64)&d->info[idx[0]].status;
-  d->desc[idx[2]].len = 1;
-  d->desc[idx[2]].flags = VRING_DESC_F_WRITE; // device writes the status
-  d->desc[idx[2]].next = 0;
+  d->desc[last].addr = (uint64)&d->info[idx[0]].status;
+  d->desc[last].len = 1;
+  d->desc[last].flags = VRING_DESC_F_WRITE; // device writes the status
+  d->desc[last].next = 0;
 
   // record the completion flag for virtio_disk_intr().
   d->info[idx[0]].done = &done;
@@ -352,16 +355,75 @@ disk_submit(struct disk *d, uint64 sector, void *data, uint32 len, int write)
   return status;
 }
 
-// buffer-cache entry point: dev is the xv6 device number (ROOTDEV=1 is disk 0).
-void
-virtio_disk_rw(struct buf *b, int write)
+// ---- the block layer's view of these disks ----
+//
+// every virtio disk is also a gendisk, which is what the file system
+// talks to. a request carries as many pages as the bio holds, in one
+// chain of descriptors; making the wait asynchronous is a later step,
+// and nothing above this layer has to change for it.
+
+static int
+vblk_submit(struct gendisk *disk, struct bio *bio)
 {
-  int idx = b->dev - 1;
-  if (!virtio_disk_present(idx))
-    panic("virtio_disk_rw: no such disk");
-  uint64 sector = b->blockno * (BSIZE / 512);
-  if (disk_submit(&disks[idx], sector, b->data, BSIZE, write) != 0)
-    panic("virtio_disk_rw status");
+  struct disk *d = disk->priv;
+  uint64 sector = bio->sector;
+  int i = 0;
+
+  // one device request per BIO_MAXPAGES pages; a bio never holds more
+  // than that, so in practice this is one request.
+  while (i < bio->npages) {
+    int n = bio->npages - i;
+    if (n > BIO_MAXPAGES)
+      n = BIO_MAXPAGES;
+    if (disk_submit_pages(d, sector, &bio->pages[i], n, bio->write) != 0) {
+      bio->error = -EIO;
+      break;
+    }
+    sector += (uint64)n * (PGSIZE / 512);
+    i += n;
+  }
+  bio->done = 1;
+  if (bio->callback)
+    bio->callback(bio);
+  return bio->error;
+}
+
+static int
+vblk_flush(struct gendisk *disk)
+{
+  (void)disk;
+  return 0; // qemu's virtio-blk writes through to the image
+}
+
+static const struct disk_ops vblk_ops = {
+    .submit = vblk_submit,
+    .flush = vblk_flush,
+};
+
+// name and register every disk that was found, and read whatever
+// partition table each one carries.
+void
+virtio_disk_register(void)
+{
+  int n = 0;
+
+  for (int i = 0; i < ndisks; i++) {
+    if (!virtio_disk_present(i))
+      continue;
+    // named in the order they were found, as Linux names them, rather
+    // than by which mmio slot they happen to sit in
+    char name[DISKNAME];
+    name[0] = 'v';
+    name[1] = 'd';
+    name[2] = 'a' + n++;
+    name[3] = 0;
+    uint64 capacity = *(uint64 *)((char *)disks[i].base + VIRTIO_MMIO_CONFIG);
+    struct gendisk *g = blk_register(name, &vblk_ops, &disks[i], capacity, 512);
+    if (g == 0)
+      continue;
+    printk("blk: %s: %ld sectors (%ld MB)\n", name, capacity, capacity / 2048);
+    blk_scan_partitions(g);
+  }
 }
 
 void

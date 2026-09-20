@@ -1,3 +1,6 @@
+#ifndef XV6_SOCK_H
+#define XV6_SOCK_H
+#include "types.h"
 // sockets (sock.c)
 
 #define NSOCK 32
@@ -23,3 +26,4 @@ extern struct sock socks[NSOCK];
 void sockclose(struct sock *s);
 int sockread(struct sock *s, int user, uint64 addr, int n);
 int sockwrite(struct sock *s, int user, uint64 addr, int n);
+#endif

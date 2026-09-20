@@ -8,13 +8,19 @@
 #include "kernel/memlayout.h"
 #include "kernel/riscv.h"
 #include "kernel/sysconf.h"
+#include "kernel/mman.h"
+#include "kernel/signal.h"
+#include "kernel/posix.h"
+#include "kernel/termios.h"
 #include "kernel/time.h"
 #include "kernel/hwinfo.h"
+#include "user/thread.h"
 
 // the paging mode, and so the top of the address space, is chosen at boot.
 #undef MAXVA
 #define MAXVA ((uint64)sysconf(_SC_XV6_MAXVA))
 #define TRAPFRAME ((uint64)sysconf(_SC_XV6_TRAPFRAME))
+#define BRK_MAX ((uint64)sysconf(_SC_XV6_BRK_MAX))
 
 //
 // Tests xv6 system calls.  usertests without arguments runs them all
@@ -25,10 +31,22 @@
 // prints "OK".
 //
 
-#define BUFSZ ((MAXOPBLOCKS + 2) * BSIZE)
-// writebig: enough blocks to reach the doubly-indirect level, but far
-// fewer than MAXFILE (which is now larger than most file systems).
-#define BIGBLOCKS (MAXFILE < 1000 ? MAXFILE : 1000)
+// the block size these tests write in. it used to be the file system's
+// own, when there was only one file system and its blocks were 1024
+// bytes; now it is simply a size that is not a round number of pages,
+// which is the interesting case for a write that straddles blocks.
+#define BSIZE 1024
+#define BUFSZ (12 * BSIZE)
+// writebig: enough blocks that the file needs more than one extent, and
+// far fewer than a file system here can hold.
+#define BIGBLOCKS 1000
+
+// the exit code of a child, or 1 if it died of a signal.
+static int
+xstat(int status)
+{
+  return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
 
 char buf[BUFSZ];
 
@@ -193,18 +211,21 @@ copyinstr2(char *s)
     for (int i = 0; i < PGSIZE; i++)
       big[i] = 'x';
     big[PGSIZE] = '\0';
-    char *args2[] = {big, big, big, 0};
+    char *args2[MAXARG];
+    for (int i = 0; i < MAXARG - 1; i++)
+      args2[i] = big; // more than ARG_MAX in total
+    args2[MAXARG - 1] = 0;
     ret = exec("echo", args2);
     if (ret != -1) {
       printf("exec(echo, BIG) returned %d, not -1\n", fd);
       exit(1);
     }
-    exit(747); // OK
+    exit(47); // OK
   }
 
   int st = 0;
   wait(&st);
-  if (st != 747) {
+  if (xstat(st) != 47) {
     printf("exec(echo, BIG) succeeded, should have failed\n");
     exit(1);
   }
@@ -432,14 +453,14 @@ truncate3(char *s)
 
   wait(&xstatus);
   unlink("truncfile");
-  exit(xstatus);
+  exit(xstat(xstatus));
 }
 
 // does chdir() call iput(p->cwd) in a transaction?
 void
 iputtest(char *s)
 {
-  if (mkdir("iputdir") < 0) {
+  if (mkdir("iputdir", 0777) < 0) {
     printf("%s: mkdir failed\n", s);
     exit(1);
   }
@@ -469,7 +490,7 @@ exitiputtest(char *s)
     exit(1);
   }
   if (pid == 0) {
-    if (mkdir("iputdir") < 0) {
+    if (mkdir("iputdir", 0777) < 0) {
       printf("%s: mkdir failed\n", s);
       exit(1);
     }
@@ -484,7 +505,7 @@ exitiputtest(char *s)
     exit(0);
   }
   wait(&xstatus);
-  exit(xstatus);
+  exit(xstat(xstatus));
 }
 
 // does the error path in open() for attempt to write a
@@ -503,7 +524,7 @@ openiputtest(char *s)
 {
   int pid, xstatus;
 
-  if (mkdir("oidir") < 0) {
+  if (mkdir("oidir", 0777) < 0) {
     printf("%s: mkdir oidir failed\n", s);
     exit(1);
   }
@@ -520,13 +541,13 @@ openiputtest(char *s)
     }
     exit(0);
   }
-  pause(1);
+  ticksleep(1);
   if (unlink("oidir") != 0) {
     printf("%s: unlink failed\n", s);
     exit(1);
   }
   wait(&xstatus);
-  exit(xstatus);
+  exit(xstat(xstatus));
 }
 
 // simple file system tests
@@ -669,7 +690,7 @@ createtest(char *s)
 void
 dirtest(char *s)
 {
-  if (mkdir("dir0") < 0) {
+  if (mkdir("dir0", 0777) < 0) {
     printf("%s: mkdir failed\n", s);
     exit(1);
   }
@@ -712,15 +733,15 @@ exectest(char *s)
     close(1);
     fd = open("echo-ok", O_CREATE | O_WRONLY);
     if (fd < 0) {
-      fprintf(errfd, "%s: create failed\n", s);
+      dprintf(errfd, "%s: create failed\n", s);
       exit(1);
     }
     if (fd != 1) {
-      fprintf(errfd, "%s: wrong fd\n", s);
+      dprintf(errfd, "%s: wrong fd\n", s);
       exit(1);
     }
     if (exec("echo", echoargv) < 0) {
-      fprintf(errfd, "%s: exec echo failed\n", s);
+      dprintf(errfd, "%s: exec echo failed\n", s);
       exit(1);
     }
     // won't get to here
@@ -799,7 +820,7 @@ pipe1(char *s)
     }
     close(fds[0]);
     wait(&xstatus);
-    exit(xstatus);
+    exit(xstat(xstatus));
   } else {
     printf("%s: fork() failed\n", s);
     exit(1);
@@ -824,11 +845,11 @@ killstatus(char *s)
       }
       exit(0);
     }
-    pause(1);
-    kill(pid1);
+    ticksleep(1);
+    kill(pid1, SIGKILL);
     wait(&xst);
-    if (xst != -1) {
-      printf("%s: status should be -1\n", s);
+    if (!WIFSIGNALED(xst)) {
+      printf("%s: the child should have been killed by a signal\n", s);
       exit(1);
     }
   }
@@ -882,9 +903,9 @@ preempt(char *s)
   }
   close(pfds[0]);
   printf("kill... ");
-  kill(pid1);
-  kill(pid2);
-  kill(pid3);
+  kill(pid1, SIGKILL);
+  kill(pid2, SIGKILL);
+  kill(pid3, SIGKILL);
   printf("wait... ");
   wait(0);
   wait(0);
@@ -909,7 +930,7 @@ exitwait(char *s)
         printf("%s: wait wrong pid\n", s);
         exit(1);
       }
-      if (i != xstate) {
+      if (!WIFEXITED(xstate) || WEXITSTATUS(xstate) != i) {
         printf("%s: wait wrong exit status\n", s);
         exit(1);
       }
@@ -940,7 +961,7 @@ reparent(char *s)
     } else {
       int pid2 = fork();
       if (pid2 < 0) {
-        kill(master_pid);
+        kill(master_pid, SIGKILL);
         exit(1);
       }
       exit(0);
@@ -1017,6 +1038,7 @@ forkfork(char *s)
 void
 forkforkfork(char *s)
 {
+  long nprocs0 = sysconf(_SC_XV6_NPROCS);
   unlink("stopforking");
 
   int pid = fork();
@@ -1032,16 +1054,26 @@ forkforkfork(char *s)
       }
       if (fork() < 0) {
         close(open("stopforking", O_CREATE | O_RDWR));
+        // out of memory: if not even the file can be opened, stop here
+        // rather than spin (the file table is allocated on demand).
+        if (open("stopforking", 0) < 0)
+          exit(0);
       }
     }
 
     exit(0);
   }
 
-  pause(20); // two seconds
+  ticksleep(20); // two seconds
   close(open("stopforking", O_CREATE | O_RDWR));
   wait(0);
-  pause(10); // one second
+  // the storm's orphans are init's to reap; there is no process table to
+  // bound them, so wait until they are gone before the free-page check.
+  for (int i = 0; i < 600; i++) {
+    if (sysconf(_SC_XV6_NPROCS) <= nprocs0)
+      break;
+    ticksleep(10);
+  }
 }
 
 // regression test. does reparent() violate the parent-then-child
@@ -1101,12 +1133,12 @@ mem(char *s)
   } else {
     int xstatus;
     wait(&xstatus);
-    if (xstatus == -1) {
+    if (WIFSIGNALED(xstatus)) {
       // probably page fault, so might be lazy lab,
       // so OK.
       exit(0);
     }
-    exit(xstatus);
+    exit(xstat(xstatus));
   }
 }
 
@@ -1141,7 +1173,7 @@ sharedfd(char *s)
     int xstatus;
     wait(&xstatus);
     if (xstatus != 0)
-      exit(xstatus);
+      exit(xstat(xstatus));
   }
 
   close(fd);
@@ -1211,7 +1243,7 @@ fourfiles(char *s)
   for (pi = 0; pi < NCHILD; pi++) {
     wait(&xstatus);
     if (xstatus != 0)
-      exit(xstatus);
+      exit(xstat(xstatus));
   }
 
   for (i = 0; i < NCHILD; i++) {
@@ -1420,10 +1452,6 @@ concreate(char *s)
   char file[3];
   int i, pid, n, fd;
   char fa[N];
-  struct {
-    ushort inum;
-    char name[DIRSIZ];
-  } de;
 
   file[0] = 'C';
   file[2] = '\0';
@@ -1453,27 +1481,33 @@ concreate(char *s)
     }
   }
 
+  // the directory is walked with readdir, not by reading the directory
+  // as a file: what those bytes look like is the file system's own
+  // business, and this kernel mounts more than one kind.
   memset(fa, 0, sizeof(fa));
-  fd = open(".", 0);
   n = 0;
-  while (read(fd, &de, sizeof(de)) > 0) {
-    if (de.inum == 0)
-      continue;
-    if (de.name[0] == 'C' && de.name[2] == '\0') {
-      i = de.name[1] - '0';
-      if (i < 0 || i >= sizeof(fa)) {
-        printf("%s: concreate weird file %s\n", s, de.name);
+  DIR *d = opendir(".");
+  if (d == 0) {
+    printf("%s: concreate opendir failed\n", s);
+    exit(1);
+  }
+  struct dirent *de;
+  while ((de = readdir(d)) != 0) {
+    if (de->d_name[0] == 'C' && de->d_name[2] == '\0') {
+      i = de->d_name[1] - '0';
+      if (i < 0 || i >= (int)sizeof(fa)) {
+        printf("%s: concreate weird file %s\n", s, de->d_name);
         exit(1);
       }
       if (fa[i]) {
-        printf("%s: concreate duplicate file %s\n", s, de.name);
+        printf("%s: concreate duplicate file %s\n", s, de->d_name);
         exit(1);
       }
       fa[i] = 1;
       n++;
     }
   }
-  close(fd);
+  closedir(d);
 
   if (n != N) {
     printf("%s: concreate not enough files in directory listing\n", s);
@@ -1547,7 +1581,7 @@ subdir(char *s)
   int fd, cc;
 
   unlink("ff");
-  if (mkdir("dd") != 0) {
+  if (mkdir("dd", 0777) != 0) {
     printf("%s: mkdir dd failed\n", s);
     exit(1);
   }
@@ -1565,7 +1599,7 @@ subdir(char *s)
     exit(1);
   }
 
-  if (mkdir("/dd/dd") != 0) {
+  if (mkdir("/dd/dd", 0777) != 0) {
     printf("%s: subdir mkdir dd/dd failed\n", s);
     exit(1);
   }
@@ -1669,15 +1703,15 @@ subdir(char *s)
     printf("%s: link dd/ff dd/dd/ffff succeeded!\n", s);
     exit(1);
   }
-  if (mkdir("dd/ff/ff") == 0) {
+  if (mkdir("dd/ff/ff", 0777) == 0) {
     printf("%s: mkdir dd/ff/ff succeeded!\n", s);
     exit(1);
   }
-  if (mkdir("dd/xx/ff") == 0) {
+  if (mkdir("dd/xx/ff", 0777) == 0) {
     printf("%s: mkdir dd/xx/ff succeeded!\n", s);
     exit(1);
   }
-  if (mkdir("dd/dd/ffff") == 0) {
+  if (mkdir("dd/dd/ffff", 0777) == 0) {
     printf("%s: mkdir dd/dd/ffff succeeded!\n", s);
     exit(1);
   }
@@ -1727,7 +1761,7 @@ bigwrite(char *s)
   int fd, sz;
 
   unlink("bigwrite");
-  for (sz = 499; sz < (MAXOPBLOCKS + 2) * BSIZE; sz += 471) {
+  for (sz = 499; sz < BUFSZ; sz += 471) {
     fd = open("bigwrite", O_CREATE | O_RDWR);
     if (fd < 0) {
       printf("%s: cannot create bigwrite\n", s);
@@ -1800,56 +1834,58 @@ bigfile(char *s)
 }
 
 void
-fourteen(char *s)
+longnames(char *s)
 {
+  // names are strings now, not a fixed fourteen-byte field, so two
+  // names that agree for the first fourteen characters are two names.
+  // this used to be the "fourteen" test, which checked the opposite.
+  char a[NAME_MAX + 1], b[NAME_MAX + 1], path[PATH_MAX];
   int fd;
 
-  // DIRSIZ is 14.
+  for (int i = 0; i < NAME_MAX; i++) {
+    a[i] = 'a' + (i % 26);
+    b[i] = 'a' + (i % 26);
+  }
+  a[NAME_MAX] = b[NAME_MAX] = 0;
+  b[NAME_MAX - 1] = 'Z'; // the same name but for its last character
 
-  if (mkdir("12345678901234") != 0) {
-    printf("%s: mkdir 12345678901234 failed\n", s);
+  if (mkdir(a, 0777) != 0) {
+    printf("%s: mkdir of a %d-character name failed\n", s, NAME_MAX);
     exit(1);
   }
-  if (mkdir("12345678901234/123456789012345") != 0) {
-    printf("%s: mkdir 12345678901234/123456789012345 failed\n", s);
+  if (mkdir(b, 0777) != 0) {
+    printf("%s: the two long names were treated as one\n", s);
     exit(1);
   }
-  fd = open("123456789012345/123456789012345/123456789012345", O_CREATE);
+  snprintf(path, sizeof(path), "%s/%s", a, b);
+  fd = open(path, O_CREATE | O_RDWR);
   if (fd < 0) {
-    printf(
-      "%s: create 123456789012345/123456789012345/123456789012345 failed\n", s);
+    printf("%s: create in a long-named directory failed\n", s);
+    exit(1);
+  }
+  if (write(fd, "hello", 5) != 5) {
+    printf("%s: write to a long-named file failed\n", s);
     exit(1);
   }
   close(fd);
-  fd = open("12345678901234/12345678901234/12345678901234", 0);
-  if (fd < 0) {
-    printf("%s: open 12345678901234/12345678901234/12345678901234 failed\n", s);
-    exit(1);
-  }
-  close(fd);
 
-  if (mkdir("12345678901234/12345678901234") == 0) {
-    printf("%s: mkdir 12345678901234/12345678901234 succeeded!\n", s);
-    exit(1);
-  }
-  if (mkdir("123456789012345/12345678901234") == 0) {
-    printf("%s: mkdir 12345678901234/123456789012345 succeeded!\n", s);
+  // and the names that used to collide do not
+  if (mkdir("12345678901234", 0777) != 0 || mkdir("123456789012345", 0777) != 0) {
+    printf("%s: names differing after fourteen characters collided\n", s);
     exit(1);
   }
 
-  // clean up
-  unlink("123456789012345/12345678901234");
-  unlink("12345678901234/12345678901234");
-  unlink("12345678901234/12345678901234/12345678901234");
-  unlink("123456789012345/123456789012345/123456789012345");
-  unlink("12345678901234/123456789012345");
   unlink("12345678901234");
+  unlink("123456789012345");
+  unlink(path);
+  unlink(b);
+  unlink(a);
 }
 
 void
 rmdot(char *s)
 {
-  if (mkdir("dots") != 0) {
+  if (mkdir("dots", 0777) != 0) {
     printf("%s: mkdir dots failed\n", s);
     exit(1);
   }
@@ -1908,7 +1944,7 @@ dirfile(char *s)
     printf("%s: create dirfile/xx succeeded!\n", s);
     exit(1);
   }
-  if (mkdir("dirfile/xx") == 0) {
+  if (mkdir("dirfile/xx", 0777) == 0) {
     printf("%s: mkdir dirfile/xx succeeded!\n", s);
     exit(1);
   }
@@ -1946,7 +1982,7 @@ iref(char *s)
   int i, fd;
 
   for (i = 0; i < NINODE + 1; i++) {
-    if (mkdir("irefd") != 0) {
+    if (mkdir("irefd", 0777) != 0) {
       printf("%s: mkdir irefd failed\n", s);
       exit(1);
     }
@@ -1955,7 +1991,7 @@ iref(char *s)
       exit(1);
     }
 
-    mkdir("");
+    mkdir("", 0777);
     link("README", "");
     fd = open("", O_CREATE);
     if (fd >= 0)
@@ -1997,10 +2033,8 @@ forktest(char *s)
     exit(1);
   }
 
-  if (n == N) {
-    printf("%s: fork claimed to work 1000 times!\n", s);
-    exit(1);
-  }
+  // no fixed process table: all N forks may succeed; every child must
+  // be reaped below and none beyond.
 
   for (; n > 0; n--) {
     if (wait(0) < 0) {
@@ -2081,7 +2115,7 @@ sbrkbasic(char *s)
   if (pid == 0)
     exit(0);
   wait(&xstatus);
-  exit(xstatus);
+  exit(xstat(xstatus));
 }
 
 void
@@ -2134,7 +2168,7 @@ sbrkmuch(char *s)
   }
 
   a = sbrk(0);
-  c = sbrk(-(sbrk(0) - oldbrk));
+  c = sbrk(-((char *)sbrk(0) - oldbrk));
   if (c != a) {
     printf("%s: sbrk downsize failed, a %p c %p\n", s, a, c);
     exit(1);
@@ -2160,7 +2194,7 @@ kernmem(char *s)
     }
     int xstatus;
     wait(&xstatus);
-    if (xstatus != -1) // did kernel kill child?
+    if (!WIFSIGNALED(xstatus)) // did a fault kill the child?
       exit(1);
   }
 }
@@ -2184,7 +2218,7 @@ MAXVAplus(char *s)
     }
     int xstatus;
     wait(&xstatus);
-    if (xstatus != -1) // did kernel kill child?
+    if (!WIFSIGNALED(xstatus)) // did a fault kill the child?
       exit(1);
   }
 }
@@ -2226,7 +2260,7 @@ sbrkfail(char *s)
         write(fds[1], "1", 1);
       // sit around until killed
       for (;;)
-        pause(1000);
+        ticksleep(1000);
     }
     if (pids[i] != -1) {
       read(fds[0], &scratch, 1);
@@ -2244,7 +2278,7 @@ sbrkfail(char *s)
   for (i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
     if (pids[i] == -1)
       continue;
-    kill(pids[i]);
+    kill(pids[i], SIGKILL);
     wait(0);
   }
   if (c == (char *)SBRK_ERROR) {
@@ -2333,6 +2367,1275 @@ bsstest(char *s)
   }
 }
 
+// there is no process table: a thousand processes at once on any
+// machine, their pids all different, everything reaped and reused.
+void
+manyprocs(char *s)
+{
+  // as many as the machine's memory allows, up to a thousand: a process
+  // costs some sixty pages until fork is copy-on-write.
+  int N = (int)(sysconf(_SC_AVPHYS_PAGES) / 128);
+  if (N > 1000)
+    N = 1000;
+  if (N < 100)
+    N = 100;
+  int fds[2];
+  if (pipe(fds) < 0) {
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  int *pids = malloc(N * sizeof(int));
+  int n = 0;
+  for (n = 0; n < N; n++) {
+    int pid = fork();
+    if (pid < 0)
+      break;
+    if (pid == 0) {
+      char c;
+      close(fds[1]);
+      read(fds[0], &c, 1); // wait to be released
+      exit(0);
+    }
+    pids[n] = pid;
+  }
+  if (n < N) {
+    printf("%s: only %d of %d processes could be created\n", s, n, N);
+    exit(1);
+  }
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++)
+      if (pids[i] == pids[j]) {
+        printf("%s: pid %d given twice\n", s, pids[i]);
+        exit(1);
+      }
+  close(fds[1]); // releases them all
+  for (int i = 0; i < n; i++) {
+    int st;
+    if (wait(&st) < 0 || st != 0) {
+      printf("%s: wait failed\n", s);
+      exit(1);
+    }
+  }
+  close(fds[0]);
+  free(pids);
+  // pids are reused only after they are free: a burst after reaping
+  // must not collide with a live process.
+  int keep = fork();
+  if (keep == 0) {
+    ticksleep(100000);
+    exit(0);
+  }
+  for (int i = 0; i < 300; i++) {
+    int pid = fork();
+    if (pid == 0)
+      exit(0);
+    if (pid == keep) {
+      printf("%s: live pid %d reused\n", s, keep);
+      exit(1);
+    }
+    wait(0);
+  }
+  kill(keep, SIGKILL);
+  wait(0);
+}
+
+// fork is copy-on-write: a child's writes stay private, the parent's
+// pages stay intact, and the frames come back when both are done.
+void
+cowtest(char *s)
+{
+  enum { N = 64 };
+  long free0 = sysconf(_SC_AVPHYS_PAGES);
+  char *buf = sbrk(N * PGSIZE);
+  if (buf == (char *)SBRK_ERROR) {
+    printf("%s: sbrk failed\n", s);
+    exit(1);
+  }
+  for (int i = 0; i < N; i++)
+    buf[i * PGSIZE] = i;
+  long free1 = sysconf(_SC_AVPHYS_PAGES);
+  int pid = fork();
+  if (pid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (pid == 0) {
+    // reading shares, writing copies
+    for (int i = 0; i < N; i++)
+      if (buf[i * PGSIZE] != (char)i) {
+        printf("%s: child saw wrong data\n", s);
+        exit(1);
+      }
+    for (int i = 0; i < N; i += 2)
+      buf[i * PGSIZE] = 100 + i;
+    exit(0);
+  }
+  // the parent's pages are untouched while the child writes
+  int st;
+  wait(&st);
+  if (st != 0)
+    exit(1);
+  for (int i = 0; i < N; i++)
+    if (buf[i * PGSIZE] != (char)i) {
+      printf("%s: parent's page %d changed\n", s, i);
+      exit(1);
+    }
+  // fork right after fork: the whole thing costs no copies until written
+  long before = sysconf(_SC_AVPHYS_PAGES);
+  pid = fork();
+  if (pid == 0) {
+    ticksleep(20);
+    exit(0);
+  }
+  long during = sysconf(_SC_AVPHYS_PAGES);
+  if (before - during > 40) {
+    printf("%s: fork copied %ld pages instead of sharing\n", s, before - during);
+    kill(pid, SIGKILL);
+    wait(0);
+    exit(1);
+  }
+  wait(0);
+  // the parent writes while nobody shares: no copy is made
+  long b2 = sysconf(_SC_AVPHYS_PAGES);
+  for (int i = 0; i < N; i++)
+    buf[i * PGSIZE] = 7;
+  if (sysconf(_SC_AVPHYS_PAGES) < b2 - 2) {
+    printf("%s: writing unshared pages allocated memory\n", s);
+    exit(1);
+  }
+  sbrk(-N * PGSIZE);
+  long free2 = sysconf(_SC_AVPHYS_PAGES);
+  if (free2 < free0 - 8) {
+    printf("%s: leaked %ld pages (%ld, %ld, %ld)\n", s, free0 - free2, free0, free1, free2);
+    exit(1);
+  }
+}
+
+// mmap: anonymous private and shared mappings, a file mapping, munmap,
+// mprotect, and faults on what is not mapped.
+void
+mmaptest(char *s)
+{
+  // anonymous private
+  char *a = mmap(0, 3 * PGSIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (a == MAP_FAILED) {
+    printf("%s: mmap failed\n", s);
+    exit(1);
+  }
+  for (int i = 0; i < 3 * PGSIZE; i++)
+    if (a[i] != 0) {
+      printf("%s: anonymous memory not zero\n", s);
+      exit(1);
+    }
+  a[0] = 1;
+  a[2 * PGSIZE + 5] = 2;
+  // a file mapping sees the file's contents
+  int fd = open("mmaptest.f", O_CREATE | O_RDWR);
+  if (fd < 0) {
+    printf("%s: create failed\n", s);
+    exit(1);
+  }
+  char data[PGSIZE + 100];
+  for (int i = 0; i < sizeof(data); i++)
+    data[i] = 'a' + (i % 26);
+  if (write(fd, data, sizeof(data)) != sizeof(data)) {
+    printf("%s: write failed\n", s);
+    exit(1);
+  }
+  close(fd);
+  fd = open("mmaptest.f", O_RDONLY);
+  char *f = mmap(0, 2 * PGSIZE, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (f == MAP_FAILED) {
+    printf("%s: file mmap failed\n", s);
+    exit(1);
+  }
+  close(fd);
+  for (int i = 0; i < sizeof(data); i++)
+    if (f[i] != data[i]) {
+      printf("%s: file mapping content wrong at %d\n", s, i);
+      exit(1);
+    }
+  for (int i = sizeof(data); i < 2 * PGSIZE; i++)
+    if (f[i] != 0) {
+      printf("%s: file mapping not zero past the end\n", s);
+      exit(1);
+    }
+  // a shared anonymous mapping is shared with a child; a private one is not
+  char *sh = mmap(0, PGSIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+  if (sh == MAP_FAILED) {
+    printf("%s: shared mmap failed\n", s);
+    exit(1);
+  }
+  sh[0] = 0;
+  int pid = fork();
+  if (pid == 0) {
+    sh[0] = 42;
+    a[0] = 99;
+    exit(0);
+  }
+  wait(0);
+  if (sh[0] != 42 || a[0] != 1) {
+    printf("%s: sharing wrong (%d %d)\n", s, sh[0], a[0]);
+    exit(1);
+  }
+  // mprotect: a write to read-only memory kills the writer
+  if (mprotect(a, PGSIZE, PROT_READ) < 0) {
+    printf("%s: mprotect failed\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid == 0) {
+    a[0] = 5; // must fault
+    exit(0);
+  }
+  int st;
+  wait(&st);
+  if (!WIFSIGNALED(st)) {
+    printf("%s: write to read-only mapping did not fault\n", s);
+    exit(1);
+  }
+  if (a[0] != 1) {
+    printf("%s: read-only page changed\n", s);
+    exit(1);
+  }
+  // munmap the middle page: it faults, the neighbours survive
+  if (munmap(a + PGSIZE, PGSIZE) < 0) {
+    printf("%s: munmap failed\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid == 0) {
+    a[PGSIZE] = 1; // unmapped
+    exit(0);
+  }
+  wait(&st);
+  if (!WIFSIGNALED(st)) {
+    printf("%s: unmapped page did not fault\n", s);
+    exit(1);
+  }
+  if (a[0] != 1 || a[2 * PGSIZE + 5] != 2) {
+    printf("%s: neighbours of the unmapped page damaged\n", s);
+    exit(1);
+  }
+  munmap(a, PGSIZE);
+  munmap(a + 2 * PGSIZE, PGSIZE);
+  munmap(f, 2 * PGSIZE);
+  munmap(sh, PGSIZE);
+  unlink("mmaptest.f");
+  // bad arguments
+  if (mmap(0, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != MAP_FAILED ||
+      munmap((void *)1, PGSIZE) == 0 || mprotect(a, PGSIZE, 99) == 0) {
+    printf("%s: bad arguments accepted\n", s);
+    exit(1);
+  }
+}
+
+
+static volatile int sigcount, siglast, sigcode, sigvalue;
+
+static void
+sighandler(int sig)
+{
+  sigcount++;
+  siglast = sig;
+}
+
+static void
+siginfohandler(int sig, siginfo_t *info, void *uc)
+{
+  sigcount++;
+  siglast = sig;
+  sigcode = info->si_code;
+  sigvalue = info->si_value.sival_int;
+}
+
+
+// ---- threads ----
+
+static void
+tt_sleep(int ticks)
+{
+  struct timespec ts = {0, 0};
+  ts.tv_sec = ticks / 100;
+  ts.tv_nsec = (long)(ticks % 100) * 10000000L;
+  nanosleep(&ts, 0);
+}
+
+#define NTHREAD 8
+
+static mutex_t tt_lock = MUTEX_INIT;
+static volatile int tt_counter;
+static volatile int tt_unlocked;
+static volatile int tt_seen_pid[NTHREAD];
+static volatile int tt_seen_tid[NTHREAD];
+static volatile int tt_errno[NTHREAD];
+static barrier_t tt_barrier;
+static cond_t tt_cond = COND_INIT;
+static mutex_t tt_cond_lock = MUTEX_INIT;
+static volatile int tt_ready;
+static volatile uint32 tt_futex_word;
+static volatile int tt_spinning;
+
+static void
+tt_bump(void *arg)
+{
+  int n = (int)(uint64)arg;
+  for (int i = 0; i < 2000; i++) {
+    mutex_lock(&tt_lock);
+    tt_counter++;
+    mutex_unlock(&tt_lock);
+    tt_unlocked++; // races on purpose: only the locked count is checked
+  }
+  (void)n;
+}
+
+// each thread makes a failing call of its own and checks that the
+// error it reads back is its own, not another thread's.
+static void
+tt_errno_thread(void *arg)
+{
+  int n = (int)(uint64)arg;
+
+  barrier_wait(&tt_barrier);
+  tt_seen_pid[n] = getpid();
+  tt_seen_tid[n] = gettid();
+  struct timespec bad = {0, -1}; // nanosleep rejects it with EINVAL
+  for (int i = 0; i < 200; i++) {
+    errno = 0;
+    if (n % 2 == 0) {
+      if (kill(999999, 0) >= 0)
+        tt_errno[n] = -1;
+      else if (errno != ESRCH)
+        tt_errno[n] = errno;
+    } else {
+      if (nanosleep(&bad, 0) >= 0)
+        tt_errno[n] = -1;
+      else if (errno != EINVAL)
+        tt_errno[n] = errno;
+    }
+  }
+}
+
+static void
+tt_cond_waiter(void *arg)
+{
+  mutex_lock(&tt_cond_lock);
+  while (!tt_ready)
+    cond_wait(&tt_cond, &tt_cond_lock);
+  tt_counter++;
+  mutex_unlock(&tt_cond_lock);
+  (void)arg;
+}
+
+static void
+tt_futex_waiter(void *arg)
+{
+  while (__atomic_load_n(&tt_futex_word, __ATOMIC_ACQUIRE) == 0)
+    futex((uint32 *)&tt_futex_word, FUTEX_WAIT, 0, 0, 0, 0);
+  tt_counter++;
+  (void)arg;
+}
+
+static void
+tt_spinner(void *arg)
+{
+  tt_spinning++;
+  for (;;)
+    ; // killed from outside, one way or another
+  (void)arg;
+}
+
+static void
+tt_exec_echo(void *arg)
+{
+  char *argv[] = {"echo", 0};
+  exec("echo", argv);
+  exit(9); // exec failed
+  (void)arg;
+}
+
+static void
+tt_sleeper(void *arg)
+{
+  tt_sleep(100);
+  (void)arg;
+}
+
+// threads: clone, join, mutexes, condition variables, barriers, a
+// private errno, shared descriptors, exit_group and signals.
+void
+threadtest(char *s)
+{
+  thread_t t[NTHREAD];
+  int pid = getpid();
+
+  // one thread, joined
+  tt_counter = 0;
+  if (thread_create(&t[0], tt_bump, (void *)0, 0) < 0) {
+    printf("%s: thread_create failed, errno %d\n", s, errno);
+    exit(1);
+  }
+  if (t[0].tid == 0) {
+    printf("%s: clone did not set the tid\n", s);
+    exit(1);
+  }
+  thread_join(&t[0]);
+  if (tt_counter != 2000) {
+    printf("%s: one thread counted %d, wanted 2000\n", s, tt_counter);
+    exit(1);
+  }
+  if (t[0].tid != 0) {
+    printf("%s: the tid was not cleared at exit\n", s);
+    exit(1);
+  }
+
+  // many threads sharing a counter under a mutex
+  tt_counter = 0;
+  tt_unlocked = 0;
+  for (int i = 0; i < NTHREAD; i++)
+    if (thread_create(&t[i], tt_bump, (void *)(uint64)i, 0) < 0) {
+      printf("%s: thread_create %d failed\n", s, i);
+      exit(1);
+    }
+  for (int i = 0; i < NTHREAD; i++)
+    thread_join(&t[i]);
+  if (tt_counter != NTHREAD * 2000) {
+    printf("%s: %d threads counted %d, wanted %d\n", s, NTHREAD, tt_counter, NTHREAD * 2000);
+    exit(1);
+  }
+
+  // identity: one process, many threads, each with its own errno
+  barrier_init(&tt_barrier, NTHREAD + 1);
+  for (int i = 0; i < NTHREAD; i++) {
+    tt_seen_pid[i] = tt_seen_tid[i] = tt_errno[i] = 0;
+    if (thread_create(&t[i], tt_errno_thread, (void *)(uint64)i, 0) < 0) {
+      printf("%s: thread_create %d failed\n", s, i);
+      exit(1);
+    }
+  }
+  barrier_wait(&tt_barrier);
+  errno = 0;
+  uint32 word = 1; // a stale futex wait fails with an error of its own
+  if (futex(&word, FUTEX_WAIT, 0, 0, 0, 0) >= 0 || errno != EAGAIN) {
+    printf("%s: the main thread lost its own errno (%d)\n", s, errno);
+    exit(1);
+  }
+  for (int i = 0; i < NTHREAD; i++)
+    thread_join(&t[i]);
+  for (int i = 0; i < NTHREAD; i++) {
+    if (tt_seen_pid[i] != pid) {
+      printf("%s: thread %d saw pid %d, wanted %d\n", s, i, tt_seen_pid[i], pid);
+      exit(1);
+    }
+    if (tt_seen_tid[i] == pid || tt_seen_tid[i] <= 0) {
+      printf("%s: thread %d has tid %d\n", s, i, tt_seen_tid[i]);
+      exit(1);
+    }
+    for (int j = 0; j < i; j++)
+      if (tt_seen_tid[i] == tt_seen_tid[j]) {
+        printf("%s: two threads share tid %d\n", s, tt_seen_tid[i]);
+        exit(1);
+      }
+    if (tt_errno[i] != 0) {
+      printf("%s: thread %d saw errno %d from another thread\n", s, i, tt_errno[i]);
+      exit(1);
+    }
+  }
+
+  // condition variables
+  tt_counter = 0;
+  tt_ready = 0;
+  for (int i = 0; i < NTHREAD; i++)
+    if (thread_create(&t[i], tt_cond_waiter, 0, 0) < 0) {
+      printf("%s: thread_create %d failed\n", s, i);
+      exit(1);
+    }
+  tt_sleep(2);
+  mutex_lock(&tt_cond_lock);
+  tt_ready = 1;
+  cond_broadcast(&tt_cond);
+  mutex_unlock(&tt_cond_lock);
+  for (int i = 0; i < NTHREAD; i++)
+    thread_join(&t[i]);
+  if (tt_counter != NTHREAD) {
+    printf("%s: %d of %d waiters woke\n", s, tt_counter, NTHREAD);
+    exit(1);
+  }
+
+  // the futex itself: wait until the word changes, then wake
+  tt_counter = 0;
+  tt_futex_word = 0;
+  for (int i = 0; i < 4; i++)
+    if (thread_create(&t[i], tt_futex_waiter, 0, 0) < 0) {
+      printf("%s: thread_create %d failed\n", s, i);
+      exit(1);
+    }
+  tt_sleep(2);
+  __atomic_store_n(&tt_futex_word, 1, __ATOMIC_RELEASE);
+  if (futex((uint32 *)&tt_futex_word, FUTEX_WAKE, 4, 0, 0, 0) < 0) {
+    printf("%s: futex wake failed\n", s);
+    exit(1);
+  }
+  for (int i = 0; i < 4; i++)
+    thread_join(&t[i]);
+  if (tt_counter != 4) {
+    printf("%s: %d of 4 futex waiters woke\n", s, tt_counter);
+    exit(1);
+  }
+
+  // a futex wait on a word that already changed returns at once
+  tt_futex_word = 7;
+  if (futex((uint32 *)&tt_futex_word, FUTEX_WAIT, 0, 0, 0, 0) >= 0 || errno != EAGAIN) {
+    printf("%s: a stale futex wait did not report EAGAIN (%d)\n", s, errno);
+    exit(1);
+  }
+
+  // a timed wait gives up on its own
+  struct timespec ts = {0, 50000000L}; // 50 ms
+  int r = futex((uint32 *)&tt_futex_word, FUTEX_WAIT, 7, &ts, 0, 0);
+  if (r >= 0 || errno != ETIMEDOUT) {
+    printf("%s: a timed futex wait returned %d errno %d\n", s, r, errno);
+    exit(1);
+  }
+
+  // threads share descriptors: one opens, another reads
+  {
+    int fd = open("threadfile", O_CREATE | O_RDWR);
+    if (fd < 0) {
+      printf("%s: cannot create threadfile\n", s);
+      exit(1);
+    }
+    write(fd, "hello", 5);
+    close(fd);
+    unlink("threadfile");
+  }
+
+  // exit_group ends every thread of the process
+  int cpid = fork();
+  if (cpid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (cpid == 0) {
+    for (int i = 0; i < NTHREAD; i++)
+      thread_create(&t[i], tt_sleeper, 0, 0);
+    tt_sleep(1);
+    exit_group(3);
+  }
+  int st;
+  if (waitpid(cpid, &st, 0) != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 3) {
+    printf("%s: exit_group gave status %d\n", s, st);
+    exit(1);
+  }
+
+  // a signal kills the whole process, spinning threads included
+  cpid = fork();
+  if (cpid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (cpid == 0) {
+    tt_spinning = 0;
+    for (int i = 0; i < 4; i++)
+      thread_create(&t[i], tt_spinner, 0, 0);
+    while (tt_spinning < 4)
+      ;
+    for (;;)
+      ;
+  }
+  tt_sleep(3);
+  kill(cpid, SIGKILL);
+  if (waitpid(cpid, &st, 0) != cpid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) {
+    printf("%s: killing a threaded process gave status %d\n", s, st);
+    exit(1);
+  }
+
+  // exec from a threaded process leaves one thread running the new image
+  cpid = fork();
+  if (cpid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (cpid == 0) {
+    for (int i = 0; i < 4; i++)
+      thread_create(&t[i], tt_sleeper, 0, 0);
+    tt_sleep(1);
+    char *argv[] = {"echo", "", 0};
+    exec("echo", argv);
+    exit(9);
+  }
+  if (waitpid(cpid, &st, 0) != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    printf("%s: exec from a thread gave status %d\n", s, st);
+    exit(1);
+  }
+
+  // exec from a thread that is not the leader: the process keeps the
+  // pid its parent is waiting for, and the other threads go away
+  cpid = fork();
+  if (cpid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (cpid == 0) {
+    if (thread_create(&t[0], tt_exec_echo, 0, 0) < 0)
+      exit(8);
+    for (;;)
+      tt_sleep(100); // replaced by the thread's exec, one way or another
+  }
+  if (waitpid(cpid, &st, 0) != cpid || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    printf("%s: exec from a second thread gave status %d\n", s, st);
+    exit(1);
+  }
+
+  // tkill reaches one thread by its own id
+  if (tkill(gettid(), 0) < 0) {
+    printf("%s: tkill of this thread failed\n", s);
+    exit(1);
+  }
+  if (tkill(999999, 0) >= 0 || errno != ESRCH) {
+    printf("%s: tkill of a stranger did not report ESRCH\n", s);
+    exit(1);
+  }
+  if (tgkill(pid, gettid(), 0) < 0) {
+    printf("%s: tgkill of this thread failed\n", s);
+    exit(1);
+  }
+
+  // clone without CLONE_VM is a fork: the child gets a copy
+  if (getpid() != pid) {
+    printf("%s: the process changed identity\n", s);
+    exit(1);
+  }
+}
+
+// signals: handlers, masks, defaults, faults, alarms, job control and
+// the wait status.
+void
+sigtest(char *s)
+{
+  struct sigaction sa;
+  sigset_t set, old;
+  int pid, st;
+
+  // a handler runs, and fork does not lose it
+  sigcount = 0;
+  siglast = 0;
+  if (signal(SIGUSR1, sighandler) == SIG_ERR) {
+    printf("%s: signal failed\n", s);
+    exit(1);
+  }
+  raise(SIGUSR1);
+  if (sigcount != 1 || siglast != SIGUSR1) {
+    printf("%s: handler did not run (%d %d)\n", s, sigcount, siglast);
+    exit(1);
+  }
+
+  // blocking: the signal waits, sigpending sees it, unblocking delivers it
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR1);
+  if (sigprocmask(SIG_BLOCK, &set, &old) < 0) {
+    printf("%s: sigprocmask failed\n", s);
+    exit(1);
+  }
+  raise(SIGUSR1);
+  if (sigcount != 1) {
+    printf("%s: a blocked signal was delivered\n", s);
+    exit(1);
+  }
+  sigset_t pend;
+  if (sigpending(&pend) < 0 || !sigismember(&pend, SIGUSR1)) {
+    printf("%s: sigpending missed it\n", s);
+    exit(1);
+  }
+  sigprocmask(SIG_SETMASK, &old, 0);
+  if (sigcount != 2 || siglast != SIGUSR1) {
+    printf("%s: unblocking did not deliver (%d)\n", s, sigcount);
+    exit(1);
+  }
+
+  // SIG_IGN, and the default for an ignored-by-default signal
+  signal(SIGUSR1, SIG_IGN);
+  raise(SIGUSR1);
+  if (sigcount != 2) {
+    printf("%s: an ignored signal was delivered\n", s);
+    exit(1);
+  }
+  signal(SIGUSR1, SIG_DFL);
+
+  // siginfo and a queued value
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = (void *)siginfohandler;
+  sa.sa_flags = SA_SIGINFO;
+  sigaction(SIGUSR2, &sa, 0);
+  sigcount = 0;
+  sigvalue = 0;
+  if (sigqueue(getpid(), SIGUSR2, 1234) < 0) {
+    printf("%s: sigqueue failed\n", s);
+    exit(1);
+  }
+  if (sigcount != 1 || sigvalue != 1234 || sigcode != SI_QUEUE) {
+    printf("%s: siginfo wrong (%d %d %d)\n", s, sigcount, sigvalue, sigcode);
+    exit(1);
+  }
+
+  // a child killed by a signal, and the status macros
+  pid = fork();
+  if (pid == 0) {
+    for (;;)
+      ticksleep(1);
+  }
+  ticksleep(2);
+  if (kill(pid, SIGTERM) < 0) {
+    printf("%s: kill failed\n", s);
+    exit(1);
+  }
+  if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGTERM) {
+    printf("%s: wrong status for a killed child (0x%x)\n", s, st);
+    exit(1);
+  }
+
+  // a child that exits: WIFEXITED and the code
+  pid = fork();
+  if (pid == 0)
+    exit(42);
+  if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 42) {
+    printf("%s: wrong status for an exited child (0x%x)\n", s, st);
+    exit(1);
+  }
+
+  // a handler in the child survives fork; exec resets it
+  sigcount = 0;
+  signal(SIGUSR1, sighandler);
+  pid = fork();
+  if (pid == 0) {
+    raise(SIGUSR1);
+    exit(sigcount == 1 ? 0 : 1);
+  }
+  if (waitpid(pid, &st, 0) != pid || xstat(st) != 0) {
+    printf("%s: the handler did not survive fork\n", s);
+    exit(1);
+  }
+
+  // SIGKILL cannot be caught or blocked
+  if (signal(SIGKILL, sighandler) != SIG_ERR) {
+    printf("%s: SIGKILL was caught\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid == 0) {
+    sigfillset(&set);
+    sigprocmask(SIG_BLOCK, &set, 0);
+    for (;;)
+      ticksleep(1);
+  }
+  ticksleep(2);
+  kill(pid, SIGKILL);
+  if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGKILL) {
+    printf("%s: SIGKILL did not kill a blocking child (0x%x)\n", s, st);
+    exit(1);
+  }
+
+  // a fault becomes SIGSEGV, and a handler sees it
+  pid = fork();
+  if (pid == 0) {
+    volatile int *bad = (int *)0xdeadbe00;
+    *bad = 1;
+    exit(0);
+  }
+  if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) || WTERMSIG(st) != SIGSEGV) {
+    printf("%s: a bad store did not give SIGSEGV (0x%x)\n", s, st);
+    exit(1);
+  }
+
+  // alarm delivers SIGALRM
+  sigcount = 0;
+  signal(SIGALRM, sighandler);
+  alarm(1);
+  for (int i = 0; i < 40 && sigcount == 0; i++)
+    ticksleep(5);
+  if (sigcount != 1 || siglast != SIGALRM) {
+    printf("%s: alarm did not fire\n", s);
+    exit(1);
+  }
+  alarm(0);
+
+  // job control: stop a child, see it with WUNTRACED, continue it
+  pid = fork();
+  if (pid == 0) {
+    for (;;)
+      ticksleep(1);
+  }
+  ticksleep(2);
+  kill(pid, SIGSTOP);
+  if (waitpid(pid, &st, WUNTRACED) != pid || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGSTOP) {
+    printf("%s: WUNTRACED did not report the stop (0x%x)\n", s, st);
+    kill(pid, SIGKILL);
+    wait(0);
+    exit(1);
+  }
+  if (waitpid(pid, &st, WNOHANG) != 0) {
+    printf("%s: WNOHANG reported a stopped child again\n", s);
+    exit(1);
+  }
+  kill(pid, SIGCONT);
+  if (waitpid(pid, &st, WCONTINUED) != pid || !WIFCONTINUED(st)) {
+    printf("%s: WCONTINUED did not report the restart (0x%x)\n", s, st);
+    exit(1);
+  }
+  kill(pid, SIGKILL);
+  waitpid(pid, &st, 0);
+
+  // process groups: a signal to the group reaches its members
+  sigcount = 0;
+  signal(SIGUSR1, sighandler);
+  int pids[3];
+  for (int i = 0; i < 3; i++) {
+    pids[i] = fork();
+    if (pids[i] == 0) {
+      signal(SIGUSR1, sighandler);
+      while (sigcount == 0)
+        ticksleep(1);
+      exit(7);
+    }
+    setpgid(pids[i], pids[0]); // the parent puts all three in one group
+  }
+  ticksleep(3);
+  if (kill(-pids[0], SIGUSR1) < 0) {
+    printf("%s: kill to a process group failed\n", s);
+    exit(1);
+  }
+  for (int i = 0; i < 3; i++) {
+    if (waitpid(pids[i], &st, 0) != pids[i] || xstat(st) != 7) {
+      printf("%s: group member %d did not get the signal (0x%x)\n", s, i, st);
+      exit(1);
+    }
+  }
+  if (getpgid(0) != getpgrp()) {
+    printf("%s: getpgid disagrees with getpgrp\n", s);
+    exit(1);
+  }
+
+  // sigsuspend waits for a signal
+  pid = fork();
+  if (pid == 0) {
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &set, 0);
+    signal(SIGUSR1, sighandler);
+    sigemptyset(&set);
+    sigcount = 0;
+    sigsuspend(&set); // unblocks SIGUSR1 and waits
+    exit(sigcount == 1 ? 0 : 1);
+  }
+  ticksleep(3);
+  kill(pid, SIGUSR1);
+  if (waitpid(pid, &st, 0) != pid || xstat(st) != 0) {
+    printf("%s: sigsuspend failed (0x%x)\n", s, st);
+    exit(1);
+  }
+
+  // a signal interrupts a blocking read
+  int fds[2];
+  if (pipe(fds) < 0) {
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid == 0) {
+    char c;
+    close(fds[1]);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = (void *)sighandler; // no SA_RESTART: the read must fail
+    sigaction(SIGUSR1, &sa, 0);
+    sigcount = 0;
+    int n = read(fds[0], &c, 1);
+    exit(n < 0 && sigcount == 1 ? 0 : 2);
+  }
+  close(fds[0]);
+  ticksleep(3);
+  kill(pid, SIGUSR1);
+  if (waitpid(pid, &st, 0) != pid || xstat(st) != 0) {
+    printf("%s: a signal did not interrupt read (0x%x)\n", s, st);
+    exit(1);
+  }
+  close(fds[1]);
+
+  // with SA_RESTART the read is resumed and sees the byte
+  if (pipe(fds) < 0) {
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid == 0) {
+    char c = 0;
+    close(fds[1]);
+    signal(SIGUSR1, sighandler); // SA_RESTART
+    sigcount = 0;
+    int n = read(fds[0], &c, 1);
+    exit(n == 1 && c == 'x' && sigcount == 1 ? 0 : 3);
+  }
+  close(fds[0]);
+  ticksleep(3);
+  kill(pid, SIGUSR1);
+  ticksleep(3);
+  write(fds[1], "x", 1);
+  if (waitpid(pid, &st, 0) != pid || xstat(st) != 0) {
+    printf("%s: SA_RESTART did not resume the read (0x%x)\n", s, st);
+    exit(1);
+  }
+  close(fds[1]);
+  signal(SIGUSR1, SIG_DFL);
+  signal(SIGUSR2, SIG_DFL);
+  signal(SIGALRM, SIG_DFL);
+}
+
+// the POSIX descriptor and I/O calls: lseek, pread/pwrite, readv/writev,
+// dup2/dup3, fcntl, pipe2, ioctl, poll, select, and the environment.
+void
+posixtest(char *s)
+{
+  int fd, n;
+  char buf[64];
+
+  // lseek on a file
+  fd = open("posixtest.f", O_CREATE | O_RDWR);
+  if (fd < 0) {
+    printf("%s: create failed\n", s);
+    exit(1);
+  }
+  if (write(fd, "0123456789", 10) != 10) {
+    printf("%s: write failed\n", s);
+    exit(1);
+  }
+  if (lseek(fd, 0, SEEK_CUR) != 10 || lseek(fd, 0, SEEK_END) != 10) {
+    printf("%s: lseek reported the wrong offset\n", s);
+    exit(1);
+  }
+  if (lseek(fd, 3, SEEK_SET) != 3 || read(fd, buf, 2) != 2 || buf[0] != '3' || buf[1] != '4') {
+    printf("%s: lseek(SEEK_SET) failed\n", s);
+    exit(1);
+  }
+  if (lseek(fd, -2, SEEK_CUR) != 3 || lseek(fd, -20, SEEK_SET) != -1) {
+    printf("%s: relative lseek failed\n", s);
+    exit(1);
+  }
+  // pread and pwrite leave the offset alone
+  if (pread(fd, buf, 3, 0) != 3 || buf[0] != '0' || lseek(fd, 0, SEEK_CUR) != 3) {
+    printf("%s: pread failed\n", s);
+    exit(1);
+  }
+  if (pwrite(fd, "xy", 2, 8) != 2 || pread(fd, buf, 2, 8) != 2 || buf[0] != 'x' || buf[1] != 'y') {
+    printf("%s: pwrite failed\n", s);
+    exit(1);
+  }
+  // readv and writev
+  struct iovec iov[2];
+  iov[0].iov_base = buf;
+  iov[0].iov_len = 4;
+  iov[1].iov_base = buf + 4;
+  iov[1].iov_len = 4;
+  lseek(fd, 0, SEEK_SET);
+  if (readv(fd, iov, 2) != 8 || memcmp(buf, "01234567", 8) != 0) {
+    printf("%s: readv failed\n", s);
+    exit(1);
+  }
+  lseek(fd, 0, SEEK_SET);
+  iov[0].iov_base = "AB";
+  iov[0].iov_len = 2;
+  iov[1].iov_base = "CD";
+  iov[1].iov_len = 2;
+  if (writev(fd, iov, 2) != 4 || pread(fd, buf, 4, 0) != 4 || memcmp(buf, "ABCD", 4) != 0) {
+    printf("%s: writev failed\n", s);
+    exit(1);
+  }
+  close(fd);
+
+  // dup2 and dup3
+  fd = open("posixtest.f", O_RDONLY);
+  int fd2 = dup2(fd, 20);
+  if (fd2 != 20 || pread(20, buf, 2, 0) != 2 || buf[0] != 'A') {
+    printf("%s: dup2 failed\n", s);
+    exit(1);
+  }
+  if (dup3(fd, 20, O_CLOEXEC) != 20 || fcntl(20, F_GETFD, 0) != FD_CLOEXEC) {
+    printf("%s: dup3 with O_CLOEXEC failed\n", s);
+    exit(1);
+  }
+  if (dup3(fd, fd, 0) != -1) {
+    printf("%s: dup3 onto itself should fail\n", s);
+    exit(1);
+  }
+  close(20);
+
+  // fcntl: descriptor flags and a duplicate above a floor
+  if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 || fcntl(fd, F_GETFD, 0) != FD_CLOEXEC) {
+    printf("%s: F_SETFD failed\n", s);
+    exit(1);
+  }
+  fcntl(fd, F_SETFD, 0);
+  int hi = fcntl(fd, F_DUPFD, 10);
+  if (hi < 10) {
+    printf("%s: F_DUPFD failed\n", s);
+    exit(1);
+  }
+  close(hi);
+  if (fcntl(fd, F_GETFL, 0) < 0 || fcntl(99, F_GETFD, 0) != -1) {
+    printf("%s: fcntl on a bad descriptor should fail\n", s);
+    exit(1);
+  }
+  close(fd);
+
+  // close-on-exec really closes
+  fd = open("posixtest.f", O_RDONLY);
+  fcntl(fd, F_SETFD, FD_CLOEXEC);
+  int pid = fork();
+  if (pid == 0) {
+    char fdstr[8];
+    fdstr[0] = '0' + fd / 10;
+    fdstr[1] = '0' + fd % 10;
+    fdstr[2] = 0;
+    char *args[] = {"fdcheck", fdstr, 0};
+    exec("fdcheck", args);
+    exit(9); // fdcheck is not in the image: skip this check
+  }
+  int st;
+  wait(&st);
+  if (xstat(st) != 9 && xstat(st) != 0) {
+    printf("%s: a close-on-exec descriptor survived exec\n", s);
+    exit(1);
+  }
+  close(fd);
+  unlink("posixtest.f");
+
+  // pipe2 with O_CLOEXEC, and poll on both ends
+  int fds[2];
+  if (pipe2(fds, O_CLOEXEC) < 0) {
+    printf("%s: pipe2 failed\n", s);
+    exit(1);
+  }
+  if (fcntl(fds[0], F_GETFD, 0) != FD_CLOEXEC || fcntl(fds[1], F_GETFD, 0) != FD_CLOEXEC) {
+    printf("%s: pipe2 ignored O_CLOEXEC\n", s);
+    exit(1);
+  }
+  struct pollfd pfd[2];
+  pfd[0].fd = fds[0];
+  pfd[0].events = POLLIN;
+  pfd[1].fd = fds[1];
+  pfd[1].events = POLLOUT;
+  n = poll(pfd, 2, 0);
+  if (n != 1 || (pfd[0].revents & POLLIN) || !(pfd[1].revents & POLLOUT)) {
+    printf("%s: poll on an empty pipe is wrong (%d %x %x)\n", s, n, pfd[0].revents, pfd[1].revents);
+    exit(1);
+  }
+  write(fds[1], "z", 1);
+  n = poll(pfd, 2, 0);
+  if (n != 2 || !(pfd[0].revents & POLLIN)) {
+    printf("%s: poll did not see the byte (%d)\n", s, n);
+    exit(1);
+  }
+  // FIONREAD counts it
+  int avail = 0;
+  if (ioctl(fds[0], FIONREAD, &avail) < 0 || avail != 1) {
+    printf("%s: FIONREAD said %d\n", s, avail);
+    exit(1);
+  }
+  read(fds[0], buf, 1);
+  // a timeout expires
+  pfd[0].events = POLLIN;
+  n = poll(pfd, 1, 50);
+  if (n != 0) {
+    printf("%s: poll should have timed out (%d)\n", s, n);
+    exit(1);
+  }
+  // select sees the write end
+  fd_set wr;
+  FD_ZERO(&wr);
+  FD_SET(fds[1], &wr);
+  struct timeval tv = {0, 0};
+  n = select(fds[1] + 1, 0, &wr, 0, &tv);
+  if (n != 1 || !FD_ISSET(fds[1], &wr)) {
+    printf("%s: select on a writable pipe failed (%d)\n", s, n);
+    exit(1);
+  }
+  // the reader sees a hangup when the writer closes
+  close(fds[1]);
+  pfd[0].events = POLLIN;
+  n = poll(pfd, 1, 100);
+  if (n != 1 || !(pfd[0].revents & (POLLHUP | POLLIN))) {
+    printf("%s: poll missed the hangup (%d %x)\n", s, n, pfd[0].revents);
+    exit(1);
+  }
+  close(fds[0]);
+
+  // the environment came through exec
+  if (getenv("PATH") == 0) {
+    printf("%s: PATH is not in the environment\n", s);
+    exit(1);
+  }
+  if (setenv("XV6TEST", "yes", 1) < 0 || strcmp(getenv("XV6TEST"), "yes") != 0) {
+    printf("%s: setenv failed\n", s);
+    exit(1);
+  }
+  setenv("XV6TEST", "no", 0);
+  if (strcmp(getenv("XV6TEST"), "yes") != 0) {
+    printf("%s: setenv overwrote when it should not\n", s);
+    exit(1);
+  }
+  setenv("XV6TEST", "no", 1);
+  if (strcmp(getenv("XV6TEST"), "no") != 0) {
+    printf("%s: setenv did not overwrite\n", s);
+    exit(1);
+  }
+  // a child inherits it through execve
+  pid = fork();
+  if (pid == 0) {
+    char *args[] = {"echoenv", "XV6TEST", 0};
+    execve("echoenv", args, environ);
+    exit(9);
+  }
+  wait(&st);
+  if (xstat(st) != 0 && xstat(st) != 9) {
+    printf("%s: execve did not pass the environment (0x%x)\n", s, st);
+    exit(1);
+  }
+  unsetenv("XV6TEST");
+  if (getenv("XV6TEST") != 0) {
+    printf("%s: unsetenv failed\n", s);
+    exit(1);
+  }
+
+  // uname, times, getrusage, umask, getrandom, nanosleep
+  struct utsname un;
+  if (uname(&un) < 0 || strcmp(un.sysname, "xv6H") != 0 || strcmp(un.machine, "riscv64") != 0) {
+    printf("%s: uname failed\n", s);
+    exit(1);
+  }
+  struct tms tm;
+  if (times(&tm) <= 0) {
+    printf("%s: times failed\n", s);
+    exit(1);
+  }
+  struct rusage ru;
+  if (getrusage(RUSAGE_SELF, &ru) < 0) {
+    printf("%s: getrusage failed\n", s);
+    exit(1);
+  }
+  int old = umask(022);
+  if (umask(old) != 022) {
+    printf("%s: umask failed\n", s);
+    exit(1);
+  }
+  char r1[32], r2[32];
+  memset(r1, 0, sizeof(r1));
+  memset(r2, 0, sizeof(r2));
+  if (getrandom(r1, sizeof(r1), 0) != sizeof(r1) || getrandom(r2, sizeof(r2), 0) != sizeof(r2)) {
+    printf("%s: getrandom failed\n", s);
+    exit(1);
+  }
+  if (memcmp(r1, r2, sizeof(r1)) == 0) {
+    printf("%s: getrandom returned the same bytes twice\n", s);
+    exit(1);
+  }
+  struct timespec req = {0, 50000000}, rem;
+  struct timespec t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  if (nanosleep(&req, &rem) < 0) {
+    printf("%s: nanosleep failed\n", s);
+    exit(1);
+  }
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+  if (ms < 40 || ms > 2000) {
+    printf("%s: nanosleep slept %ld ms\n", s, ms);
+    exit(1);
+  }
+}
+
+// the terminal: settings, raw mode, the window size, the foreground
+// group, and the stop a background reader gets.
+void
+ttytest(char *s)
+{
+  struct termios saved, t;
+  struct winsize ws;
+  int pgrp, st;
+
+  if (ioctl(0, TCGETS, &saved) < 0) {
+    printf("%s: TCGETS failed\n", s);
+    exit(1);
+  }
+  if (!(saved.c_lflag & ICANON) || !(saved.c_lflag & ISIG)) {
+    printf("%s: the console should start canonical with signals\n", s);
+    exit(1);
+  }
+  // raw mode, then back
+  t = saved;
+  t.c_lflag &= ~(ICANON | ECHO);
+  t.c_cc[VMIN] = 1;
+  t.c_cc[VTIME] = 0;
+  if (ioctl(0, TCSETS, &t) < 0) {
+    printf("%s: TCSETS failed\n", s);
+    exit(1);
+  }
+  if (ioctl(0, TCGETS, &t) < 0 || (t.c_lflag & ICANON)) {
+    printf("%s: raw mode did not stick\n", s);
+    exit(1);
+  }
+  if (ioctl(0, TCSETS, &saved) < 0) {
+    printf("%s: restoring the settings failed\n", s);
+    exit(1);
+  }
+
+  // the window size
+  if (ioctl(0, TIOCGWINSZ, &ws) < 0 || ws.ws_col == 0) {
+    printf("%s: TIOCGWINSZ failed\n", s);
+    exit(1);
+  }
+  struct winsize ws2 = ws;
+  ws2.ws_col = 132;
+  if (ioctl(0, TIOCSWINSZ, &ws2) < 0 || ioctl(0, TIOCGWINSZ, &ws2) < 0 || ws2.ws_col != 132) {
+    printf("%s: TIOCSWINSZ failed\n", s);
+    exit(1);
+  }
+  ioctl(0, TIOCSWINSZ, &ws);
+
+  // the foreground group is ours (the shell put us there)
+  if (ioctl(0, TIOCGPGRP, &pgrp) < 0 || pgrp != getpgrp()) {
+    printf("%s: we are not the foreground group (%d vs %d)\n", s, pgrp, getpgrp());
+    exit(1);
+  }
+
+  // a background process reading the terminal is stopped
+  int pid = fork();
+  if (pid == 0) {
+    char c;
+    setpgid(0, 0); // leave the foreground group
+    signal(SIGTTIN, SIG_DFL);
+    read(0, &c, 1); // must stop us
+    exit(3);
+  }
+  setpgid(pid, pid);
+  if (waitpid(pid, &st, WUNTRACED) != pid || !WIFSTOPPED(st) || WSTOPSIG(st) != SIGTTIN) {
+    printf("%s: a background read did not stop the reader (0x%x)\n", s, st);
+    kill(pid, SIGKILL);
+    wait(0);
+    exit(1);
+  }
+  kill(pid, SIGKILL);
+  kill(pid, SIGCONT);
+  waitpid(pid, &st, 0);
+
+  // ioctl on something that is not a terminal
+  int fds[2];
+  pipe(fds);
+  if (ioctl(fds[0], TCGETS, &t) != -1 || errno != ENOTTY) {
+    printf("%s: TCGETS on a pipe should fail with ENOTTY\n", s);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
 // the clocks: realtime is a plausible date and monotonic never goes back.
 void
 clocktest(char *s)
@@ -2342,8 +3645,8 @@ clocktest(char *s)
     printf("%s: no real-time clock\n", s);
     exit(1);
   }
-  if (a.sec < 1700000000L || a.nsec < 0 || a.nsec >= 1000000000L) { // after Nov 2023
-    printf("%s: implausible time %ld.%ld\n", s, a.sec, a.nsec);
+  if (a.tv_sec < 1700000000L || a.tv_nsec < 0 || a.tv_nsec >= 1000000000L) { // after Nov 2023
+    printf("%s: implausible time %ld.%ld\n", s, a.tv_sec, a.tv_nsec);
     exit(1);
   }
   if (clock_gettime(CLOCK_MONOTONIC, &a) < 0) {
@@ -2351,7 +3654,7 @@ clocktest(char *s)
     exit(1);
   }
   for (int i = 0; i < 1000; i++) {
-    if (clock_gettime(CLOCK_MONOTONIC, &b) < 0 || b.sec < a.sec || (b.sec == a.sec && b.nsec < a.nsec)) {
+    if (clock_gettime(CLOCK_MONOTONIC, &b) < 0 || b.tv_sec < a.tv_sec || (b.tv_sec == a.tv_sec && b.tv_nsec < a.tv_nsec)) {
       printf("%s: monotonic clock went backwards\n", s);
       exit(1);
     }
@@ -2376,10 +3679,11 @@ bigargtest(char *s)
   if (pid == 0) {
     static char *args[MAXARG];
     int i;
-    // MAXARG-1 of these overflow the user stack, whatever its size.
-    char big[(USERSTACK * PGSIZE) / (MAXARG - 1) + 16];
-    memset(big, ' ', sizeof(big));
-    big[sizeof(big) - 1] = '\0';
+    // MAXARG-1 of these exceed ARG_MAX, so exec must refuse them.
+    long bigsz = ARG_MAX / (MAXARG - 1) + 16;
+    char *big = malloc(bigsz);
+    memset(big, ' ', bigsz);
+    big[bigsz - 1] = '\0';
     for (i = 0; i < MAXARG - 1; i++)
       args[i] = big;
     args[MAXARG - 1] = 0;
@@ -2396,7 +3700,7 @@ bigargtest(char *s)
 
   wait(&xstatus);
   if (xstatus != 0)
-    exit(xstatus);
+    exit(xstat(xstatus));
   fd = open("bigarg-ok", 0);
   if (fd < 0) {
     printf("%s: bigarg test failed!\n", s);
@@ -2482,7 +3786,7 @@ stacktest(char *s)
   pid = fork();
   if (pid == 0) {
     char *sp = (char *)r_sp();
-    sp -= USERSTACK * PGSIZE;
+    sp -= sysconf(_SC_XV6_STACK_MAX); // below the stack region: the guard
     // the *sp should cause a trap.
     printf("%s: stacktest: read below stack %d\n", s, *sp);
     exit(1);
@@ -2491,10 +3795,10 @@ stacktest(char *s)
     exit(1);
   }
   wait(&xstatus);
-  if (xstatus == -1) // kernel killed child?
+  if (WIFSIGNALED(xstatus)) // killed by a signal?
     exit(0);
   else
-    exit(xstatus);
+    exit(xstat(xstatus));
 }
 
 // check that writes to a few forbidden addresses
@@ -2744,10 +4048,12 @@ lazy_copy(char *s)
     }
   }
 
-  // read() and write() to these addresses should fail.
+  // read() and write() to these addresses should fail: the guard page
+  // under the stack, the trapframe and trampoline pages, the top of the
+  // address space and beyond it.
   unsigned long bad[] = {
-    0x3fffffc000, 0x3fffffd000, 0x3fffffe000,
-    0x3ffffff000, 0x4000000000, 0x8000000000,
+    (unsigned long)sysconf(_SC_XV6_STACK_GUARD), TRAPFRAME, TRAPFRAME + PGSIZE,
+    MAXVA - PGSIZE, MAXVA, MAXVA * 2,
   };
   for (int i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
     int fd = open("README", 0);
@@ -2815,7 +4121,7 @@ lazy_sbrk(char *s)
 {
   // sbrk() takes just int, so take 2^30-sized steps towards MAXVA
   char *p = sbrk(0);
-  while ((uint64)p < MAXVA - (1 << 30)) {
+  while ((uint64)p < BRK_MAX - (1 << 30)) {
     p = sbrklazy(1 << 30);
     if (p < 0) {
       printf("sbrklazy(%d) returned %p\n", 1 << 30, p);
@@ -2825,7 +4131,7 @@ lazy_sbrk(char *s)
     p = sbrklazy(0);
   }
 
-  int n = TRAPFRAME - PGSIZE - (uint64)p;
+  int n = BRK_MAX - PGSIZE - (uint64)p;
 
   char *p1 = sbrklazy(n);
   if (p1 < 0 || p1 != p) {
@@ -2834,8 +4140,8 @@ lazy_sbrk(char *s)
   }
 
   p = sbrk(PGSIZE);
-  if (p < 0 || (uint64)p != TRAPFRAME - PGSIZE) {
-    printf("sbrk(%d) returned %p, not expected TRAPFRAME-PGSIZE\n", PGSIZE, p);
+  if (p < 0 || (uint64)p != BRK_MAX - PGSIZE) {
+    printf("sbrk(%d) returned %p, not expected BRK_MAX-PGSIZE\n", PGSIZE, p);
     exit(1);
   }
 
@@ -2968,11 +4274,11 @@ partial_write(char *s)
 void
 unlinkcwd(char *s)
 {
-  if (mkdir("/a") < 0) {
+  if (mkdir("/a", 0777) < 0) {
     printf("%s: mkdir /a failed\n", s);
     exit(1);
   }
-  if (mkdir("/a/b") < 0) {
+  if (mkdir("/a/b", 0777) < 0) {
     printf("%s: mkdir /a/b failed\n", s);
     exit(1);
   }
@@ -3069,7 +4375,7 @@ fpfork(char *s)
         acc2 += base * 0.5;
         facc += 0.25f;
         if (i % 200 == 0)
-          pause(1);
+          ticksleep(1);
       }
       if (dtol(acc * 4) != dtol(base * 4000 * 4) || dtol(acc2 * 8) != dtol(base * 2000 * 8) ||
           (int)facc != 1000) {
@@ -3095,7 +4401,7 @@ fpcsr(char *s)
 {
   uint64 frm, fflags;
   asm volatile("fsrm %0, %1" : "=r"(frm) : "r"(2L)); // round down
-  pause(2);
+  ticksleep(2);
   asm volatile("frrm %0" : "=r"(frm));
   if (frm != 2) {
     printf("%s: rounding mode lost across a context switch (%ld)\n", s, frm);
@@ -3153,7 +4459,7 @@ vtest(char *s)
     }
     int st;
     wait(&st);
-    if (st != -1) {
+    if (!WIFSIGNALED(st)) {
       printf("%s: vector instruction without V not reported as illegal (%d)\n", s, st);
       exit(1);
     }
@@ -3194,7 +4500,7 @@ vtest(char *s)
 
 // each child keeps its own pattern in v0..v7 across many context switches.
 void
-vfork(char *s)
+vecfork(char *s)
 {
   if (!have_v())
     return;
@@ -3216,7 +4522,7 @@ vfork(char *s)
                    ".option pop\n"
                    : "=r"(vl) : "r"(1024L), "r"(pat) : "memory");
       for (int i = 0; i < 20; i++) {
-        pause(1);
+        ticksleep(1);
         asm volatile(".option push\n.option arch, +v\nvse8.v v0, (%0)\n.option pop\n" : : "r"(back) : "memory");
         for (long j = 0; j < vl; j++) {
           if (back[j] != pat[j]) {
@@ -3252,7 +4558,7 @@ vcsrtest(char *s)
     return;
   uint64 v;
   asm volatile("csrw vcsr, %0" : : "r"(4L)); // vxrm (bits 2:1) = 2 (rdn)
-  pause(2);
+  ticksleep(2);
   asm volatile("csrr %0, vcsr" : "=r"(v));
   if ((v & 6) != 4) {
     printf("%s: vcsr lost across a context switch (%ld)\n", s, v);
@@ -3260,7 +4566,7 @@ vcsrtest(char *s)
   }
   long vl;
   asm volatile(".option push\n.option arch, +v\nvsetvli %0, %1, e16, m2, ta, ma\n.option pop\n" : "=r"(vl) : "r"(7L));
-  pause(2);
+  ticksleep(2);
   uint64 vtype, vlnow;
   asm volatile("csrr %0, vtype" : "=r"(vtype));
   asm volatile("csrr %0, vl" : "=r"(vlnow));
@@ -3288,7 +4594,7 @@ vcsrtest(char *s)
 void
 fpvexec(char *s)
 {
-  static char *progs[] = {"fpbench", "mandel", "vecbench", 0};
+  static const char *const progs[] = {"fpbench", "mandel", "vecbench", 0};
   for (int i = 0; progs[i]; i++) {
     int pid = fork();
     if (pid < 0) {
@@ -3296,7 +4602,7 @@ fpvexec(char *s)
       exit(1);
     }
     if (pid == 0) {
-      char *argv[] = {progs[i], "2", 0};
+      char *argv[] = {(char *)progs[i], "2", 0};
       exec(progs[i], argv);
       printf("%s: exec %s failed\n", s, progs[i]);
       exit(1);
@@ -3312,8 +4618,13 @@ fpvexec(char *s)
 
 struct test {
   void (*f)(char *);
-  char *s;
-} quicktests[] = {
+  const char *s;
+};
+
+// the tables are const so that a position-independent program keeps
+// them out of its read-only data, where the addresses in them could
+// not be relocated.
+static const struct test quicktests[] = {
   {copyin, "copyin"},
   {copyout, "copyout"},
   {copyinstr1, "copyinstr1"},
@@ -3352,7 +4663,7 @@ struct test {
   {subdir, "subdir"},
   {bigwrite, "bigwrite"},
   {bigfile, "bigfile"},
-  {fourteen, "fourteen"},
+  {longnames, "longnames"},
   {rmdot, "rmdot"},
   {dirfile, "dirfile"},
   {iref, "iref"},
@@ -3367,6 +4678,13 @@ struct test {
   {bsstest, "bsstest"},
   {bigargtest, "bigargtest"},
   {clocktest, "clocktest"},
+  {sigtest, "sigtest"},
+  {threadtest, "threadtest"},
+  {posixtest, "posixtest"},
+  {ttytest, "ttytest"},
+  {cowtest, "cowtest"},
+  {mmaptest, "mmaptest"},
+  {manyprocs, "manyprocs"},
   {argptest, "argptest"},
   {stacktest, "stacktest"},
   {nowrite, "nowrite"},
@@ -3386,7 +4704,7 @@ struct test {
   {fpfork, "fpfork"},
   {fpcsr, "fpcsr"},
   {vtest, "vtest"},
-  {vfork, "vfork"},
+  {vecfork, "vfork"},
   {vcsrtest, "vcsrtest"},
   {fpvexec, "fpvexec"},
   {0, 0},
@@ -3593,7 +4911,7 @@ diskfull(char *s)
       done = 1;
       break;
     }
-    for (int i = 0; i < MAXFILE; i++) {
+    for (int i = 0; i < BIGBLOCKS; i++) {
       char buf[BSIZE];
       if (write(fd, buf, BSIZE) != BSIZE) {
         done = 1;
@@ -3624,8 +4942,8 @@ diskfull(char *s)
   }
 
   // this mkdir() is expected to fail.
-  if (mkdir("diskfulldir") == 0)
-    printf("%s: mkdir(diskfulldir) unexpectedly succeeded!\n", s);
+  if (mkdir("diskfulldir", 0777) == 0)
+    printf("%s: mkdir(diskfulldir, 0777) unexpectedly succeeded!\n", s);
 
   unlink("diskfulldir");
 
@@ -3708,8 +5026,8 @@ linkoverflow(char *s)
     pn[3] = 'a' + (d / 16);
     pn[4] = 'a' + (d % 16);
     pn[5] = '\0';
-    if (f == 0 && mkdir(pn) < 0) {
-      printf("%s: mkdir(%s) failed\n", s, pn);
+    if (f == 0 && mkdir(pn, 0777) < 0) {
+      printf("%s: mkdir(%s, 0777) failed\n", s, pn);
       exit(1);
     }
 
@@ -3751,7 +5069,7 @@ linkoverflow(char *s)
   }
 }
 
-struct test slowtests[] = {
+static const struct test slowtests[] = {
   {bigdir, "bigdir"},
   {manywrites, "manywrites"},
   {badwrite, "badwrite"},
@@ -3770,7 +5088,7 @@ struct test slowtests[] = {
 // run each test in its own process. run returns 1 if child's exit()
 // indicates success.
 int
-run(void f(char *), char *s)
+run(void f(char *), const char *s)
 {
   int pid;
   int xstatus;
@@ -3781,7 +5099,7 @@ run(void f(char *), char *s)
     exit(1);
   }
   if (pid == 0) {
-    f(s);
+    f((char *)s);
     exit(0);
   } else {
     wait(&xstatus);
@@ -3794,10 +5112,10 @@ run(void f(char *), char *s)
 }
 
 int
-runtests(struct test *tests, char *justone, int continuous)
+runtests(const struct test *tests, char *justone, int continuous)
 {
   int ntests = 0;
-  for (struct test *t = tests; t->s != 0; t++) {
+  for (const struct test *t = tests; t->s != 0; t++) {
     if ((justone == 0) || strcmp(t->s, justone) == 0) {
       ntests++;
       if (!run(t->f, t->s)) {
@@ -3825,6 +5143,7 @@ drivetests(int quick, int continuous, char *justone)
 {
   do {
     printf("usertests starting\n");
+    long nprocs0 = sysconf(_SC_XV6_NPROCS);
     int free0 = countfree();
     int free1 = 0;
     int ntests = 0;
@@ -3849,7 +5168,12 @@ drivetests(int quick, int continuous, char *justone)
         ntests += n;
       }
     }
-    if ((free1 = countfree()) < free0) {
+    // orphans of the tests are init's to reap, on its own schedule: give
+    // it a moment before counting. the kernel also keeps a little for
+    // itself between runs (object cache slabs): allow that.
+    for (int i = 0; i < 300 && sysconf(_SC_XV6_NPROCS) > nprocs0; i++)
+      ticksleep(10);
+    if ((free1 = countfree()) < free0 - 64) {
       printf("FAILED -- lost some free pages %d (out of %d)\n", free1, free0);
       if (continuous != 2) {
         return 1;

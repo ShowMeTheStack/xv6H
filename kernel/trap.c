@@ -7,6 +7,8 @@
 #include "defs.h"
 #include "platform.h"
 #include "intc.h"
+#include "mm.h"
+#include "signal.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -63,7 +65,7 @@ usertrap(void)
     // system call
 
     if (killed(p))
-      kexit(-1);
+      kexit(0);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
@@ -76,27 +78,49 @@ usertrap(void)
     syscall();
   } else if ((which_dev = devintr()) != 0) {
     // ok
-  } else if ((r_scause() == 15 || r_scause() == 13) &&
-             vmfault(p->pagetable, p->sz, r_stval(),
-                     (r_scause() == 13) ? 1 : 0) != 0) {
-    // page fault on lazily-allocated page
+  } else if ((r_scause() == 15 || r_scause() == 13 || r_scause() == 12) &&
+             mm_fault(p->mm, r_stval(), r_scause() == 15) == 0) {
+    // a page brought in on first touch, or copied on a first write
   } else {
-    printk("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
-    printk("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
-    setkilled(p);
+    // a fault the process must answer for
+    uint64 cause = r_scause(), addr = r_stval();
+    int sig = SIGSEGV, code = SEGV_MAPERR;
+    if (cause == 2) {
+      sig = SIGILL;
+      code = ILL_ILLOPC;
+    } else if (cause == 1 || cause == 5 || cause == 7) {
+      sig = SIGBUS;
+      code = BUS_ADRERR;
+    } else if (cause == 3) {
+      sig = SIGTRAP;
+      code = 0;
+    } else if (cause != 12 && cause != 13 && cause != 15) {
+      printk("usertrap(): unexpected scause 0x%lx pid=%d\n", cause, p->pid);
+      printk("            sepc=0x%lx stval=0x%lx\n", r_sepc(), addr);
+    }
+    signal_fault(p, sig, code, addr);
   }
 
   if (killed(p))
-    kexit(-1);
+    kexit(0);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  if (which_dev == 2) {
+    p->utime++; // the tick interrupted user code
     yield();
+  }
+
+  // deliver a pending signal before going back to user space
+  if (signal_pending(p))
+    do_signals();
+
+  if (killed(p))
+    kexit(0);
 
   prepare_return();
 
   // the user page table to switch to, for trampoline.S
-  uint64 satp = MAKE_SATP(p->pagetable);
+  uint64 satp = MAKE_SATP(p->mm->pagetable);
 
   // return to trampoline.S; satp value in a0.
   return satp;
@@ -117,13 +141,13 @@ prepare_return(void)
 
   // send syscalls, interrupts, and exceptions to uservec in trampoline.S
   uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
-  w_sscratch(TRAPFRAME); // the trampoline finds the trapframe here
+  w_sscratch(p->tf_va); // the trampoline finds this thread's trapframe here
   w_stvec(trampoline_uservec);
 
   // set up trapframe values that uservec will need when
   // the process next traps into the kernel.
   p->trapframe->kernel_satp = r_satp();         // kernel page table
-  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
+  p->trapframe->kernel_sp = p->kstack + KSTACK_PAGES * PGSIZE; // process's kernel stack
   p->trapframe->kernel_trap = (uint64)usertrap;
   p->trapframe->kernel_hartid = r_tp(); // hartid for cpuid()
 
@@ -203,6 +227,9 @@ clockintr()
   if (next < now + 100)
     next = now + 100;
   w_stimecmp(next);
+  if (cpuid() == 0)
+    signal_timers(); // SIGALRM where it is due
+
 }
 
 // dispatch one external interrupt identity from the interrupt controller.
@@ -211,7 +238,9 @@ extintr(int irq)
 {
   int idx;
   if (plat.intc_kind == INTC_IMSIC && irq == IMSIC_IPI_ID) {
-    ipi_handle();
+    uint64 reasons = ipi_handle();
+    if (reasons & IPI_TLBFLUSH)
+      kstack_flush_ack();
   } else if (irq == plat.uart_irq) {
     uartintr();
   } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
@@ -247,7 +276,9 @@ devintr()
     return 1;
   } else if (scause == 0x8000000000000001L) {
     // supervisor software interrupt: an IPI from another hart.
-    ipi_handle();
+    uint64 reasons = ipi_handle();
+    if (reasons & IPI_TLBFLUSH)
+      kstack_flush_ack();
     return 1;
   } else if (scause == 0x8000000000000005L) {
     // timer interrupt.

@@ -65,7 +65,7 @@ tx_put(struct vm *vm, char c)
       break;
     sleep_prepare(&vm->cons_out);
     release(&vm->lock);
-    sleep();
+    sleep_intr();
     acquire(&vm->lock);
   }
   if (cring_full(&vm->cons_out))
@@ -238,7 +238,7 @@ vm_cons_read(struct vm *vm, int user, uint64 dst, int n)
     }
     sleep_prepare(&vm->cons_out);
     release(&vm->lock);
-    sleep();
+    sleep_intr();
     acquire(&vm->lock);
   }
   while (i < n && !cring_empty(&vm->cons_out))

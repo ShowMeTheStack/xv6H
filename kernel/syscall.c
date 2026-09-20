@@ -6,16 +6,17 @@
 #include "proc.h"
 #include "syscall.h"
 #include "defs.h"
+#include "errno.h"
+#include "mm.h"
 
 // Fetch the uint64 at addr from the current process.
 int
 fetchaddr(uint64 addr, uint64 *ip)
 {
   struct proc *p = myproc();
-  if (addr >= p->sz ||
-      addr + sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+  if (addr + sizeof(uint64) < addr) // overflow
     return -1;
-  if (copyin(p->pagetable, p->sz, (char *)ip, addr, sizeof(*ip)) != 0)
+  if (copyin(p->mm, (char *)ip, addr, sizeof(*ip)) != 0)
     return -1;
   return 0;
 }
@@ -26,7 +27,7 @@ int
 fetchstr(uint64 addr, char *buf, int max)
 {
   struct proc *p = myproc();
-  if (copyinstr(p->pagetable, p->sz, buf, addr, max) < 0)
+  if (copyinstr(p->mm, buf, addr, max) < 0)
     return -1;
   return strlen(buf);
 }
@@ -116,12 +117,63 @@ extern uint64 sys_recvfrom(void);
 extern uint64 sys_netinfo(void);
 extern uint64 sys_clock_gettime(void);
 extern uint64 sys_sysconf(void);
+extern uint64 sys_mmap(void);
+extern uint64 sys_munmap(void);
+extern uint64 sys_mprotect(void);
+extern uint64 sys_sigaction(void);
+extern uint64 sys_sigprocmask(void);
+extern uint64 sys_sigpending(void);
+extern uint64 sys_sigsuspend(void);
+extern uint64 sys_sigaltstack(void);
+extern uint64 sys_sigreturn(void);
+extern uint64 sys_sigqueue(void);
+extern uint64 sys_alarm(void);
+extern uint64 sys_wait4(void);
+extern uint64 sys_setpgid(void);
+extern uint64 sys_getpgid(void);
+extern uint64 sys_setsid(void);
+extern uint64 sys_getsid(void);
+extern uint64 sys_getppid(void);
+extern uint64 sys_lseek(void);
+extern uint64 sys_pread(void);
+extern uint64 sys_pwrite(void);
+extern uint64 sys_readv(void);
+extern uint64 sys_writev(void);
+extern uint64 sys_dup2(void);
+extern uint64 sys_dup3(void);
+extern uint64 sys_fcntl(void);
+extern uint64 sys_pipe2(void);
+extern uint64 sys_ftruncate(void);
+extern uint64 sys_ioctl(void);
+extern uint64 sys_poll(void);
+extern uint64 sys_select(void);
+extern uint64 sys_execve(void);
+extern uint64 sys_nanosleep(void);
+extern uint64 sys_times(void);
+extern uint64 sys_getrusage(void);
+extern uint64 sys_uname(void);
+extern uint64 sys_sethostname(void);
+extern uint64 sys_gethostname(void);
+extern uint64 sys_umask(void);
+extern uint64 sys_getrandom(void);
 extern uint64 sys_vm_run(void);
 extern uint64 sys_vm_destroy(void);
 extern uint64 sys_vm_cons(void);
 extern uint64 sys_vm_info(void);
 extern uint64 sys_consraw(void);
 extern uint64 sys_sync(void);
+extern uint64 sys_clone(void);
+extern uint64 sys_futex(void);
+extern uint64 sys_gettid(void);
+extern uint64 sys_tkill(void);
+extern uint64 sys_tgkill(void);
+extern uint64 sys_exit_group(void);
+extern uint64 sys_set_tid_address(void);
+extern uint64 sys_mount(void);
+extern uint64 sys_umount(void);
+extern uint64 sys_getdents(void);
+extern uint64 sys_statfs(void);
+extern uint64 sys_fsync(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -162,12 +214,63 @@ static uint64 (*syscalls[])(void) = {
   [SYS_netinfo]    = sys_netinfo,
   [SYS_clock_gettime] = sys_clock_gettime,
   [SYS_sysconf]    = sys_sysconf,
+  [SYS_mmap]       = sys_mmap,
+  [SYS_munmap]     = sys_munmap,
+  [SYS_mprotect]   = sys_mprotect,
+  [SYS_sigaction]  = sys_sigaction,
+  [SYS_sigprocmask] = sys_sigprocmask,
+  [SYS_sigpending] = sys_sigpending,
+  [SYS_sigsuspend] = sys_sigsuspend,
+  [SYS_sigaltstack] = sys_sigaltstack,
+  [SYS_sigreturn]  = sys_sigreturn,
+  [SYS_sigqueue]   = sys_sigqueue,
+  [SYS_alarm]      = sys_alarm,
+  [SYS_wait4]      = sys_wait4,
+  [SYS_setpgid]    = sys_setpgid,
+  [SYS_getpgid]    = sys_getpgid,
+  [SYS_setsid]     = sys_setsid,
+  [SYS_getsid]     = sys_getsid,
+  [SYS_getppid]    = sys_getppid,
+  [SYS_lseek]       = sys_lseek,
+  [SYS_pread]       = sys_pread,
+  [SYS_pwrite]      = sys_pwrite,
+  [SYS_readv]       = sys_readv,
+  [SYS_writev]      = sys_writev,
+  [SYS_dup2]        = sys_dup2,
+  [SYS_dup3]        = sys_dup3,
+  [SYS_fcntl]       = sys_fcntl,
+  [SYS_pipe2]       = sys_pipe2,
+  [SYS_ftruncate]   = sys_ftruncate,
+  [SYS_ioctl]       = sys_ioctl,
+  [SYS_poll]        = sys_poll,
+  [SYS_select]      = sys_select,
+  [SYS_execve]      = sys_execve,
+  [SYS_nanosleep]   = sys_nanosleep,
+  [SYS_times]       = sys_times,
+  [SYS_getrusage]   = sys_getrusage,
+  [SYS_uname]       = sys_uname,
+  [SYS_sethostname] = sys_sethostname,
+  [SYS_gethostname] = sys_gethostname,
+  [SYS_umask]       = sys_umask,
+  [SYS_getrandom]   = sys_getrandom,
   [SYS_vm_run]     = sys_vm_run,
   [SYS_vm_destroy] = sys_vm_destroy,
   [SYS_vm_cons]    = sys_vm_cons,
   [SYS_vm_info]    = sys_vm_info,
   [SYS_consraw]    = sys_consraw,
   [SYS_sync]    = sys_sync,
+  [SYS_clone]   = sys_clone,
+  [SYS_futex]   = sys_futex,
+  [SYS_gettid]  = sys_gettid,
+  [SYS_tkill]   = sys_tkill,
+  [SYS_tgkill]  = sys_tgkill,
+  [SYS_exit_group] = sys_exit_group,
+  [SYS_set_tid_address] = sys_set_tid_address,
+  [SYS_mount]   = sys_mount,
+  [SYS_umount]  = sys_umount,
+  [SYS_getdents] = sys_getdents,
+  [SYS_statfs]  = sys_statfs,
+  [SYS_fsync]   = sys_fsync,
   // clang-format on
 };
 
@@ -178,10 +281,15 @@ syscall(void)
   struct proc *p = myproc();
 
   num = p->trapframe->a7;
+  p->syscall_a0 = p->trapframe->a0; // kept in case a signal restarts the call
+  p->restartable = 0;
+  p->norestart = 0;
   if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
     p->trapframe->a0 = syscalls[num]();
+    if ((long)p->trapframe->a0 == -EINTR && !p->norestart)
+      p->restartable = 1;
   } else {
     printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
     p->trapframe->a0 = -1;

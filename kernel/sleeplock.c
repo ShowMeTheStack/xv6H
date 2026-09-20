@@ -18,6 +18,24 @@ initsleeplock(struct sleeplock *lk, char *name)
   lk->pid = 0;
 }
 
+// take the lock if it is free, and say whether it was. this is what
+// lets one caller hold a lock and reach for others without the
+// possibility of deadlock: it never waits while holding anything.
+int
+tryacquiresleep(struct sleeplock *lk)
+{
+  int got = 0;
+
+  acquire(&lk->lk);
+  if (!lk->locked) {
+    lk->locked = 1;
+    lk->pid = myproc()->pid;
+    got = 1;
+  }
+  release(&lk->lk);
+  return got;
+}
+
 void
 acquiresleep(struct sleeplock *lk)
 {

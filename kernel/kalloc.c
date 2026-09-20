@@ -26,6 +26,7 @@
 #include "spinlock.h"
 #include "riscv.h"
 #include "defs.h"
+#include "blk.h"
 #include "platform.h"
 #include "page.h"
 
@@ -44,6 +45,7 @@ static struct {
 #define PCACHE_FILL 32
 #define PCACHE_MAX  96
 static struct {
+  struct spinlock lock; // held for the hart's own use and for stealing
   struct page *head;
   int n;
 } pcache[NCPU];
@@ -153,6 +155,7 @@ kinit(void)
 {
   initlock(&km.lock, "kmem");
   for (int i = 0; i < NCPU; i++) {
+    initlock(&pcache[i].lock, "pcache");
     pcache[i].head = 0;
     pcache[i].n = 0;
   }
@@ -234,7 +237,7 @@ kfree_order(void *pa, int order)
   release(&km.lock);
 }
 
-// refill this hart's cache from a 32-page block.
+// refill this hart's cache from a 32-page block (pcache[id].lock held).
 static void
 pcache_fill(int id)
 {
@@ -255,7 +258,7 @@ pcache_fill(int id)
   }
 }
 
-// return half of this hart's cache to the global lists.
+// return half of this hart's cache to the global lists (pcache[id].lock held).
 static void
 pcache_drain(int id)
 {
@@ -269,11 +272,34 @@ pcache_drain(int id)
   release(&km.lock);
 }
 
-void *
-kalloc(void)
+// memory is short: take a page from another hart's cache, if any has one.
+static struct page *
+pcache_steal(int me)
+{
+  for (int i = 0; i < NCPU; i++) {
+    if (i == me || pcache[i].n == 0)
+      continue;
+    acquire(&pcache[i].lock);
+    struct page *pg = pcache[i].head;
+    if (pg) {
+      pcache[i].head = pg->next;
+      pcache[i].n--;
+    }
+    release(&pcache[i].lock);
+    if (pg)
+      return pg;
+  }
+  return 0;
+}
+
+static void *kalloc_once(void);
+
+static void *
+kalloc_once(void)
 {
   push_off();
   int id = cpuid();
+  acquire(&pcache[id].lock);
   if (pcache[id].n == 0)
     pcache_fill(id);
   struct page *pg = pcache[id].head;
@@ -281,18 +307,36 @@ kalloc(void)
     pcache[id].head = pg->next;
     pcache[id].n--;
   }
-  pop_off();
+  release(&pcache[id].lock);
   if (pg == 0) {
-    // the cache could not be filled with a 32-page block: try a single page.
+    // no 32-page block was free: a single page, then other harts' caches.
     acquire(&km.lock);
     pg = alloc_block(0);
     release(&km.lock);
     if (pg == 0)
-      return 0;
+      pg = pcache_steal(id);
   }
+  pop_off();
+  if (pg == 0)
+    return 0;
+  pg->refcount = 1; // a recycled page comes out of the cache with 0
   pg->next = pg->prev = 0;
   void *pa = (void *)PAGE2PA(pg);
   memset(pa, 5, PGSIZE); // junk, to catch uninitialized use
+  return pa;
+}
+
+// one page. when there is none, the block cache is asked for the pages
+// it is holding only because they might be useful again: a clean cached
+// block is a copy of what is on the disk, and a page is worth more to
+// whoever needs one now.
+void *
+kalloc(void)
+{
+  void *pa = kalloc_once();
+
+  if (pa == 0 && blk_reclaim(64) > 0)
+    pa = kalloc_once();
   return pa;
 }
 
@@ -314,6 +358,7 @@ kfree(void *pa)
   memset(pa, 1, PGSIZE); // junk, to catch dangling references
   push_off();
   int id = cpuid();
+  acquire(&pcache[id].lock);
   pg->hart = id;
   pg->refcount = 0;
   pg->next = pcache[id].head;
@@ -321,6 +366,7 @@ kfree(void *pa)
   pcache[id].n++;
   if (pcache[id].n > PCACHE_MAX)
     pcache_drain(id);
+  release(&pcache[id].lock);
   pop_off();
 }
 

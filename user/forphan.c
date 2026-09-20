@@ -22,7 +22,7 @@ main(int argc, char **argv)
     exit(1);
   }
   if (fstat(fd, &st) < 0) {
-    fprintf(2, "%s: cannot stat %s\n", s, "ff");
+    fprintf(stderr, "%s: cannot stat %s\n", s, "ff");
     exit(1);
   }
   if (unlink(ff) < 0) {
@@ -36,5 +36,5 @@ main(int argc, char **argv)
   printf("wait for kill and reclaim %d\n", st.ino);
   // sit around until killed
   for (;;)
-    pause(1000);
+    ticksleep(1000);
 }

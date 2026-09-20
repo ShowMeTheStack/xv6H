@@ -1,3 +1,5 @@
+#ifndef XV6_SYSCALL_H
+#define XV6_SYSCALL_H
 // System call numbers
 #define SYS_fork   1
 #define SYS_exit   2
@@ -40,3 +42,55 @@
 #define SYS_netinfo    39
 #define SYS_clock_gettime 40
 #define SYS_sysconf    41
+#define SYS_mmap       42
+#define SYS_munmap     43
+#define SYS_mprotect   44
+#define SYS_sigaction  45
+#define SYS_sigprocmask 46
+#define SYS_sigpending 47
+#define SYS_sigsuspend 48
+#define SYS_sigaltstack 49
+#define SYS_sigreturn  50
+#define SYS_sigqueue   51
+#define SYS_alarm      52
+#define SYS_wait4      53
+#define SYS_setpgid    54
+#define SYS_getpgid    55
+#define SYS_setsid     56
+#define SYS_getsid     57
+#define SYS_getppid    58
+#define SYS_lseek      59
+#define SYS_pread      60
+#define SYS_pwrite     61
+#define SYS_readv      62
+#define SYS_writev     63
+#define SYS_dup2       64
+#define SYS_dup3       65
+#define SYS_fcntl      66
+#define SYS_pipe2      67
+#define SYS_ftruncate  68
+#define SYS_ioctl      69
+#define SYS_poll       70
+#define SYS_select     71
+#define SYS_execve     72
+#define SYS_nanosleep  73
+#define SYS_times      74
+#define SYS_getrusage  75
+#define SYS_uname      76
+#define SYS_sethostname 77
+#define SYS_gethostname 78
+#define SYS_umask      79
+#define SYS_getrandom  80
+#define SYS_clone      81
+#define SYS_futex      82
+#define SYS_gettid     83
+#define SYS_tkill      84
+#define SYS_tgkill     85
+#define SYS_exit_group 86
+#define SYS_set_tid_address 87
+#define SYS_mount      88
+#define SYS_umount     89
+#define SYS_getdents   90
+#define SYS_statfs     91
+#define SYS_fsync      92
+#endif

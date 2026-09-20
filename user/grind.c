@@ -41,8 +41,10 @@ do_rand(unsigned long *ctx)
 
 unsigned long rand_next = 1;
 
-int
-rand(void)
+// grind's own generator, kept so that a run repeats exactly; the
+// library's rand() is a different sequence.
+static int
+grand(void)
 {
   return (do_rand(&rand_next));
 }
@@ -55,7 +57,7 @@ go(int which_child)
   char *break0 = sbrk(0);
   uint64 iters = 0;
 
-  mkdir("grindir");
+  mkdir("grindir", 0777);
   if (chdir("grindir") != 0) {
     printf("grind: chdir grindir failed\n");
     exit(1);
@@ -66,7 +68,7 @@ go(int which_child)
     iters++;
     if ((iters % 500) == 0)
       write(1, which_child ? "B" : "A", 1);
-    int what = rand() % 23;
+    int what = grand() % 23;
     if (what == 1) {
       close(open("grindir/../a", O_CREATE | O_RDWR));
     } else if (what == 2) {
@@ -91,11 +93,11 @@ go(int which_child)
     } else if (what == 8) {
       read(fd, buf, sizeof(buf));
     } else if (what == 9) {
-      mkdir("grindir/../a");
+      mkdir("grindir/../a", 0777);
       close(open("a/../a/./a", O_CREATE | O_RDWR));
       unlink("a/a");
     } else if (what == 10) {
-      mkdir("/../b");
+      mkdir("/../b", 0777);
       close(open("grindir/../b/b", O_CREATE | O_RDWR));
       unlink("b/b");
     } else if (what == 11) {
@@ -127,8 +129,8 @@ go(int which_child)
     } else if (what == 15) {
       sbrk(6011);
     } else if (what == 16) {
-      if (sbrk(0) > break0)
-        sbrk(-(sbrk(0) - break0));
+      if ((char *)sbrk(0) > break0)
+        sbrk(-((char *)sbrk(0) - break0));
     } else if (what == 17) {
       int pid = fork();
       if (pid == 0) {
@@ -142,12 +144,12 @@ go(int which_child)
         printf("grind: chdir failed\n");
         exit(1);
       }
-      kill(pid);
+      kill(pid, SIGKILL);
       wait(0);
     } else if (what == 18) {
       int pid = fork();
       if (pid == 0) {
-        kill(getpid());
+        kill(getpid(), SIGKILL);
         exit(0);
       } else if (pid < 0) {
         printf("grind: fork failed\n");
@@ -181,7 +183,7 @@ go(int which_child)
       int pid = fork();
       if (pid == 0) {
         unlink("a");
-        mkdir("a");
+        mkdir("a", 0777);
         chdir("a");
         unlink("../a");
         fd = open("x", O_CREATE | O_RDWR);
@@ -224,11 +226,11 @@ go(int which_child)
       // echo hi | cat
       int aa[2], bb[2];
       if (pipe(aa) < 0) {
-        fprintf(2, "grind: pipe failed\n");
+        fprintf(stderr, "grind: pipe failed\n");
         exit(1);
       }
       if (pipe(bb) < 0) {
-        fprintf(2, "grind: pipe failed\n");
+        fprintf(stderr, "grind: pipe failed\n");
         exit(1);
       }
       int pid1 = fork();
@@ -238,16 +240,16 @@ go(int which_child)
         close(aa[0]);
         close(1);
         if (dup(aa[1]) != 1) {
-          fprintf(2, "grind: dup failed\n");
+          fprintf(stderr, "grind: dup failed\n");
           exit(1);
         }
         close(aa[1]);
         char *args[3] = {"echo", "hi", 0};
         exec("grindir/../echo", args);
-        fprintf(2, "grind: echo: not found\n");
+        fprintf(stderr, "grind: echo: not found\n");
         exit(2);
       } else if (pid1 < 0) {
-        fprintf(2, "grind: fork failed\n");
+        fprintf(stderr, "grind: fork failed\n");
         exit(3);
       }
       int pid2 = fork();
@@ -256,22 +258,22 @@ go(int which_child)
         close(bb[0]);
         close(0);
         if (dup(aa[0]) != 0) {
-          fprintf(2, "grind: dup failed\n");
+          fprintf(stderr, "grind: dup failed\n");
           exit(4);
         }
         close(aa[0]);
         close(1);
         if (dup(bb[1]) != 1) {
-          fprintf(2, "grind: dup failed\n");
+          fprintf(stderr, "grind: dup failed\n");
           exit(5);
         }
         close(bb[1]);
         char *args[2] = {"cat", 0};
         exec("/cat", args);
-        fprintf(2, "grind: cat: not found\n");
+        fprintf(stderr, "grind: cat: not found\n");
         exit(6);
       } else if (pid2 < 0) {
-        fprintf(2, "grind: fork failed\n");
+        fprintf(stderr, "grind: fork failed\n");
         exit(7);
       }
       close(aa[0]);
@@ -324,8 +326,8 @@ iter()
   int st1 = -1;
   wait(&st1);
   if (st1 != 0) {
-    kill(pid1);
-    kill(pid2);
+    kill(pid1, SIGKILL);
+    kill(pid2, SIGKILL);
   }
   int st2 = -1;
   wait(&st2);
@@ -345,7 +347,7 @@ main()
     if (pid > 0) {
       wait(0);
     }
-    pause(20);
+    ticksleep(20);
     rand_next += 1;
   }
 }

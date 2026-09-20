@@ -49,9 +49,12 @@
 #define VIRTIO_RING_F_INDIRECT_DESC 28
 #define VIRTIO_RING_F_EVENT_IDX     29
 
-// this many virtio descriptors.
-// must be a power of two.
-#define NUM 8
+// this many virtio descriptors. must be a power of two, and large
+// enough for the longest chain a request can need: a request carrying
+// BIO_MAXPAGES pages uses one descriptor for its header, one per page
+// and one for its status. the three rings are one page each, and 64
+// descriptors is 1 KB of them.
+#define NUM 64
 
 // a single descriptor, from the spec.
 struct virtq_desc {
@@ -68,7 +71,7 @@ struct virtq_avail {
   uint16 flags;     // always zero
   uint16 idx;       // driver will write ring[idx] next
   uint16 ring[NUM]; // descriptor numbers of chain heads
-  uint16 unused;
+  uint16 unused;    // used_event, which this driver does not use
 };
 
 // one entry in the "used" ring, with which the

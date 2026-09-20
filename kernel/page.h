@@ -1,3 +1,5 @@
+#ifndef XV6_PAGE_H
+#define XV6_PAGE_H
 //
 // the page frame database and the page allocator interface.
 //
@@ -58,3 +60,5 @@ void page_get(struct page *pg);
 void page_put(struct page *pg);      // frees the block at zero
 uint64 kmem_free_pages(void);
 void kmem_info(struct meminfo *mi);
+
+#endif

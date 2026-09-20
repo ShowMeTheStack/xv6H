@@ -41,8 +41,8 @@ static struct vm *
 vm_by_mac(const uint8 *mac)
 {
   for (int i = 0; i < NVM; i++) {
-    struct vm *vm = &vms[i];
-    if (vm->state == VM_RUNNING && memcmp(vm->vnet.mac, mac, ETHADDR_LEN) == 0)
+    struct vm *vm = vmtab[i];
+    if (vm && vm->state == VM_RUNNING && memcmp(vm->vnet.mac, mac, ETHADDR_LEN) == 0)
       return vm;
   }
   return 0;
@@ -90,8 +90,8 @@ bridge_rx_uplink(struct mbuf *m)
   }
   if (is_broadcast(e->dhost)) {
     for (int i = 0; i < NVM; i++) {
-      struct vm *vm = &vms[i];
-      if (vm->state == VM_RUNNING && vm->vnet.present) {
+      struct vm *vm = vmtab[i];
+      if (vm && vm->state == VM_RUNNING && vm->vnet.present) {
         struct mbuf *c = clone(m);
         if (c)
           vvnet_rx(vm, c);
@@ -115,8 +115,8 @@ bridge_tx_host(struct mbuf *m)
   struct eth *e = (struct eth *)m->head;
   if (is_broadcast(e->dhost)) {
     for (int i = 0; i < NVM; i++) {
-      struct vm *vm = &vms[i];
-      if (vm->state == VM_RUNNING && vm->vnet.present) {
+      struct vm *vm = vmtab[i];
+      if (vm && vm->state == VM_RUNNING && vm->vnet.present) {
         struct mbuf *c = clone(m);
         if (c)
           vvnet_rx(vm, c);
@@ -163,8 +163,8 @@ bridge_tx_guest(struct vm *from, struct mbuf *m)
   }
   if (is_broadcast(e->dhost)) {
     for (int i = 0; i < NVM; i++) {
-      struct vm *vm = &vms[i];
-      if (vm != from && vm->state == VM_RUNNING && vm->vnet.present) {
+      struct vm *vm = vmtab[i];
+      if (vm && vm != from && vm->state == VM_RUNNING && vm->vnet.present) {
         struct mbuf *c = clone(m);
         if (c)
           vvnet_rx(vm, c);

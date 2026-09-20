@@ -24,15 +24,15 @@
 #include "user/user.h"
 
 #define DETACH_CHAR 0x1d // Ctrl-]
-#define MAXVM 16
+#define MAXVM 64
 
-static char *states[] = {"free", "new", "running", "halting", "paused"};
-static char *intcs[] = {"plic", "aplic", "aplic-msi+imsic"};
+static const char *const states[] = {"free", "new", "running", "halting", "paused"};
+static const char *const intcs[] = {"plic", "aplic", "aplic-msi+imsic"};
 
 static void
 usage(void)
 {
-  fprintf(2, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
+  fprintf(stderr, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
              "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-d]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats\n");
@@ -71,7 +71,7 @@ must_lookup(char *s)
 {
   int id = lookup(s);
   if (id < 0) {
-    fprintf(2, "vmm: no vm '%s'\n", s);
+    fprintf(stderr, "vmm: no vm '%s'\n", s);
     exit(1);
   }
   return id;
@@ -92,7 +92,7 @@ parse_addr(char *s)
     else if (*s >= 'A' && *s <= 'F')
       d = *s - 'A' + 10;
     else {
-      fprintf(2, "vmm: bad address\n");
+      fprintf(stderr, "vmm: bad address\n");
       exit(1);
     }
     v = v * 16 + d;
@@ -116,7 +116,7 @@ attach(int id)
 {
   struct vminfo vi;
   if (getinfo(id, &vi) < 0) {
-    fprintf(2, "vmm: no vm %d\n", id);
+    fprintf(stderr, "vmm: no vm %d\n", id);
     exit(1);
   }
   if (vi.state == VM_FREE) {
@@ -149,7 +149,7 @@ attach(int id)
   int n;
   while ((n = vm_cons(id, VMCONS_READ, buf, sizeof(buf))) > 0)
     write(1, buf, n);
-  kill(writer);
+  kill(writer, SIGKILL);
   wait(0);
   consraw(0);
   if (getinfo(id, &vi) == 0 && vi.state == VM_FREE)
@@ -164,13 +164,13 @@ launch(struct vmconfig *cfg)
 {
   int id = vm_create(cfg);
   if (id < 0) {
-    fprintf(2, "vmm: cannot create vm (kernel/disk missing, disk in use, no memory, or no hypervisor?)\n");
+    fprintf(stderr, "vmm: cannot create vm (kernel/disk missing, disk in use, no memory, or no hypervisor?)\n");
     return -1;
   }
   for (int i = 0; i < cfg->nvcpu; i++) {
     int pid = fork();
     if (pid < 0) {
-      fprintf(2, "vmm: fork failed\n");
+      fprintf(stderr, "vmm: fork failed\n");
       vm_destroy(id);
       return -1;
     }
@@ -189,7 +189,7 @@ setstr(char *dst, int max, char *src)
 {
   int n = strlen(src);
   if (n >= max) {
-    fprintf(2, "vmm: '%s' is too long\n", src);
+    fprintf(stderr, "vmm: '%s' is too long\n", src);
     exit(1);
   }
   memmove(dst, src, n + 1);
@@ -200,7 +200,7 @@ append_bootarg(struct vmconfig *cfg, char *w)
 {
   int len = strlen(cfg->bootargs), n = strlen(w);
   if (len + n + 2 > sizeof(cfg->bootargs)) {
-    fprintf(2, "vmm: bootargs too long\n");
+    fprintf(stderr, "vmm: bootargs too long\n");
     exit(1);
   }
   if (len)
@@ -230,7 +230,7 @@ parse_net(struct vmconfig *cfg, char *spec)
     prefix = atoi(slash + 1);
   }
   if (parse_ip(p, &cfg->ip) < 0 || prefix < 1 || prefix > 30) {
-    fprintf(2, "vmm: bad address '%s'\n", spec);
+    fprintf(stderr, "vmm: bad address '%s'\n", spec);
     exit(1);
   }
   cfg->mask = ~0U << (32 - prefix);
@@ -242,11 +242,11 @@ parse_net(struct vmconfig *cfg, char *spec)
     if (q)
       *q++ = 0;
     if (parse_ip(p, &cfg->gw) < 0) {
-      fprintf(2, "vmm: bad gateway '%s'\n", p);
+      fprintf(stderr, "vmm: bad gateway '%s'\n", p);
       exit(1);
     }
     if (q && parse_ip(q, &cfg->dns) < 0) {
-      fprintf(2, "vmm: bad dns '%s'\n", q);
+      fprintf(stderr, "vmm: bad dns '%s'\n", q);
       exit(1);
     }
   }
@@ -324,7 +324,7 @@ start(int argc, char *argv[])
         if (n && w[0] == '"') { w++; n--; }
         if (n && w[n - 1] == '"') n--;
         if (len + n + 2 > sizeof(cfg.bootargs)) {
-          fprintf(2, "vmm: bootargs too long\n");
+          fprintf(stderr, "vmm: bootargs too long\n");
           exit(1);
         }
         if (len)
@@ -349,7 +349,7 @@ start(int argc, char *argv[])
   if (cfg.nvcpu <= 0 || cfg.mem_mb <= 0)
     usage();
   if (cfg.name[0] && lookup(cfg.name) >= 0) {
-    fprintf(2, "vmm: a vm named '%s' already exists\n", cfg.name);
+    fprintf(stderr, "vmm: a vm named '%s' already exists\n", cfg.name);
     exit(1);
   }
   net_bootargs(&cfg);
@@ -363,7 +363,7 @@ start(int argc, char *argv[])
 }
 
 static void
-pad(char *s, int width)
+pad(const char *s, int width)
 {
   printf("%s", s);
   for (int n = strlen(s); n < width; n++)
@@ -441,7 +441,7 @@ stats(void)
   uint64 s[2 + MAXVM];
   memset(s, 0, sizeof(s));
   if (vm_stats(s, 2 + MAXVM) < 0) {
-    fprintf(2, "vmm: vm_stats failed\n");
+    fprintf(stderr, "vmm: vm_stats failed\n");
     exit(1);
   }
   printf("free guest memory: %ld MB, ipis: %ld, exits:", s[0], s[1]);
@@ -458,9 +458,9 @@ wait_freed(int id)
   for (int i = 0; i < 100; i++) {
     if (getinfo(id, &vi) < 0 || vi.state == VM_FREE)
       return;
-    pause(1);
+    ticksleep(1);
   }
-  fprintf(2, "vmm: vm %d did not stop\n", id);
+  fprintf(stderr, "vmm: vm %d did not stop\n", id);
   exit(1);
 }
 
@@ -468,7 +468,7 @@ static void
 killvm(int id)
 {
   if (vm_destroy(id) < 0) {
-    fprintf(2, "vmm: no vm %d\n", id);
+    fprintf(stderr, "vmm: no vm %d\n", id);
     exit(1);
   }
   wait_freed(id);
@@ -514,8 +514,8 @@ ps(int id)
   if (reader == 0)
     output_loop(id);
   vm_cons(id, VMCONS_WRITE, &c, 1);
-  pause(5);
-  kill(reader);
+  ticksleep(5);
+  kill(reader, SIGKILL);
   wait(0);
   vm_cons(id, VMCONS_DETACH, 0, 0);
   printf("\n");

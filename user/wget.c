@@ -9,12 +9,12 @@ int
 main(int argc, char *argv[])
 {
   if (argc < 2) {
-    fprintf(2, "usage: wget http://host[:port]/path [file]\n");
+    fprintf(stderr, "usage: wget http://host[:port]/path [file]\n");
     exit(1);
   }
   char *url = argv[1];
   if (memcmp(url, "http://", 7) != 0) {
-    fprintf(2, "wget: only http:// urls (use https for TLS)\n");
+    fprintf(stderr, "wget: only http:// urls (use https for TLS)\n");
     exit(1);
   }
   char host[128], *path;
@@ -43,14 +43,14 @@ main(int argc, char *argv[])
   n += strlen(strcpy(req + n, host));
   n += strlen(strcpy(req + n, "\r\nUser-Agent: xv6-wget\r\nConnection: close\r\n\r\n"));
   if (write(fd, req, n) != n) {
-    fprintf(2, "wget: write failed\n");
+    fprintf(stderr, "wget: write failed\n");
     exit(1);
   }
   int out = 1;
   if (argc > 2) {
     out = open(argv[2], O_WRONLY | O_CREATE | O_TRUNC);
     if (out < 0) {
-      fprintf(2, "wget: cannot create %s\n", argv[2]);
+      fprintf(stderr, "wget: cannot create %s\n", argv[2]);
       exit(1);
     }
   }
@@ -79,7 +79,7 @@ main(int argc, char *argv[])
         continue;
       header_done = 1;
       status = atoi(hdr + 9);
-      fprintf(2, "wget: %s:%d%s -> HTTP %d\n", host, port, path, status);
+      fprintf(stderr, "wget: %s:%d%s -> HTTP %d\n", host, port, path, status);
       int consumed = (e - hdr) - (hlen - n); // header bytes inside this buf
       body = buf + consumed;
       blen = n - consumed;
@@ -94,6 +94,6 @@ main(int argc, char *argv[])
   close(fd);
   if (out != 1)
     close(out);
-  fprintf(2, "wget: %d body bytes\n", total);
+  fprintf(stderr, "wget: %d body bytes\n", total);
   exit(status == 200 ? 0 : 1);
 }

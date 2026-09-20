@@ -1,3 +1,8 @@
+#ifndef XV6_RISCV_H
+#define XV6_RISCV_H
+#ifndef __ASSEMBLER__
+#include "types.h"
+#endif
 #ifndef __ASSEMBLER__
 
 // which hart (core) is this?
@@ -400,6 +405,14 @@ r_mcounteren()
   return x;
 }
 
+static inline uint64
+r_cycle()
+{
+  uint64 x;
+  asm volatile("csrr %0, cycle" : "=r"(x));
+  return x;
+}
+
 // machine-mode cycle counter
 static inline uint64
 r_time()
@@ -501,6 +514,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define PTE_W (1L << 2)
 #define PTE_X (1L << 3)
 #define PTE_U (1L << 4) // user can access
+#define PTE_COW (1L << 8) // (reserved bit) a shared frame: copy on the first write
 
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
@@ -520,3 +534,4 @@ typedef uint64 *pagetable_t; // 512 PTEs
 // that have the high bit set.
 // the Sv48 bound; the effective one is plat.maxva (Sv39: 1L << 38).
 #define MAXVA (1L << (9 + 9 + 9 + 9 + 12 - 1))
+#endif

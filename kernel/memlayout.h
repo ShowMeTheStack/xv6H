@@ -1,3 +1,5 @@
+#ifndef XV6_MEMLAYOUT_H
+#define XV6_MEMLAYOUT_H
 // Physical memory layout
 
 // qemu -machine virt is set up like this,
@@ -76,4 +78,14 @@
 //   TRAMPOLINE (the same page as in the kernel)
 #ifdef KERNEL
 #define TRAPFRAME (TRAMPOLINE - PGSIZE)
+// the page holding the signal-return trampoline, readable and executable
+// by the process (the trampoline page itself is not).
+#define SIGTRAMP (TRAPFRAME - PGSIZE)
+
+// every thread needs a trapframe at its own address in the shared
+// address space: they are mapped downward from here.
+#define THREAD_TF_SLOTS 1024
+#define THREAD_TF_TOP   (SIGTRAMP - PGSIZE)
+#define THREAD_TF_BOT   (THREAD_TF_TOP - THREAD_TF_SLOTS * PGSIZE)
+#endif
 #endif

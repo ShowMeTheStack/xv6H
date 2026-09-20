@@ -4,6 +4,8 @@
 #include "param.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "errno.h"
+#include "signal.h"
 #include "fs.h"
 #include "sleeplock.h"
 #include "file.h"
@@ -73,38 +75,65 @@ pipeclose(struct pipe *pi, int writable)
     release(&pi->lock);
 }
 
+// bytes waiting to be read, or whether a write would fit; -1 on hangup.
+int
+piperready(struct pipe *pi, int write)
+{
+  acquire(&pi->lock);
+  int r;
+  if (write)
+    r = pi->readopen == 0 ? -1 : (pi->nwrite < pi->nread + PIPESIZE);
+  else
+    r = pi->nread != pi->nwrite ? (int)(pi->nwrite - pi->nread) : (pi->writeopen ? 0 : -1);
+  release(&pi->lock);
+  return r;
+}
+
 int
 pipewrite(struct pipe *pi, uint64 addr, int n)
 {
   int i = 0;
   struct proc *pr = myproc();
+  char chunk[128];
 
-  acquire(&pi->lock);
+  // user memory is copied with the lock released: bringing a page in may
+  // sleep (a file-backed page, a copy-on-write copy).
   while (i < n) {
-    if (pi->readopen == 0 || killed(pr)) {
-      release(&pi->lock);
-      return -1;
-    }
-    if (pi->nwrite == pi->nread + PIPESIZE) { //DOC: pipewrite-full
-      wakeup(&pi->nread);
-      sleep_prepare(&pi->nwrite);
-      release(&pi->lock);
-      sleep();
-      acquire(&pi->lock);
-    } else {
-      char ch;
-      if (copyin(pr->pagetable, pr->sz, &ch, addr + i, 1) == -1) {
-        if (i == 0)
-          i = -1;
-        break;
+    int k = n - i;
+    if (k > sizeof(chunk))
+      k = sizeof(chunk);
+    if (copyin(pr->mm, chunk, addr + i, k) == -1)
+      return i == 0 ? -1 : i;
+    int done = 0;
+    acquire(&pi->lock);
+    while (done < k) {
+      if (pi->readopen == 0) {
+        release(&pi->lock);
+        signal_fault(pr, SIGPIPE, SI_KERNEL, 0);
+        return i + done > 0 ? i + done : -EPIPE;
       }
-      pi->data[pi->nwrite++ % PIPESIZE] = ch;
-      i++;
+      if (killed(pr)) {
+        release(&pi->lock);
+        return -EPIPE;
+      }
+      if (signal_pending(pr)) {
+        release(&pi->lock);
+        return i + done > 0 ? i + done : -EINTR;
+      }
+      if (pi->nwrite == pi->nread + PIPESIZE) { //DOC: pipewrite-full
+        wakeup(&pi->nread);
+        sleep_prepare(&pi->nwrite);
+        release(&pi->lock);
+        sleep_intr();
+        acquire(&pi->lock);
+      } else {
+        pi->data[pi->nwrite++ % PIPESIZE] = chunk[done++];
+      }
     }
+    wakeup(&pi->nread);
+    release(&pi->lock);
+    i += k;
   }
-  wakeup(&pi->nread);
-  release(&pi->lock);
-
   return i;
 }
 
@@ -113,31 +142,33 @@ piperead(struct pipe *pi, uint64 addr, int n)
 {
   int i;
   struct proc *pr = myproc();
-  char ch;
+  char chunk[128];
 
   acquire(&pi->lock);
   while (pi->nread == pi->nwrite && pi->writeopen) { //DOC: pipe-empty
     if (killed(pr)) {
       release(&pi->lock);
-      return -1;
+      return -EINTR;
+    }
+    if (signal_pending(pr)) {
+      release(&pi->lock);
+      return -EINTR;
     }
     sleep_prepare(&pi->nread); //DOC: piperead-sleep
     release(&pi->lock);
-    sleep();
+    sleep_intr();
     acquire(&pi->lock);
   }
-  for (i = 0; i < n; i++) { //DOC: piperead-copy
+  // take what is there (up to n), then copy it out without the lock.
+  for (i = 0; i < n && i < sizeof(chunk); i++) { //DOC: piperead-copy
     if (pi->nread == pi->nwrite)
       break;
-    ch = pi->data[pi->nread % PIPESIZE];
-    if (copyout(pr->pagetable, pr->sz, addr + i, &ch, 1) == -1) {
-      if (i == 0)
-        i = -1;
-      break;
-    }
+    chunk[i] = pi->data[pi->nread % PIPESIZE];
     pi->nread++;
   }
   wakeup(&pi->nwrite); //DOC: piperead-wakeup
   release(&pi->lock);
+  if (i > 0 && copyout(pr->mm, addr, chunk, i) == -1)
+    return -1;
   return i;
 }

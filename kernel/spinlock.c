@@ -22,8 +22,10 @@ void
 acquire(struct spinlock *lk)
 {
   push_off(); // disable interrupts to avoid deadlock.
-  if (holding(lk))
+  if (holding(lk)) {
+    printk("acquire: %s is already held by this cpu\n", lk->name);
     panic("acquire");
+  }
 
   // On RISC-V, __atomic_exchange_n turns into an atomic swap:
   //   a5 = 1
@@ -45,8 +47,10 @@ acquire(struct spinlock *lk)
 void
 release(struct spinlock *lk)
 {
-  if (!holding(lk))
+  if (!holding(lk)) {
+    printk("release: %s is not held by this cpu\n", lk->name);
     panic("release");
+  }
 
   lk->cpu = 0;
 

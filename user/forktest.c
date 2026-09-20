@@ -28,10 +28,8 @@ forktest(void)
       exit(0);
   }
 
-  if (n == N) {
-    print("fork claimed to work N times!\n");
-    exit(1);
-  }
+  // there is no fixed process table any more: N forks are expected to
+  // succeed; what matters is that every child is reaped, and no more.
 
   for (; n > 0; n--) {
     if (wait(0) < 0) {

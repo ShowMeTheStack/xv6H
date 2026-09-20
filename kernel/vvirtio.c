@@ -66,11 +66,9 @@ xfer(struct vm *vm, struct vvirtio *b, uint64 sector, uint64 gpa, uint32 len, in
     if (write) {
       if (vm_copyin(vm, b->bounce, gpa, n) < 0)
         return -1;
-      begin_op();
       ilock(ip);
       int r = writei(ip, 0, (uint64)b->bounce, off, n);
       iunlock(ip);
-      end_op();
       if (r != n)
         return -1;
     } else {

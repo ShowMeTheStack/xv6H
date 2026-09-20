@@ -76,10 +76,32 @@ def t_linux_boot(QEMU, intc, cpus, log):
         assert "TYPED-INTO-LINUX" in out, out
         poweroff(q)
         assert "no vms" in vm_ls(q)
-        free1, _ = host_stats(q)
-        assert free1 == free0, (free0, free1)
+        # the guest's memory comes back at once; what it wrote to its
+        # disk image is still dirty in the host's block cache, and those
+        # pages are only reclaimable once kflushd has written them out.
+        free1 = wait_free(q, free0, timeout=20)
+        # a megabyte of slack, and it is the report's own resolution:
+        # "free guest memory" is printed in megabytes, so two readings a
+        # page apart can differ by one. Booting Linux also reads tens of
+        # megabytes of kernel image through the block cache, and the
+        # object cache behind those cached blocks keeps a partly used
+        # slab or two. The guest's own memory is what this checks, and
+        # 128 MB of it either came back or did not.
+        assert free1 >= free0 - 1, (free0, free1)
     finally:
         q.close()
+
+
+def wait_free(q, free0, timeout=20):
+    """free memory comes back over a moment, not at once: a killed guest's
+    pages return when its last vcpu has left, and the blocks it wrote are
+    reclaimable only after the writeback thread has put them on the disk."""
+    end = time.time() + timeout
+    while True:
+        free1, _ = host_stats(q)
+        if free1 >= free0 - 1 or time.time() > end:
+            return free1
+        time.sleep(0.5)
 
 
 def t_linux_disk_smp(QEMU, intc, cpus, log, extra=""):
@@ -95,7 +117,10 @@ def t_linux_disk_smp(QEMU, intc, cpus, log, extra=""):
         out = linux_cmd(q, "echo written-by-linux > /mnt/note && sync && cat /mnt/note")
         assert "written-by-linux" in out, out
         # both cpus do work: two busy loops finish in about the time of one
-        loop = "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done"
+        # long enough that the ratio means something: at 20000 the loop
+        # took half a second on a busy build box and the noise was
+        # larger than the parallelism being measured.
+        loop = "i=0; while [ $i -lt 60000 ]; do i=$((i+1)); done"
         out = linux_cmd(q, "time sh -c '%s'" % loop, 120)
         m = re.search(r"real\s+0m\s*([\d.]+)s", out)
         assert m, out

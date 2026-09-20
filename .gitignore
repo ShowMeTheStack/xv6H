@@ -26,3 +26,9 @@ guest/vguest
 tls/obj/
 tls/libbearssl.a
 user/tls_date.h
+build/
+user/*.so
+user/ld.so
+user/static/
+user/libc.a
+mkfs/mkext4

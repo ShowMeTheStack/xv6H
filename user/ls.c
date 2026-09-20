@@ -1,88 +1,89 @@
-#include "kernel/types.h"
-#include "kernel/stat.h"
+// ls [-l] [-a] [FILE...]: what is in a directory, or about a file.
 #include "user/user.h"
-#include "kernel/fs.h"
-#include "kernel/fcntl.h"
 
-char *
-fmtname(char *path)
+static int longform, showall;
+
+static const char *
+type_name(short type)
 {
-  static char buf[DIRSIZ + 1];
-  char *p;
-
-  // Find first character after last slash.
-  for (p = path + strlen(path); p >= path && *p != '/'; p--)
-    ;
-  p++;
-
-  // Return blank-padded name.
-  if (strlen(p) >= DIRSIZ)
-    return p;
-  memmove(buf, p, strlen(p));
-  memset(buf + strlen(p), ' ', DIRSIZ - strlen(p));
-  buf[sizeof(buf) - 1] = '\0';
-  return buf;
+  switch (type) {
+  case T_DIR: return "dir";
+  case T_FILE: return "file";
+  case T_DEVICE: return "dev";
+  default: return "?";
+  }
 }
 
-void
-ls(char *path)
+static void
+show(const char *path, const char *name, struct stat *st)
 {
-  char buf[512], *p;
-  int fd;
-  struct dirent de;
+  if (longform)
+    printf("%-4s %2d %6d %8ld %s\n", type_name(st->type), st->dev, st->ino, (long)st->size, name);
+  else
+    printf("%s\n", name);
+  (void)path;
+}
+
+static void
+ls(const char *path)
+{
   struct stat st;
 
-  if ((fd = open(path, O_RDONLY)) < 0) {
-    fprintf(2, "ls: cannot open %s\n", path);
+  if (stat(path, &st) < 0) {
+    fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
+    return;
+  }
+  if (st.type != T_DIR) {
+    show(path, path, &st);
     return;
   }
 
-  if (fstat(fd, &st) < 0) {
-    fprintf(2, "ls: cannot stat %s\n", path);
-    close(fd);
+  DIR *d = opendir(path);
+  if (d == 0) {
+    fprintf(stderr, "ls: %s: %s\n", path, strerror(errno));
     return;
   }
-
-  switch (st.type) {
-  case T_DEVICE:
-  case T_FILE:
-    printf("%s %d %d %d\n", fmtname(path), st.type, st.ino, (int)st.size);
-    break;
-
-  case T_DIR:
-    if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf) {
-      printf("ls: path too long\n");
-      break;
+  struct dirent *e;
+  while ((e = readdir(d)) != 0) {
+    if (!showall && e->d_name[0] == '.')
+      continue;
+    char full[PATH_MAX];
+    snprintf(full, sizeof(full), "%s%s%s", path, path[strlen(path) - 1] == '/' ? "" : "/",
+             e->d_name);
+    struct stat es;
+    if (stat(full, &es) < 0) {
+      memset(&es, 0, sizeof(es));
+      es.ino = e->d_ino;
     }
-    strcpy(buf, path);
-    p = buf + strlen(buf);
-    *p++ = '/';
-    while (read(fd, &de, sizeof(de)) == sizeof(de)) {
-      if (de.inum == 0)
-        continue;
-      memmove(p, de.name, DIRSIZ);
-      p[DIRSIZ] = 0;
-      if (stat(buf, &st) < 0) {
-        printf("ls: cannot stat %s\n", buf);
-        continue;
-      }
-      printf("%s %d %d %d\n", fmtname(buf), st.type, st.ino, (int)st.size);
-    }
-    break;
+    show(full, e->d_name, &es);
   }
-  close(fd);
+  closedir(d);
 }
 
 int
 main(int argc, char *argv[])
 {
-  int i;
+  int i = 1;
 
-  if (argc < 2) {
+  for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++)
+    for (char *p = argv[i] + 1; *p; p++) {
+      if (*p == 'l')
+        longform = 1;
+      else if (*p == 'a')
+        showall = 1;
+      else {
+        fprintf(stderr, "usage: ls [-la] [FILE...]\n");
+        exit(1);
+      }
+    }
+  if (i >= argc) {
     ls(".");
     exit(0);
   }
-  for (i = 1; i < argc; i++)
+  for (; i < argc; i++) {
+    if (argc - i > 1)
+      printf("%s:\n", argv[i]);
     ls(argv[i]);
+  }
   exit(0);
 }

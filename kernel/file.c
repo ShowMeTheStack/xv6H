@@ -10,6 +10,8 @@
 #include "spinlock.h"
 #include "sleeplock.h"
 #include "file.h"
+#include "fcntl.h"
+#include "slab.h"
 #include "net.h"
 #include "sock.h"
 #include "stat.h"
@@ -17,32 +19,27 @@
 
 struct devsw devsw[NDEV];
 struct {
-  struct spinlock lock;
-  struct file file[NFILE];
+  struct spinlock lock; // reference counts
 } ftable;
+static struct kmem_cache *file_cache;
 
 void
 fileinit(void)
 {
   initlock(&ftable.lock, "ftable");
+  file_cache = kmem_cache_create("file", sizeof(struct file), 8, 0);
 }
 
 // Allocate a file structure.
 struct file *
 filealloc(void)
 {
-  struct file *f;
-
-  acquire(&ftable.lock);
-  for (f = ftable.file; f < ftable.file + NFILE; f++) {
-    if (f->ref == 0) {
-      f->ref = 1;
-      release(&ftable.lock);
-      return f;
-    }
-  }
-  release(&ftable.lock);
-  return 0;
+  struct file *f = kmem_cache_alloc(file_cache);
+  if (f == 0)
+    return 0;
+  memset(f, 0, sizeof(*f));
+  f->ref = 1;
+  return f;
 }
 
 // Increment ref count for file f.
@@ -74,15 +71,14 @@ fileclose(struct file *f)
   f->ref = 0;
   f->type = FD_NONE;
   release(&ftable.lock);
+  kmem_cache_free(file_cache, f); // the copy ff carries what is left to do
 
   if (ff.type == FD_SOCK) {
     sockclose(ff.sock);
   } else if (ff.type == FD_PIPE) {
     pipeclose(ff.pipe, ff.writable);
   } else if (ff.type == FD_INODE || ff.type == FD_DEVICE) {
-    begin_op();
     iput(ff.ip);
-    end_op();
   }
 }
 
@@ -98,7 +94,7 @@ filestat(struct file *f, uint64 addr)
     ilock(f->ip);
     stati(f->ip, &st);
     iunlock(f->ip);
-    if (copyout(p->pagetable, p->sz, addr, (char *)&st, sizeof(st)) < 0)
+    if (copyout(p->mm, addr, (char *)&st, sizeof(st)) < 0)
       return -1;
     return 0;
   }
@@ -154,23 +150,24 @@ filewrite(struct file *f, uint64 addr, int n)
       return -1;
     ret = devsw[f->major].write(1, addr, n);
   } else if (f->type == FD_INODE) {
-    // write a few blocks at a time to avoid exceeding
-    // the maximum log transaction size, including
-    // i-node, indirect block, allocation blocks,
-    // and 2 blocks of slop for non-aligned writes.
-    int max = ((MAXOPBLOCKS - 1 - 1 - 2) / 2) * BSIZE;
+    // a long write is broken into pieces so that one call does not
+    // hold the inode for an unbounded time, and so that the file
+    // system's transaction stays a size it can promise to fit.
+    int max = FILEWRITE_MAX;
     int i = 0;
     while (i < n) {
       int n1 = n - i;
       if (n1 > max)
         n1 = max;
 
-      begin_op();
       ilock(f->ip);
+      // a file opened for appending always writes at the end, however
+      // far anyone else has moved it since the last write.
+      if (f->flags & O_APPEND)
+        f->off = f->ip->size;
       if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
         f->off += r;
       iunlock(f->ip);
-      end_op();
 
       if (r != n1) {
         // error from writei
@@ -184,4 +181,26 @@ filewrite(struct file *f, uint64 addr, int n)
   }
 
   return ret;
+}
+
+// is this file ready for reading (write == 0) or writing (write == 1)?
+// returns the number of bytes available for reading, 1 for a writable
+// file, 0 when it would block, and -1 for a hangup.
+int
+fileready(struct file *f, int write)
+{
+  switch (f->type) {
+  case FD_PIPE:
+    return piperready(f->pipe, write);
+  case FD_SOCK:
+    return sockready(f->sock, write);
+  case FD_DEVICE:
+    if (f->major >= 0 && f->major < NDEV && devsw[f->major].ready)
+      return devsw[f->major].ready(write);
+    return 1;
+  case FD_INODE:
+    return write ? 1 : 1; // a regular file never blocks
+  default:
+    return -1;
+  }
 }

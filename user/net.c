@@ -126,7 +126,7 @@ tcp_open(const char *host, int port)
 {
   uint32 ip;
   if (dns_resolve(host, &ip) < 0) {
-    fprintf(2, "cannot resolve %s\n", host);
+    fprintf(stderr, "cannot resolve %s\n", host);
     return -1;
   }
   int fd = socket(SOCK_STREAM);
@@ -135,7 +135,7 @@ tcp_open(const char *host, int port)
   int rc = connect(fd, ip, port);
   if (rc < 0) {
     char b[20];
-    fprintf(2, "connect to %s:%d failed%s\n", ip2str(ip, b), port, rc == -2 ? " (blocked by policy)" : "");
+    fprintf(stderr, "connect to %s:%d failed%s\n", ip2str(ip, b), port, (rc < 0 && errno == EACCES) ? " (blocked by policy)" : "");
     close(fd);
     return -1;
   }

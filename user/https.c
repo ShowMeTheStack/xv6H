@@ -138,8 +138,8 @@ plat_read(int fd, void *buf, int n)
 #include "kernel/time.h"
 #include "user/user.h"
 #include "user/tls_date.h"
-#define eprintf(...) fprintf(2, __VA_ARGS__)
-#define oprintf(...) fprintf(1, __VA_ARGS__)
+#define eprintf(...) fprintf(stderr, __VA_ARGS__)
+#define oprintf(...) fprintf(stdout, __VA_ARGS__)
 #define plat_connect tcp_open
 #define plat_read read
 #define plat_write write
@@ -151,8 +151,8 @@ plat_time(uint32_t *days, uint32_t *secs)
 {
   struct timespec ts;
   uint64 s;
-  if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.sec >= (long)TLS_BUILD_SECS)
-    s = ts.sec;
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec >= (long)TLS_BUILD_SECS)
+    s = ts.tv_sec;
   else
     s = (uint64)TLS_BUILD_SECS + uptime() / 10; // no RTC: build date, 10 ticks per second
   *days = (uint32_t)(s / 86400) + 719528;

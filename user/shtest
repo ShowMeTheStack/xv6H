@@ -1,0 +1,245 @@
+#!/rescue/sh
+# the shell's own tests, written in the language it implements.
+# every check prints "ok" or "FAIL" with what it expected.
+
+passed=0
+failed=0
+
+check() {
+	# check NAME EXPECTED ACTUAL
+	if [ "$2" = "$3" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		echo "FAIL $1: wanted [$2] got [$3]"
+	fi
+}
+
+# ---- words, quoting and expansion ----
+check simple hello "$(echo hello)"
+check squote 'a  b' "$(echo 'a  b')"
+check dquote 'a b' "$(echo "a b")"
+check concat abc "$(echo a"b"c)"
+check escape 'a$b' "$(echo 'a$b')"
+check backslash 'a b' "$(echo a\ b)"
+x=world
+check var hello-world "$(echo hello-$x)"
+check braced helloworld "$(echo hello${x})"
+check inquote "hello world" "$(echo "hello $x")"
+unset_var_test=
+check empty "" "$unset_var_test"
+check default fallback "${nosuchvar:-fallback}"
+check default2 "" "${nosuchvar-}"
+set_it=${nosuchvar2:=assigned}
+check assign assigned "$nosuchvar2"
+check plus yes "${x:+yes}"
+check plusempty "" "${nosuchvar3:+yes}"
+check length 5 "${#x}"
+path=/usr/local/bin/prog
+check rmprefix "local/bin/prog" "${path#/usr/}"
+check rmprefixlong "prog" "${path##*/}"
+check rmsuffix "/usr/local/bin" "${path%/prog}"
+check rmsuffixlong "" "${path%%/*}"
+
+# ---- arithmetic ----
+check arith 7 "$((3 + 4))"
+check arith2 20 "$((4 * 5))"
+check arith3 2 "$((7 / 3))"
+check arith4 1 "$((7 % 3))"
+check arith5 1 "$((2 > 1))"
+check arith6 0 "$((2 < 1))"
+check arith7 8 "$((2 << 2))"
+check arith8 6 "$(( (1 + 2) * 2 ))"
+n=5
+check arithvar 10 "$((n * 2))"
+check arithtern 1 "$((n > 3 ? 1 : 0))"
+
+# ---- command substitution ----
+check cmdsub hi "$(echo hi)"
+check cmdsub_old hi "`echo hi`"
+check cmdsub_nested "ab" "$(echo "a$(echo b)")"
+check cmdsub_status 0 "$(echo x >/dev/null; echo $?)"
+
+# ---- exit status ----
+true
+check status_true 0 "$?"
+false
+check status_false 1 "$?"
+(exit 3)
+check status_sub 3 "$?"
+check not_true 0 "$(if ! true; then echo 1; else echo 0; fi)"
+check not_false 1 "$(if ! false; then echo 1; else echo 0; fi)"
+
+# ---- lists ----
+check andor1 yes "$(true && echo yes)"
+check andor2 "" "$(false && echo yes)"
+check andor3 yes "$(false || echo yes)"
+check andor4 "" "$(true || echo yes)"
+check seq "a b" "$(echo -n 'a '; echo b)"
+
+# ---- pipelines ----
+check pipe1 hello "$(echo hello | cat)"
+check pipe2 hello "$(echo hello | cat | cat)"
+check pipe3 hello "$(echo hello | cat | cat | cat)"
+
+# ---- redirection ----
+rm -f /shtest.tmp
+echo written > /shtest.tmp
+check redir_out written "$(cat /shtest.tmp)"
+echo more >> /shtest.tmp
+check redir_append "written
+more" "$(cat /shtest.tmp)"
+check redir_in "written
+more" "$(cat < /shtest.tmp)"
+echo replaced > /shtest.tmp
+check redir_trunc replaced "$(cat /shtest.tmp)"
+rm -f /shtest.tmp
+
+# a here-document, expanded and not
+cat > /shtest.tmp <<END
+hello $x
+END
+check heredoc "hello world" "$(cat /shtest.tmp)"
+cat > /shtest.tmp <<'END'
+hello $x
+END
+check heredoc_quoted 'hello $x' "$(cat /shtest.tmp)"
+rm -f /shtest.tmp
+
+# ---- control flow ----
+if true; then r=then; else r=else; fi
+check if_then then "$r"
+if false; then r=then; else r=else; fi
+check if_else else "$r"
+if false; then r=a; elif true; then r=b; else r=c; fi
+check if_elif b "$r"
+
+i=0
+while [ $i -lt 3 ]; do
+	i=$((i + 1))
+done
+check while 3 "$i"
+
+i=0
+until [ $i -ge 3 ]; do
+	i=$((i + 1))
+done
+check until 3 "$i"
+
+out=
+for v in a b c; do
+	out="$out$v"
+done
+check for abc "$out"
+
+out=
+for v in a b c d; do
+	if [ "$v" = c ]; then continue; fi
+	if [ "$v" = d ]; then break; fi
+	out="$out$v"
+done
+check loopctl ab "$out"
+
+case hello in
+	x) r=no ;;
+	h*) r=yes ;;
+	*) r=other ;;
+esac
+check case_glob yes "$r"
+
+case abc in
+	a|b|abc) r=alt ;;
+	*) r=no ;;
+esac
+check case_alt alt "$r"
+
+# ---- functions ----
+greet() {
+	echo "hello $1"
+}
+check func "hello there" "$(greet there)"
+
+count() {
+	echo $#
+}
+check func_args 3 "$(count a b c)"
+
+ret5() {
+	return 5
+}
+ret5
+check func_return 5 "$?"
+
+# a function sees the shell's variables and can change them
+setg() {
+	g=fromfunc
+}
+setg
+check func_global fromfunc "$g"
+
+# ---- test ----
+check test_str 0 "$(test abc = abc; echo $?)"
+check test_ne 0 "$(test abc != abd; echo $?)"
+check test_num 0 "$(test 5 -gt 3; echo $?)"
+check test_z 0 "$(test -z ''; echo $?)"
+check test_n 0 "$(test -n x; echo $?)"
+check test_file 0 "$(test -e /init; echo $?)"
+check test_dir 0 "$(test -d /; echo $?)"
+check test_nofile 1 "$(test -e /no-such-file; echo $?)"
+check test_and 0 "$([ 1 -eq 1 -a 2 -eq 2 ]; echo $?)"
+check test_or 0 "$([ 1 -eq 2 -o 2 -eq 2 ]; echo $?)"
+check test_bang 0 "$([ ! 1 -eq 2 ]; echo $?)"
+
+# ---- built-ins ----
+check echo_n "ab" "$(echo -n a; echo -n b)"
+check printf_d "42" "$(printf '%d' 42)"
+check printf_s "hi there" "$(printf '%s %s' hi there)"
+check printf_pad "  7" "$(printf '%3d' 7)"
+check pwd_root / "$(cd /; pwd)"
+old=$(pwd)
+cd /
+check cd_root / "$(pwd)"
+cd "$old"
+
+v=abc
+check unset_works "" "$(unset v; echo $v)"
+
+set -- one two three
+check positional_count 3 "$#"
+check positional_1 one "$1"
+check positional_all "one two three" "$*"
+shift
+check shifted two "$1"
+check shifted_count 2 "$#"
+set --
+
+# ---- globbing ----
+mkdir -p /globdir 2>/dev/null
+rm -f /globdir/*
+echo a > /globdir/fa
+echo b > /globdir/fb
+echo c > /globdir/gc
+check glob_star "/globdir/fa /globdir/fb /globdir/gc" "$(echo /globdir/*)"
+check glob_prefix "/globdir/fa /globdir/fb" "$(echo /globdir/f*)"
+check glob_question "/globdir/fa /globdir/fb" "$(echo /globdir/f?)"
+check glob_none "/globdir/z*" "$(echo /globdir/z*)"
+rm -f /globdir/fa /globdir/fb /globdir/gc
+
+# ---- IFS and field splitting ----
+words="a b c"
+check split 3 "$(set -- $words; echo $#)"
+check nosplit 1 "$(set -- "$words"; echo $#)"
+
+# ---- subshells and groups ----
+check subshell_var outer "$(v=outer; (v=inner) ; echo $v)"
+check group_var inner "$(v=outer; { v=inner; } ; echo $v)"
+check subshell_out "x" "$( (echo x) )"
+
+# ---- exit code of a pipeline is the last command's ----
+check pipe_status 0 "$(false | true; echo $?)"
+check pipe_status2 1 "$(true | false; echo $?)"
+
+echo "shtest: $passed checks, $failed failures"
+if [ $failed -eq 0 ]; then
+	echo "ALL TESTS PASSED"
+fi

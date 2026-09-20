@@ -8,7 +8,7 @@ int
 main(int argc, char *argv[])
 {
   if (argc != 2) {
-    fprintf(2, "usage: nslookup name\n");
+    fprintf(stderr, "usage: nslookup name\n");
     exit(1);
   }
   struct netinfo ni;

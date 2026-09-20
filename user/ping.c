@@ -9,20 +9,20 @@ int
 main(int argc, char *argv[])
 {
   if (argc < 2) {
-    fprintf(2, "usage: ping host [count]\n");
+    fprintf(stderr, "usage: ping host [count]\n");
     exit(1);
   }
   int count = argc > 2 ? atoi(argv[2]) : 4;
   uint32 ip;
   if (dns_resolve(argv[1], &ip) < 0) {
-    fprintf(2, "ping: cannot resolve %s\n", argv[1]);
+    fprintf(stderr, "ping: cannot resolve %s\n", argv[1]);
     exit(1);
   }
   char s[20];
   printf("PING %s (%s)\n", argv[1], ip2str(ip, s));
   int fd = socket(SOCK_ICMP);
   if (fd < 0) {
-    fprintf(2, "ping: no network\n");
+    fprintf(stderr, "ping: no network\n");
     exit(1);
   }
   int ok = 0;
@@ -32,7 +32,7 @@ main(int argc, char *argv[])
       data[i] = 'a' + i % 26;
     int t0 = uptime();
     int rc = sendto(fd, data, sizeof(data), ip, seq);
-    if (rc == -2) {
+    if (rc < 0 && errno == EACCES) {
       printf("ping: %s is blocked by the network policy\n", s);
       exit(2);
     }
@@ -54,7 +54,7 @@ main(int argc, char *argv[])
       ok++;
     }
     if (seq < count)
-      pause(10);
+      ticksleep(10);
   }
   printf("%d packets transmitted, %d received\n", count, ok);
   exit(ok ? 0 : 1);

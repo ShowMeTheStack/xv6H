@@ -1,0 +1,87 @@
+#!/bin/bash
+#
+# run the test harness on the build box (32 cores), in a named copy of
+# this tree, so that several versions can be tested at the same time
+# while the laptop keeps working:
+#
+#   tools/remote.sh run NAME SUITE [test-hyp.py args...]   # sync, build, start in tmux
+#   tools/remote.sh status [NAME]                           # progress of a run, or of all runs
+#   tools/remote.sh wait NAME                               # block until NAME is done, print the summary
+#   tools/remote.sh log NAME                                # the full results file
+#   tools/remote.sh script NAME FILE.py [args...]            # sync, build, run a python script (test-hyp helpers available)
+#   tools/remote.sh kill NAME                               # stop a run
+#   tools/remote.sh rm NAME                                 # delete a run's copy
+#
+# the copy lives in ~/xv6h-runs/NAME on the box; the Linux artifacts come
+# from ~/xv6h-linux/out there. results: ~/xv6h-runs/NAME/results.out and
+# a "done" file holding the exit status.
+#
+set -e
+HOST=${HOST:-build@buildbox}
+RUNS='~/xv6h-runs'
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+cmd=$1; shift || true
+
+sync_tree() { # NAME
+  local name=$1
+  ssh -o BatchMode=yes $HOST "mkdir -p $RUNS/$name"
+  rsync -a --delete \
+    --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
+    --exclude 'fs.img' --exclude 'test-*.img' --exclude 'user/_*' --exclude 'user/usys.S' \
+    --exclude 'kernel/kernel' --exclude 'mkfs/mkfs' --exclude 'mkfs/mkext4' --exclude 'tls/obj' --exclude 'tls/libbearssl.a' \
+    --exclude 'guest/*.img' --exclude 'guest/kernel' --exclude 'guest/hello' --exclude 'guest/hello.bin' \
+    --exclude 'guest/fdguest' --exclude 'guest/vguest' --exclude 'guest/badguest' \
+    --exclude 'linux/Image*' --exclude 'linux/linux.img' --exclude 'user/tls_date.h' \
+    --exclude 'results.out' --exclude 'done' --exclude 'test-hyp.log' --exclude '.git' \
+    "$HERE/" "$HOST:$RUNS/$name/"
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
+}
+
+case "$cmd" in
+run)
+  name=$1; shift; suite=$1; shift || true
+  [ -n "$name" ] && [ -n "$suite" ] || { echo "usage: remote.sh run NAME SUITE [args]"; exit 1; }
+  sync_tree "$name"
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
+    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && ./test-hyp.py $suite $* > results.out 2>&1; echo \\\$? > done)\""
+  echo "started $name: ./test-hyp.py $suite $* on $HOST (tools/remote.sh status $name)"
+  ;;
+script)
+  name=$1; shift; script=$1; shift || true
+  [ -n "$name" ] && [ -f "$script" ] || { echo "usage: remote.sh script NAME FILE.py [args]"; exit 1; }
+  sync_tree "$name"
+  scp -q "$script" "$HOST:$RUNS/$name/run_script.py"
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
+    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=128 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
+  echo "started $name: $script $* on $HOST"
+  ;;
+status)
+  name=$1
+  if [ -n "$name" ]; then
+    ssh -o BatchMode=yes $HOST "cd $RUNS/$name 2>/dev/null || exit 1; \
+      if [ -f done ]; then echo \"$name: done, exit \$(cat done)\"; else echo \"$name: running\"; fi; \
+      grep -c ': PASS' results.out 2>/dev/null | sed 's/^/  passed: /'; grep ': FAIL' results.out 2>/dev/null | cut -c1-160; \
+      grep 'failure(s)' results.out 2>/dev/null; tail -1 results.out 2>/dev/null | grep '^== [a-z0-9-]*$' | sed 's/^/  now: /'; \
+      grep -i error build.out 2>/dev/null | head -3"
+  else
+    ssh -o BatchMode=yes $HOST "for d in $RUNS/*/; do n=\$(basename \$d); if [ -f \$d/done ]; then s=\"done, exit \$(cat \$d/done)\"; else s=running; fi; \
+      p=\$(grep -c ': PASS' \$d/results.out 2>/dev/null); f=\$(grep -c ': FAIL' \$d/results.out 2>/dev/null); echo \"\$n: \$s, \$p passed, \$f failed\"; done"
+  fi
+  ;;
+wait)
+  name=$1
+  until ssh -o BatchMode=yes $HOST "test -f $RUNS/$name/done"; do sleep 30; done
+  "$0" status "$name"
+  ;;
+log)
+  ssh -o BatchMode=yes $HOST "cat $RUNS/$1/results.out"
+  ;;
+kill)
+  ssh -o BatchMode=yes $HOST "tmux kill-session -t xv6h-$1 2>/dev/null; pkill -f 'xv6h-runs/$1/' ; echo killed" 
+  ;;
+rm)
+  ssh -o BatchMode=yes $HOST "tmux kill-session -t xv6h-$1 2>/dev/null; rm -rf $RUNS/$1"
+  ;;
+*)
+  sed -n 2,18p "$0"; exit 1;;
+esac

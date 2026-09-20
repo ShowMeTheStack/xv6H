@@ -14,6 +14,7 @@ main()
 {
   if (cpuid() == 0) {
     consoleinit();
+    devnullinit();
     printkinit();
     printk("\n");
     printk("xv6 kernel is booting\n");
@@ -27,22 +28,32 @@ main()
     if (plat.has_v)
       printk("vector extension: vlen %ld bits\n", plat.vlenb * 8);
     kinit();            // physical page allocator
+    slabinit();         // object caches
+    mminit();           // address spaces
+    siginit();          // signal state caches
     kvminit();          // create kernel page table
     kvminithart();      // turn on paging
-    procinit();         // process table
+    kstackinit();       // the kernel stack region
+    procinit_early();   // command-line settings for processes
+    procinit();         // processes
     trapinit();         // trap vectors
     trapinithart();     // install kernel trap vector
     intc_init();        // set up interrupt controller
     intc_inithart();    // ask it for device interrupts
-    binit();            // buffer cache
     iinit();            // inode table
     fileinit();         // file table
-    virtio_disk_init(); // emulated hard disk(s)
+    virtio_disk_init();
+    blkinit();
+    vfs_init();
+    procfs_init();
+    ext4_init();
     rtcinit();          // the real-time clock
+    randominit();       // the random generator
     bridgeinit();       // software switch between host, guests and the NIC
     netinit();          // network device and stack
     hypinit();          // hypervisor (if the H extension is present)
     userinit();         // first user process
+    kthread_selftest(); // two kernel threads take turns, then print
 
     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);
   } else {

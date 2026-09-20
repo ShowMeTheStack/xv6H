@@ -52,5 +52,6 @@ int tcp_connect(struct sock *s);
 int tcp_listen(struct sock *s, int backlog);
 struct sock *tcp_accept(struct sock *s);
 int tcp_read(struct sock *s, int user, uint64 addr, int n);
+int tcp_ready(struct tcpcb *t, int write);
 int tcp_write(struct sock *s, int user, uint64 addr, int n);
 void tcp_close(struct sock *s);

@@ -17,6 +17,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "blk.h"
 #include "fs.h"
 #include "file.h"
 #include "elf.h"
@@ -27,7 +28,7 @@
 #include "page.h"
 #include "hyp.h"
 
-struct vm vms[NVM];
+struct vm *vmtab[NVM];
 static struct spinlock vmslock;
 
 void guestret(struct vcpu *v);
@@ -76,11 +77,8 @@ void
 hypinit(void)
 {
   initlock(&vmslock, "vms");
-  for (int i = 0; i < NVM; i++) {
-    initlock(&vms[i].lock, "vm");
-    vms[i].id = i;
-    vms[i].state = VM_FREE;
-  }
+  for (int i = 0; i < NVM; i++)
+    vmtab[i] = 0;
   if (!plat.has_h) {
     printk("hyp: no hypervisor extension; guests disabled\n");
     return;
@@ -209,7 +207,7 @@ vm_lookup(int id)
 {
   if (id < 0 || id >= NVM)
     return 0;
-  return &vms[id];
+  return vmtab[id]; // 0 for a slot never used
 }
 
 static void
@@ -248,9 +246,7 @@ static void
 vm_put_disk(struct inode *ip)
 {
   if (ip) {
-    begin_op();
     iput(ip);
-    end_op();
   }
 }
 
@@ -259,8 +255,8 @@ static int
 disk_in_use(struct vm *self, struct inode *ip)
 {
   for (int i = 0; i < NVM; i++) {
-    struct vm *o = &vms[i];
-    if (o == self || o->state == VM_FREE || o->disk_ip == 0)
+    struct vm *o = vmtab[i];
+    if (o == 0 || o == self || o->state == VM_FREE || o->disk_ip == 0)
       continue;
     if (o->disk_ip->dev == ip->dev && o->disk_ip->inum == ip->inum)
       return 1;
@@ -354,11 +350,27 @@ vm_create(struct vmconfig *cfg)
   if (cfg->kernel[0] == 0)
     return -1;
 
+  // a slot: a VM object is allocated the first time its slot is used and
+  // kept for reuse (struct vm is large: vcpus, interrupt controller
+  // state, console rings).
   acquire(&vmslock);
   struct vm *vm = 0;
   for (int i = 0; i < NVM; i++) {
-    if (vms[i].state == VM_FREE) {
-      vm = &vms[i];
+    if (vmtab[i] == 0) {
+      int order = 0;
+      while (((uint64)PGSIZE << order) < sizeof(struct vm))
+        order++;
+      struct vm *nv = kalloc_order(order);
+      if (nv == 0)
+        break;
+      memset(nv, 0, sizeof(*nv));
+      initlock(&nv->lock, "vm");
+      nv->id = i;
+      nv->state = VM_FREE;
+      vmtab[i] = nv;
+    }
+    if (vmtab[i]->state == VM_FREE) {
+      vm = vmtab[i];
       vm->state = VM_NEW;
       break;
     }
@@ -406,10 +418,8 @@ vm_create(struct vmconfig *cfg)
 
   // the disk image: a regular file in the host file system.
   if (cfg->disk[0]) {
-    begin_op();
     struct inode *ip = namei(cfg->disk);
     if (ip == 0) {
-      end_op();
       goto fail;
     }
     ilock(ip);
@@ -417,10 +427,8 @@ vm_create(struct vmconfig *cfg)
     iunlock(ip);
     if (!ok || disk_in_use(vm, ip)) {
       iput(ip);
-      end_op();
       goto fail;
     }
-    end_op();
     vm->disk_ip = ip;
   }
 
@@ -515,9 +523,7 @@ vm_load(struct vm *vm)
   struct proghdr ph;
   int ret = -1;
 
-  begin_op();
   if ((ip = namei(cfg->kernel)) == 0) {
-    end_op();
     return -1;
   }
   ilock(ip);
@@ -563,7 +569,6 @@ vm_load(struct vm *vm)
 
 done:
   iunlockput(ip);
-  end_op();
   if (ret < 0)
     return -1;
 
@@ -849,8 +854,8 @@ hyp_tick(void)
     return;
   uint64 now = r_time();
   for (int i = 0; i < NVM; i++) {
-    struct vm *vm = &vms[i];
-    if (vm->state != VM_RUNNING)
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state != VM_RUNNING)
       continue;
     for (int j = 0; j < vm->nvcpu; j++) {
       struct vcpu *v = &vm->vcpu[j];
@@ -868,8 +873,8 @@ hyp_next_deadline(uint64 dflt)
     return dflt;
   uint64 best = dflt;
   for (int i = 0; i < NVM; i++) {
-    struct vm *vm = &vms[i];
-    if (vm->state != VM_RUNNING)
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state != VM_RUNNING)
       continue;
     for (int j = 0; j < vm->nvcpu; j++) {
       struct vcpu *v = &vm->vcpu[j];
@@ -1062,8 +1067,12 @@ vm_run(struct vm *vm, int vcpuid)
 void
 hyp_stats(uint64 *out, int n)
 {
-  if (n > 0)
-    out[0] = kmem_free_pages() >> 8; // MB
+  if (n > 0) {
+    kstack_drain();
+    // what a guest could have: the pages that are free, and the pages
+    // the block cache is holding only because they might be useful.
+    out[0] = (kmem_free_pages() + blk_reclaimable()) >> 8; // MB
+  }
   if (n > 1) {
     uint64 t = 0;
     for (int i = 0; i < NCPU; i++)
@@ -1072,8 +1081,10 @@ hyp_stats(uint64 *out, int n)
   }
   for (int i = 0; i < NVM && 2 + i < n; i++) {
     uint64 e = 0;
-    for (int j = 0; j < vms[i].nvcpu; j++)
-      e += vms[i].vcpu[j].exits;
+    struct vm *vm = vmtab[i];
+    if (vm)
+      for (int j = 0; j < vm->nvcpu; j++)
+        e += vm->vcpu[j].exits;
     out[2 + i] = e;
   }
 }

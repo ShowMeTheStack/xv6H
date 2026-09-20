@@ -1,3 +1,6 @@
+#ifndef XV6_HWINFO_H
+#define XV6_HWINFO_H
+#include "types.h"
 // hwinfo(): what this kernel is running on (hwinfo system call).
 struct hwinfo {
   uint64 misa;   // ISA bits: bit 5 F, bit 3 D, bit 21 V, bit 7 H, ...
@@ -8,3 +11,4 @@ struct hwinfo {
   int is_guest;  // running as an xv6H guest
   int guest_id;
 };
+#endif

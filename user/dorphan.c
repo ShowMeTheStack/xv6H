@@ -14,7 +14,7 @@ main(int argc, char **argv)
 {
   char *s = argv[0];
 
-  if (mkdir("dd") != 0) {
+  if (mkdir("dd", 0777) != 0) {
     printf("%s: mkdir dd failed\n", s);
     exit(1);
   }
@@ -31,5 +31,5 @@ main(int argc, char **argv)
   printf("wait for kill and reclaim\n");
   // sit around until killed
   for (;;)
-    pause(1000);
+    ticksleep(1000);
 }

@@ -301,7 +301,7 @@ struct vm {
   uint64 dtb_gpa;
 };
 
-extern struct vm vms[NVM];
+extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used
 
 // hyp.c
 void hypinithart(void);

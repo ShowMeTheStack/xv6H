@@ -18,6 +18,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "errno.h"
 #include "net.h"
 #include "sock.h"
 #include "tcp.h"
@@ -646,7 +647,7 @@ tcp_connect(struct sock *s)
   if (!net_policy_ok(s->rip, IPPROTO_TCP, s->rport, 0)) {
     net_policy_dropped++;
     release(&netlock);
-    return -2;
+    return -EACCES; // the egress policy refused it
   }
   struct tcpcb *t = tcb_alloc();
   if (t == 0) {
@@ -673,7 +674,7 @@ tcp_connect(struct sock *s)
       break;
     sleep_prepare(t);
     release(&netlock);
-    sleep();
+    sleep_intr();
     acquire(&netlock);
   }
   int ok = (t->state == TCPS_ESTABLISHED);
@@ -721,7 +722,7 @@ tcp_accept(struct sock *s)
     }
     sleep_prepare(l);
     release(&netlock);
-    sleep();
+    sleep_intr();
     acquire(&netlock);
     if (s->tcp != l) {
       release(&netlock);
@@ -772,8 +773,7 @@ tcp_accept(struct sock *s)
 int
 tcp_read(struct sock *s, int user, uint64 addr, int n)
 {
-  static char bounce[512]; // guarded by netlock (copied out with it released)
-  char local[512];
+  char local[512]; // filled under netlock, copied out with it released
   acquire(&netlock);
   struct tcpcb *t = s->tcp;
   if (t == 0) {
@@ -791,7 +791,7 @@ tcp_read(struct sock *s, int user, uint64 addr, int n)
     }
     sleep_prepare(t);
     release(&netlock);
-    sleep();
+    sleep_intr();
     acquire(&netlock);
     if (s->tcp != t) {
       release(&netlock);
@@ -803,8 +803,7 @@ tcp_read(struct sock *s, int user, uint64 addr, int n)
   int total = 0;
   while (total < n && avail > 0) {
     uint32 chunk = MIN(MIN(n - total, avail), sizeof(local));
-    tring_peek(&t->rcv, t->rcv.r, bounce, chunk);
-    memmove(local, bounce, chunk);
+    tring_peek(&t->rcv, t->rcv.r, local, chunk);
     t->rcv.r += chunk;
     avail -= chunk;
     release(&netlock);
@@ -847,7 +846,7 @@ tcp_write(struct sock *s, int user, uint64 addr, int n)
       }
       sleep_prepare(t);
       release(&netlock);
-      sleep();
+      sleep_intr();
       acquire(&netlock);
       if (s->tcp != t) {
         release(&netlock);
@@ -898,4 +897,30 @@ tcp_close(struct sock *s)
     break;
   }
   release(&netlock);
+}
+
+// bytes the application can read, 1 if a write would not block, or -1
+// when the connection is gone. netlock is taken here; the caller must
+// not hold it.
+int
+tcp_ready(struct tcpcb *t, int write)
+{
+  if (t == 0)
+    return -1;
+  acquire(&netlock);
+  int r;
+  if (write) {
+    if (t->state == TCPS_CLOSED || t->state == TCPS_TIME_WAIT)
+      r = -1;
+    else if (t->state != TCPS_ESTABLISHED && t->state != TCPS_CLOSE_WAIT)
+      r = 0; // still connecting
+    else
+      r = tring_space(&t->snd) > 0;
+  } else {
+    r = tring_len(&t->rcv);
+    if (r == 0 && (t->rcv_fin || t->state == TCPS_CLOSED || t->state == TCPS_TIME_WAIT))
+      r = -1;
+  }
+  release(&netlock);
+  return r;
 }

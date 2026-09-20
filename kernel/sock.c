@@ -20,6 +20,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "errno.h"
 #include "fs.h"
 #include "file.h"
 #include "net.h"
@@ -34,14 +35,7 @@ static uint16 next_port = 49152;
 static int
 sock_fdalloc(struct file *f)
 {
-  struct proc *p = myproc();
-  for (int fd = 0; fd < NOFILE; fd++) {
-    if (p->ofile[fd] == 0) {
-      p->ofile[fd] = f;
-      return fd;
-    }
-  }
-  return -1;
+  return fdalloc(f);
 }
 
 void
@@ -178,7 +172,7 @@ wait_up(int timeout)
       return -1;
     sleep_prepare(&netcfg);
     if (!netcfg.up)
-      sleep();
+      sleep_intr();
   }
   return 0;
 }
@@ -189,7 +183,7 @@ static struct sock *
 fdsock(int fd, struct file **fp)
 {
   struct file *f;
-  if (fd < 0 || fd >= NOFILE || (f = myproc()->ofile[fd]) == 0 || f->type != FD_SOCK)
+  if ((f = fdget(myproc(), fd)) == 0 || f->type != FD_SOCK)
     return 0;
   if (fp)
     *fp = f;
@@ -342,7 +336,7 @@ sys_sendto(void)
       return -1;
     if (!net_policy_ok(dst, IPPROTO_ICMP, 0, 0)) {
       net_policy_dropped++;
-      return -2;
+      return -EACCES; // the egress policy refused it
     }
     return net_tx_icmp_echo(dst, s->lport, port, data, n) < 0 ? -1 : n;
   }
@@ -357,7 +351,7 @@ sys_sendto(void)
   }
   if (!net_policy_ok(dst, IPPROTO_UDP, port, 0)) {
     net_policy_dropped++;
-    return -2;
+    return -EACCES; // the egress policy refused it
   }
   struct mbuf *m = mbufalloc(MBUF_HEADROOM);
   if (m == 0)
@@ -397,7 +391,7 @@ sys_recvfrom(void)
     }
     sleep_prepare(s);
     release(&s->lock);
-    sleep();
+    sleep_intr();
     acquire(&s->lock);
   }
   struct mbuf *m = s->rxq;
@@ -448,7 +442,7 @@ sockread(struct sock *s, int user, uint64 addr, int n)
     }
     sleep_prepare(s);
     release(&s->lock);
-    sleep();
+    sleep_intr();
     acquire(&s->lock);
   }
   struct mbuf *m = s->rxq;
@@ -471,7 +465,7 @@ sockwrite(struct sock *s, int user, uint64 addr, int n)
     return -1;
   if (!net_policy_ok(s->rip, IPPROTO_UDP, s->rport, 0)) {
     net_policy_dropped++;
-    return -2;
+    return -EACCES; // the egress policy refused it
   }
   struct mbuf *m = mbufalloc(MBUF_HEADROOM);
   if (m == 0)
@@ -484,4 +478,25 @@ sockwrite(struct sock *s, int user, uint64 addr, int n)
   if (net_tx_udp(m, s->rip, s->lport, s->rport) < 0)
     return -1;
   return n;
+}
+
+// is this socket ready? bytes readable, 1 if writable, -1 on hangup.
+int
+sockready(struct sock *s, int write)
+{
+  if (s == 0)
+    return -1;
+  if (s->type == SOCK_STREAM)
+    return tcp_ready(s->tcp, write);
+  acquire(&s->lock);
+  int r;
+  if (write) {
+    r = 1;
+  } else {
+    r = s->rxq ? (int)s->rxq->len : 0;
+    if (r == 0 && s->closed)
+      r = -1;
+  }
+  release(&s->lock);
+  return r;
 }
