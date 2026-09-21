@@ -1,0 +1,22 @@
+# what init starts, and when.
+#
+#   id:runlevels:action:process
+#
+# the actions are sysinit, boot, bootwait, wait, once, respawn,
+# ctrlaltdel and powerfail; an empty runlevel field means every one.
+
+# before anything else: mounts, the hostname, the clock, the log
+si::sysinit:/etc/init.d/rcS
+
+# the services of the multi-user runlevel
+rc:2:wait:/etc/rc.d/rc 2
+
+# a shell on the console. this is a development machine and the console
+# is not a public terminal, so it is a shell rather than a getty asking
+# for a password; the line below it is what a machine with users on
+# terminals would have instead.
+sh:2:respawn:/bin/sh
+#1:2:respawn:/sbin/getty console
+
+# what to do when the keyboard asks for a reboot
+ca::ctrlaltdel:/sbin/shutdown -r now

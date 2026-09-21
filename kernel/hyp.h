@@ -261,6 +261,8 @@ struct vcpu {
 
 // ---- vm ----
 
+struct gendisk;
+
 struct vm {
   struct spinlock lock;
   int id;
@@ -268,6 +270,7 @@ struct vm {
   struct vmconfig cfg;    // how it was created
   uint64 entry;           // guest entry point
   struct inode *disk_ip;  // the disk image file, or 0
+  struct gendisk *disk;   // a whole block device given to the guest instead, or 0
   int nvcpu;
   int vcpus_running;      // vcpus whose host process is inside vm_run
   struct vcpu vcpu[NVCPU];
@@ -299,6 +302,7 @@ struct vm {
   int cons_detach_req;    // a detach was requested: the next read returns -1
 
   uint64 dtb_gpa;
+
 };
 
 extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used
@@ -306,6 +310,7 @@ extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used
 // hyp.c
 void hypinithart(void);
 struct vm *vm_lookup(int id);
+int vm_count(void);
 int vm_create(struct vmconfig *cfg);
 int vm_run(struct vm *vm, int vcpuid);
 int vm_destroy(struct vm *vm);

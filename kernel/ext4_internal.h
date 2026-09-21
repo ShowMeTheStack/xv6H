@@ -58,6 +58,20 @@ int ext4_alloc_blocks(struct ext4_fs *fs, uint64 goal, uint32 want, int prefill,
                       uint32 *got);
 int ext4_free_block(struct ext4_fs *fs, uint64 blkno);
 int ext4_alloc_inode(struct ext4_fs *fs, uint64 dirino, int is_dir, uint64 *out);
+
+// where one inode lives on the disk: the block that holds it and the
+// offset within that block. the attribute code needs it because what it
+// writes lives inside the inode, past the fields the driver keeps.
+int ext4_inode_place(struct ext4_fs *fs, uint64 ino, uint64 *blk, uint32 *off);
+
+// ---- extended attributes (ext4_xattr.c) ----
+int ext4_xattr_get(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino,
+                   const char *fullname, char *buf, int size);
+int ext4_xattr_set(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino,
+                   const char *fullname, const char *value, int vlen, int flags);
+int ext4_xattr_list(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, char *buf,
+                    int size);
+void ext4_xattr_drop(struct ext4_fs *fs, uint64 ino);
 int ext4_free_inode(struct ext4_fs *fs, uint64 ino, int is_dir);
 
 // ---- hash-indexed directories (ext4_htree.c) ----

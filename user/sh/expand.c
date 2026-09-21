@@ -722,12 +722,22 @@ expand_braced(const char *spec, int *is_at_out)
 // when `fields` is given, $@ and an unquoted expansion may split into
 // more than one field, and the splitting happens here.
 
+// "$@" with no positional parameters expands to no fields at all, not
+// to one empty one -- so a word that is nothing but "$@" disappears.
+// the caller needs to know that happened, because an empty word it
+// built for any other reason is a real, empty argument.
+static int at_expanded_empty;
+
 static void
 add_arg_fields(struct buf *out, struct wordlist *fields, int in_quotes, int is_at)
 {
   const char *ifs = var_get("IFS");
   char sep = (ifs && *ifs) ? ifs[0] : ' ';
 
+  if (is_at && in_quotes && nscript_args == 0) {
+    at_expanded_empty = 1;
+    return;
+  }
   if (is_at && in_quotes && fields) {
     // "$@" is one field per argument, however they are spelled
     for (int i = 0; i < nscript_args; i++) {
@@ -745,6 +755,48 @@ add_arg_fields(struct buf *out, struct wordlist *fields, int in_quotes, int is_a
       buf_add(out, sep, in_quotes);
     buf_addstr(out, script_args[i], in_quotes);
   }
+}
+
+// the closing parenthesis of a $( ) or a $(( )), found by counting
+// the ones that are really nesting. a parenthesis inside quotes or
+// behind a backslash is a character in a word, not a bracket -- so
+// `$(grep -c 'a(' file)` has to end at the last one and not at the
+// one in the pattern.
+//
+// the quoting that matters is the quoting inside the substitution,
+// not the quoting around it: the body of a $( ) is parsed as a
+// command of its own, and an expansion happens inside double quotes
+// as readily as outside them. so the `quoted` array the caller
+// carries -- which says what was in quotes in the enclosing word --
+// is deliberately not consulted here.
+static int
+find_close_paren(const char *text, int len, int start)
+{
+  int depth = 0;
+
+  for (int j = start; j < len; j++) {
+    if (text[j] == '\\' && j + 1 < len) {
+      j++;
+      continue;
+    }
+    if (text[j] == '\'' || text[j] == '"') {
+      int qc = text[j];
+      for (j++; j < len; j++) {
+        if (qc == '"' && text[j] == '\\' && j + 1 < len) {
+          j++;
+          continue;
+        }
+        if (text[j] == qc)
+          break;
+      }
+      continue;
+    }
+    if (text[j] == '(')
+      depth++;
+    else if (text[j] == ')' && --depth == 0)
+      return j;
+  }
+  return len;
 }
 
 static void
@@ -810,13 +862,7 @@ expand_into(struct buf *out, const char *text, const char *quoted, int len, stru
     int next = (unsigned char)text[i + 1];
     if (next == '(' && i + 2 < len && text[i + 2] == '(') {
       // $((expression))
-      int depth = 0, j = i + 1;
-      for (; j < len; j++) {
-        if (text[j] == '(')
-          depth++;
-        else if (text[j] == ')' && --depth == 0)
-          break;
-      }
+      int j = find_close_paren(text, len, i + 1);
       int inner_start = i + 3, inner_len = j - 1 - inner_start;
       if (inner_len < 0)
         inner_len = 0;
@@ -835,18 +881,14 @@ expand_into(struct buf *out, const char *text, const char *quoted, int len, stru
       free(inner);
       free(qz);
       buf_free(&eb);
-      i = j + 1; // past the second )
+      // j is the second ')'; the loop's own i++ moves past it, and
+      // adding one here as well ate the character after $(( ))
+      i = j;
       continue;
     }
     if (next == '(') {
       // $(command)
-      int depth = 0, j = i + 1;
-      for (; j < len; j++) {
-        if (text[j] == '(')
-          depth++;
-        else if (text[j] == ')' && --depth == 0)
-          break;
-      }
+      int j = find_close_paren(text, len, i + 1);
       int inner_start = i + 2, inner_len = j - inner_start;
       if (inner_len < 0)
         inner_len = 0;
@@ -1037,6 +1079,7 @@ expand_word_list(struct word *w, struct wordlist *out, int for_assign)
     struct buf b;
     buf_init(&b);
     int before = out->n;
+    at_expanded_empty = 0;
     expand_into(&b, w->text, w->quoted, w->len, for_assign ? 0 : out, 0);
     buf_add(&b, 0, 0);
     b.len--;
@@ -1059,8 +1102,9 @@ expand_word_list(struct word *w, struct wordlist *out, int for_assign)
     }
 
     // an unquoted expansion that produced nothing at all disappears,
-    // unless the word had other text in it
-    if (b.len == 0 && out->n > before) {
+    // unless the word had other text in it -- and so does a word that
+    // was only a "$@" with nothing in it
+    if (b.len == 0 && (out->n > before || at_expanded_empty)) {
       buf_free(&b);
       continue;
     }

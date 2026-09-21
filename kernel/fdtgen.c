@@ -426,7 +426,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   int off_strings = off_struct + w.stpos;
   int total = off_strings + w.sspos;
   if (w.err || total > max) {
-    printk("hyp: guest device tree too large (%d bytes, max %d)\n", total, max);
+    printk("hyp: guest device tree will not fit (error %d, %d bytes, max %d)\n", w.err, total, max);
     kfree(stpage);
     kfree(sspage);
     return -1;

@@ -17,7 +17,7 @@ main(int argc, char *argv[])
     fprintf(stderr, "cp: cannot open %s\n", argv[1]);
     exit(1);
   }
-  int out = open(argv[2], O_WRONLY | O_CREATE | O_TRUNC);
+  int out = open(argv[2], O_WRONLY | O_CREATE | O_TRUNC, 0666);
   if (out < 0) {
     fprintf(stderr, "cp: cannot create %s\n", argv[2]);
     exit(1);

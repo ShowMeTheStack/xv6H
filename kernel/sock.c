@@ -46,6 +46,41 @@ sockinit(void)
     initlock(&socks[i].lock, "sock");
 }
 
+// walk the socket table for /proc/net/tcp and /proc/net/udp. each
+// socket's own lock is taken in turn rather than one lock over the
+// whole walk, so a busy connection is not held up by a reader.
+void
+sock_walk(void (*fn)(const struct sockinfo *si, void *arg), void *arg)
+{
+  for (int i = 0; i < NSOCK; i++) {
+    struct sock *s = &socks[i];
+    struct sockinfo si;
+
+    acquire(&s->lock);
+    if (s->type == SOCK_NONE) {
+      release(&s->lock);
+      continue;
+    }
+    memset(&si, 0, sizeof(si));
+    si.index = i;
+    si.type = s->type;
+    si.lip = s->lip;
+    si.rip = s->rip;
+    si.lport = s->lport;
+    si.rport = s->rport;
+    si.rxcount = s->rxcount;
+    si.closed = s->closed;
+    si.state = -1;
+    if (s->type == SOCK_STREAM && s->tcp) {
+      si.state = s->tcp->state;
+      si.rxbytes = s->tcp->rcv.w - s->tcp->rcv.r;
+      si.txbytes = s->tcp->snd.w - s->tcp->snd.r;
+    }
+    release(&s->lock);
+    fn(&si, arg);
+  }
+}
+
 static struct sock *
 sockalloc(int type)
 {
@@ -58,6 +93,9 @@ sockalloc(int type)
       s->lport = s->rport = 0;
       s->rxq = 0;
       s->rxcount = 0;
+      s->ttl = 0;
+      s->want_errors = 0;
+      s->deadline = 0;
       s->tcp = 0;
       s->closed = 0;
       s->id = i;
@@ -158,6 +196,68 @@ sock_icmp_rx(struct mbuf *m, uint32 src, uint16 id)
     }
   }
   return -1;
+}
+
+// an ICMP error about a packet this machine sent. it is delivered as
+// an empty datagram whose `port` carries the sequence number of the
+// probe and, above it, the ICMP type -- an echo reply is type zero,
+// so a program that does not care about errors never sees one and a
+// program that does can tell them apart.
+int
+sock_icmp_error(uint32 src, int type, int code, uint16 id, uint16 seq)
+{
+  (void)code;
+  for (int i = 0; i < NSOCK; i++) {
+    struct sock *s = &socks[i];
+    if (s->type != SOCK_ICMP || s->lport != id || !s->want_errors)
+      continue;
+    struct mbuf *m = mbufalloc(MBUF_HEADROOM);
+    if (m == 0)
+      return -1;
+    m->arg = src;
+    m->arg16 = seq;
+    m->arg_type = type;
+    return sock_enqueue(s, m);
+  }
+  return -1;
+}
+
+// the same for a UDP socket, named by the source port of the packet
+// the error is about
+int
+sock_udp_error(uint32 src, int type, int code, uint16 sport)
+{
+  (void)code;
+  for (int i = 0; i < NSOCK; i++) {
+    struct sock *s = &socks[i];
+    if (s->type != SOCK_DGRAM || s->lport != sport || !s->want_errors)
+      continue;
+    struct mbuf *m = mbufalloc(MBUF_HEADROOM);
+    if (m == 0)
+      return -1;
+    m->arg = src;
+    m->arg16 = 0;
+    m->arg_type = type;
+    return sock_enqueue(s, m);
+  }
+  return -1;
+}
+
+// wake any socket whose receive has waited long enough. called once a
+// tick; the loop is over thirty-two slots and only runs at all while
+// something is waiting, which costs nothing worth measuring.
+void
+sock_timer(void)
+{
+  for (int i = 0; i < NSOCK; i++) {
+    struct sock *s = &socks[i];
+    if (s->deadline == 0)
+      continue;
+    acquire(&s->lock);
+    if (s->deadline != 0 && (int)(ticks - s->deadline) >= 0)
+      wakeup(s);
+    release(&s->lock);
+  }
 }
 
 // wait for the interface to be configured (at most timeout ticks).
@@ -338,7 +438,7 @@ sys_sendto(void)
       net_policy_dropped++;
       return -EACCES; // the egress policy refused it
     }
-    return net_tx_icmp_echo(dst, s->lport, port, data, n) < 0 ? -1 : n;
+    return net_tx_icmp_echo(dst, s->lport, port, data, n, s->ttl) < 0 ? -1 : n;
   }
   if (s->type != SOCK_DGRAM)
     return -1;
@@ -361,7 +461,7 @@ sys_sendto(void)
     mbuffree(m);
     return -1;
   }
-  if (net_tx_udp(m, dst, s->lport, port) < 0)
+  if (net_tx_udp(m, dst, s->lport, port, s->ttl) < 0)
     return -1;
   return n;
 }
@@ -384,8 +484,14 @@ sys_recvfrom(void)
 
   uint t0 = ticks;
   acquire(&s->lock);
+  // a timeout has to be able to fire on its own: nothing else will
+  // wake this sleeper when the answer never comes, so the tick hand
+  // is told to look at this socket (see sock_timer).
+  s->deadline = timeout ? t0 + (uint)timeout : 0;
   while (s->rxq == 0) {
-    if (killed(myproc()) || (timeout && ticks - t0 >= (uint)timeout)) {
+    if (killed(myproc()) || signal_pending(myproc()) ||
+        (timeout && ticks - t0 >= (uint)timeout)) {
+      s->deadline = 0;
       release(&s->lock);
       return -1;
     }
@@ -394,6 +500,7 @@ sys_recvfrom(void)
     sleep_intr();
     acquire(&s->lock);
   }
+  s->deadline = 0;
   struct mbuf *m = s->rxq;
   s->rxq = m->next;
   s->rxcount--;
@@ -403,7 +510,9 @@ sys_recvfrom(void)
   if (either_copyout(1, buf, m->head, len) < 0)
     len = -1;
   uint32 src = m->arg;
-  int sport = m->arg16;
+  // an ICMP error puts its type above the sequence number, so that one
+  // call can hand back both what answered and what it said
+  int sport = m->arg16 | ((int)m->arg_type << 16);
   mbuffree(m);
   if (len < 0)
     return -1;
@@ -412,6 +521,37 @@ sys_recvfrom(void)
   if (portp && either_copyout(1, portp, &sport, 4) < 0)
     return -1;
   return len;
+}
+
+// sockopt(fd, option, value): the few knobs a socket here has
+uint64
+sys_sockopt(void)
+{
+  int fd, opt, value;
+
+  argint(0, &fd);
+  argint(1, &opt);
+  argint(2, &value);
+  struct sock *s = fdsock(fd, 0);
+  if (s == 0)
+    return -EBADF;
+  acquire(&s->lock);
+  int r = 0;
+  switch (opt) {
+  case SO_TTL:
+    if (value < 0 || value > 255)
+      r = -EINVAL;
+    else
+      s->ttl = value;
+    break;
+  case SO_ICMP_ERRORS:
+    s->want_errors = value != 0;
+    break;
+  default:
+    r = -ENOPROTOOPT;
+  }
+  release(&s->lock);
+  return r;
 }
 
 uint64
@@ -475,7 +615,7 @@ sockwrite(struct sock *s, int user, uint64 addr, int n)
     mbuffree(m);
     return -1;
   }
-  if (net_tx_udp(m, s->rip, s->lport, s->rport) < 0)
+  if (net_tx_udp(m, s->rip, s->lport, s->rport, s->ttl) < 0)
     return -1;
   return n;
 }

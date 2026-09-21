@@ -174,7 +174,7 @@ plat_entropy(br_ssl_engine_context *eng)
 static int
 plat_open_out(const char *path)
 {
-  return open(path, O_WRONLY | O_CREATE | O_TRUNC);
+  return open(path, O_WRONLY | O_CREATE | O_TRUNC, 0666);
 }
 #endif
 

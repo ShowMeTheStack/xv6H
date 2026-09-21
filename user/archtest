@@ -1,0 +1,173 @@
+#!/bin/sh
+# tar and gzip: that a tree survives the round trip, that the archive
+# is really ustar, and that we read what GNU tar and GNU gzip wrote.
+
+passed=0
+failed=0
+
+check() {
+	# check NAME EXPECTED ACTUAL
+	if [ "$2" = "$3" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		echo "FAIL $1: wanted [$2] got [$3]"
+	fi
+}
+
+# a run of one character, built rather than typed: the reference
+# archives use names of an exact length, and a literal here drifts
+rep() {
+	# rep CHAR COUNT
+	i=0
+	s=
+	while [ $i -lt $2 ]; do
+		s="$s$1"
+		i=$((i + 1))
+	done
+	echo "$s"
+}
+
+tmp=/tmp/archtest
+rm -rf $tmp
+mkdir -p $tmp/tree/sub
+cd $tmp
+
+printf 'hello\n' > tree/a
+printf 'second file\nwith two lines\n' > tree/sub/b
+ln -s ../a tree/sub/link
+mkdir tree/emptydir
+chmod 751 tree/sub
+# something long enough to be worth compressing, and compressible
+i=0
+while [ $i -lt 200 ]; do
+	echo "line $i of the repetitive file" >> tree/big
+	i=$((i + 1))
+done
+
+# ---- gzip on its own ----
+
+cp tree/big g1
+gzip g1
+check gz_replaced '' "$(ls g1 2>/dev/null)"
+check gz_made g1.gz "$(ls g1.gz)"
+gunzip g1.gz
+check gz_back "$(cat tree/big)" "$(cat g1)"
+check gz_gone '' "$(ls g1.gz 2>/dev/null)"
+
+gzip -c tree/big > g2.gz
+check gz_c_kept ok "$(test -f tree/big && echo ok)"
+check gz_zcat "$(cat tree/big)" "$(zcat g2.gz)"
+check gz_smaller smaller "$(a=$(wc -c < tree/big); b=$(wc -c < g2.gz); \
+	if [ $b -lt $a ]; then echo smaller; fi)"
+
+# the magic bytes, so that a file we make is a gzip file to anyone
+check gz_magic 1f8b "$(od -A n -t x1 -N 2 g2.gz | tr -d ' ')"
+
+# a byte that is not there cannot come back
+printf '' | gzip | gunzip > g3
+check gz_empty 0 "$(wc -c < g3)"
+
+# every byte value, not just text
+od -A n -t x1 /bin/cat > bin1
+gzip -c bin1 | gunzip > bin2
+check gz_binary same "$(cmp -s bin1 bin2 && echo same)"
+
+# a damaged file is refused rather than half-written
+gzip -c tree/big > g4.gz
+printf 'X' | dd of=g4.gz bs=1 seek=40 conv=notrunc 2>/dev/null
+check gz_damaged bad "$(gunzip -c g4.gz > /dev/null 2>&1 || echo bad)"
+
+# ---- tar ----
+
+tar cf t1.tar tree
+check tar_made ok "$(test -f t1.tar && echo ok)"
+
+# ustar magic lives at offset 257 of the first header
+check tar_ustar 7573746172 "$(od -A n -t x1 -j 257 -N 5 t1.tar | tr -d ' ')"
+
+# a tar's length is always a multiple of 512
+check tar_blocked 0 "$(($(wc -c < t1.tar) % 512))"
+
+check tar_t_a tree/a "$(tar tf t1.tar | grep '^tree/a$')"
+check tar_t_sub tree/sub/b "$(tar tf t1.tar | grep '^tree/sub/b$')"
+check tar_t_dir tree/emptydir/ "$(tar tf t1.tar | grep emptydir)"
+
+mkdir out1
+tar xf t1.tar -C out1
+check tar_x_a hello "$(cat out1/tree/a)"
+check tar_x_b "$(cat tree/sub/b)" "$(cat out1/tree/sub/b)"
+check tar_x_big "$(cat tree/big)" "$(cat out1/tree/big)"
+check tar_x_dir ok "$(test -d out1/tree/emptydir && echo ok)"
+check tar_x_link ../a "$(readlink out1/tree/sub/link)"
+check tar_x_deref hello "$(cat out1/tree/sub/link)"
+check tar_x_mode 751 "$(stat -c %a out1/tree/sub)"
+
+# ---- tar and gzip together ----
+
+tar czf t2.tar.gz tree
+check targz_smaller smaller "$(a=$(wc -c < t1.tar); b=$(wc -c < t2.tar.gz); \
+	if [ $b -lt $a ]; then echo smaller; fi)"
+check targz_magic 1f8b "$(od -A n -t x1 -N 2 t2.tar.gz | tr -d ' ')"
+mkdir out2
+tar xzf t2.tar.gz -C out2
+check targz_x_a hello "$(cat out2/tree/a)"
+check targz_x_big "$(cat tree/big)" "$(cat out2/tree/big)"
+check targz_t tree/sub/b "$(tar tzf t2.tar.gz | grep '^tree/sub/b$')"
+
+# ---- archives made elsewhere ----
+# /usr/share/archtest holds archives written by an implementation that
+# is not ours, so reading them is a check against the real format and
+# not against our own opinion of it.
+
+share=/usr/share/archtest
+
+# ustar, including a name that only fits by using the prefix field
+mkdir out3
+tar xzf $share/ref.tar.gz -C out3
+check ref_file 'a file from GNU tar' "$(cat out3/ref/greeting)"
+check ref_nested nested "$(cat out3/ref/deep/down/here)"
+check ref_prefix 'the prefix field works' "$(cat out3/ref/$(cat out3/ref/longname))"
+check ref_list ref/greeting "$(tar tzf $share/ref.tar.gz | grep '^ref/greeting$')"
+check ref_symlink greeting "$(readlink out3/ref/pointer)"
+check ref_mode 755 "$(stat -c %a out3/ref/executable)"
+
+# pax extended headers, which is what a modern tar writes
+Z=$(rep z 130)
+Y=$(rep y 130)
+mkdir out4
+tar xzf $share/pax.tar.gz -C out4
+check pax_plain 'an ordinary member beside it' "$(cat out4/pax/plain)"
+check pax_long 'a pax extended header named this' "$(cat out4/pax/$Z)"
+check pax_linkpath plain "$(readlink out4/pax/$Y)"
+
+# GNU's own long-name blocks
+W=$(rep w 130)
+mkdir out5
+tar xzf $share/gnu.tar.gz -C out5
+check gnu_plain 'an ordinary member beside it' "$(cat out5/gnu/plain)"
+check gnu_long 'a GNU LongLink named this' "$(cat out5/gnu/$W)"
+
+# deflate at every level: stored blocks, fixed trees and dynamic ones
+for lvl in 0 1 6 9; do
+	check "gz_level$lvl" "$(cat $share/levels.txt | wc -c)" \
+		"$(zcat $share/level$lvl.gz | wc -c)"
+	check "gz_level${lvl}_same" same \
+		"$(zcat $share/level$lvl.gz > lv; cmp -s lv $share/levels.txt && echo same)"
+done
+
+# ---- a member must not be able to write outside the directory ----
+
+tar xf $share/evil.tar -C out1 > escape.out 2>&1
+check tar_escape refused "$(grep refusing escape.out > /dev/null && echo refused)"
+check tar_escape_clean ok "$(test ! -f /tmp/pwned && echo ok)"
+# the members that were not trying anything are still extracted
+check tar_escape_rest 'this one is fine' "$(cat out1/innocent)"
+
+cd /
+rm -rf $tmp
+echo "archtest: $((passed + failed)) checks, $failed failures"
+if [ "$failed" = "0" ]; then
+	exit 0
+fi
+exit 1

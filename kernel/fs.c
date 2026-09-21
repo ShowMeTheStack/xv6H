@@ -157,6 +157,10 @@ iget(uint dev, uint inum)
   ip->ops = 0;
   ip->sb = 0;
   ip->fsdata = 0;
+  // the chattr flags belong to the file that used to be here; a file
+  // system that has no such thing never sets them, so leaving them
+  // would make some later file immutable at random
+  ip->attr = 0;
   release(&itable.lock);
 
   return ip;
@@ -266,6 +270,14 @@ stati(struct inode *ip, struct stat *st)
   st->type = ip->type;
   st->nlink = ip->nlink;
   st->size = ip->size;
+  st->mode = ip->mode;
+  st->uid = ip->uid;
+  st->gid = ip->gid;
+  st->atime = ip->atime;
+  st->mtime = ip->mtime;
+  st->ctime = ip->ctime;
+  st->blocks = (ip->size + 511) / 512;
+  st->rdev = ip->type == T_DEVICE ? ((ip->major << 8) | (ip->minor & 0xff)) : 0;
 }
 
 // Directories
@@ -339,16 +351,39 @@ cross_mount(struct inode *ip)
   return ip;
 }
 
+// how many symbolic links one path may go through before the kernel
+// decides they lead in a circle. Linux allows forty.
+#define SYMLINK_MAX 16
+
+// walk a path. `nofollow` says the last element is not followed if it
+// turns out to be a symbolic link, which is what lstat and O_NOFOLLOW
+// want; everything before the last is always followed, because a
+// symbolic link in the middle of a path is a directory or nothing.
+// the walk itself. `myroot` is what "/" means for this process, or
+// zero for the file system's own root; it is borrowed, not owned, so
+// that the recursion a symbolic link causes does not have to look it
+// up again or give it back.
 static struct inode *
-namex(char *path, int nameiparent, char *name)
+namex_root(struct inode *start, char *path, int nameiparent, int nofollow, char *name,
+           struct inode *myroot)
 {
   struct inode *ip, *next;
+  char buf[MAXPATH], target[MAXPATH];
+  int links = 0;
 
   if (*path == '/') {
-    struct super *rsb = vfs_root_super();
-    if (rsb == 0 || rsb->root == 0)
-      panic("namex: no root file system");
-    ip = idup(rsb->root);
+    if (myroot) {
+      ip = idup(myroot);
+    } else {
+      struct super *rsb = vfs_root_super();
+      if (rsb == 0 || rsb->root == 0)
+        panic("namex: no root file system");
+      ip = idup(rsb->root);
+    }
+    if (start)
+      iput(start);
+  } else if (start) {
+    ip = start;
   } else {
     ip = proc_cwd(myproc());
   }
@@ -369,11 +404,80 @@ namex(char *path, int nameiparent, char *name)
       iunlock(ip);
       return ip;
     }
+
+    // ".." at the process's own root stays there: a process that has
+    // been put in a subtree cannot climb out of it by asking for its
+    // parent, which is the whole point of chroot.
+    if (namecmp(name, "..") == 0 && myroot && ip->dev == myroot->dev &&
+        ip->inum == myroot->inum) {
+      iunlock(ip);
+      continue;
+    }
+    // ".." out of the root of a mounted file system is the parent of
+    // the directory it covers, not the file system's own root looking
+    // at itself.
+    if (namecmp(name, "..") == 0) {
+      struct super *msb = vfs_root_of(ip);
+      if (msb && msb->covered) {
+        struct inode *cov = idup(msb->covered);
+        iunlockput(ip);
+        ip = cov;
+        ilock(ip);
+      }
+    }
+    // every directory on the way has to be one this process may search
+    if (inode_permitted(ip, 1) < 0) {
+      iunlockput(ip);
+      return 0;
+    }
     if ((next = dirlookup(ip, name, 0)) == 0) {
       iunlockput(ip);
       return 0;
     }
-    iunlockput(ip);
+    iunlock(ip); // still held: a relative link starts from here
+
+    // a symbolic link stands for what it names. the last element is
+    // left alone when the caller asked for it to be.
+    ilock(next);
+    int islink = next->type == T_SYMLINK;
+    iunlock(next);
+    if (islink && !(nofollow && *path == '\0')) {
+      int n;
+
+      if (++links > SYMLINK_MAX) {
+        iput(next);
+        iput(ip);
+        return 0;
+      }
+      ilock(next);
+      n = next->ops && next->ops->readlink ? next->ops->readlink(next, target, sizeof(target) - 1)
+                                           : -1;
+      iunlockput(next);
+      if (n <= 0 || n >= (int)sizeof(target)) {
+        iput(ip);
+        return 0;
+      }
+      target[n] = 0;
+
+      // the rest of the path is appended to what the link names, and
+      // the walk starts again from there: from the root if the target
+      // is absolute, from this directory if it is not.
+      if (strlen(target) + strlen(path) + 2 > sizeof(buf)) {
+        iput(ip);
+        return 0;
+      }
+      safestrcpy(buf, target, sizeof(buf));
+      if (*path) {
+        int len = strlen(buf);
+        buf[len++] = '/';
+        safestrcpy(buf + len, path, sizeof(buf) - len);
+      }
+      // namex_at takes the reference to ip: it is the directory a
+      // relative target is resolved from, and it releases it.
+      return namex_root(ip, buf, nameiparent, nofollow, name, myroot);
+    }
+
+    iput(ip);
     ip = cross_mount(next);
   }
   if (nameiparent) {
@@ -381,6 +485,41 @@ namex(char *path, int nameiparent, char *name)
     return 0;
   }
   return ip;
+}
+
+static struct inode *
+namex_at(struct inode *start, char *path, int nameiparent, int nofollow, char *name)
+{
+  struct inode *myroot = proc_root(myproc());
+  struct inode *ip = namex_root(start, path, nameiparent, nofollow, name, myroot);
+
+  if (myroot)
+    iput(myroot);
+  return ip;
+}
+
+static struct inode *
+namex(char *path, int nameiparent, char *name)
+{
+  return namex_at(0, path, nameiparent, 0, name);
+}
+
+// the same, but a symbolic link named by the last element is returned
+// as itself rather than followed: lstat and O_NOFOLLOW.
+struct inode *
+namei_nofollow(char *path)
+{
+  char name[DIRSIZ];
+
+  return namex_at(0, path, 0, 1, name);
+}
+
+// a path resolved from a directory that is not the current one: the
+// *at family hands in the directory it was given.
+struct inode *
+namei_from(struct inode *dir, char *path, int nameiparent, int nofollow, char *name)
+{
+  return namex_at(dir, path, nameiparent, nofollow, name);
 }
 
 struct inode *
@@ -433,6 +572,15 @@ itrunc(struct inode *ip)
 {
   if (ip->ops && ip->ops->trunc)
     ip->ops->trunc(ip);
+}
+
+// set a file's length, when the file system it is on can do it
+int
+isetsize(struct inode *ip, uint64 len)
+{
+  if (ip->ops == 0 || ip->ops->setsize == 0)
+    return -ENOTSUP;
+  return ip->ops->setsize(ip, len);
 }
 
 void

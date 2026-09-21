@@ -101,6 +101,12 @@ entry("accept");
 entry("sendto");
 entry("recvfrom");
 entry("netinfo");
+entry("sockopt");
+entry("setpriority");
+# a nice value may be negative, and the stubs read a negative return
+# as -errno; the kernel hands back 20 - nice and the library turns
+# it round, which is exactly what Linux and glibc do between them
+entry("__getpriority", "getpriority");
 entry("vm_run");
 entry("vm_destroy");
 entry("vm_cons");
@@ -117,6 +123,45 @@ entry("umount");
 entry("getdents");
 entry("statfs");
 entry("fsync");
+entry("symlink");
+entry("readlink");
+entry("rename");
+entry("fstatat");
+entry("readlinkat");
+entry("unlinkat");
+entry("faccessat");
+entry("openat");
+entry("mkdirat");
+entry("renameat");
+entry("linkat");
+entry("symlinkat");
+entry("__setxattr", "setxattr");
+entry("__getxattr", "getxattr");
+entry("__listxattr", "listxattr");
+entry("__removexattr", "removexattr");
+entry("getuid");
+entry("geteuid");
+entry("getgid");
+entry("getegid");
+entry("setuid");
+entry("setgid");
+entry("setresuid");
+entry("setresgid");
+entry("getresuid");
+entry("getresgid");
+entry("__getgroups", "getgroups");
+entry("__setgroups", "setgroups");
+entry("capget");
+entry("capset");
+entry("__chmod", "chmod");
+entry("__fchmod", "fchmod");
+entry("__fchmodat", "fchmodat");
+entry("__chown", "chown");
+entry("__fchown", "fchown");
+entry("__fchownat", "fchownat");
+entry("chroot");
+entry("reboot");
+entry("ptrace");
 
 # the shared tail: a negative return that looks like -errno becomes -1
 # with errno set; anything else is passed through.

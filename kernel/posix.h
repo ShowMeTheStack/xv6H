@@ -79,11 +79,19 @@ struct rusage {
 
 // ioctl requests
 #define FIONREAD   0x541B
+// the flags chattr and lsattr read and write; the numbers are Linux's
+#define FS_IOC_GETFLAGS 0x80086601
+#define FS_IOC_SETFLAGS 0x40086602
 #define TIOCGWINSZ 0x5413
 #define TIOCSWINSZ 0x5414
 struct winsize {
   unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel;
 };
+
+// reboot(2): what to do
+#define XV6_REBOOT_HALT     0
+#define XV6_REBOOT_POWEROFF 1
+#define XV6_REBOOT_RESTART  2
 
 // mount flags
 #define MS_RDONLY   1
@@ -113,6 +121,11 @@ struct statfs {
   uint64 f_ffree;
   uint64 f_namelen;
 };
+
+// setpriority(2) and getpriority(2): which set of processes is meant
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
 
 // the auxiliary vector exec leaves above the environment
 #define AT_NULL   0

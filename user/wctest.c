@@ -537,7 +537,7 @@ test_spawn(void)
                                             O_CREATE | O_WRONLY | O_TRUNC, 0666),
            0);
   char *argv[] = {"echo", "spawned", 0};
-  CHECKINT(posix_spawn(&pid, "/echo", &fa, 0, argv, environ), 0);
+  CHECKINT(posix_spawn(&pid, "/bin/echo", &fa, 0, argv, environ), 0);
   CHECK(waitpid(pid, &st, 0) == pid);
   CHECK(WIFEXITED(st));
   CHECKINT(WEXITSTATUS(st), 0);

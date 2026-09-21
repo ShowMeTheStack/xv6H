@@ -1,3 +1,4 @@
+#include "cred.h"
 #include "signal.h"
 // Saved registers for kernel context switches.
 struct context {
@@ -126,6 +127,10 @@ struct fsinfo {
   struct spinlock lock;
   int ref;
   struct inode *cwd;
+  // the directory "/" means for this process. zero is the file
+  // system's own root; chroot(2) makes it something else, and a path
+  // walk that reaches it cannot go further up.
+  struct inode *root;
 };
 
 // Per-process state
@@ -158,6 +163,18 @@ struct proc {
   int pgid, sid;         // process group and session
   int tty;               // controlling terminal (0: none)
   int stopped_sig;       // the signal that stopped it, 0 when running
+  // set between marking itself STOPPED and actually switching away.
+  // in that window the process is still running on its own hart, so
+  // whoever wakes it must not also put it on the run queue.
+  int stop_parked;
+
+  // ptrace: a process is watched by its own parent and by nobody
+  // else. `traced` is set by PTRACE_TRACEME, `trace_wants_stop` by
+  // PTRACE_SYSCALL, and `trace_at_exit` remembers that the stop on
+  // the way in has happened so that the one on the way out follows.
+  int traced;
+  int trace_wants_stop;
+  int trace_at_exit;
 
   // signals (per thread once threads arrive; per process for now)
   struct sighand *sighand;
@@ -176,6 +193,15 @@ struct proc {
   uint64 cutime, cstime; // ... by reaped children
   uint64 minflt, majflt; // page faults served without and with I/O
   int umask;
+  struct cred cred;      // who this process is (cred.h)
+  // the nice value, -20 (most of the processor) to 19 (least), as
+  // setpriority(2) sets it and nice(1) asks for. it is inherited by
+  // fork and kept across exec. the scheduler does not weight by it
+  // yet -- that arrives with the fair scheduler of section 6 -- so
+  // for now it is state that is faithfully kept and reported rather
+  // than acted upon, which is what lets nice, renice, ps and top be
+  // written and tested against it.
+  int nice;
 
   // proc_lock (proc.c) must be held when using these:
   struct proc *all_next, *all_prev; // every live process

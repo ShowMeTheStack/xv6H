@@ -1,0 +1,7 @@
+# things this machine does on a schedule.
+#
+#   minute hour day-of-month month day-of-week user command
+#
+# the log files are rotated once a day, so that a machine left running
+# does not fill its disk with what it said.
+0 4 * * * root /etc/cron.d/rotate-logs

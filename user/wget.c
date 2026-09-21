@@ -1,4 +1,9 @@
-// wget URL [file]: fetch http://host[:port]/path; print the body, or save it.
+// wget: fetch http://host[:port]/path.
+//
+//   wget URL [FILE]      save it, or print it with -O -
+//   -O FILE              where to put it ("-" is standard output)
+//   -q                   say nothing but the body
+//   -S                   print the response header
 #include "kernel/types.h"
 #include "kernel/stat.h"
 #include "kernel/fcntl.h"
@@ -8,26 +13,41 @@
 int
 main(int argc, char *argv[])
 {
-  if (argc < 2) {
-    fprintf(stderr, "usage: wget http://host[:port]/path [file]\n");
+  const char *outfile = 0;
+  int quiet = 0, show_header = 0, i = 1;
+
+  for (; i < argc && argv[i][0] == '-' && argv[i][1]; i++) {
+    if (strcmp(argv[i], "-O") == 0 && i + 1 < argc)
+      outfile = argv[++i];
+    else if (strcmp(argv[i], "-q") == 0)
+      quiet = 1;
+    else if (strcmp(argv[i], "-S") == 0)
+      show_header = 1;
+    else {
+      fprintf(stderr, "usage: wget [-q] [-S] [-O FILE] http://host[:port]/path [FILE]\n");
+      exit(1);
+    }
+  }
+  if (i >= argc) {
+    fprintf(stderr, "usage: wget [-q] [-S] [-O FILE] http://host[:port]/path [FILE]\n");
     exit(1);
   }
-  char *url = argv[1];
+  char *url = argv[i++];
   if (memcmp(url, "http://", 7) != 0) {
     fprintf(stderr, "wget: only http:// urls (use https for TLS)\n");
     exit(1);
   }
   char host[128], *path;
   char *h = url + 7;
-  int i = 0;
-  while (h[i] && h[i] != '/' && h[i] != ':' && i < 127) {
-    host[i] = h[i];
-    i++;
+  int k = 0;
+  while (h[k] && h[k] != '/' && h[k] != ':' && k < 127) {
+    host[k] = h[k];
+    k++;
   }
-  host[i] = 0;
+  host[k] = 0;
   int port = 80;
-  if (h[i] == ':')
-    port = atoi(h + i + 1);
+  if (h[k] == ':')
+    port = atoi(h + k + 1);
   path = strchr(h, '/');
   if (path == 0)
     path = "/";
@@ -47,10 +67,11 @@ main(int argc, char *argv[])
     exit(1);
   }
   int out = 1;
-  if (argc > 2) {
-    out = open(argv[2], O_WRONLY | O_CREATE | O_TRUNC);
+  const char *dest = outfile ? outfile : (i < argc ? argv[i] : 0);
+  if (dest && strcmp(dest, "-") != 0) {
+    out = open(dest, O_WRONLY | O_CREATE | O_TRUNC, 0666);
     if (out < 0) {
-      fprintf(stderr, "wget: cannot create %s\n", argv[2]);
+      fprintf(stderr, "wget: cannot create %s\n", dest);
       exit(1);
     }
   }
@@ -79,7 +100,10 @@ main(int argc, char *argv[])
         continue;
       header_done = 1;
       status = atoi(hdr + 9);
-      fprintf(stderr, "wget: %s:%d%s -> HTTP %d\n", host, port, path, status);
+      if (show_header)
+        fprintf(stderr, "%.*s", (int)(e - hdr), hdr);
+      if (!quiet)
+        fprintf(stderr, "wget: %s:%d%s -> HTTP %d\n", host, port, path, status);
       int consumed = (e - hdr) - (hlen - n); // header bytes inside this buf
       body = buf + consumed;
       blen = n - consumed;
@@ -94,6 +118,7 @@ main(int argc, char *argv[])
   close(fd);
   if (out != 1)
     close(out);
-  fprintf(stderr, "wget: %d body bytes\n", total);
+  if (!quiet)
+    fprintf(stderr, "wget: %d body bytes\n", total);
   exit(status == 200 ? 0 : 1);
 }

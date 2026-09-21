@@ -1,0 +1,2 @@
+# what /etc/init.d/httpd starts it with.
+PORT=80

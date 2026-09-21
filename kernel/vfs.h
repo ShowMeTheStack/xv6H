@@ -33,6 +33,10 @@ struct inode_ops {
   int (*read)(struct inode *ip, int user_dst, uint64 dst, uint off, uint n);
   int (*write)(struct inode *ip, int user_src, uint64 src, uint off, uint n);
   void (*trunc)(struct inode *ip);
+  // set the file's length to `len`. growing leaves a hole, which reads
+  // as zeros; shrinking gives back what is past the new end. a file
+  // system without this can only be truncated to nothing.
+  int (*setsize)(struct inode *ip, uint64 len);
   // everything this file holds is on the disk when this returns: its
   // data first, then the metadata that points at it.
   int (*fsync)(struct inode *ip, int datasync);
@@ -47,8 +51,19 @@ struct inode_ops {
   struct inode *(*create)(struct inode *dir, char *name, short type, short major, short minor);
   int (*link)(struct inode *dir, char *name, struct inode *ip);
   int (*unlink)(struct inode *dir, char *name);
+  // make a symbolic link named `name` in `dir`, holding `target`
+  int (*symlink)(struct inode *dir, char *name, const char *target);
   // where a symbolic link points
   int (*readlink)(struct inode *ip, char *buf, int max);
+
+  // extended attributes: a name and a value hung on the inode, beside
+  // its contents. getxattr with size 0 reports the value's length;
+  // setxattr with a null value removes the name; listxattr fills the
+  // buffer with the names, each ending in a zero byte, and with size 0
+  // reports how much room they would need.
+  int (*getxattr)(struct inode *ip, const char *name, char *buf, int size);
+  int (*setxattr)(struct inode *ip, const char *name, const char *value, int size, int flags);
+  int (*listxattr)(struct inode *ip, char *buf, int size);
 };
 
 // what a mounted file system can do
@@ -61,6 +76,9 @@ struct super_ops {
   // an inode that has lost its last link and its last reference. the
   // inode itself is gone by now, so this is given only what it needs.
   void (*ifree)(struct super *sb, uint inum, int isdir);
+  // the mount's flags are changing: ro to rw, or the other way. a file
+  // system that cannot do it says so and the mount is left alone.
+  int (*remount)(struct super *sb, int readonly, const char *opts);
 };
 
 #define MAXMOUNT 16
@@ -77,6 +95,9 @@ struct super {
   struct inode *root;             // its root inode
   struct inode *covered;          // the inode it is mounted over, or zero for /
   int readonly;
+  int flags;                      // the MS_* the mount was made with
+  int bind;                       // a second name for a directory, not a file system
+  int loopdev;                    // the loop device mounting it attached, or -1
   int used;
 };
 
@@ -91,13 +112,23 @@ struct fs_type {
 void vfs_init(void);
 void vfs_register(struct fs_type *type);
 struct fs_type *vfs_find_type(const char *name);
-struct super *vfs_mount(const char *source, const char *target, const char *type, int readonly,
+// mount, with the MS_* flags the system call was given. MS_BIND makes
+// `target` a second name for the directory `source`; MS_REMOUNT
+// changes the flags of what is already mounted there.
+struct super *vfs_mount(const char *source, const char *target, const char *type, int flags,
                         const char *opts);
 int vfs_umount(const char *target);
 struct super *vfs_super_alloc(void);
 void vfs_super_free(struct super *sb);
 // the file system mounted on this inode, if any
 struct super *vfs_mounted_on(struct inode *ip);
+// the mount whose root this inode is, if it is one. that is what makes
+// ".." out of a mount point go back to the directory it covers.
+struct super *vfs_root_of(struct inode *ip);
+// the mount at this path, if there is one
+struct super *vfs_find_mount(const char *path);
+// may this inode's file system be written to?
+int vfs_readonly(struct inode *ip);
 int vfs_sync_all(void);
 void vfs_list(void (*emit)(const char *source, const char *path, const char *type, int readonly,
                            void *arg),

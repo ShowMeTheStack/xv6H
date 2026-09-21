@@ -120,7 +120,11 @@ def t_mm_512g(QEMU, intc, cpus, log, have_linux):
         assert 519000 <= mb <= 524288 and nblocks < 64 and 5000 <= dbmb <= 5200, (mb, nblocks, dbmb)
         assert free_mb(q) > 519000
         g.start_guest(q, "-n big -m 8192 -c 2", 120)
-        assert "ALL TESTS PASSED" in run(q, "usertests -q", 900)
+        # usertests in a guest this large is not quick: its memory
+        # tests touch every page the guest has, and each of those is a
+        # fault the guest handles and the host backs. mm-16g, with six
+        # gigabytes, takes about nineteen minutes.
+        assert "ALL TESTS PASSED" in run(q, "usertests -q", 1800)
         g.detach(q)
         g.kill_vm(q, "big")
         if have_linux:

@@ -122,6 +122,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap);
 void perror(const char *s);
 int remove(const char *path);
 int rename(const char *from, const char *to);
+int renameat(int fromfd, const char *from, int tofd, const char *to);
 FILE *popen(const char *cmd, const char *mode);
 int pclose(FILE *f);
 void flockfile(FILE *f);

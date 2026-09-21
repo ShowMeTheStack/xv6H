@@ -76,6 +76,9 @@ struct bio {
 
 struct gendisk *blk_register(const char *name, const struct disk_ops *ops, void *priv,
                              uint64 nsectors, int sector_size);
+void blk_unregister(struct gendisk *disk);         // a disk that is going away
+void blk_resize(struct gendisk *disk, uint64 nsectors, int readonly);
+void blk_drop_partitions(struct gendisk *disk);
 struct gendisk *blk_find(const char *name);       // "vda" or "vda1"
 struct gendisk *blk_by_index(int i);
 int blk_submit(struct gendisk *disk, struct bio *bio);       // start a request
@@ -123,10 +126,15 @@ struct blkbuf *blk_get_fill(struct gendisk *disk, uint64 blkno); // no read and 
 // read a run of blocks in before anything asks for them
 void blk_readahead(struct gendisk *disk, uint64 blkno, int n);
 int blk_cached(struct gendisk *disk, uint64 blkno);
+void blk_invalidate_clean(struct gendisk *disk, uint64 blkno);
+// a valid cached block, referenced but not locked, for reading only
+struct blkbuf *blk_peek(struct gendisk *disk, uint64 blkno);
+void blk_unpeek(struct blkbuf *b);
 void blk_put(struct blkbuf *b);                               // release the lock and the reference
 void blk_mark_dirty(struct blkbuf *b);
 int blk_sync(struct gendisk *disk);          // write back everything dirty for one disk
 int blk_sync_block(struct gendisk *disk, uint64 blkno);  // one block, for fsync
+int blk_sync_range(struct gendisk *disk, uint64 start, uint64 n); // a run of them, batched
 int blk_sync_all(void);
 void blk_forget(struct gendisk *disk);       // drop a disk's cached blocks
 void blk_cache_stats(uint64 *hits, uint64 *misses, uint64 *dirty);
@@ -137,6 +145,10 @@ uint64 blk_cache_pages(void);
 // pages the cache would give back if it had to, and giving them back
 void blk_start_flusher(void);   // the writeback thread
 uint64 blk_reclaimable(void);
+// the two tunables /sys/mm and /sys/fs expose
+int blk_set_cache_pct(int pct);
+int blk_cache_pct(void);
+extern int blk_flush_secs;
 uint64 blk_reclaim(uint64 want);
 
 #endif

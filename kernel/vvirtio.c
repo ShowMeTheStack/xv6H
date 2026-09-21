@@ -1,7 +1,10 @@
 //
 // virtual virtio-mmio block device (virtio 1.x "modern" mmio transport,
-// legacy-style split virtqueue), backed by a disk image file in the
-// host file system (vm->disk_ip), read and written through the inode.
+// legacy-style split virtqueue), backed either by a disk image file in
+// the host file system (vm->disk_ip, read and written through the
+// inode) or by a whole block device the guest was given (vm->disk,
+// read and written through the block layer, with no host file system
+// in the way).
 //
 
 #include "types.h"
@@ -16,6 +19,8 @@
 #include "file.h"
 #include "virtio.h"
 #include "platform.h"
+#include "blk.h"
+#include "blkdev.h"
 #include "hyp.h"
 
 #define VIRTIO_MMIO_DEVICE_FEATURES_SEL 0x014
@@ -58,24 +63,35 @@ static int
 xfer(struct vm *vm, struct vvirtio *b, uint64 sector, uint64 gpa, uint32 len, int write)
 {
   struct inode *ip = vm->disk_ip;
+  struct gendisk *d = vm->disk;
   uint64 off = sector * 512;
-  if (ip == 0 || len == 0 || (len % 512) != 0 || off + len > b->capacity * 512)
+  if ((ip == 0 && d == 0) || len == 0 || (len % 512) != 0 || off + len > b->capacity * 512)
     return -1;
   while (len > 0) {
     uint32 n = len > PGSIZE ? PGSIZE : len;
     if (write) {
       if (vm_copyin(vm, b->bounce, gpa, n) < 0)
         return -1;
-      ilock(ip);
-      int r = writei(ip, 0, (uint64)b->bounce, off, n);
-      iunlock(ip);
-      if (r != n)
+      int r;
+      if (d) {
+        r = blkdev_write(d, 0, (uint64)b->bounce, off, n);
+      } else {
+        ilock(ip);
+        r = writei(ip, 0, (uint64)b->bounce, off, n);
+        iunlock(ip);
+      }
+      if (r != (int)n)
         return -1;
     } else {
-      ilock(ip);
-      int r = readi(ip, 0, (uint64)b->bounce, off, n);
-      iunlock(ip);
-      if (r != n)
+      int r;
+      if (d) {
+        r = blkdev_read(d, 0, (uint64)b->bounce, off, n);
+      } else {
+        ilock(ip);
+        r = readi(ip, 0, (uint64)b->bounce, off, n);
+        iunlock(ip);
+      }
+      if (r != (int)n)
         return -1;
       if (vm_copyout(vm, gpa, b->bounce, n) < 0)
         return -1;
@@ -322,7 +338,9 @@ vvirtio_init(struct vm *vm)
   initsleeplock(&b->qlock, "vvirtio");
   b->bounce = kalloc();
   b->capacity = 0;
-  if (vm->disk_ip) {
+  if (vm->disk) {
+    b->capacity = vm->disk->nsectors;
+  } else if (vm->disk_ip) {
     ilock(vm->disk_ip);
     b->capacity = vm->disk_ip->size / 512;
     iunlock(vm->disk_ip);

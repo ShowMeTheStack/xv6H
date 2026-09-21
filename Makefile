@@ -9,12 +9,20 @@ OBJS = \
   $K/blk.o \
   $K/vfs.o \
   $K/procfs.o \
+  $K/devfs.o \
+  $K/logdev.o \
+  $K/ramfs.o \
+  $K/sysfs.o \
+  $K/overlayfs.o \
+  $K/blkdev.o \
+  $K/loop.o \
   $K/crc32c.o \
   $K/ext4_read.o \
   $K/jbd2.o \
   $K/ext4_journal.o \
   $K/ext4_write.o \
   $K/ext4_htree.o \
+  $K/ext4_xattr.o \
   $K/ext4_vfs.o \
   $K/printk.o \
   $K/uart.o \
@@ -72,6 +80,8 @@ OBJS = \
   $K/sigtramp.o \
   $K/vrtc.o \
   $K/sock.o \
+  $K/pktcap.o \
+  $K/ptrace.o \
   $K/tcp.o
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
@@ -263,6 +273,14 @@ $U/static/_%: $U/%.o $(ULIB) $U/user.ld
 $U/usys.S : $U/usys.pl
 	perl $U/usys.pl > $U/usys.S
 
+# the names of the system calls, taken from the header that numbers
+# them. a table written out by hand would go quietly wrong the first
+# time a call was added, and strace would then name the wrong one.
+$U/syscallnames.h: $K/syscall.h
+	@sed -n 's/^#define SYS_\([a-zA-Z0-9_]*\)[ \t]*\([0-9]*\).*$$/  [\2] = "\1",/p' $< > $@
+
+$U/strace.o: $U/syscallnames.h
+
 $U/clone.o : $U/clone.S
 	$(CC) $(CFLAGS) -c -o $U/clone.o $U/clone.S
 
@@ -398,6 +416,110 @@ UPROGS=\
 	$U/_wctest\
 	$U/_editest\
 	$U/_fsbench\
+	$U/_dd\
+	$U/_blkid\
+	$U/_id\
+	$U/_chmod\
+	$U/_login\
+	$U/_sudo\
+	$U/_useradd\
+	$U/_groups\
+	$U/_syslogd\
+	$U/_klogd\
+	$U/_logger\
+	$U/_who\
+	$U/_sysctl\
+	$U/_uname\
+	$U/_hostname\
+	$U/_sleep\
+	$U/_head\
+	$U/_tail\
+	$U/_touch\
+	$U/_env\
+	$U/_seq\
+	$U/_yes\
+	$U/_tee\
+	$U/_basename\
+	$U/_sort\
+	$U/_uniq\
+	$U/_cut\
+	$U/_tr\
+	$U/_df\
+	$U/_du\
+	$U/_free\
+	$U/_uptime\
+	$U/_nproc\
+	$U/_dmesg\
+	$U/_ps\
+	$U/_pgrep\
+	$U/_chroot\
+	$U/_which\
+	$U/_tty\
+	$U/_realpath\
+	$U/_getty\
+	$U/_shutdown\
+	$U/_service\
+	$U/_start-stop-daemon\
+	$U/_telinit\
+	$U/_crond\
+	$U/_crontab\
+	$U/_httpd\
+	$U/_cmp\
+	$U/_od\
+	$U/_strings\
+	$U/_nl\
+	$U/_sed\
+	$U/_awk\
+	$U/_tar\
+	$U/_gzip\
+	$U/_stat\
+	$U/_comm\
+	$U/_join\
+	$U/_paste\
+	$U/_split\
+	$U/_file\
+	$U/_truncate\
+	$U/_find\
+	$U/_xargs\
+	$U/_diff\
+	$U/_patch\
+	$U/_less\
+	$U/_true\
+	$U/_netstat\
+	$U/_ip\
+	$U/_nc\
+	$U/_curl\
+	$U/_dig\
+	$U/_traceroute\
+	$U/_tcpdump\
+	$U/_nettest\
+	$U/_bc\
+	$U/_expr\
+	$U/_cal\
+	$U/_timecmd\
+	$U/_vmstat\
+	$U/_top\
+	$U/_nice\
+	$U/_stty\
+	$U/_lsof\
+	$U/_nm\
+	$U/_e2tools\
+	$U/_mkimage\
+	$U/_mkfs_ext4\
+	$U/_chattr\
+	$U/_strace\
+	$U/_su\
+	$U/_passwd\
+	$U/_chown\
+	$U/_whoami\
+	$U/_nologin\
+	$U/_rmdir\
+	$U/_getfattr\
+	$U/_setfattr\
+	$U/_blockdev\
+	$U/_losetup\
+	$U/_sfdisk\
+	$U/_mv\
 
 # ---- guest images ----
 # everything a guest needs lives in the host file system (fs.img):
@@ -418,7 +540,7 @@ HOSTFILES ?=
 guest/kernel: $K/kernel
 	$(OBJCOPY) -S $K/kernel guest/kernel
 
-GUESTFILES = README $(STRIPPED) $(DYNFILES) $(RESCUEFILES) user/shtest
+GUESTFILES = README $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest
 GUESTDEPS = mkfs/mkext4 README user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS)
 
 guest/disk.img: $(GUESTDEPS)
@@ -486,6 +608,51 @@ build/rescue/%: $U/static/_%
 # the programs that go into a file system image are stripped: the
 # debug information belongs to the copy the host debugger reads.
 STRIPPED = $(patsubst $U/_%,build/bin/_%,$(UPROGS))
+
+# the programs live in /bin, and init in /sbin, the way they do on any
+# unix. keeping them at the root meant a new tool could take the name a
+# program wanted for a file: `dd` arrived and usertests could no longer
+# make a directory called dd.
+UPROGNAMES = $(patsubst $U/_%,%,$(UPROGS))
+BINFILES = $(foreach p,$(filter-out su passwd sudo useradd getty shutdown service telinit start-stop-daemon,$(UPROGNAMES)),bin/$(p):build/bin/_$(p)) \
+	   bin/fdisk:build/bin/_sfdisk \
+	   bin/chgrp:build/bin/_chown bin/w:build/bin/_who bin/last:build/bin/_who \
+	   bin/dirname:build/bin/_basename bin/printenv:build/bin/_env \
+	   bin/pkill:build/bin/_pgrep bin/killall:build/bin/_pgrep \
+	   bin/hexdump:build/bin/_od bin/xxd:build/bin/_od \
+	   bin/egrep:build/bin/_grep bin/fgrep:build/bin/_grep \
+	   bin/rgrep:build/bin/_grep \
+	   bin/rev:build/bin/_nl bin/expand:build/bin/_nl \
+	   bin/gunzip:build/bin/_gzip bin/zcat:build/bin/_gzip \
+	   bin/readlink:build/bin/_stat bin/fold:build/bin/_paste \
+	   bin/fallocate:build/bin/_truncate bin/more:build/bin/_less \
+	   bin/false:build/bin/_true bin/ss:build/bin/_netstat \
+	   bin/route:build/bin/_ip bin/arp:build/bin/_ip \
+	   bin/host:build/bin/_dig \
+	   bin/time:build/bin/_timecmd bin/timeout:build/bin/_timecmd \
+	   bin/nohup:build/bin/_timecmd \
+	   bin/iostat:build/bin/_vmstat bin/mpstat:build/bin/_vmstat \
+	   bin/renice:build/bin/_nice bin/reset:build/bin/_stty \
+	   bin/clear:build/bin/_stty bin/fuser:build/bin/_lsof \
+	   sbin/mkfs.ext4:build/bin/_mkfs_ext4 \
+	   sbin/dumpe2fs:build/bin/_e2tools sbin/tune2fs:build/bin/_e2tools \
+	   sbin/fsck.ext4:build/bin/_e2tools sbin/e2fsck:build/bin/_e2tools \
+	   sbin/resize2fs:build/bin/_e2tools sbin/mkimage:build/bin/_mkimage \
+	   bin/lsattr:build/bin/_chattr \
+	   sbin/userdel:build/bin/_useradd sbin/usermod:build/bin/_useradd \
+	   sbin/groupadd:build/bin/_useradd sbin/groupdel:build/bin/_useradd \
+	   sbin/groupmod:build/bin/_useradd sbin/useradd:build/bin/_useradd \
+	   sbin/getty:build/bin/_getty sbin/shutdown:build/bin/_shutdown \
+	   sbin/halt:build/bin/_shutdown sbin/reboot:build/bin/_shutdown \
+	   sbin/poweroff:build/bin/_shutdown sbin/service:build/bin/_service \
+	   sbin/update-rc.d:build/bin/_service sbin/telinit:build/bin/_telinit \
+	   sbin/start-stop-daemon:build/bin/_start-stop-daemon
+# su and passwd run as root whoever starts them: one reads /etc/shadow
+# and becomes another user, the other rewrites it. login is started by
+# init, which is root already, so it needs nothing.
+SETUIDFILES = bin/su::mode:4755:build/bin/_su bin/passwd::mode:4755:build/bin/_passwd \
+	      bin/sudo::mode:4755:build/bin/_sudo
+SBINFILES = sbin/init:build/bin/_init
 build/bin/_%: $U/_%
 	@mkdir -p build/bin
 	$(OBJCOPY) -S $< $@
@@ -496,14 +663,110 @@ build/bin/_%: $U/_%
 
 # the host file system, written by mkext4 and mounted by the kernel
 # through the VFS.
+# the accounts the image is built with. ROOTPW and USERPW are the
+# passwords; PWSALT makes the build reproducible, and leaving it empty
+# takes a fresh salt from the build machine's /dev/urandom.
+ROOTPW ?= root
+USERPW ?= user
+PWSALT ?= xv6hbuildsalt
+
+ETCFILES = etc/passwd etc/group etc/login.defs etc/profile etc/sudoers etc/hostname \
+	   etc/sysctl.conf etc/inittab etc/fstab etc/crontab
+INITSCRIPTS = etc/init.d/rcS:etc/init.d/rcS etc/init.d/syslogd:etc/init.d/syslogd \
+	      etc/init.d/klogd:etc/init.d/klogd etc/rc.d/rc:etc/rc.d/rc \
+	      lib/init/functions:lib/init/functions \
+	      etc/rc.d/rc2.d/S10syslogd::sym:../../init.d/syslogd \
+	      etc/rc.d/rc2.d/S20klogd::sym:../../init.d/klogd \
+	      etc/init.d/crond:etc/init.d/crond \
+	      etc/cron.d/rotate-logs::mode:0755:etc/cron.d/rotate-logs \
+	      etc/rc.d/rc2.d/S30crond::sym:../../init.d/crond \
+	      etc/rc.d/rc2.d/S10networking::sym:../../init.d/networking \
+	      etc/rc.d/rc2.d/S40httpd::sym:../../init.d/httpd \
+	      var/spool::dir var/spool/cron::dir var/spool/cron/crontabs::dir \
+	      etc/init.d/networking:etc/init.d/networking \
+	      etc/network/interfaces:etc/network/interfaces \
+	      etc/init.d/httpd:etc/init.d/httpd etc/default/httpd:etc/default/httpd \
+	      srv/www/index.html:srv/www/index.html srv/www/hello.txt:srv/www/hello.txt
+ETCSPEC = $(foreach f,$(ETCFILES),$(f):$(f)) etc/shadow:build/etc/shadow \
+	  home/user::dir root::dir:0700 var::dir var/log::dir:0755 var/run::dir tmp::dir:1777 \
+	  sbin/nologin:build/bin/_nologin
+
+# /etc/shadow, written here so that the image has the password the
+# build was given rather than none at all. it is root's alone (0600),
+# which mkext4 takes from the file it copies.
+# the hashes are checked rather than assumed: a mkpasswd that cannot
+# run writes nothing, and an /etc/shadow with an empty hash is an
+# account with no password, which is the one mistake this file must
+# not make quietly.
+build/etc/shadow: mkfs/mkpasswd
+	@mkdir -p build/etc
+	@rh=$$(mkfs/mkpasswd $(if $(PWSALT),-s $(PWSALT),) '$(ROOTPW)') && \
+	 uh=$$(mkfs/mkpasswd $(if $(PWSALT),-s $(PWSALT),) '$(USERPW)') && \
+	 case "$$rh$$uh" in *'$$pbkdf2-sha256$$'*) ;; \
+	   *) echo "mkpasswd produced no hash; refusing to build an image with no passwords" >&2; \
+	      exit 1;; esac && \
+	 { \
+	  echo "root:$$rh:19000:0:99999:7:::"; \
+	  echo "daemon:*:19000:0:99999:7:::"; \
+	  echo "bin:*:19000:0:99999:7:::"; \
+	  echo "sys:*:19000:0:99999:7:::"; \
+	  echo "user:$$uh:19000:0:99999:7:::"; \
+	  echo "nobody:*:19000:0:99999:7:::"; \
+	 } > build/etc/shadow
+	@chmod 600 build/etc/shadow
+
+mkfs/mkpasswd: mkfs/mkpasswd.c user/libc/pbkdf2.h
+	gcc -Wall -Wno-unknown-attributes -I. -o mkfs/mkpasswd mkfs/mkpasswd.c
+
+# the archives user/archtest reads. tools/mkarchref.py writes them with
+# Python's tarfile and gzip, so what archtest checks is that our tar and
+# our gzip read another implementation's output, not just their own.
+ARCHREFNAMES = ref.tar.gz pax.tar.gz gnu.tar.gz evil.tar levels.txt \
+	       level0.gz level1.gz level6.gz level9.gz
+ARCHREFS = $(foreach f,$(ARCHREFNAMES),usr/share/archtest/$(f):build/archtest/$(f))
+ARCHREFDEPS = $(foreach f,$(ARCHREFNAMES),build/archtest/$(f))
+
+$(ARCHREFDEPS): tools/mkarchref.py
+	@mkdir -p build/archtest
+	python3 tools/mkarchref.py build/archtest
+
 FSFILES = README $(GUESTBINS) $(GUESTDISKIMGS) \
-	  $(STRIPPED) $(DYNFILES) $(RESCUEFILES) user/shtest $(HOSTFILES)
-FSDEPS = README user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) $(HOSTFILES)
+	  $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest user/texttest user/archtest user/filetest user/calctest \
+	  user/systest \
+	  $(HOSTFILES) \
+	  $(ARCHREFS) $(ETCSPEC) $(SETUIDFILES) $(INITSCRIPTS)
+FSDEPS = README user/shtest user/texttest user/archtest user/filetest user/calctest user/systest $(ARCHREFDEPS) $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) \
+	 $(HOSTFILES) $(ETCFILES) build/etc/shadow build/bin/_nologin \
+	 etc/init.d/rcS etc/init.d/syslogd etc/init.d/klogd etc/init.d/crond etc/rc.d/rc \
+	 etc/cron.d/rotate-logs etc/init.d/networking etc/network/interfaces lib/init/functions \
+	 etc/init.d/httpd etc/default/httpd srv/www/index.html srv/www/hello.txt
 
 fs.img: mkfs/mkext4 $(FSDEPS)
 	mkfs/mkext4 -b $$(( $(HOSTFS_MB) * 256 )) -j 1024 fs.img $(FSFILES)
 
--include kernel/*.d user/*.d user/libc/*.d user/libc/math/*.d user/libc/pic/*.d user/libc/pic/math/*.d tls/obj/*.d tls/obj/*/*.d
+# every directory this build puts object files in. the two lines below
+# both depend on it, so a directory added to one is never missing from
+# the other -- which is how user/sh went for a milestone without
+# dependency tracking, and how a change to struct stat left the shell
+# compiled against the old one.
+OBJDIRS = kernel user user/sh user/ldso user/libc user/libc/math user/libc/pic \
+	  user/libc/pic/math tls/obj tls/obj/*
+
+# an object file with no dependency file beside it is a hazard: make
+# has no idea which headers it was compiled from, so a change to one of
+# them leaves it stale and the program gets linked from two different
+# views of the same structure. that is not a theory -- kernel/vvnet.o
+# survived a change to struct vm that way, and the guest read a pointer
+# out of the middle of another field. any such object is removed here,
+# before anything is built, so it is compiled again.
+STALEOBJS := $(foreach o,$(wildcard $(foreach d,$(OBJDIRS),$(d)/*.o)),\
+               $(if $(wildcard $(o:.o=.d)),,$(o)))
+ifneq ($(STALEOBJS),)
+$(info removing $(words $(STALEOBJS)) object files with no dependency file)
+$(shell rm -f $(STALEOBJS))
+endif
+
+-include $(foreach d,$(OBJDIRS),$(d)/*.d)
 
 clean: 
 	rm -rf tls/obj

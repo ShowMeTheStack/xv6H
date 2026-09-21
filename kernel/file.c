@@ -5,6 +5,8 @@
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
+#include "blk.h"
+#include "blkdev.h"
 #include "param.h"
 #include "fs.h"
 #include "spinlock.h"
@@ -73,11 +75,15 @@ fileclose(struct file *f)
   release(&ftable.lock);
   kmem_cache_free(file_cache, f); // the copy ff carries what is left to do
 
+  if (ff.type == FD_DEVICE && ff.major >= 0 && ff.major < NDEV &&
+      devsw[ff.major].close)
+    devsw[ff.major].close();
+
   if (ff.type == FD_SOCK) {
     sockclose(ff.sock);
   } else if (ff.type == FD_PIPE) {
     pipeclose(ff.pipe, ff.writable);
-  } else if (ff.type == FD_INODE || ff.type == FD_DEVICE) {
+  } else if (ff.type == FD_INODE || ff.type == FD_DEVICE || ff.type == FD_BLOCK) {
     iput(ff.ip);
   }
 }
@@ -90,7 +96,7 @@ filestat(struct file *f, uint64 addr)
   struct proc *p = myproc();
   struct stat st;
 
-  if (f->type == FD_INODE || f->type == FD_DEVICE) {
+  if (f->type == FD_INODE || f->type == FD_DEVICE || f->type == FD_BLOCK) {
     ilock(f->ip);
     stati(f->ip, &st);
     iunlock(f->ip);
@@ -115,6 +121,10 @@ fileread(struct file *f, uint64 addr, int n)
     r = sockread(f->sock, 1, addr, n);
   } else if (f->type == FD_PIPE) {
     r = piperead(f->pipe, addr, n);
+  } else if (f->type == FD_BLOCK) {
+    r = blkdev_read(f->disk, 1, addr, f->off, n);
+    if (r > 0)
+      f->off += r;
   } else if (f->type == FD_DEVICE) {
     if (f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
       return -1;
@@ -145,6 +155,10 @@ filewrite(struct file *f, uint64 addr, int n)
     ret = sockwrite(f->sock, 1, addr, n);
   } else if (f->type == FD_PIPE) {
     ret = pipewrite(f->pipe, addr, n);
+  } else if (f->type == FD_BLOCK) {
+    ret = blkdev_write(f->disk, 1, addr, f->off, n);
+    if (ret > 0)
+      f->off += ret;
   } else if (f->type == FD_DEVICE) {
     if (f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
       return -1;
@@ -170,12 +184,19 @@ filewrite(struct file *f, uint64 addr, int n)
       iunlock(f->ip);
 
       if (r != n1) {
-        // error from writei
+        // a short write or an error. what the file system said is
+        // worth keeping: a caller that runs out of space should be
+        // told so, and collapsing everything to -1 made errno say
+        // "operation not permitted" for a full disk.
+        if (r > 0)
+          i += r;
+        if (i == 0 && r < 0)
+          return r;
         break;
       }
       i += r;
     }
-    ret = (i == n ? n : -1);
+    ret = (i > 0 ? i : (n == 0 ? 0 : -1));
   } else {
     panic("filewrite");
   }
@@ -198,6 +219,7 @@ fileready(struct file *f, int write)
     if (f->major >= 0 && f->major < NDEV && devsw[f->major].ready)
       return devsw[f->major].ready(write);
     return 1;
+  case FD_BLOCK:
   case FD_INODE:
     return write ? 1 : 1; // a regular file never blocks
   default:

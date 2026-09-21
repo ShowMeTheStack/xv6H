@@ -1,0 +1,292 @@
+#!/bin/sh
+# the text tools' own tests: sed, awk, and the small filters, checked
+# against what every other unix gives for the same input.
+
+passed=0
+failed=0
+
+check() {
+	# check NAME EXPECTED ACTUAL
+	if [ "$2" = "$3" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		echo "FAIL $1: wanted [$2] got [$3]"
+	fi
+}
+
+tmp=/tmp/texttest
+mkdir -p $tmp
+printf 'one\ntwo\nthree\n' > $tmp/lines
+printf 'a 1\nb 2\nc 3\n' > $tmp/table
+printf 'b\na\nc\na\n' > $tmp/dup
+
+# ---- sed ----
+check sed_s 0ne "$(sed 's/o/0/' $tmp/lines | head -1)"
+check sed_sg 'tw0' "$(sed -n '2s/o/0/p' $tmp/lines)"
+check sed_p two "$(sed -n '2p' $tmp/lines)"
+check sed_d 'one three' "$(sed '2d' $tmp/lines | tr '\n' ' ' | sed 's/ $//')"
+check sed_regex two "$(sed -n '/tw/p' $tmp/lines)"
+check sed_range three "$(sed '1,2d' $tmp/lines)"
+check sed_last 'one two' "$(sed '$d' $tmp/lines | tr '\n' ' ' | sed 's/ $//')"
+check sed_group '[o]ne' "$(sed -n '1s/\(o\)ne/[\1]ne/p' $tmp/lines)"
+check sed_amp abbc "$(echo abc | sed 's/b/&&/')"
+check sed_y OnE "$(sed -n '1y/aeiou/AEIOU/;1p' $tmp/lines)"
+check sed_q 'one two' "$(sed '2q' $tmp/lines | tr '\n' ' ' | sed 's/ $//')"
+check sed_count 3 "$(sed -n '$=' $tmp/lines)"
+check sed_i inserted "$(sed -n '1i\inserted' $tmp/lines | head -1)"
+check sed_a appended "$(sed -n '1a\appended' $tmp/lines | head -1)"
+check sed_hold ',one,two,three' "$(sed -n 'H;${x;s/\n/,/g;p}' $tmp/lines)"
+check sed_ere XneXwXXhree "$(sed -E 's/(o|t)/X/g' $tmp/lines | tr -d '\n')"
+check sed_multi '1 2 three' "$(sed -e 's/one/1/' -e 's/two/2/' $tmp/lines | tr '\n' ' ' | sed 's/ $//')"
+cp $tmp/lines $tmp/inplace
+sed -i 's/one/ONE/' $tmp/inplace
+check sed_inplace ONE "$(head -1 $tmp/inplace)"
+
+# ---- awk ----
+check awk_fields '1 a' "$(awk 'NR==1{print $2, $1}' $tmp/table)"
+check awk_pattern 'b c' "$(awk '$2 > 1 {print $1}' $tmp/table | tr '\n' ' ' | sed 's/ $//')"
+check awk_sum 6 "$(awk '{s+=$2} END{print s}' $tmp/table)"
+check awk_nr '2 b 2' "$(awk '/b/{print NR, $0}' $tmp/table)"
+check awk_fs root "$(awk -F: 'NR==1{print $1}' /etc/passwd)"
+check awk_printf ' 3.10|hi|42' "$(awk 'BEGIN{printf "%5.2f|%s|%d", 3.1, "hi", 42}')"
+check awk_length 5 "$(awk 'BEGIN{print length("hello")}')"
+check awk_substr ell "$(awk 'BEGIN{print substr("hello",2,3)}')"
+check awk_index 3 "$(awk 'BEGIN{print index("hello","ll")}')"
+check awk_split 'a b c' "$(awk 'BEGIN{n=split("a:b:c",r,":");for(i=1;i<=n;i++)printf "%s%s", (i>1?" ":""), r[i]}')"
+check awk_gsub f00 "$(awk 'BEGIN{s="foo";gsub(/o/,"0",s);print s}')"
+check awk_sub f0o "$(awk 'BEGIN{s="foo";sub(/o/,"0",s);print s}')"
+check awk_func 42 "$(awk 'function f(x){return x*2} BEGIN{print f(21)}')"
+check awk_array 3 "$(awk 'BEGIN{a["x"]=1;a["y"]=2;a["z"]=3;n=0;for(k in a)n++;print n}')"
+check awk_match '2 2' "$(awk 'BEGIN{match("foobar",/o+/);print RSTART, RLENGTH}')"
+check awk_case 'ABC abc' "$(awk 'BEGIN{print toupper("abc"), tolower("ABC")}')"
+check awk_end 3 "$(awk 'END{print NR}' $tmp/table)"
+check awk_ofs 'a:1' "$(awk 'BEGIN{OFS=":"} NR==1{print $1, $2}' $tmp/table)"
+check awk_nf 2 "$(awk 'NR==1{print NF}' $tmp/table)"
+check awk_while 15 "$(awk 'BEGIN{i=0;s=0;while(i<5){i++;s+=i}print s}')"
+check awk_for 10 "$(awk 'BEGIN{s=0;for(i=1;i<=4;i++)s+=i;print s}')"
+check awk_if yes "$(awk 'BEGIN{if (1<2) print "yes"; else print "no"}')"
+check awk_ternary yes "$(awk 'BEGIN{print (1<2) ? "yes" : "no"}')"
+check awk_concat ab "$(awk 'BEGIN{print "a" "b"}')"
+check awk_numstr 1 "$(awk 'BEGIN{print ("10" > "9") ? 0 : 1}')"
+check awk_var hi "$(awk -v x=hi 'BEGIN{print x}')"
+check awk_next 'a c' "$(awk '/b/{next} {printf "%s%s", (NR>1&&NR!=2?" ":""), $1}' $tmp/table)"
+
+# ---- the small filters ----
+check sort_u abc "$(sort -u $tmp/dup | tr -d '\n')"
+check sort_r cbaa "$(sort -r $tmp/dup | tr -d '\n')"
+check uniq_c 2 "$(sort $tmp/dup | uniq -c | awk '$2=="a"{print $1}')"
+check cut_f 1 "$(echo 'a:1' | cut -d: -f2)"
+check cut_c ab "$(echo abcd | cut -c1-2)"
+check tr_upper HELLO "$(echo hello | tr a-z A-Z)"
+check tr_d hello "$(echo 'h e l l o' | tr -d ' ')"
+check tr_s 'a b' "$(echo 'a    b' | tr -s ' ')"
+check head_1 one "$(head -1 $tmp/lines)"
+check tail_1 three "$(tail -1 $tmp/lines)"
+check wc_l 3 "$(wc -l < $tmp/lines)"
+check nl_1 1 "$(nl $tmp/lines | head -1 | awk '{print $1}')"
+check rev_1 eno "$(head -1 $tmp/lines | rev)"
+check cmp_same 0 "$(cmp -s $tmp/lines $tmp/lines; echo $?)"
+check cmp_diff 1 "$(cmp -s $tmp/lines $tmp/table; echo $?)"
+check strings_1 hello "$(printf 'hello' | strings)"
+check od_1 00000000 "$(printf 'ab' | hexdump -C | head -1 | awk '{print $1}')"
+check basename_1 c "$(basename /a/b/c)"
+check dirname_1 /a/b "$(dirname /a/b/c)"
+check seq_1 '1 2 3' "$(seq -s' ' 1 3)"
+check tee_1 hi "$(echo hi | tee $tmp/tee1 > /dev/null; cat $tmp/tee1)"
+
+# ---- comm ----
+printf 'a\nb\nd\n' > $tmp/c1
+printf 'b\nc\nd\n' > $tmp/c2
+check comm_both 'b d' "$(comm -12 $tmp/c1 $tmp/c2 | tr '\n' ' ' | sed 's/ $//')"
+check comm_first a "$(comm -23 $tmp/c1 $tmp/c2)"
+check comm_second c "$(comm -13 $tmp/c1 $tmp/c2)"
+check comm_all 4 "$(comm $tmp/c1 $tmp/c2 | wc -l)"
+
+# ---- join ----
+printf '1 apple\n2 pear\n3 plum\n' > $tmp/j1
+printf '1 red\n3 purple\n4 green\n' > $tmp/j2
+check join_1 '1 apple red' "$(join $tmp/j1 $tmp/j2 | head -1)"
+check join_2 2 "$(join $tmp/j1 $tmp/j2 | wc -l)"
+check join_a1 '2 pear' "$(join -a 1 $tmp/j1 $tmp/j2 | grep pear)"
+check join_v1 '2 pear' "$(join -v 1 $tmp/j1 $tmp/j2)"
+check join_o 'apple red' "$(join -o 1.2,2.2 $tmp/j1 $tmp/j2 | head -1)"
+printf 'a:1\nb:2\n' > $tmp/j3
+printf 'a:x\nb:y\n' > $tmp/j4
+check join_t 'a:1:x' "$(join -t : $tmp/j3 $tmp/j4 | head -1)"
+
+# ---- paste and fold ----
+printf '1\n2\n3\n' > $tmp/p1
+printf 'a\nb\nc\n' > $tmp/p2
+check paste_1 '1	a' "$(paste $tmp/p1 $tmp/p2 | head -1)"
+check paste_d '1,a' "$(paste -d , $tmp/p1 $tmp/p2 | head -1)"
+check paste_s '1	2	3' "$(paste -s $tmp/p1)"
+check fold_1 'abcde' "$(printf 'abcdefghij\n' | fold -w 5 | head -1)"
+check fold_2 2 "$(printf 'abcdefghij\n' | fold -w 5 | wc -l)"
+check fold_s 'one two ' "$(printf 'one two three\n' | fold -s -w 9 | head -1)"
+
+# ---- split ----
+mkdir -p $tmp/sp
+(cd $tmp/sp && seq 1 10 > all && split -l 4 all && ls | tr '\n' ' ') > $tmp/sp.out
+check split_names 'all xaa xab xac ' "$(cat $tmp/sp.out)"
+check split_first 4 "$(wc -l < $tmp/sp/xaa)"
+check split_last 2 "$(wc -l < $tmp/sp/xac)"
+check split_join "$(cat $tmp/sp/all)" "$(cat $tmp/sp/xaa $tmp/sp/xab $tmp/sp/xac)"
+(cd $tmp/sp && rm -f x?? && split -d -b 3 all && echo x*) > $tmp/sp2.out
+check split_d 'x00 x01 x02 x03 x04 x05 x06' "$(cat $tmp/sp2.out)"
+
+# ---- stat and readlink ----
+printf 'abcd' > $tmp/st
+chmod 640 $tmp/st
+check stat_size 4 "$(stat -c %s $tmp/st)"
+check stat_mode 640 "$(stat -c %a $tmp/st)"
+check stat_kind 'regular file' "$(stat -c %F $tmp/st)"
+check stat_name "$tmp/st" "$(stat -c %n $tmp/st)"
+check stat_rwx '-rw-r-----' "$(stat -c %A $tmp/st)"
+check stat_dir directory "$(stat -c %F $tmp)"
+ln -s st $tmp/stlink
+check stat_link 'symbolic link' "$(stat -c %F $tmp/stlink)"
+check stat_deref 'regular file' "$(stat -L -c %F $tmp/stlink)"
+check readlink_1 st "$(readlink $tmp/stlink)"
+check readlink_f "$tmp/st" "$(readlink -f $tmp/stlink)"
+check stat_missing 1 "$(stat /no/such/file > /dev/null 2>&1; echo $?)"
+
+# ---- file ----
+check file_text 'ASCII text' "$(file -b $tmp/lines)"
+check file_dir directory "$(file -b $tmp)"
+check file_elf ok "$(file -b /bin/cat | grep -c ELF | sed 's/^1$/ok/')"
+check file_gzip 'gzip compressed data' "$(gzip -c $tmp/lines > $tmp/f.gz; file -b $tmp/f.gz)"
+check file_tar 'POSIX tar archive' "$(cd $tmp && tar cf f.tar lines && file -b f.tar)"
+check file_empty empty "$(: > $tmp/f.empty; file -b $tmp/f.empty)"
+check file_link ok "$(file -b $tmp/stlink | grep -c '^symbolic link' | sed 's/^1$/ok/')"
+check file_mime 'text/plain; charset=us-ascii' "$(file -b -i $tmp/lines)"
+
+# ---- truncate and fallocate ----
+: > $tmp/tr1
+truncate -s 100 $tmp/tr1
+check trunc_grow 100 "$(stat -c %s $tmp/tr1)"
+truncate -s 10 $tmp/tr1
+check trunc_shrink 10 "$(stat -c %s $tmp/tr1)"
+truncate -s +5 $tmp/tr1
+check trunc_relative 15 "$(stat -c %s $tmp/tr1)"
+truncate -s -5 $tmp/tr1
+check trunc_back 10 "$(stat -c %s $tmp/tr1)"
+fallocate -l 64 $tmp/tr2
+check falloc_1 64 "$(stat -c %s $tmp/tr2)"
+fallocate -o 64 -l 64 $tmp/tr2
+check falloc_2 128 "$(stat -c %s $tmp/tr2)"
+truncate -c -s 5 $tmp/tr-missing
+check trunc_c '' "$(ls $tmp/tr-missing 2>/dev/null)"
+
+# ---- od, in the shapes POSIX describes ----
+check od_x1 '61 62 63' "$(printf 'abc' | od -A n -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check od_c 'a b c' "$(printf 'abc' | od -A n -t c | tr -s ' ' | sed 's/^ //;s/ $//')"
+check od_o2 '0000000 061141' "$(printf 'ab' | od -t o2 | head -1)"
+check od_skip '63 64' "$(printf 'abcd' | od -A n -j 2 -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check od_count '61 62' "$(printf 'abcd' | od -A n -N 2 -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check od_addr_x 000002 "$(printf 'ab' | od -A x -t x1 | tail -1)"
+check od_addr_d 0000002 "$(printf 'ab' | od -A d -t x1 | tail -1)"
+check od_star 2 "$(head -c 64 /dev/zero | od -A n -t x1 | wc -l)"
+check od_v 4 "$(head -c 64 /dev/zero | od -A n -v -t x1 | wc -l)"
+check od_two 2 "$(printf 'ab' | od -A n -t x1 -t c | grep -c .)"
+check od_xxd '00000000: 6162 0a' "$(printf 'ab\n' | xxd | cut -c1-18 | sed 's/ *$//')"
+
+# ---- grep, with the options it is supposed to have ----
+printf 'alpha\nBeta\ngamma\nbeta line\n' > $tmp/g1
+check grep_plain alpha "$(grep alpha $tmp/g1)"
+check grep_i 2 "$(grep -i beta $tmp/g1 | wc -l)"
+check grep_v 3 "$(grep -v alpha $tmp/g1 | wc -l)"
+check grep_n '1:alpha' "$(grep -n alpha $tmp/g1)"
+check grep_c 1 "$(grep -c alpha $tmp/g1)"
+check grep_l "$tmp/g1" "$(grep -l alpha $tmp/g1)"
+check grep_L "$tmp/g1" "$(grep -L nosuchthing $tmp/g1)"
+check grep_q 0 "$(grep -q alpha $tmp/g1; echo $?)"
+check grep_q_no 1 "$(grep -q nosuchthing $tmp/g1; echo $?)"
+check grep_w 1 "$(grep -cw beta $tmp/g1)"
+check grep_x 1 "$(grep -cx Beta $tmp/g1)"
+check grep_o beta "$(grep -o beta $tmp/g1)"
+check grep_e 2 "$(grep -c -e alpha -e gamma $tmp/g1)"
+check grep_m 1 "$(grep -m 1 -c a $tmp/g1)"
+# a real regular expression, not just ^ . * $
+check grep_bre_brace 1 "$(grep -c 'm\{2\}' $tmp/g1)"
+check grep_ere 2 "$(grep -cE 'alpha|gamma' $tmp/g1)"
+check grep_ere_plus 1 "$(grep -cE 'g[a-z]+a' $tmp/g1)"
+check grep_class 4 "$(grep -c '[[:alpha:]]' $tmp/g1)"
+check grep_F 0 "$(grep -cF 'a.pha' $tmp/g1)"
+check grep_F_lit 1 "$(printf 'a.pha\n' | grep -cF 'a.pha')"
+check grep_egrep 2 "$(egrep -c 'alpha|gamma' $tmp/g1)"
+check grep_names "$tmp/g1:alpha" "$(grep alpha $tmp/g1 /dev/null)"
+check grep_h alpha "$(grep -h alpha $tmp/g1 /dev/null)"
+mkdir -p $tmp/gr/sub
+echo findme > $tmp/gr/sub/deep
+check grep_r "$tmp/gr/sub/deep:findme" "$(grep -r findme $tmp/gr)"
+check grep_stdin alpha "$(cat $tmp/g1 | grep alpha)"
+
+# ---- ls ----
+mkdir -p $tmp/ld
+touch $tmp/ld/c $tmp/ld/a $tmp/ld/b
+check ls_sorted 'a b c' "$(ls $tmp/ld | tr '\n' ' ' | sed 's/ $//')"
+check ls_reverse 'c b a' "$(ls -r $tmp/ld | tr '\n' ' ' | sed 's/ $//')"
+check ls_dotfiles 3 "$(touch $tmp/ld/.hidden; ls $tmp/ld | wc -l)"
+check ls_a 4 "$(ls -A $tmp/ld | wc -l)"
+check ls_d "$tmp/ld" "$(ls -d $tmp/ld)"
+check ls_two_files "$tmp/ld/a $tmp/ld/b" "$(ls $tmp/ld/a $tmp/ld/b | tr '\n' ' ' | sed 's/ $//')"
+check ls_F 'ld/' "$(cd $tmp && ls -dF ld)"
+check ls_l_size 4 "$(printf 'abcd' > $tmp/ld/sz; ls -l $tmp/ld/sz | awk '{print $5}')"
+check ls_l_owner root "$(ls -l $tmp/ld/sz | awk '{print $3}')"
+check ls_i ok "$(ls -i $tmp/ld/sz | awk '{print ($1 > 0) ? "ok" : "no"}')"
+check ls_S sz "$(ls -S $tmp/ld | head -1)"
+
+# ---- the escapes and offsets that -print0 and a diff body need ----
+check printf_nul 4 "$(printf 'a\0b\0' | wc -c)"
+check printf_nul_bytes '61 00 62 00' "$(printf 'a\0b\0' | od -A n -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check printf_octal '41 42' "$(printf '\101\102' | od -A n -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check printf_dashdash '--- x' "$(printf -- '--- x\n')"
+check printf_c ab "$(printf 'ab\ccd\n')"
+check tr_nul '61 00 62 00' "$(printf 'a\nb\n' | tr '\n' '\0' | od -A n -t x1 | tr -s ' ' | sed 's/^ //;s/ $//')"
+check tr_octal 'X' "$(printf 'A' | tr '\101' 'X')"
+check tail_plus '3 4 5' "$(seq 1 5 | tail -n +3 | tr '\n' ' ' | sed 's/ $//')"
+check tail_plus1 '1 2 3' "$(seq 1 3 | tail -n +1 | tr '\n' ' ' | sed 's/ $//')"
+check tail_plus_beyond '' "$(seq 1 3 | tail -n +9)"
+check tail_last '4 5' "$(seq 1 5 | tail -n 2 | tr '\n' ' ' | sed 's/ $//')"
+check tail_bytes_plus 'cde' "$(printf 'abcde' | tail -c +3)"
+check true_prog 0 "$(/bin/true; echo $?)"
+check false_prog 1 "$(/bin/false; echo $?)"
+check false_via_path 1 "$(false; echo $?)"
+
+# ---- cal ----
+check cal_title ok "$(cal 2 2024 | head -1 | grep -c 'February 2024' | sed 's/^1$/ok/')"
+check cal_days 'Su Mo Tu We Th Fr Sa' "$(cal 2 2024 | sed -n 2p)"
+check cal_leap 29 "$(cal 2 2024 | tr ' ' '\n' | grep -v '^$' | tail -1)"
+check cal_noleap 28 "$(cal 2 2023 | tr ' ' '\n' | grep -v '^$' | tail -1)"
+check cal_first_day '    1  2  3  4  5  6' "$(cal 1 2024 | sed -n 3p)"
+check cal_monday 'Mo Tu We Th Fr Sa Su' "$(cal -m 2 2024 | sed -n 2p)"
+check cal_year ok "$(cal 2024 | head -1 | grep -c 2024 | sed 's/^1$/ok/')"
+check cal_year_months 12 "$(cal 2024 | tr -s ' ' '\n' | grep -cE '^(January|February|March|April|May|June|July|August|September|October|November|December)$')"
+# 1 January 2000 was a Saturday, which is a date everyone can check
+check cal_y2k ok "$(cal 1 2000 | sed -n 3p | grep -c '1$' | sed 's/^1$/ok/')"
+
+# ---- time, timeout and nohup ----
+check time_status 0 "$(time true > /dev/null 2>&1; echo $?)"
+check time_status_fail 3 "$(time sh -c 'exit 3' > /dev/null 2>&1; echo $?)"
+check time_reports ok "$(time true 2>&1 | grep -c real | sed 's/^1$/ok/')"
+check time_posix ok "$(time -p true 2>&1 | grep -c '^real ' | sed 's/^1$/ok/')"
+check timeout_quick 0 "$(timeout 5 true; echo $?)"
+check timeout_fires 124 "$(timeout 1 sleep 30; echo $?)"
+check timeout_passes_status 7 "$(timeout 5 sh -c 'exit 7'; echo $?)"
+check nohup_runs hello "$(nohup echo hello 2>/dev/null)"
+check nohup_status 0 "$(nohup true > /dev/null 2>&1; echo $?)"
+
+# ---- vmstat, iostat and mpstat ----
+check vmstat_header ok "$(vmstat | head -1 | grep -c memory | sed 's/^1$/ok/')"
+check vmstat_numbers ok "$(vmstat | tail -1 | awk '{print ($3 > 0) ? "ok" : "no"}')"
+check iostat_device ok "$(iostat | grep -c '^vda' | sed 's/^1$/ok/')"
+check mpstat_all ok "$(mpstat | grep -c '^all' | sed 's/^1$/ok/')"
+check mpstat_percpu 3 "$(mpstat | grep -cE '^  [0-9]')"
+
+rm -rf $tmp
+echo "texttest: $((passed + failed)) checks, $failed failures"
+if [ "$failed" = "0" ]; then
+	exit 0
+fi
+exit 1

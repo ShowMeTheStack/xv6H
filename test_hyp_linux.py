@@ -121,10 +121,15 @@ def t_linux_disk_smp(QEMU, intc, cpus, log, extra=""):
         # took half a second on a busy build box and the noise was
         # larger than the parallelism being measured.
         loop = "i=0; while [ $i -lt 60000 ]; do i=$((i+1)); done"
-        out = linux_cmd(q, "time sh -c '%s'" % loop, 120)
-        m = re.search(r"real\s+0m\s*([\d.]+)s", out)
-        assert m, out
-        one = float(m.group(1))
+        # twice, and the slower of the two is the baseline: the box
+        # this runs on may be running five other suites, and a single
+        # measurement catches whatever it was doing at the time.
+        one = 0
+        for _ in range(2):
+            out = linux_cmd(q, "time sh -c '%s'" % loop, 120)
+            m = re.search(r"real\s+0m\s*([\d.]+)s", out)
+            assert m, out
+            one = max(one, float(m.group(1)))
         out = linux_cmd(q, "time sh -c '(%s) & (%s); wait'" % (loop, loop), 120)
         m = re.search(r"real\s+0m\s*([\d.]+)s", out)
         assert m, out

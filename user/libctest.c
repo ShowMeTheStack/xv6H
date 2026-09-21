@@ -26,6 +26,7 @@
 #include "user/user.h"
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 
 static int failures, checks;
 
@@ -928,7 +929,7 @@ test_dlopen(void)
 static void
 test_dirent(void)
 {
-  DIR *d = opendir("/");
+  DIR *d = opendir("/sbin");
   CHECK(d != 0);
   int found_init = 0, entries = 0;
   struct dirent *e;
@@ -938,14 +939,14 @@ test_dirent(void)
     if (strcmp(e->d_name, "init") == 0)
       found_init = 1;
   }
-  CHECK(entries > 5);
+  CHECK(entries > 2); // ".", ".." and init
   CHECK(found_init);
   rewinddir(d);
   CHECK(readdir(d) != 0);
   closedir(d);
   CHECK(opendir("/no/such/directory") == 0);
-  CHECK(opendir("/init") == 0); // not a directory
-  printf("dirent: %d entries in /\n", entries);
+  CHECK(opendir("/sbin/init") == 0); // not a directory
+  printf("dirent: %d entries in /sbin\n", entries);
 }
 
 static void
@@ -1009,11 +1010,11 @@ test_misc(void)
   CHECK(getcwd(path, sizeof(path)) != 0);
   CHECKSTR(path, "/");
   CHECK(isatty(0) || !isatty(0)); // just that it answers
-  CHECKINT(access("/init", F_OK), 0);
+  CHECKINT(access("/sbin/init", F_OK), 0);
   CHECKINT(access("/nothing-here", F_OK), -1);
 
   struct stat sb;
-  CHECKINT(stat("/init", &sb), 0);
+  CHECKINT(stat("/sbin/init", &sb), 0);
   CHECK(sb.size > 0);
   CHECK(S_ISREG(ST_MODE(sb)));
   CHECKINT(stat("/", &sb), 0);
@@ -1022,6 +1023,96 @@ test_misc(void)
   CHECKINT(sysconf(_SC_PAGESIZE), 4096);
   CHECK(sysconf(_SC_NPROCESSORS_ONLN) >= 1);
   printf("misc: ok\n");
+}
+
+// ftruncate sets a length rather than only clearing one: growing
+// leaves a hole that reads as zeros, shrinking gives the blocks back,
+// and what was past the new end must not come back when the file
+// grows again.
+static void
+test_truncate(void)
+{
+  static char buf[70000];
+  static char zero[70000];
+  static char back[70000];
+  struct stat st;
+
+  int fd = open("/libctest5.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644);
+  CHECK(fd >= 0);
+
+  // a file big enough to need more than one extent's worth of blocks
+  for (int i = 0; i < (int)sizeof(buf); i++)
+    buf[i] = (char)('a' + (i % 26));
+  CHECK(write(fd, buf, sizeof(buf)) == (int)sizeof(buf));
+  CHECK(fstat(fd, &st) == 0 && st.size == sizeof(buf));
+
+  // shrink to a length that is not a multiple of the block size
+  CHECK(ftruncate(fd, 5000) == 0);
+  CHECK(fstat(fd, &st) == 0);
+  CHECK(st.size == 5000);
+  CHECK(lseek(fd, 0, SEEK_SET) == 0);
+  CHECK(read(fd, back, sizeof(back)) == 5000);
+  CHECK(memcmp(back, buf, 5000) == 0);
+
+  // grow again: everything past the old end reads as zeros, not as
+  // whatever used to be in that block
+  CHECK(ftruncate(fd, 20000) == 0);
+  CHECK(fstat(fd, &st) == 0 && st.size == 20000);
+  CHECK(lseek(fd, 0, SEEK_SET) == 0);
+  CHECK(read(fd, back, sizeof(back)) == 20000);
+  CHECK(memcmp(back, buf, 5000) == 0);
+  CHECK(memcmp(back + 5000, zero, 15000) == 0);
+
+  // a write into the hole, and the rest of it still reads as zeros
+  CHECK(lseek(fd, 10000, SEEK_SET) == 10000);
+  CHECK(write(fd, "here", 4) == 4);
+  CHECK(lseek(fd, 0, SEEK_SET) == 0);
+  CHECK(read(fd, back, sizeof(back)) == 20000);
+  CHECK(memcmp(back + 5000, zero, 5000) == 0);
+  CHECK(memcmp(back + 10000, "here", 4) == 0);
+  CHECK(memcmp(back + 10004, zero, 9996) == 0);
+
+  // down to nothing and back up
+  CHECK(ftruncate(fd, 0) == 0);
+  CHECK(fstat(fd, &st) == 0 && st.size == 0);
+  CHECK(ftruncate(fd, 3) == 0);
+  CHECK(lseek(fd, 0, SEEK_SET) == 0);
+  CHECK(read(fd, back, 8) == 3);
+  CHECK(memcmp(back, zero, 3) == 0);
+
+  // exactly one block, and one block plus a byte
+  CHECK(ftruncate(fd, 4096) == 0);
+  CHECK(fstat(fd, &st) == 0 && st.size == 4096);
+  CHECK(ftruncate(fd, 4097) == 0);
+  CHECK(fstat(fd, &st) == 0 && st.size == 4097);
+
+  // a negative length is refused
+  CHECK(ftruncate(fd, -1) < 0);
+  close(fd);
+
+  // the length survives a reopen, which is the part that lives on disk
+  fd = open("/libctest5.tmp", O_RDONLY);
+  CHECK(fd >= 0);
+  CHECK(fstat(fd, &st) == 0 && st.size == 4097);
+  CHECK(read(fd, back, sizeof(back)) == 4097);
+  CHECK(memcmp(back, zero, 4097) == 0);
+  close(fd);
+  unlink("/libctest5.tmp");
+
+  // the same on tmpfs, which keeps its pages in memory
+  fd = open("/tmp/libctest5.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644);
+  CHECK(fd >= 0);
+  CHECK(write(fd, buf, 9000) == 9000);
+  CHECK(ftruncate(fd, 100) == 0);
+  CHECK(ftruncate(fd, 9000) == 0);
+  CHECK(lseek(fd, 0, SEEK_SET) == 0);
+  CHECK(read(fd, back, sizeof(back)) == 9000);
+  CHECK(memcmp(back, buf, 100) == 0);
+  CHECK(memcmp(back + 100, zero, 8900) == 0);
+  close(fd);
+  unlink("/tmp/libctest5.tmp");
+
+  printf("truncate: ok\n");
 }
 
 static void
@@ -1035,6 +1126,33 @@ test_process(void)
   CHECKSTR(buf, "from-popen\n");
   pclose(p);
 
+  // the other direction. this one deadlocked until fclose was made to
+  // close the pipe before waiting for the child: the child sits in
+  // read() until end of file, and end of file is the parent's close.
+  p = popen("cat > /libctest4.tmp", "w");
+  CHECK(p != 0);
+  CHECK(fputs("to-popen\n", p) >= 0);
+  // enough to run past any buffer, so the child is certainly reading
+  for (int i = 0; i < 2000; i++)
+    CHECK(fputs("a line that is written to a pipe\n", p) >= 0);
+  CHECK(pclose(p) == 0);
+  FILE *pf = fopen("/libctest4.tmp", "r");
+  CHECK(pf != 0);
+  CHECK(fgets(buf, sizeof(buf), pf) != 0);
+  CHECKSTR(buf, "to-popen\n");
+  int lines = 1;
+  while (fgets(buf, sizeof(buf), pf))
+    lines++;
+  CHECK(lines == 2001);
+  fclose(pf);
+  unlink("/libctest4.tmp");
+
+  // a command that fails is reported through pclose, not swallowed
+  p = popen("exit 3", "w");
+  CHECK(p != 0);
+  int pst = pclose(p);
+  CHECK(WIFEXITED(pst) && WEXITSTATUS(pst) == 3);
+
   int st = system("echo from-system > /libctest3.tmp");
   CHECK(WIFEXITED(st));
   FILE *f = fopen("/libctest3.tmp", "r");
@@ -1044,6 +1162,229 @@ test_process(void)
   fclose(f);
   unlink("/libctest3.tmp");
   printf("process: ok\n");
+}
+
+// the *at family and symbolic links: a relative path resolved from a
+// descriptor rather than from the working directory, and a name that
+// is followed or not depending on what is being asked.
+static void
+test_at(void)
+{
+  char buf[64];
+  struct stat sb;
+
+  mkdir("/atdir", 0777);
+  mkdir("/atdir/sub", 0777);
+  int dfd = open("/atdir", O_RDONLY);
+  CHECK(dfd >= 0);
+
+  // openat creates and finds relative to that directory
+  int fd = openat(dfd, "a", O_CREAT | O_WRONLY, 0666);
+  CHECK(fd >= 0);
+  CHECKINT(write(fd, "at", 2), 2);
+  close(fd);
+  CHECKINT(stat("/atdir/a", &sb), 0);
+  CHECKINT(sb.size, 2);
+
+  fd = openat(dfd, "a", O_RDONLY);
+  CHECK(fd >= 0);
+  CHECKINT(read(fd, buf, sizeof(buf)), 2);
+  buf[2] = 0;
+  CHECKSTR(buf, "at");
+  close(fd);
+
+  // an absolute path ignores the descriptor
+  fd = openat(dfd, "/atdir/a", O_RDONLY);
+  CHECK(fd >= 0);
+  close(fd);
+
+  // AT_FDCWD is the working directory
+  CHECKINT(chdir("/atdir"), 0);
+  fd = openat(AT_FDCWD, "a", O_RDONLY);
+  CHECK(fd >= 0);
+  close(fd);
+  CHECKINT(chdir("/"), 0);
+
+  // fstatat, with and without following the link at the end
+  CHECKINT(symlinkat("a", dfd, "l"), 0);
+  CHECKINT(fstatat(dfd, "l", &sb, 0), 0);
+  CHECKINT(sb.type, T_FILE);
+  CHECKINT(sb.size, 2);
+  CHECKINT(fstatat(dfd, "l", &sb, AT_SYMLINK_NOFOLLOW), 0);
+  CHECKINT(sb.type, T_SYMLINK);
+  CHECKINT(lstat("/atdir/l", &sb), 0);
+  CHECKINT(sb.type, T_SYMLINK);
+  CHECK(S_ISLNK(ST_MODE(sb)));
+  CHECKINT(stat("/atdir/l", &sb), 0);
+  CHECKINT(sb.type, T_FILE);
+
+  // readlink gives the target back, unchanged
+  CHECKINT(readlinkat(dfd, "l", buf, sizeof(buf)), 1);
+  buf[1] = 0;
+  CHECKSTR(buf, "a");
+  CHECKINT(readlink("/atdir/l", buf, sizeof(buf)), 1);
+  CHECKINT(readlink("/atdir/a", buf, sizeof(buf)), -1);
+  CHECKINT(errno, EINVAL);
+
+  // O_NOFOLLOW refuses a symbolic link, and only at the end
+  CHECKINT(openat(dfd, "l", O_RDONLY | O_NOFOLLOW), -1);
+  CHECKINT(errno, ELOOP);
+
+  // AT_EMPTY_PATH asks about the descriptor itself
+  fd = openat(dfd, "a", O_RDONLY);
+  CHECKINT(fstatat(fd, "", &sb, AT_EMPTY_PATH), 0);
+  CHECKINT(sb.size, 2);
+  close(fd);
+
+  // linkat, renameat, mkdirat, unlinkat
+  CHECKINT(linkat(dfd, "a", dfd, "b", 0), 0);
+  CHECKINT(fstatat(dfd, "b", &sb, 0), 0);
+  CHECKINT(sb.size, 2);
+  CHECKINT(renameat(dfd, "b", dfd, "sub/c"), 0);
+  CHECKINT(fstatat(dfd, "b", &sb, 0), -1);
+  CHECKINT(stat("/atdir/sub/c", &sb), 0);
+  CHECKINT(mkdirat(dfd, "sub/d", 0777), 0);
+  CHECKINT(stat("/atdir/sub/d", &sb), 0);
+  CHECKINT(sb.type, T_DIR);
+
+  // the flag says which call this is: a directory needs AT_REMOVEDIR
+  CHECKINT(unlinkat(dfd, "sub/d", 0), -1);
+  CHECKINT(errno, EISDIR);
+  CHECKINT(unlinkat(dfd, "sub/d", AT_REMOVEDIR), 0);
+  CHECKINT(unlinkat(dfd, "sub/c", AT_REMOVEDIR), -1);
+  CHECKINT(errno, ENOTDIR);
+  CHECKINT(unlinkat(dfd, "sub/c", 0), 0);
+
+  // faccessat and access
+  CHECKINT(faccessat(dfd, "a", F_OK, 0), 0);
+  CHECKINT(faccessat(dfd, "nothing", F_OK, 0), -1);
+  CHECKINT(access("/atdir/a", F_OK), 0);
+  CHECKINT(access("/atdir/nothing", F_OK), -1);
+
+  // a descriptor that is not a directory is not a starting point
+  fd = openat(dfd, "a", O_RDONLY);
+  CHECKINT(openat(fd, "x", O_RDONLY), -1);
+  close(fd);
+
+  CHECKINT(unlinkat(dfd, "l", 0), 0);
+  CHECKINT(unlinkat(dfd, "a", 0), 0);
+  close(dfd);
+  CHECKINT(rmdir("/atdir/sub"), 0);
+  CHECKINT(rmdir("/atdir"), 0);
+  CHECKINT(stat("/atdir", &sb), -1);
+  printf("at: ok\n");
+}
+
+// extended attributes: a name and a value beside the file's contents.
+// a short one lives inside the inode and a long one in a block of its
+// own, and the tests here cross that line on purpose.
+static void
+test_xattr(void)
+{
+  char buf[4096], list[1024];
+  int fd;
+
+  fd = open("/xa.tmp", O_CREAT | O_WRONLY, 0666);
+  CHECK(fd >= 0);
+  CHECKINT(write(fd, "body", 4), 4);
+  close(fd);
+
+  // nothing there yet
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), -1);
+  CHECKINT(errno, ENODATA);
+  CHECKINT(listxattr("/xa.tmp", list, sizeof(list)), 0);
+
+  // a short one: it goes inside the inode
+  CHECKINT(setxattr("/xa.tmp", "user.a", "one", 3, 0), 0);
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), 3);
+  CHECK(memcmp(buf, "one", 3) == 0);
+  CHECKINT(getxattr("/xa.tmp", "user.a", 0, 0), 3); // how long is it?
+
+  // the flags say what must already be true of the name
+  CHECKINT(setxattr("/xa.tmp", "user.a", "x", 1, XATTR_CREATE), -1);
+  CHECKINT(errno, EEXIST);
+  CHECKINT(setxattr("/xa.tmp", "user.b", "x", 1, XATTR_REPLACE), -1);
+  CHECKINT(errno, ENODATA);
+
+  // replacing a value, and a second name
+  CHECKINT(setxattr("/xa.tmp", "user.a", "twotwo", 6, XATTR_REPLACE), 0);
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), 6);
+  CHECK(memcmp(buf, "twotwo", 6) == 0);
+  CHECKINT(setxattr("/xa.tmp", "user.b", "bee", 3, XATTR_CREATE), 0);
+
+  // the list holds both names, each ending in a zero byte
+  int n = listxattr("/xa.tmp", list, sizeof(list));
+  CHECKINT(n, (int)(sizeof("user.a") + sizeof("user.b")));
+  int seen_a = 0, seen_b = 0;
+  for (int i = 0; i < n; i += strlen(list + i) + 1) {
+    if (strcmp(list + i, "user.a") == 0)
+      seen_a = 1;
+    if (strcmp(list + i, "user.b") == 0)
+      seen_b = 1;
+  }
+  CHECK(seen_a && seen_b);
+  CHECKINT(listxattr("/xa.tmp", 0, 0), n);
+  CHECKINT(listxattr("/xa.tmp", list, 3), -1);
+  CHECKINT(errno, ERANGE);
+
+  // a value too long for the room inside the inode goes to a block of
+  // its own, and reads back the same either way
+  memset(buf, 'Z', 2000);
+  CHECKINT(setxattr("/xa.tmp", "user.big", buf, 2000, 0), 0);
+  memset(buf, 0, sizeof(buf));
+  CHECKINT(getxattr("/xa.tmp", "user.big", buf, sizeof(buf)), 2000);
+  for (int i = 0; i < 2000; i++)
+    if (buf[i] != 'Z') {
+      CHECK(buf[i] == 'Z');
+      break;
+    }
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), 6);
+  CHECKINT(getxattr("/xa.tmp", "user.big", buf, 10), -1);
+  CHECKINT(errno, ERANGE);
+
+  // growing a value past what the inode holds moves it to the block
+  CHECKINT(setxattr("/xa.tmp", "user.a", buf, 900, XATTR_REPLACE), 0);
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), 900);
+  CHECKINT(setxattr("/xa.tmp", "user.a", "small", 5, XATTR_REPLACE), 0);
+  CHECKINT(getxattr("/xa.tmp", "user.a", buf, sizeof(buf)), 5);
+
+  // through a descriptor, and on a symbolic link
+  fd = open("/xa.tmp", O_RDONLY);
+  CHECK(fd >= 0);
+  CHECKINT(fgetxattr(fd, "user.b", buf, sizeof(buf)), 3);
+  CHECKINT(fsetxattr(fd, "user.c", "see", 3, 0), 0);
+  CHECKINT(flistxattr(fd, 0, 0) > 0, 1);
+  CHECKINT(fremovexattr(fd, "user.c"), 0);
+  close(fd);
+
+  CHECKINT(symlink("/xa.tmp", "/xa.link"), 0);
+  CHECKINT(getxattr("/xa.link", "user.b", buf, sizeof(buf)), 3);  // follows
+  CHECKINT(lgetxattr("/xa.link", "user.b", buf, sizeof(buf)), -1); // the link itself
+  CHECKINT(errno, ENODATA);
+  CHECKINT(unlink("/xa.link"), 0);
+
+  // a prefix ext4 does not know is not stored
+  CHECKINT(setxattr("/xa.tmp", "bogus.x", "x", 1, 0), -1);
+  CHECKINT(errno, EOPNOTSUPP);
+
+  // removing: the name goes, the others stay
+  CHECKINT(removexattr("/xa.tmp", "user.b"), 0);
+  CHECKINT(getxattr("/xa.tmp", "user.b", buf, sizeof(buf)), -1);
+  CHECKINT(errno, ENODATA);
+  CHECKINT(removexattr("/xa.tmp", "user.b"), -1);
+  CHECKINT(errno, ENODATA);
+  CHECKINT(getxattr("/xa.tmp", "user.big", buf, sizeof(buf)), 2000);
+  CHECKINT(removexattr("/xa.tmp", "user.big"), 0);
+  CHECKINT(removexattr("/xa.tmp", "user.a"), 0);
+  CHECKINT(listxattr("/xa.tmp", list, sizeof(list)), 0);
+
+  // the file's contents were never touched by any of it
+  fd = open("/xa.tmp", O_RDONLY);
+  CHECKINT(read(fd, buf, sizeof(buf)), 4);
+  CHECK(memcmp(buf, "body", 4) == 0);
+  close(fd);
+  CHECKINT(unlink("/xa.tmp"), 0);
+  printf("xattr: ok\n");
 }
 
 int
@@ -1072,6 +1413,9 @@ main(int argc, char *argv[])
   GROUP(dirent);
   GROUP(getopt);
   GROUP(misc);
+  GROUP(at);
+  GROUP(xattr);
+  GROUP(truncate);
   GROUP(process);
 
   printf("libctest: %d checks, %d failures\n", checks, failures);

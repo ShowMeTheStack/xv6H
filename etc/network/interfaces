@@ -1,0 +1,8 @@
+# how each interface is configured.
+#
+#   auto NAME              bring it up at boot
+#   iface NAME inet dhcp   ask the network for an address
+#   iface NAME inet static with address, netmask, gateway and dns below
+
+auto eth0
+iface eth0 inet dhcp

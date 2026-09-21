@@ -29,6 +29,18 @@
 #include "hyp.h"
 
 struct vm *vmtab[NVM];
+
+// how many VMs exist, which is what /sys/hypervisor/vms reports
+int
+vm_count(void)
+{
+  int n = 0;
+
+  for (int i = 0; i < NVM; i++)
+    if (vmtab[i] && vmtab[i]->state != VM_FREE)
+      n++;
+  return n;
+}
 static struct spinlock vmslock;
 
 void guestret(struct vcpu *v);
@@ -250,15 +262,31 @@ vm_put_disk(struct inode *ip)
   }
 }
 
-// is the file already the disk of another VM?
+// a block device the guest had is the host's again. what the guest
+// wrote went through this kernel's cache, so it is written out first;
+// then the cache lets go of the device, because what is on it now is
+// the guest's file system and not what the host last read.
+static void
+vm_put_device(struct gendisk *d)
+{
+  if (d) {
+    blk_sync(d);
+    blk_forget(d);
+    d->claimed = 0;
+  }
+}
+
+// is the file, or the device, already the disk of another VM?
 static int
-disk_in_use(struct vm *self, struct inode *ip)
+disk_in_use(struct vm *self, struct inode *ip, struct gendisk *d)
 {
   for (int i = 0; i < NVM; i++) {
     struct vm *o = vmtab[i];
-    if (o == 0 || o == self || o->state == VM_FREE || o->disk_ip == 0)
+    if (o == 0 || o == self || o->state == VM_FREE)
       continue;
-    if (o->disk_ip->dev == ip->dev && o->disk_ip->inum == ip->inum)
+    if (d && o->disk == d)
+      return 1;
+    if (ip && o->disk_ip && o->disk_ip->dev == ip->dev && o->disk_ip->inum == ip->inum)
       return 1;
   }
   return 0;
@@ -416,20 +444,41 @@ vm_create(struct vmconfig *cfg)
   // the guest device tree sits in the last 64 KB of guest RAM.
   vm->dtb_gpa = G_RAM_BASE + vm->ram_size - 0x10000;
 
-  // the disk image: a regular file in the host file system.
+  // the disk: a regular file in the host file system, or a whole block
+  // device -- a disk, a partition, a loop device -- handed to the guest
+  // as it is. a device is faster (no host file system in the way) and
+  // is what a guest that owns its storage wants; while a guest has one
+  // the host will not mount it and no other guest may take it.
   if (cfg->disk[0]) {
     struct inode *ip = namei(cfg->disk);
     if (ip == 0) {
       goto fail;
     }
     ilock(ip);
-    int ok = (ip->type == T_FILE && ip->size >= 512);
+    int isdev = ip->type == T_DEVICE && ip->major == DEV_BLOCK;
+    int minor = ip->minor;
+    int ok = isdev || (ip->type == T_FILE && ip->size >= 512);
     iunlock(ip);
-    if (!ok || disk_in_use(vm, ip)) {
+    if (!ok) {
       iput(ip);
       goto fail;
     }
-    vm->disk_ip = ip;
+    if (isdev) {
+      struct gendisk *d = blk_by_index(minor);
+      if (d == 0 || d->nsectors == 0 || d->claimed || disk_in_use(vm, 0, d)) {
+        iput(ip);
+        goto fail;
+      }
+      d->claimed = 1;
+      vm->disk = d;
+      iput(ip); // the device node was only how the disk was named
+    } else {
+      if (disk_in_use(vm, ip, 0)) {
+        iput(ip);
+        goto fail;
+      }
+      vm->disk_ip = ip;
+    }
   }
 
   vm->vic_kind = plat.intc_kind;
@@ -460,8 +509,11 @@ fail:
   vm_free_resources(vm);
   {
     struct inode *ip = vm->disk_ip;
+    struct gendisk *d = vm->disk;
     vm->disk_ip = 0;
+    vm->disk = 0;
     vm_put_disk(ip);
+    vm_put_device(d);
   }
   vm->state = VM_FREE;
   return -1;
@@ -632,11 +684,14 @@ vm_destroy(struct vm *vm)
     // nobody is inside vm_run: free right here.
     vm_free_resources(vm);
     struct inode *ip = vm->disk_ip;
+    struct gendisk *d = vm->disk;
     vm->disk_ip = 0;
+    vm->disk = 0;
     vm->state = VM_FREE;
     wakeup(&vm->cons_out);
     release(&vm->lock);
     vm_put_disk(ip);
+    vm_put_device(d);
     return 0;
   }
   vm->state = VM_HALTING;
@@ -1050,15 +1105,19 @@ vm_run(struct vm *vm, int vcpuid)
     for (int i = 0; i < vm->nvcpu; i++)
       vcpu_kick(&vm->vcpu[i]);
   }
+  struct gendisk *dev = 0;
   if (vm->vcpus_running == 0) {
     vm_free_resources(vm);
     ip = vm->disk_ip;
+    dev = vm->disk;
     vm->disk_ip = 0;
+    vm->disk = 0;
     vm->state = VM_FREE;
     wakeup(&vm->cons_out); // an attached console reader sees the end
   }
   release(&vm->lock);
   vm_put_disk(ip);
+  vm_put_device(dev);
   return rc;
 }
 

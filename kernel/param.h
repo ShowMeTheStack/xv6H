@@ -7,7 +7,7 @@
 #define NOFILE_INIT 64                // ... initially (the table grows on demand)
 // (open files come from an object cache; there is no system-wide limit)
 #define NINODE      50                // maximum number of active i-nodes
-#define NDEV        10                // maximum major device number
+#define NDEV        12                // maximum major device number
 #define MAXARG      32                // max exec arguments
 #define MAXENV      64                // max environment entries
 #define FILEWRITE_MAX (256 * 1024)     // bytes one write(2) hands the file system at a time
@@ -25,3 +25,5 @@
 #define HOSTMEM     ((uint64)HOSTMEM_MB * 1024 * 1024)
 #define NVM         64                // VM slots (a VM's memory is allocated when the slot is used)
 #define NVCPU       64                // maximum vcpus per VM (more than harts is fine: they are time-sliced)
+#define XV6H_RELEASE "1.0"
+#define XV6H_VERSION "xv6H riscv64"

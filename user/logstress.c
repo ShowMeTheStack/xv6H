@@ -23,7 +23,7 @@ main(int argc, char **argv)
       exit(1);
     }
     if (pid1 == 0) {
-      fd = open(argv[i], O_CREATE | O_RDWR);
+      fd = open(argv[i], O_CREATE | O_RDWR, 0666);
       if (fd < 0) {
         printf("%s: create %s failed\n", argv[0], argv[i]);
         exit(1);

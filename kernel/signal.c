@@ -434,8 +434,13 @@ do_stop(struct proc *p, int sig)
   release(&p->lock);
   proc_notify_parent(p);
   acquire(&p->lock);
-  if (p->state == STOPPED)
+  // `parked` says the switch is really about to happen, so that a
+  // wakeup arriving in this window queues the process rather than
+  // leaving it both running here and waiting to be run elsewhere
+  p->stop_parked = 1;
+  while (p->state == STOPPED)
     sched_stopped(); // switches away; the scheduler will not pick a STOPPED process
+  p->stop_parked = 0;
   release(&p->lock);
 }
 

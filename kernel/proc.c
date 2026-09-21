@@ -575,6 +575,7 @@ fsinfo_copy(struct fsinfo *src)
     return 0;
   acquire(&src->lock);
   fs->cwd = src->cwd ? idup(src->cwd) : 0;
+  fs->root = src->root ? idup(src->root) : 0;
   release(&src->lock);
   return fs;
 }
@@ -587,11 +588,15 @@ fsinfo_put(struct fsinfo *fs)
   acquire(&fs->lock);
   int n = --fs->ref;
   struct inode *cwd = fs->cwd;
+  struct inode *root = fs->root;
   release(&fs->lock);
   if (n > 0)
     return;
   if (cwd) {
     iput(cwd);
+  }
+  if (root) {
+    iput(root);
   }
   kmem_cache_free(fs_cache, fs);
 }
@@ -605,6 +610,37 @@ proc_cwd(struct proc *p)
   struct inode *ip = fs->cwd ? idup(fs->cwd) : 0;
   release(&fs->lock);
   return ip;
+}
+
+// what "/" means for this process, or zero for the file system's own
+// root. the caller owns the reference.
+struct inode *
+proc_root(struct proc *p)
+{
+  struct fsinfo *fs = p->fs;
+
+  if (fs == 0)
+    return 0;
+  acquire(&fs->lock);
+  struct inode *ip = fs->root ? idup(fs->root) : 0;
+  release(&fs->lock);
+  return ip;
+}
+
+// chroot: "/" becomes this directory. the caller owns `ip` and this
+// takes it over.
+void
+proc_set_root(struct proc *p, struct inode *ip)
+{
+  struct fsinfo *fs = p->fs;
+  struct inode *old;
+
+  acquire(&fs->lock);
+  old = fs->root;
+  fs->root = ip;
+  release(&fs->lock);
+  if (old)
+    iput(old);
 }
 
 // change it; the old one is returned for the caller to release.
@@ -867,6 +903,13 @@ userinit(void)
   // until root_mount has decided which one the root disk holds.
   p->pgid = p->sid = p->pid; // init leads its own session
 
+  // init is root, with every capability: everything else is descended
+  // from it and gets what it is given.
+  memset(&p->cred, 0, sizeof(p->cred));
+  p->cred.cap_effective = CAP_FULL;
+  p->cred.cap_permitted = CAP_FULL;
+  p->cred.cap_bounding = CAP_FULL;
+
   p->state = RUNNABLE;
   rq_push(p);
 
@@ -967,6 +1010,13 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
   np->sid = p->sid;
   np->tty = p->tty;
   np->umask = p->umask;
+  np->cred = p->cred; // a child is whoever its parent was
+  np->nice = p->nice; // and starts with the same claim on the processor
+  // a child is not watched because its parent is: ptrace(TRACEME) is
+  // something a process does for itself
+  np->traced = 0;
+  np->trace_wants_stop = 0;
+  np->trace_at_exit = 0;
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   int tid = np->pid;
@@ -1062,6 +1112,9 @@ kexit(int status)
 
   if (p == initproc)
     panic("init exiting");
+
+  // whatever was watching it has nothing left to watch
+  ptrace_exit(p);
 
   // the last thread of a process reports its status to the parent; the
   // others simply vanish. a leader leaving takes the group with it.
@@ -1380,10 +1433,13 @@ forkret(void)
 
     // We can invoke kexec() now that file system is initialized.
     // Put the return value (argc) of kexec into a0.
-    p->trapframe->a0 = kexec("/init", (char *[]){"/init", 0});
-    if (p->trapframe->a0 == -1) {
-      panic("exec");
-    }
+    // /sbin/init is where it lives; /init is where it used to, and a
+    // disk made before the move still boots.
+    p->trapframe->a0 = kexec("/sbin/init", (char *[]){"/sbin/init", 0});
+    if (p->trapframe->a0 < 0)
+      p->trapframe->a0 = kexec("/init", (char *[]){"/init", 0});
+    if (p->trapframe->a0 < 0)
+      panic("exec: no init");
   }
 
   // return to user space, mimicing usertrap()'s return.
@@ -1401,8 +1457,17 @@ void
 proc_make_runnable(struct proc *p)
 {
   if (p->state == SLEEPING || p->state == STOPPED) {
+    int stopped = p->state == STOPPED;
     p->state = RUNNABLE;
     p->stopped_sig = 0;
+    // a process that has marked itself STOPPED but has not yet
+    // switched away is still running on its own hart. putting it on
+    // the run queue as well would let a second hart into the same
+    // process, with one trapframe and one kernel stack between them.
+    // it will see that it is RUNNABLE when it takes its lock again
+    // and simply carry on, so there is nothing to queue.
+    if (stopped && !p->stop_parked)
+      return;
     rq_push(p);
   }
 }

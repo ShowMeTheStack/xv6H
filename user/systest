@@ -1,0 +1,234 @@
+#!/bin/sh
+# the tools that report on the machine: top, nice, stty, lsof, nm, and
+# the ext4 image tools.
+
+passed=0
+failed=0
+
+check() {
+	# check NAME EXPECTED ACTUAL
+	if [ "$2" = "$3" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		echo "FAIL $1: wanted [$2] got [$3]"
+	fi
+}
+
+tmp=/tmp/systest
+rm -rf $tmp
+mkdir -p $tmp
+cd $tmp
+
+# ---- /proc/PID/fd, which is what lsof reads ----
+
+check procfd_dir ok "$(test -d /proc/1/fd && echo ok)"
+check procfd_has_stdin ok "$(readlink /proc/1/fd/0 > /dev/null && echo ok)"
+check procfd_link ok "$(readlink /proc/1/fd/0 | grep -c '^dev:\[' | sed 's/^1$/ok/')"
+check procfd_cwd ok "$(readlink /proc/1/cwd | grep -c ':\[' | sed 's/^1$/ok/')"
+check procfd_root 'root:[/]' "$(readlink /proc/1/root)"
+check procfd_self ok "$(test -d /proc/self/fd && echo ok)"
+# a file this shell has open shows up under its own descriptors
+check procfd_counts ok "$(ls /proc/self/fd | wc -l | awk '{print ($1 >= 3) ? "ok" : "no"}')"
+
+# ---- lsof ----
+
+check lsof_self ok "$(lsof -p 1 | grep -c '^init' | awk '{print ($1 >= 3) ? "ok" : "no"}')"
+check lsof_header COMMAND "$(lsof -p 1 | head -1 | awk '{print $1}')"
+check lsof_terse 1 "$(lsof -t -p 1 | head -1)"
+check lsof_user ok "$(lsof -p 1 | grep -c root | awk '{print ($1 >= 3) ? "ok" : "no"}')"
+check lsof_cmd ok "$(lsof -c init | grep -c '^init' | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+# the console is open by more than one process, and lsof finds them by
+# the identity of the file rather than by the spelling of a path
+check lsof_by_file ok "$(lsof /dev/console 2>/dev/null | grep -c . | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+check fuser_console ok "$(fuser /dev/console 2>/dev/null | grep -c '[0-9]' | sed 's/^1$/ok/')"
+check fuser_missing 1 "$(fuser /no/such/file > /dev/null 2>&1; echo $?)"
+
+# ---- top, in batch ----
+
+check top_batch ok "$(top -b -n 1 | grep -c '^top - up' | sed 's/^1$/ok/')"
+check top_header ok "$(top -b -n 1 | grep -c '^  PID USER' | sed 's/^1$/ok/')"
+check top_has_init ok "$(top -b -n 1 | grep -c ' init$' | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+check top_mem ok "$(top -b -n 1 | grep -c '^Mem:' | sed 's/^1$/ok/')"
+check top_one_pid ok "$(top -b -n 1 -p 1 | tail -1 | awk '{print ($1 == 1) ? "ok" : "no"}')"
+check top_sort_pid ok "$(top -b -n 1 -o pid | sed -n '6p' | awk '{print ($1 == 1) ? "ok" : "no"}')"
+
+# ---- nice and renice ----
+
+check nice_reports 0 "$(nice)"
+check nice_runs hello "$(nice -n 5 echo hello)"
+check nice_value 5 "$(nice -n 5 nice)"
+check nice_value_10 10 "$(nice -n 10 nice)"
+# only root may ask for a smaller number, and this is root
+check nice_negative -5 "$(nice -n -5 nice)"
+check renice_self ok "$(renice -n 3 -p $$ > /dev/null 2>&1; echo ok)"
+
+# ---- stty ----
+
+check stty_reads ok "$(stty -a < /dev/console 2>/dev/null | grep -c speed | sed 's/^1$/ok/')"
+check stty_cc ok "$(stty -a < /dev/console 2>/dev/null | grep -c 'intr = ' | sed 's/^1$/ok/')"
+check stty_flags ok "$(stty -a < /dev/console 2>/dev/null | grep -c icanon | sed 's/^1$/ok/')"
+check stty_save ok "$(stty -g < /dev/console 2>/dev/null | grep -c ':' | sed 's/^1$/ok/')"
+
+# ---- nm ----
+
+check nm_symbols ok "$(nm /bin/cat | wc -l | awk '{print ($1 >= 3) ? "ok" : "no"}')"
+check nm_sorted ok "$(nm /lib/libc.so | awk '{n=$NF ""; if (p != "" && n < p) bad=1; p=n} END {print bad ? "no" : "ok"}')"
+check nm_undefined ok "$(nm -u /bin/cat | grep -c ' U ' | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+check nm_defined ok "$(nm --defined-only /lib/libc.so | grep -c ' U ' | sed 's/^0$/ok/')"
+check nm_numeric ok "$(nm -n --defined-only /lib/libc.so | awk '{a=$1 ""; if (p != "" && a < p) bad=1; p=a} END {print bad ? "no" : "ok"}')"
+check nm_dynamic ok "$(nm -D /lib/libc.so | grep -c ' T ' | awk '{print ($1 >= 10) ? "ok" : "no"}')"
+check nm_notelf 1 "$(echo hello > notelf; nm notelf > /dev/null 2>&1; echo $?)"
+
+# ---- the ext4 image tools ----
+
+check mkfs_makes ok "$(mkfs.ext4 -b 4096 img1 > /dev/null 2>&1 && test -f img1 && echo ok)"
+check mkfs_size 16777216 "$(stat -c %s img1)"
+check dumpe2fs_magic 0xef53 "$(dumpe2fs -h img1 2>/dev/null | grep 'magic number' | awk '{print $4}')"
+check dumpe2fs_blocks 4096 "$(dumpe2fs -h img1 2>/dev/null | grep '^Block count' | awk '{print $3}')"
+check dumpe2fs_bsize 4096 "$(dumpe2fs -h img1 2>/dev/null | grep '^Block size' | awk '{print $3}')"
+check dumpe2fs_csum yes "$(dumpe2fs -h img1 2>/dev/null | grep '^Checksum verified' | awk '{print $3}')"
+check dumpe2fs_features ok "$(dumpe2fs -h img1 2>/dev/null | grep -c 'metadata_csum' | sed 's/^1$/ok/')"
+check dumpe2fs_groups ok "$(dumpe2fs img1 2>/dev/null | grep -c '^Group 0:' | sed 's/^1$/ok/')"
+
+check fsck_clean 0 "$(fsck.ext4 -n img1 > /dev/null 2>&1; echo $?)"
+check fsck_says ok "$(fsck.ext4 -n img1 2>/dev/null | grep -c clean | sed 's/^1$/ok/')"
+check fsck_notext4 8 "$(head -c 4096 /dev/zero > notfs; fsck.ext4 -n notfs > /dev/null 2>&1; echo $?)"
+
+# tune2fs changes the superblock and dumpe2fs reads the change back
+check tune_label ok "$(tune2fs -L myvolume img1 > /dev/null 2>&1 && echo ok)"
+check tune_label_read myvolume "$(dumpe2fs -h img1 2>/dev/null | grep '^Filesystem volume name' | awk '{print $4}')"
+check tune_still_clean 0 "$(fsck.ext4 -n img1 > /dev/null 2>&1; echo $?)"
+check tune_reserved ok "$(tune2fs -m 10 img1 > /dev/null 2>&1 && echo ok)"
+check tune_reserved_read 409 "$(dumpe2fs -h img1 2>/dev/null | grep '^Reserved block count' | awk '{print $4}')"
+check tune_mounts ok "$(tune2fs -c 30 img1 > /dev/null 2>&1 && echo ok)"
+check tune_mounts_read 30 "$(dumpe2fs -h img1 2>/dev/null | grep '^Maximum mount count' | awk '{print $4}')"
+# the uuid seeds every checksum, so changing it is refused rather than
+# done by halves
+check tune_uuid_refused 1 "$(tune2fs -U random img1 > /dev/null 2>&1; echo $?)"
+
+check resize_reports ok "$(resize2fs img1 2>&1 | grep -c 'minimum size' | sed 's/^1$/ok/')"
+check resize_same ok "$(resize2fs img1 4096 2>&1 | grep -c 'Nothing to do' | sed 's/^1$/ok/')"
+check resize_refused 1 "$(resize2fs img1 8192 > /dev/null 2>&1; echo $?)"
+
+# ---- mkimage: a tree in, a file system out ----
+
+mkdir -p tree/sub
+echo alpha > tree/a
+echo beta > tree/sub/b
+ln -s a tree/link
+chmod 755 tree/sub
+
+check mkimage_makes ok "$(mkimage -b 4096 img2 tree > /dev/null 2>&1 && test -f img2 && echo ok)"
+check mkimage_clean 0 "$(fsck.ext4 -n img2 > /dev/null 2>&1; echo $?)"
+# and what came out has the tree in it, which mkfs.ext4 -l lists
+check mkimage_has_a ok "$(mkfs.ext4 -l img2 2>/dev/null | grep -c '^/a ' | sed 's/^1$/ok/')"
+check mkimage_has_sub ok "$(mkfs.ext4 -l img2 2>/dev/null | grep -c '^/sub/b ' | sed 's/^1$/ok/')"
+check mkimage_has_link ok "$(mkfs.ext4 -l img2 2>/dev/null | grep -c '^/link ' | sed 's/^1$/ok/')"
+# the image really mounts, which is the whole point of making one
+mkdir -p mnt
+check mkimage_mounts ok "$(losetup /dev/loop0 img2 2>/dev/null && mount -t ext4 /dev/loop0 $tmp/mnt 2>/dev/null && echo ok)"
+check mkimage_content alpha "$(cat $tmp/mnt/a 2>/dev/null)"
+check mkimage_content2 beta "$(cat $tmp/mnt/sub/b 2>/dev/null)"
+check mkimage_link a "$(readlink $tmp/mnt/link 2>/dev/null)"
+umount $tmp/mnt 2>/dev/null
+losetup -d /dev/loop0 2>/dev/null
+
+# ---- chattr and lsattr ----
+
+echo original > locked
+check lsattr_plain '---------------' "$(lsattr locked | awk '{print $1}')"
+
+# immutable: nothing may be written, removed, renamed or linked to,
+# and that holds for root as much as for anyone
+chattr +i locked
+check chattr_i_set ok "$(lsattr locked | awk '{print ($1 ~ /i/) ? "ok" : "no"}')"
+check chattr_i_nowrite 1 "$(echo more > locked 2>/dev/null; echo $?)"
+check chattr_i_noappend 1 "$(echo more >> locked 2>/dev/null; echo $?)"
+check chattr_i_nounlink 1 "$(rm -f locked 2>/dev/null; echo $?)"
+check chattr_i_nomove 1 "$(mv locked elsewhere 2>/dev/null; echo $?)"
+check chattr_i_nolink 1 "$(ln locked another 2>/dev/null; echo $?)"
+check chattr_i_readable original "$(cat locked)"
+check chattr_i_still_there ok "$(test -f locked && echo ok)"
+
+# and clearing it gives the file back
+chattr -i locked
+check chattr_i_cleared '---------------' "$(lsattr locked | awk '{print $1}')"
+check chattr_i_writable 0 "$(echo more > locked 2>/dev/null; echo $?)"
+check chattr_i_removable 0 "$(cp locked keep; rm locked 2>/dev/null; echo $?)"
+mv keep locked
+
+# append only: it may be added to and nothing else
+chattr +a locked
+check chattr_a_set ok "$(lsattr locked | awk '{print ($1 ~ /a/) ? "ok" : "no"}')"
+check chattr_a_appends 0 "$(echo added >> locked 2>/dev/null; echo $?)"
+check chattr_a_kept ok "$(grep -c added locked | sed 's/^1$/ok/')"
+check chattr_a_no_trunc 1 "$(echo replaced > locked 2>/dev/null; echo $?)"
+check chattr_a_nounlink 1 "$(rm -f locked 2>/dev/null; echo $?)"
+check chattr_a_still ok "$(grep -c added locked | sed 's/^1$/ok/')"
+chattr -a locked
+check chattr_a_cleared 0 "$(rm -f locked 2>/dev/null; echo $?)"
+
+# the flags survive being written to the disk and read back
+echo x > persist
+chattr +i persist
+sync
+check chattr_persist ok "$(lsattr persist | awk '{print ($1 ~ /i/) ? "ok" : "no"}')"
+chattr -i persist
+
+# a flag on a directory stops things being made in it
+mkdir lockeddir
+chattr +i lockeddir
+check chattr_dir_set ok "$(lsattr -d lockeddir | awk '{print ($1 ~ /i/) ? "ok" : "no"}')"
+chattr -i lockeddir
+
+check lsattr_recursive ok "$(mkdir -p rd/sub; : > rd/sub/f; lsattr -R rd | grep -c 'rd/sub/f' | sed 's/^1$/ok/')"
+check chattr_bad_letter 1 "$(chattr +Z locked > /dev/null 2>&1; echo $?)"
+
+# ---- strace, and the ptrace underneath it ----
+
+check strace_runs hi "$(strace /bin/echo hi 2>/dev/null)"
+check strace_status 0 "$(strace /bin/true > /dev/null 2>&1; echo $?)"
+check strace_passes_status 3 "$(strace sh -c 'exit 3' > /dev/null 2>&1; echo $?)"
+# the trace goes to a file so that what the program prints and what
+# strace prints do not have to be told apart afterwards
+strace -o t1.out /bin/echo hello > /dev/null 2>&1
+check strace_traces ok "$(grep -c '^write(1' t1.out | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+check strace_exit ok "$(grep -c 'exited with 0' t1.out | sed 's/^1$/ok/')"
+# the buffer of a write is shown as the text it is
+check strace_string ok "$(grep -c 'write(1, \"hello\"' t1.out | sed 's/^1$/ok/')"
+# a call that takes nothing prints as taking nothing
+check strace_noargs ok "$(grep -c 'gettid()' t1.out | awk '{print ($1 >= 1) ? "ok" : "no"}')"
+# the names come from the kernel's own header, so an unknown number
+# would show as syscall_N and there should be none of those
+check strace_all_named 0 "$(grep -c 'syscall_[0-9]' t1.out)"
+# every call has an answer beside it
+check strace_all_answered 0 "$(grep -c ')$' t1.out)"
+strace -e write -o t2.out /bin/echo hi > /dev/null 2>&1
+check strace_filter ok "$(grep -cv '^write(' t2.out | sed 's/^1$/ok/')"
+strace -c -o t3.out /bin/echo hi > /dev/null 2>&1
+check strace_summary ok "$(grep -c total t3.out | sed 's/^1$/ok/')"
+check strace_summary_counts ok "$(grep -c '^ *[0-9]' t3.out | awk '{print ($1 >= 3) ? "ok" : "no"}')"
+check strace_to_file ok "$(strace -o tr.out /bin/echo hi > /dev/null 2>&1; grep -c 'exited with' tr.out | sed 's/^1$/ok/')"
+check strace_no_attach 1 "$(strace -p 1 > /dev/null 2>&1; echo $?)"
+
+# and the calls a traced program makes still do what they were going to
+check strace_side_effects written "$(strace sh -c 'echo written > traced.txt' > /dev/null 2>&1; cat traced.txt)"
+check strace_many ok "$(strace /bin/ls / > /dev/null 2>tr2.out; grep -c 'exited with 0' tr2.out | sed 's/^1$/ok/')"
+
+# ptrace itself refuses what it should
+check ptrace_not_parent 1 "$(strace -p $$ > /dev/null 2>&1; echo $?)"
+
+# ---- vmstat and the rest read /proc, so /proc has to have it ----
+
+check proc_meminfo ok "$(grep -c MemTotal /proc/meminfo | sed 's/^1$/ok/')"
+check proc_diskstats ok "$(grep -c '^vda' /proc/diskstats | sed 's/^1$/ok/')"
+check proc_stat ok "$(grep -c '^processes' /proc/stat | sed 's/^1$/ok/')"
+
+cd /
+rm -rf $tmp
+echo "systest: $((passed + failed)) checks, $failed failures"
+if [ "$failed" = "0" ]; then
+	exit 0
+fi
+exit 1

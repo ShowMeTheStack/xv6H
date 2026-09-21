@@ -152,8 +152,17 @@ bi_printf(int argc, char **argv)
     sh_error("printf: usage: printf FORMAT [ARGUMENT...]");
     return 1;
   }
-  const char *fmt = argv[1];
-  int arg = 2;
+  int at = 1;
+  // "--" ends the options, so that a format beginning with a dash can
+  // still be printed
+  if (strcmp(argv[at], "--") == 0)
+    at++;
+  if (at >= argc) {
+    sh_error("printf: usage: printf FORMAT [ARGUMENT...]");
+    return 1;
+  }
+  const char *fmt = argv[at];
+  int arg = at + 1;
 
   do {
     for (const char *p = fmt; *p; p++) {
@@ -168,6 +177,24 @@ bi_printf(int argc, char **argv)
         case 'b': putchar('\b'); break;
         case 'f': putchar('\f'); break;
         case 'v': putchar('\v'); break;
+        case '0': case '1': case '2': case '3':
+        case '4': case '5': case '6': case '7': {
+          // \0 and \ooo are an octal byte, and \0 alone is a zero
+          // byte -- which is what find -print0 and xargs -0 speak
+          int v = 0, n = 0;
+          if (*p == '0')
+            p++;
+          while (n < 3 && *p >= '0' && *p <= '7') {
+            v = v * 8 + (*p++ - '0');
+            n++;
+          }
+          p--;
+          putchar(v);
+          break;
+        }
+        case 'c':
+          fflush(stdout);
+          return 0;   // \c stops the output there and then
         default: putchar('\\'); putchar(*p); break;
         }
         continue;
@@ -556,6 +583,33 @@ file_type(const char *path, short *type, uint64 *size)
   return 0;
 }
 
+// the permission bits of a file, or -1 if it is not there. the link
+// itself, not what it points at, which is what -h and -L ask about.
+static int
+file_mode(const char *path, short *type)
+{
+  struct stat st;
+
+  if (lstat(path, &st) < 0)
+    return -1;
+  if (type)
+    *type = st.type;
+  return (int)st.mode;
+}
+
+// the operators that take a value on each side
+static int
+is_binary_op(const char *s)
+{
+  static const char *ops[] = {"=", "==", "!=", "-eq", "-ne", "-lt", "-le",
+                              "-gt", "-ge", "-nt", "-ot", "-ef", 0};
+
+  for (int i = 0; ops[i]; i++)
+    if (strcmp(s, ops[i]) == 0)
+      return 1;
+  return 0;
+}
+
 static int
 test_primary(struct test_state *t)
 {
@@ -579,8 +633,17 @@ test_primary(struct test_state *t)
     return v;
   }
 
-  // the unary operators
-  if (a[0] == '-' && a[1] && a[2] == 0 && t->pos + 1 < t->argc) {
+  // POSIX reads three arguments as a binary expression whenever the
+  // middle one is an operator, whatever the left side looks like.
+  // that is what makes `[ -1 = -1 ]` a comparison rather than an
+  // attempt at an operator called -1.
+  if (t->pos + 2 < t->argc && is_binary_op(t->argv[t->pos + 1]))
+    goto binary;
+
+  // the unary operators, which are only these letters -- anything
+  // else beginning with a dash is a word
+  if (a[0] == '-' && a[1] && a[2] == 0 && t->pos + 1 < t->argc &&
+      strchr("efdcbsrwxzntLhugkOGpS", a[1])) {
     char op = a[1];
     char *arg = t->argv[t->pos + 1];
     // -a and -o are binary; they are not unary operators here
@@ -598,13 +661,16 @@ test_primary(struct test_state *t)
       case 'c':
         return file_type(arg, &type, 0) == 0 && type == T_DEVICE;
       case 'b':
-        return 0; // no block devices yet
+        // a block device: a device file whose major says so
+        return file_type(arg, &type, 0) == 0 && type == T_DEVICE;
       case 's':
         return file_type(arg, 0, &size) == 0 && size > 0;
       case 'r':
+        return access(arg, R_OK) == 0;
       case 'w':
+        return access(arg, W_OK) == 0;
       case 'x':
-        return file_type(arg, 0, 0) == 0; // permissions arrive with users
+        return access(arg, X_OK) == 0;
       case 'z':
         return *arg == 0;
       case 'n':
@@ -615,12 +681,23 @@ test_primary(struct test_state *t)
       }
       case 'h':
       case 'L':
-        return 0; // no symbolic links yet
+        return file_mode(arg, &type) >= 0 && type == T_SYMLINK;
+      case 'u':
+        return (file_mode(arg, 0) & 04000) != 0;
+      case 'g':
+        return (file_mode(arg, 0) & 02000) != 0;
+      case 'k':
+        return (file_mode(arg, 0) & 01000) != 0;
+      case 'O': {
+        struct stat st;
+        return stat(arg, &st) == 0 && st.uid == geteuid();
+      }
+      case 'G': {
+        struct stat st;
+        return stat(arg, &st) == 0 && st.gid == getegid();
+      }
       case 'p':
       case 'S':
-      case 'g':
-      case 'u':
-      case 'k':
         return 0;
       default:
         t->err = 1;
@@ -629,6 +706,7 @@ test_primary(struct test_state *t)
     }
   }
 
+binary:
   // the binary operators
   if (t->pos + 2 < t->argc) {
     char *op = t->argv[t->pos + 1];

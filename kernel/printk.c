@@ -46,6 +46,9 @@ pflush(void)
 {
   if (pr.n > 0) {
     consputs(pr.buf, pr.n);
+    // and into the ring /dev/kmsg reads, so that what the kernel said
+    // is still there for klogd and for whoever asks later
+    kmsg_note(pr.buf, pr.n);
     pr.n = 0;
   }
 }
@@ -162,12 +165,41 @@ printk(char *fmt, ...)
   return 0;
 }
 
+// the return addresses on the stack, which the frame pointer chains
+// together: the kernel is built with -fno-omit-frame-pointer, so s0
+// points at the top of the current frame and the two words below it
+// are the caller's return address and frame pointer.
+void
+backtrace(void)
+{
+  uint64 fp;
+
+  asm volatile("mv %0, s0" : "=r"(fp));
+  printk("backtrace:");
+  for (int i = 0; i < 16; i++) {
+    // a frame lives on a kernel stack: one page-aligned region, and a
+    // pointer outside it ends the walk rather than faulting
+    if (fp < 0x80000000UL || (fp & 7) != 0)
+      break;
+    uint64 ra = *(uint64 *)(fp - 8);
+    uint64 next = *(uint64 *)(fp - 16);
+    if (ra < 0x80000000UL)
+      break;
+    printk(" %p", (void *)ra);
+    if (next <= fp)
+      break;
+    fp = next;
+  }
+  printk("\n");
+}
+
 void
 panic(char *s)
 {
   panicking = 1;
   printk("panic: ");
   printk("%s\n", s);
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for (;;)
     ;

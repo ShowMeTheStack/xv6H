@@ -32,3 +32,7 @@ user/ld.so
 user/static/
 user/libc.a
 mkfs/mkext4
+mkfs/mkpasswd
+.DS_Store
+dbg.log
+user/syscallnames.h

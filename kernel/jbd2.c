@@ -287,6 +287,57 @@ jbd2_jread(struct jbd2 *j, uint64 jblk, void *page)
   return blk_read_block(j->disk, d, page);
 }
 
+// ---- writing several blocks in one request ----
+//
+// a transaction's blocks go to the log one after another, and the log
+// is a file whose blocks are usually one extent, so they are usually
+// next to each other on the disk. writing them one request at a time
+// costs a round trip each; gathered into one request they cost one.
+//
+// the pages must still be there when the batch is written, so a buffer
+// the journal reuses -- the descriptor it is building, the escaped
+// copy -- is never put in a batch.
+struct jbd2_batch {
+  struct gendisk *disk;
+  uint64 start; // the disk block of pages[0]
+  int n;
+  void *pages[BIO_MAXPAGES];
+};
+
+static int
+jbd2_batch_flush(struct jbd2_batch *bt)
+{
+  struct bio bio;
+  int r;
+
+  if (bt->n == 0)
+    return 0;
+  memset(&bio, 0, sizeof(bio));
+  bio.sector = bt->start * SECTORS_PER_BLOCK;
+  bio.nsectors = bt->n * SECTORS_PER_BLOCK;
+  bio.npages = bt->n;
+  for (int i = 0; i < bt->n; i++)
+    bio.pages[i] = bt->pages[i];
+  bio.write = 1;
+  r = blk_submit_wait(bt->disk, &bio);
+  bt->n = 0;
+  return r;
+}
+
+static int
+jbd2_batch_add(struct jbd2_batch *bt, uint64 diskblk, void *page)
+{
+  if (bt->n > 0 && (diskblk != bt->start + (uint64)bt->n || bt->n == BIO_MAXPAGES)) {
+    int r = jbd2_batch_flush(bt);
+    if (r < 0)
+      return r;
+  }
+  if (bt->n == 0)
+    bt->start = diskblk;
+  bt->pages[bt->n++] = page;
+  return 0;
+}
+
 static int
 jbd2_jwrite(struct jbd2 *j, uint64 jblk, void *page)
 {
@@ -297,6 +348,19 @@ jbd2_jwrite(struct jbd2 *j, uint64 jblk, void *page)
     return -EIO;
   }
   return blk_write_block(j->disk, d, page);
+}
+
+// the same, gathered with whatever came before it
+static int
+jbd2_jwrite_batch(struct jbd2 *j, struct jbd2_batch *bt, uint64 jblk, void *page)
+{
+  uint64 d = jbd2_map_block(j, jblk);
+
+  if (d == 0) {
+    printk("jbd2: journal block %lu has no disk block\n", jblk);
+    return -EIO;
+  }
+  return jbd2_batch_add(bt, d, page);
 }
 
 // ---- checksums over the four kinds of block ----
@@ -905,8 +969,12 @@ jbd2_write_txn(struct jbd2 *j, uint32 tid, uint64 *head_out)
   uint64 blk = j->head;
   uint64 ns;
   struct commit_header *ch;
+  struct jbd2_batch bt;
   int i = 0, k = 0;
   int r;
+
+  memset(&bt, 0, sizeof(bt));
+  bt.disk = j->disk;
 
   while (i < t->nblocks) {
     journal_header_t *dh;
@@ -952,7 +1020,15 @@ jbd2_write_txn(struct jbd2 *j, uint32 tid, uint64 *head_out)
       tag->t_flags = jbd2_be32(flags);
       tag->t_checksum = jbd2_be32(jbd2_tag_csum(j, tid, data));
 
-      r = jbd2_jwrite(j, blk, data);
+      if (data == j->ebuf) {
+        // the escaped copy is one buffer reused for every escaped
+        // block, so it cannot wait in a batch
+        r = jbd2_batch_flush(&bt);
+        if (r == 0)
+          r = jbd2_jwrite(j, blk, data);
+      } else {
+        r = jbd2_jwrite_batch(j, &bt, blk, data);
+      }
       if (r < 0)
         return r;
       j->nblocks_written++;
@@ -973,7 +1049,11 @@ jbd2_write_txn(struct jbd2 *j, uint32 tid, uint64 *head_out)
 
     tag->t_flags = jbd2_be32(jbd2_be32(tag->t_flags) | JBD2_FLAG_LAST_TAG);
     jbd2_desc_csum_set(j, j->dbuf);
-    r = jbd2_jwrite(j, descblk, j->dbuf);
+    // the descriptor is built in one buffer that the next group reuses,
+    // so the blocks it describes go out first and it goes out alone.
+    r = jbd2_batch_flush(&bt);
+    if (r == 0)
+      r = jbd2_jwrite(j, descblk, j->dbuf);
     if (r < 0)
       return r;
     j->nblocks_written++;
@@ -1046,12 +1126,31 @@ jbd2_checkpoint(struct jbd2 *j)
   struct jbd2_txn *t = &j->txn;
   int r;
 
+  // in order of block number, so that the ones that lie next to each
+  // other on the disk go in one request. the array's order means
+  // nothing after this: the caller only walks it to clear a flag.
+  for (int i = 1; i < t->nblocks; i++) {
+    struct blkbuf *v = t->blocks[i];
+    int k = i - 1;
+    while (k >= 0 && t->blocks[k]->blkno > v->blkno) {
+      t->blocks[k + 1] = t->blocks[k];
+      k--;
+    }
+    t->blocks[k + 1] = v;
+  }
+
+  struct jbd2_batch bt;
+  memset(&bt, 0, sizeof(bt));
+  bt.disk = j->disk;
   for (int i = 0; i < t->nblocks; i++) {
     struct blkbuf *b = t->blocks[i];
-    r = blk_write_block(j->disk, b->blkno, b->data);
+    r = jbd2_batch_add(&bt, b->blkno, b->data);
     if (r < 0)
       return r;
   }
+  r = jbd2_batch_flush(&bt);
+  if (r < 0)
+    return r;
   return blk_flush(j->disk);
 }
 

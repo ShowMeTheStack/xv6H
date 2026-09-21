@@ -33,11 +33,11 @@ open_redir(struct redir *r, char *file)
     return open(file, O_RDONLY);
   case R_OUT:
   case R_CLOBBER:
-    return open(file, O_WRONLY | O_CREAT | O_TRUNC);
+    return open(file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   case R_APPEND:
-    return open(file, O_WRONLY | O_CREAT | O_APPEND);
+    return open(file, O_WRONLY | O_CREAT | O_APPEND, 0666);
   case R_RDWR:
-    return open(file, O_RDWR | O_CREAT);
+    return open(file, O_RDWR | O_CREAT, 0666);
   default:
     return -1;
   }
@@ -51,11 +51,11 @@ heredoc_fd(struct redir *r)
   static int counter;
 
   snprintf(name, sizeof(name), "/tmp.here%d.%d", shell_pid, counter++);
-  int fd = open(name, O_CREAT | O_RDWR | O_TRUNC);
+  int fd = open(name, O_CREAT | O_RDWR | O_TRUNC, 0666);
   if (fd < 0) {
     // without /tmp, fall back to the working directory
     snprintf(name, sizeof(name), "here%d.%d", shell_pid, counter++);
-    fd = open(name, O_CREAT | O_RDWR | O_TRUNC);
+    fd = open(name, O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
       sh_error("cannot make a here-document: %s", strerror(errno));
       return -1;

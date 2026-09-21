@@ -22,6 +22,8 @@
 #include "vfs.h"
 #include "ext4.h"
 #include "ext4_ondisk.h"
+#include "ext4_internal.h"
+#include "xattr.h"
 #include "slab.h"
 #include "errno.h"
 
@@ -79,10 +81,19 @@ fill_inode(struct inode *ip, struct ext4_inode_info *info)
     ip->type = T_DIR;
   else if (fmt == 0x2000 || fmt == 0x6000)
     ip->type = T_DEVICE;
+  else if (fmt == 0xa000)
+    ip->type = T_SYMLINK;
   else
     ip->type = T_FILE;
   ip->nlink = info->nlink;
   ip->size = info->size;
+  ip->mode = info->mode & 07777;
+  ip->uid = info->uid;
+  ip->gid = info->gid;
+  ip->atime = info->atime;
+  ip->mtime = info->mtime;
+  ip->ctime = info->ctime;
+  ip->attr = info->flags;
   ip->major = 0;
   ip->minor = 0;
   if (fmt == 0x2000 || fmt == 0x6000) {
@@ -130,6 +141,18 @@ ext4_vfs_update(struct inode *ip)
     return;
   info->size = ip->size;
   info->nlink = ip->nlink;
+  // the permission bits and the owner, keeping the format the inode
+  // was made with: changing a file's mode must not change its kind.
+  info->mode = (info->mode & 0xf000) | (ip->mode & 07777);
+  info->uid = ip->uid;
+  info->gid = ip->gid;
+  // the chattr flags, keeping the ones the driver owns: the extent
+  // and inline-data bits say how the file is laid out, and are not
+  // the user's to set
+  info->flags = (info->flags & (EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL |
+                                EXT4_EA_INODE_FL | EXT4_INDEX_FL | EXT4_HUGE_FILE_FL)) |
+                (ip->attr & ~(EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL |
+                              EXT4_EA_INODE_FL | EXT4_INDEX_FL | EXT4_HUGE_FILE_FL));
   ext4_write_inode(m->fs, ip->inum, info);
   ext4_trans_end(m->fs);
 }
@@ -214,6 +237,29 @@ ext4_vfs_trunc(struct inode *ip)
   ip->size = 0;
 }
 
+static int
+ext4_vfs_setsize(struct inode *ip, uint64 len)
+{
+  struct ext4_mount *m = mount_of(ip);
+  struct ext4_inode_info *info = info_of(ip);
+  int r;
+
+  if (m == 0 || info == 0)
+    return -EIO;
+  if (m->fs->readonly)
+    return -EROFS;
+  if (ip->type != T_FILE)
+    return -EINVAL;
+  if ((r = ext4_trans_begin(m->fs, EXT4_CREDITS_BIG)) < 0)
+    return r;
+  r = ext4_truncate(m->fs, info, ip->inum, len);
+  ext4_trans_end(m->fs);
+  if (r < 0)
+    return r;
+  ip->size = len;
+  return 0;
+}
+
 // this file, on the disk. the data goes first and the journal second,
 // so that the metadata naming those blocks only becomes durable after
 // the blocks themselves do: a crash in between leaves the file as it
@@ -233,14 +279,36 @@ ext4_vfs_fsync(struct inode *ip, int datasync)
   if (m->fs->readonly)
     return 0;
 
+  // the file's blocks, in runs of ones that lie next to each other on
+  // the disk: a run is one request. writing them one at a time was
+  // what made fsync of a large file cost a round trip per block.
   nblocks = (info->size + m->fs->blocksize - 1) / m->fs->blocksize;
+  uint64 run_start = 0, run_len = 0, prev = 0;
   for (uint64 i = 0; i < nblocks; i++) {
     uint64 diskblk = 0;
     if (ext4_bmap(m->fs, info, i, &diskblk) < 0)
       break;
-    if (diskblk == 0)
-      continue; // a hole has nothing to write
-    int e = blk_sync_block(m->fs->disk, diskblk);
+    if (diskblk == 0) {
+      diskblk = 0; // a hole has nothing to write; it ends the run
+    } else if (run_len > 0 && diskblk == prev + 1) {
+      run_len++;
+      prev = diskblk;
+      continue;
+    }
+    if (run_len > 0) {
+      int e = blk_sync_range(m->fs->disk, run_start, run_len);
+      if (e < 0)
+        r = e;
+      run_len = 0;
+    }
+    if (diskblk != 0) {
+      run_start = diskblk;
+      run_len = 1;
+      prev = diskblk;
+    }
+  }
+  if (run_len > 0) {
+    int e = blk_sync_range(m->fs->disk, run_start, run_len);
     if (e < 0)
       r = e;
   }
@@ -293,6 +361,42 @@ ext4_vfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *i
   return 1;
 }
 
+// a symbolic link: an inode of its own holding the path it names, and
+// a name for it in the directory.
+static int
+ext4_vfs_symlink(struct inode *dp, char *name, const char *target)
+{
+  struct ext4_mount *m = mount_of(dp);
+  struct ext4_inode_info *dirinfo = info_of(dp);
+  struct ext4_inode_info newinfo;
+  uint64 ino;
+  int len = strlen(target);
+
+  if (m == 0 || dirinfo == 0)
+    return -EIO;
+  if (m->fs->readonly)
+    return -EROFS;
+  if (len == 0 || len > 1023)
+    return -ENAMETOOLONG;
+
+  int e = ext4_trans_begin(m->fs, EXT4_CREDITS_CREATE);
+  if (e < 0)
+    return e;
+  if (ext4_make_inode(m->fs, dp->inum, 0xa1ff, &ino, &newinfo) < 0) {
+    ext4_trans_end(m->fs);
+    return -ENOSPC;
+  }
+  int r = ext4_set_symlink(m->fs, &newinfo, ino, target, len);
+  if (r == 0)
+    r = ext4_add_entry(m->fs, dirinfo, dp->inum, name, strlen(name), ino, EXT4_FT_SYMLINK);
+  dp->size = dirinfo->size;
+  dp->nlink = dirinfo->nlink;
+  if (r < 0)
+    ext4_free_inode(m->fs, ino, 0);
+  ext4_trans_end(m->fs);
+  return r;
+}
+
 static int
 ext4_vfs_readlink(struct inode *ip, char *buf, int max)
 {
@@ -322,6 +426,8 @@ ftype_of(short type)
     return EXT4_FT_DIR;
   case T_DEVICE:
     return EXT4_FT_CHRDEV;
+  case T_SYMLINK:
+    return EXT4_FT_SYMLINK;
   default:
     return EXT4_FT_REG_FILE;
   }
@@ -340,7 +446,10 @@ ext4_vfs_create(struct inode *dp, char *name, short type, short major, short min
   if (m->fs->readonly)
     return 0;
 
-  uint16 mode = (type == T_DIR) ? 0x41ed : (type == T_DEVICE ? 0x21b6 : 0x81a4);
+  uint16 mode = (type == T_DIR)      ? 0x41ed
+                : (type == T_DEVICE)  ? 0x21b6
+                : (type == T_SYMLINK) ? 0xa1ff
+                                      : 0x81a4;
   if (ext4_trans_begin(m->fs, EXT4_CREDITS_CREATE) < 0)
     return 0;
   if (ext4_make_inode(m->fs, dp->inum, mode, &ino, &newinfo) < 0) {
@@ -487,16 +596,72 @@ ext4_vfs_link(struct inode *dp, char *name, struct inode *ip)
   return r;
 }
 
+// ---- extended attributes ----
+//
+// the attribute lives partly inside the inode, so every one of these
+// runs with the file system's lock held, and a change is a transaction
+// of its own: the inode, one block, and the bitmaps behind it.
+static int
+ext4_vfs_getxattr(struct inode *ip, const char *name, char *buf, int size)
+{
+  struct ext4_mount *m = mount_of(ip);
+  struct ext4_inode_info *info = info_of(ip);
+
+  if (m == 0 || info == 0)
+    return -EIO;
+  acquiresleep(&m->fs->lock);
+  int r = ext4_xattr_get(m->fs, info, ip->inum, name, buf, size);
+  releasesleep(&m->fs->lock);
+  return r;
+}
+
+static int
+ext4_vfs_setxattr(struct inode *ip, const char *name, const char *value, int size, int flags)
+{
+  struct ext4_mount *m = mount_of(ip);
+  struct ext4_inode_info *info = info_of(ip);
+
+  if (m == 0 || info == 0)
+    return -EIO;
+  if (m->fs->readonly)
+    return -EROFS;
+  int e = ext4_trans_begin(m->fs, EXT4_CREDITS_CREATE);
+  if (e < 0)
+    return e;
+  int r = ext4_xattr_set(m->fs, info, ip->inum, name, value, size, flags);
+  ext4_trans_end(m->fs);
+  return r;
+}
+
+static int
+ext4_vfs_listxattr(struct inode *ip, char *buf, int size)
+{
+  struct ext4_mount *m = mount_of(ip);
+  struct ext4_inode_info *info = info_of(ip);
+
+  if (m == 0 || info == 0)
+    return -EIO;
+  acquiresleep(&m->fs->lock);
+  int r = ext4_xattr_list(m->fs, info, ip->inum, buf, size);
+  releasesleep(&m->fs->lock);
+  return r;
+}
+
 static const struct inode_ops ext4_iops = {
     .load = ext4_vfs_load,
     .update = ext4_vfs_update,
     .release = ext4_vfs_release,
+    .getxattr = ext4_vfs_getxattr,
+    .setxattr = ext4_vfs_setxattr,
+    .listxattr = ext4_vfs_listxattr,
     .read = ext4_vfs_read,
     .write = ext4_vfs_write,
     .trunc = ext4_vfs_trunc,
+    .setsize = ext4_vfs_setsize,
     .fsync = ext4_vfs_fsync,
     .lookup = ext4_vfs_lookup,
     .readdir = ext4_vfs_readdir,
+    .symlink = ext4_vfs_symlink,
     .readlink = ext4_vfs_readlink,
     .create = ext4_vfs_create,
     .link = ext4_vfs_link,
@@ -572,8 +737,29 @@ ext4_sb_ifree(struct super *sb, uint inum, int isdir)
     return;
   if (ext4_trans_begin(m->fs, EXT4_CREDITS_SMALL) < 0)
     return;
+  ext4_xattr_drop(m->fs, inum);
   ext4_free_inode(m->fs, inum, isdir);
   ext4_trans_end(m->fs);
+}
+
+// ro to rw and back. going read-write replays nothing: the journal was
+// recovered at mount, and what this changes is only whether the driver
+// will write. going read-only writes out what is held first.
+static int
+ext4_sb_remount(struct super *sb, int readonly, const char *opts)
+{
+  struct ext4_mount *m = sb->priv;
+
+  (void)opts;
+  if (m == 0)
+    return -EIO;
+  if (readonly && !m->fs->readonly) {
+    if (m->fs->journal)
+      ext4_journal_commit(m->fs);
+    blk_sync(m->fs->disk);
+  }
+  m->fs->readonly = readonly;
+  return 0;
 }
 
 static const struct super_ops ext4_sops = {
@@ -582,6 +768,7 @@ static const struct super_ops ext4_sops = {
     .sync = ext4_sb_sync,
     .unmount = ext4_sb_unmount,
     .ifree = ext4_sb_ifree,
+    .remount = ext4_sb_remount,
 };
 
 // the mount options this file system understands. only one so far:

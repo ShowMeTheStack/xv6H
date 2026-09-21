@@ -593,8 +593,8 @@ ext4_free_inode(struct ext4_fs *fs, uint64 ino, int is_dir)
 // ---- writing an inode back ----
 
 // where one inode lives on the disk
-static int
-inode_place(struct ext4_fs *fs, uint64 ino, uint64 *blk, uint32 *off)
+int
+ext4_inode_place(struct ext4_fs *fs, uint64 ino, uint64 *blk, uint32 *off)
 {
   struct ext4_group_desc gd;
   uint32 group, index;
@@ -625,7 +625,7 @@ inode_mark_deleted(struct ext4_fs *fs, uint64 ino)
   uint64 blk;
   uint32 off;
 
-  if (inode_place(fs, ino, &blk, &off) < 0)
+  if (ext4_inode_place(fs, ino, &blk, &off) < 0)
     return;
   b = ext4_bread(fs, blk);
   if (b == 0)
@@ -651,7 +651,7 @@ ext4_write_inode(struct ext4_fs *fs, uint64 ino, struct ext4_inode_info *in)
 
   if (fs->readonly)
     return -EROFS;
-  r = inode_place(fs, ino, &blk, &off);
+  r = ext4_inode_place(fs, ino, &blk, &off);
   if (r < 0)
     return r;
   b = ext4_bread(fs, blk);
@@ -1107,6 +1107,7 @@ ext4_write_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, uint
 {
   uint64 done = 0;
   int faulted = 0;
+  int err = 0;
 
   if (fs->readonly)
     return -EROFS;
@@ -1136,8 +1137,14 @@ ext4_write_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, uint
     uint64 diskblk;
     uint32 got = 1;
     int r = ext4_bmap_alloc_run(fs, in, ino, fileblk, want, prefill, &diskblk, &got);
-    if (r < 0)
-      return done > 0 ? (int)done : r;
+    if (r < 0) {
+      // a write that stops part way is still a write: the bytes that
+      // did land have to be counted, and the size and the inode
+      // written, or the file ends shorter than what the caller was
+      // told went into it and the next write is past its end.
+      err = r;
+      break;
+    }
 
     // the run is contiguous both in the file and on the disk, so the
     // bytes that fall inside it are written without mapping again.
@@ -1152,8 +1159,11 @@ ext4_write_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, uint
         b = blk_get_fill(fs->disk, diskblk + k); // every byte is about to be written
       else
         b = ext4_bread(fs, diskblk + k);
-      if (b == 0)
-        return done > 0 ? (int)done : -EIO;
+      if (b == 0) {
+        err = -EIO;
+        faulted = 1;
+        break;
+      }
       // in data=journal the block has to be the journal's before it is
       // modified, the same rule metadata follows
       ext4_journal_data_access(fs, b);
@@ -1177,64 +1187,195 @@ ext4_write_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, uint
     in->size = off + done;
   ext4_touch(in, 1);
   ext4_write_inode(fs, ino, in);
-  if (done == 0 && faulted)
+  if (done > 0)
+    return (int)done;
+  if (err)
+    return err;
+  if (faulted)
     return -EFAULT;
-  return (int)done;
+  return 0;
 }
 
 // ---- truncating ----
 
-// free every block of a file and empty its extent tree. partial
-// truncation to a non-zero length comes with the rest of the write
-// path; a file is either made and written or removed.
+// every block of the subtree rooted at `blkno`, and the block itself.
+// `depth` is the depth of the node that block holds: zero means its
+// entries are extents, above that they are indices.
+static void
+free_subtree(struct ext4_fs *fs, uint64 blkno, int depth, uint64 *freed)
+{
+  struct blkbuf *b = ext4_bread(fs, blkno);
+
+  if (b) {
+    struct ext4_extent_header *eh = b->data;
+    if (eh->eh_magic == EXT4_EXT_MAGIC) {
+      if (depth == 0) {
+        struct ext4_extent *ex = (struct ext4_extent *)(eh + 1);
+        for (int i = 0; i < eh->eh_entries; i++) {
+          uint64 start = extent_start(&ex[i]);
+          for (uint32 k = 0; k < extent_len(&ex[i]); k++, (*freed)++)
+            ext4_free_block(fs, start + k);
+        }
+      } else {
+        struct ext4_extent_idx *ix = (struct ext4_extent_idx *)(eh + 1);
+        for (int i = 0; i < eh->eh_entries; i++)
+          free_subtree(fs, ix[i].ei_leaf_lo | ((uint64)ix[i].ei_leaf_hi << 32),
+                       depth - 1, freed);
+      }
+    }
+    blk_put(b);
+  }
+  ext4_free_block(fs, blkno);
+  (*freed)++;
+}
+
+// drop everything at or past file block `from` from one node of the
+// tree. an extent that straddles the line is shortened rather than
+// freed. `*freed` counts the blocks given back, metadata included,
+// because that is what i_blocks counts; `*dirty` says whether this
+// node itself changed and so needs writing.
+static int
+prune_node(struct ext4_fs *fs, struct ext4_extent_header *eh, int depth, uint32 from,
+           uint64 ino, uint32 gen, uint64 *freed, int *dirty)
+{
+  int keep = 0;
+
+  if (eh->eh_magic != EXT4_EXT_MAGIC)
+    return -EIO;
+
+  if (depth == 0) {
+    struct ext4_extent *ex = (struct ext4_extent *)(eh + 1);
+    for (int i = 0; i < eh->eh_entries; i++) {
+      uint32 first = ex[i].ee_block;
+      uint32 len = extent_len(&ex[i]);
+      int unwritten = ex[i].ee_len > 32768;
+      uint64 start = extent_start(&ex[i]);
+
+      if (first >= from) {
+        for (uint32 k = 0; k < len; k++, (*freed)++)
+          ext4_free_block(fs, start + k);
+        *dirty = 1;
+        continue; // the whole extent is past the new end
+      }
+      if (first + len > from) {
+        uint32 newlen = from - first;
+        for (uint32 k = newlen; k < len; k++, (*freed)++)
+          ext4_free_block(fs, start + k);
+        ex[i].ee_len = (uint16)(unwritten ? newlen + 32768 : newlen);
+        *dirty = 1;
+      }
+      if (keep != i)
+        ex[keep] = ex[i];
+      keep++;
+    }
+    eh->eh_entries = (uint16)keep;
+    return 0;
+  }
+
+  struct ext4_extent_idx *ix = (struct ext4_extent_idx *)(eh + 1);
+  for (int i = 0; i < eh->eh_entries; i++) {
+    uint64 child = ix[i].ei_leaf_lo | ((uint64)ix[i].ei_leaf_hi << 32);
+
+    if (ix[i].ei_block >= from) {
+      free_subtree(fs, child, depth - 1, freed);
+      *dirty = 1;
+      continue;
+    }
+    struct blkbuf *b = ext4_bread(fs, child);
+    if (b == 0)
+      return -EIO;
+    // write access is taken before the change, as everywhere else that
+    // walks the tree to alter it
+    ext4_journal_access(fs, b);
+    int cdirty = 0;
+    int r = prune_node(fs, (struct ext4_extent_header *)b->data, depth - 1, from, ino,
+                       gen, freed, &cdirty);
+    struct ext4_extent_header *ceh = b->data;
+    int empty = (r == 0 && ceh->eh_entries == 0);
+    if (cdirty && !empty) {
+      ext4_extentblock_csum(fs, ino, gen, b->data);
+      ext4_journal_dirty(fs, b);
+    }
+    blk_put(b);
+    if (r < 0)
+      return r;
+    if (empty) {
+      // nothing left under it, so the index entry goes too
+      ext4_free_block(fs, child);
+      (*freed)++;
+      *dirty = 1;
+      continue;
+    }
+    if (keep != i)
+      ix[keep] = ix[i];
+    keep++;
+  }
+  eh->eh_entries = (uint16)keep;
+  return 0;
+}
+
+// set a file's length. growing leaves a hole, which reads as zeros;
+// shrinking frees the blocks past the new end and shortens the extent
+// that straddles it.
 int
 ext4_truncate(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, uint64 newsize)
 {
-  struct ext4_extent_header *root = inode_extent_root(in);
+  struct ext4_extent_header *root;
+  uint64 freed = 0;
+  int dirty = 0, r;
 
   if (fs->readonly)
     return -EROFS;
-  if (newsize != 0)
-    return -EOPNOTSUPP;
-  if ((in->flags & EXT4_EXTENTS_FL) == 0 || root->eh_magic != EXT4_EXT_MAGIC) {
-    in->size = 0;
+  if (newsize == in->size)
+    return 0;
+  if (newsize > in->size) {
+    in->size = newsize;
+    ext4_touch(in, 1);
     ext4_write_inode(fs, ino, in);
     return 0;
   }
 
-  // walk the tree, freeing the blocks of every leaf and then the index
-  // blocks themselves
-  if (root->eh_depth == 0) {
-    struct ext4_extent *ex = (struct ext4_extent *)(root + 1);
-    for (int i = 0; i < root->eh_entries; i++) {
-      uint64 start = extent_start(&ex[i]);
-      for (uint32 k = 0; k < extent_len(&ex[i]); k++)
-        ext4_free_block(fs, start + k);
-    }
-  } else {
-    struct ext4_extent_idx *ix = (struct ext4_extent_idx *)(root + 1);
-    for (int i = 0; i < root->eh_entries; i++) {
-      uint64 child = ix[i].ei_leaf_lo | ((uint64)ix[i].ei_leaf_hi << 32);
-      struct blkbuf *b = ext4_bread(fs, child);
-      if (b == 0)
-        continue;
-      struct ext4_extent_header *eh = b->data;
-      if (eh->eh_magic == EXT4_EXT_MAGIC && eh->eh_depth == 0) {
-        struct ext4_extent *ex = (struct ext4_extent *)(eh + 1);
-        for (int k = 0; k < eh->eh_entries; k++) {
-          uint64 start = extent_start(&ex[k]);
-          for (uint32 j = 0; j < extent_len(&ex[k]); j++)
-            ext4_free_block(fs, start + j);
-        }
+  root = inode_extent_root(in);
+  if ((in->flags & EXT4_EXTENTS_FL) == 0 || root->eh_magic != EXT4_EXT_MAGIC) {
+    // an inode with no extent tree has no blocks of its own to give
+    // back; the old indirect format is read but never written here
+    in->size = newsize;
+    if (newsize == 0)
+      in->blocks = 0;
+    ext4_touch(in, 1);
+    ext4_write_inode(fs, ino, in);
+    return 0;
+  }
+
+  uint32 from = (uint32)((newsize + fs->blocksize - 1) >> fs->blockbits);
+  r = prune_node(fs, root, root->eh_depth, from, ino, in->generation, &freed, &dirty);
+  if (r < 0)
+    return r;
+
+  // whatever is left in the last block past the new end must read as
+  // zeros, or a later write beyond it would show what used to be there
+  uint32 tail = (uint32)(newsize & (fs->blocksize - 1));
+  if (tail) {
+    uint64 diskblk = 0;
+    if (ext4_bmap(fs, in, newsize >> fs->blockbits, &diskblk) >= 0 && diskblk) {
+      struct blkbuf *b = ext4_bread(fs, diskblk);
+      if (b) {
+        ext4_journal_access(fs, b);
+        memset((uchar *)b->data + tail, 0, fs->blocksize - tail);
+        ext4_journal_dirty(fs, b);
+        blk_put(b);
       }
-      blk_put(b);
-      ext4_free_block(fs, child);
     }
   }
 
-  extent_init(in);
-  in->size = 0;
-  in->blocks = 0;
+  if (root->eh_entries == 0)
+    extent_init(in); // nothing left: back to an empty tree at depth zero
+
+  uint64 sectors = freed * (fs->blocksize / 512);
+  in->blocks = in->blocks > sectors ? in->blocks - sectors : 0;
+  if (newsize == 0)
+    in->blocks = 0;
+  in->size = newsize;
   ext4_touch(in, 1);
   ext4_write_inode(fs, ino, in);
   return 0;
@@ -1406,6 +1547,38 @@ ext4_remove_entry(struct ext4_fs *fs, struct ext4_inode_info *dir, uint64 dirino
 }
 
 // ---- making and removing files ----
+
+// a symbolic link's target. a target short enough to fit in the sixty
+// bytes where an inode keeps its block map is kept there instead --
+// Linux calls that a fast symlink, and tells one by the inode owning no
+// blocks -- and a longer one goes in a block of its own like any file.
+int
+ext4_set_symlink(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, const char *target,
+                 int len)
+{
+  struct ext4_inode *di = (struct ext4_inode *)in->raw;
+
+  if (len <= 0 || len > 1023)
+    return -ENAMETOOLONG;
+
+  if (len < (int)EXT4_I_BLOCK_SIZE) {
+    in->flags &= ~(uint32)EXT4_EXTENTS_FL;
+    di->i_flags = in->flags;
+    memset(di->i_block, 0, sizeof(di->i_block));
+    memmove((uchar *)di->i_block, target, len);
+    in->size = len;
+    in->blocks = 0;
+    return ext4_write_inode(fs, ino, in);
+  }
+
+  // long enough to need a block: the inode keeps its extent tree and
+  // the target is the file's contents.
+  int r = ext4_write_file(fs, in, ino, 0, 0, (uint64)target, len);
+  if (r < 0)
+    return r;
+  in->size = len;
+  return ext4_write_inode(fs, ino, in);
+}
 
 // a device node keeps its device number where its blocks would be, and
 // has no blocks at all: i_block[0] holds (major << 8) | minor for the

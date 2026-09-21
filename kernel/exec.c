@@ -7,11 +7,13 @@
 #include "proc.h"
 #include "defs.h"
 #include "platform.h"
+#include "stat.h"
 #include "fs.h"
 #include "file.h"
 #include "mm.h"
 #include "elf.h"
 #include "page.h"
+#include "vfs.h"
 #include "posix.h"
 #include "errno.h"
 
@@ -146,7 +148,39 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   if ((ip = namei(path)) == 0) {
     return -ENOENT;
   }
+  // a file system mounted noexec holds data, whatever the file looks
+  // like. this is the check, and it is here rather than at open so
+  // that a program on such a mount can still be read and copied.
+  if (ip->sb && (ip->sb->flags & MS_NOEXEC)) {
+    iput(ip);
+    return -EACCES;
+  }
   ilock(ip);
+
+  // it has to be a file this process may run
+  if (ip->type != T_FILE) {
+    err = -EACCES;
+    goto bad;
+  }
+  if ((err = inode_permitted(ip, 1)) < 0)
+    goto bad;
+
+  // set-user-id and set-group-id: the program runs as its owner. a
+  // mount made nosuid, or a process that asked for no_new_privs, gets
+  // nothing; and the ids it would have gone back to are replaced, so
+  // the program cannot drop the privilege and take it up again.
+  uint new_euid = myproc()->cred.euid, new_egid = myproc()->cred.egid;
+  int setid = 0;
+  if (!(ip->sb && (ip->sb->flags & MS_NOSUID)) && !myproc()->cred.no_new_privs) {
+    if (ip->mode & 04000) {
+      new_euid = ip->uid;
+      setid = 1;
+    }
+    if (ip->mode & 02000) {
+      new_egid = ip->gid;
+      setid = 1;
+    }
+  }
 
   // Read the ELF header.
   if (readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
@@ -368,6 +402,25 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   sighand_exec(p);      // handled signals go back to the default
   fdtable_cloexec(p);   // and the close-on-exec descriptors are closed
 
+  // who the new program is. a set-user-id program's saved id is the
+  // one it took on, so it can drop the privilege and take it back; an
+  // ordinary program's is its effective id, so it cannot. capabilities
+  // follow the effective user id the same way they do for setuid(2).
+  {
+    struct cred *c = &p->cred;
+    c->euid = new_euid;
+    c->egid = new_egid;
+    c->suid = c->euid;
+    c->sgid = c->egid;
+    if (c->euid == 0)
+      c->cap_effective = c->cap_permitted = c->cap_bounding;
+    else if (setid)
+      c->cap_effective = c->cap_permitted = 0;
+    else
+      c->cap_effective = c->cap_permitted =
+          (c->cap_permitted & c->cap_inheritable) & c->cap_bounding;
+  }
+
   // Save program name for debugging.
   for (last = s = path; *s; s++)
     if (*s == '/')
@@ -390,6 +443,11 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   p->trapframe->epc = entry; // the interpreter's entry, or the program's
   p->trapframe->sp = sp;         // initial stack pointer
   proc_mm_free(oldmm);
+
+  // a watched process stops once here, before the new program's first
+  // instruction, so that whoever is watching sees what it became
+  if (p->traced)
+    ptrace_exec_stop(p);
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 

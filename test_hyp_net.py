@@ -63,6 +63,112 @@ def xv6_policy(q):
     assert "not trusted" in out, out
 
 
+def net_tools(q):
+    """the tools that read /proc/net say what the stack says, and the ones
+    that talk to the network get answers."""
+    # /proc/net is where all of them get their state
+    out = run(q, "cat /proc/net/route", 10)
+    assert "Destination" in out and "eth0" in out, out
+    out = run(q, "cat /proc/net/dev", 10)
+    assert "eth0" in out and "lo:" in out, out
+
+    # ip, route and arp
+    out = run(q, "ip addr show", 15)
+    assert re.search(r"inet 10\.0\.2\.\d+/\d+", out), out
+    assert "link/ether 52:54:00" in out, out
+    out = run(q, "ip link show", 15)
+    assert "eth0" in out and "state UP" in out, out
+    out = run(q, "ip route show", 15)
+    assert re.search(r"default via 10\.0\.2\.2", out), out
+    out = run(q, "route -n", 15)
+    assert "0.0.0.0" in out and "10.0.2.2" in out and "UG" in out, out
+    # the gateway answers ARP, so the cache has it after any traffic
+    run(q, "ping 8.8.8.8", 30)
+    out = run(q, "arp -n", 15)
+    assert "HWaddress" in out, out
+    assert re.search(r"10\.0\.2\.\d+\s+ether\s+52:55:0a", out) or \
+           re.search(r"10\.0\.2\.\d+\s+ether", out), out
+    out = run(q, "ip neigh show", 15)
+    assert re.search(r"10\.0\.2\.\d+ dev eth0 lladdr", out), out
+
+    # netstat and ss, over a socket that is definitely there
+    run(q, "service httpd start", 30)
+    out = run(q, "netstat -ltn", 20)
+    assert "LISTEN" in out and ":80" in out, out
+    out = run(q, "ss -ltn", 20)
+    assert "LISTEN" in out and ":80" in out, out
+    out = run(q, "netstat -i", 20)
+    assert "eth0" in out and "RX-OK" in out, out
+    out = run(q, "netstat -r", 20)
+    assert "Destination" in out and "UG" in out, out
+    out = run(q, "netstat -s", 20)
+    assert "TCP: inuse" in out, out
+
+    # nc against the machine's own web server, which is the loopback
+    # path and never leaves the machine
+    out = run(q, "printf 'GET /hello.txt HTTP/1.0\\r\\n\\r\\n' | nc 127.0.0.1 80", 30)
+    assert "200 OK" in out, out
+    out = run(q, "nc -z -v 127.0.0.1 80", 20)
+    assert "succeeded" in out, out
+    out = run(q, "nc -z 127.0.0.1 81", 20)
+    assert "open" not in out, out
+
+    # curl, the same way
+    out = run(q, "curl -s http://127.0.0.1/hello.txt", 30)
+    assert "hello" in out.lower(), out
+    out = run(q, "curl -s -o /tmp/c1 http://127.0.0.1/hello.txt && cat /tmp/c1", 30)
+    assert "hello" in out.lower(), out
+    out = run(q, "curl -s -I http://127.0.0.1/hello.txt", 30)
+    assert "200 OK" in out, out
+    out = run(q, "curl -s -w '%{http_code}' -o /dev/null http://127.0.0.1/nope", 30)
+    assert "404" in out, out
+
+    # curl over the real internet, and its https path
+    out = run(q, "curl -s http://example.com/ | head -5", 60)
+    assert "<" in out, out
+    out = run(q, "curl -s https://example.com/ | head -5", 90)
+    assert "<" in out, out
+
+    # dig and host
+    out = run(q, "dig +short example.com", 40)
+    assert re.search(r"(?m)^\d+\.\d+\.\d+\.\d+\.?$", out), out
+    out = run(q, "dig example.com", 40)
+    assert "ANSWER SECTION" in out and "IN\tA" in out, out
+    out = run(q, "dig example.com MX", 40)
+    assert "ANSWER SECTION" in out or "no " in out, out
+    out = run(q, "host example.com", 40)
+    assert "has address" in out, out
+    out = run(q, "dig +short nx-this-name-does-not-exist-xv6.com", 40)
+    assert not re.search(r"(?m)^\d+\.\d+\.\d+\.\d+$", out), out
+
+    # traceroute: behind the NAT the first hop answers, which is enough
+    # to show that the time to live and the ICMP errors both work
+    out = run(q, "traceroute -m 4 -q 1 -w 2 8.8.8.8", 60)
+    assert re.search(r"(?m)^\s*1\s", out), out
+    assert re.search(r"\d+\.\d+\.\d+\.\d+", out), out
+
+    # tcpdump: capture a ping and read the file back
+    out = run(q, "tcpdump -c 4 -w /tmp/p.pcap & sleep 1; ping 8.8.8.8 2; wait", 60)
+    out = run(q, "ls -l /tmp/p.pcap", 15)
+    assert re.search(r"\b\d\d+\b", out), out
+    out = run(q, "od -A n -t x1 -N 4 /tmp/p.pcap", 15)
+    assert "d4 c3 b2 a1" in out, out   # the pcap magic, little endian
+    out = run(q, "tcpdump -t -n -r /tmp/p.pcap", 30)
+    assert "ICMP echo" in out or "IP " in out or "ARP" in out, out
+    out = run(q, "tcpdump -t -n -r /tmp/p.pcap icmp", 30)
+    assert "ICMP" in out or out.strip() == "", out
+
+
+def t_net_tools(QEMU, intc, cpus, log):
+    """netstat, ss, ip, route, arp, nc, curl, dig, traceroute and tcpdump."""
+    q = g.boot_host(QEMU, intc, cpus, log)
+    try:
+        wait_up(q)
+        net_tools(q)
+    finally:
+        q.close()
+
+
 def t_host_net(QEMU, intc, cpus, log):
     """the host xv6 configures itself by DHCP and reaches the internet."""
     q = g.boot_host(QEMU, intc, cpus, log)
@@ -209,6 +315,7 @@ def tests(modes, cpus, log, QEMU, have_linux):
         t.append(("net-host-%s" % m, lambda m=m: t_host_net(QEMU, m, cpus, log)))
         t.append(("net-guest-dhcp-%s" % m, lambda m=m: t_guest_net_dhcp(QEMU, m, cpus, log)))
     t.append(("net-guest-static", lambda: t_guest_net_static(QEMU, modes[0], cpus, log)))
+    t.append(("net-tools", lambda: t_net_tools(QEMU, modes[0], cpus, log)))
     if have_linux:
         for m in modes:
             t.append(("net-linux-dhcp-%s" % m, lambda m=m: t_linux_net_dhcp(QEMU, m, cpus, log)))

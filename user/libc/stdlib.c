@@ -532,7 +532,7 @@ system(const char *cmd)
     return -1;
   if (pid == 0) {
     char *argv[] = {"sh", "-c", (char *)cmd, 0};
-    execv("/sh", argv);
+    execv("/bin/sh", argv);
     _exit(127);
   }
   int st;
@@ -579,7 +579,7 @@ mkstemp(char *tmpl)
   for (int try = 0; try < 100; try++) {
     if (fill_template(tmpl, 6) < 0)
       return -1;
-    int fd = open(tmpl, O_CREAT | O_EXCL | O_RDWR);
+    int fd = open(tmpl, O_CREAT | O_EXCL | O_RDWR, 0666);
     if (fd >= 0)
       return fd;
     if (errno != EEXIST)
@@ -622,38 +622,50 @@ tmpnam(char *s)
   return mktemp(p);
 }
 
-// resolve . and .. textually and check that the result exists. there
-// are no symbolic links yet, so no loop to follow.
+// the absolute path with no `.`, no `..` and no symbolic link left in
+// it. each component is resolved in turn: when one turns out to be a
+// link, what it points at is put in front of whatever is left of the
+// path and the walk carries on. forty expansions is as far as this
+// goes, which is where a loop of links is called a loop.
 char *
 realpath(const char *path, char *out)
 {
-  char tmp[PATH_MAX];
+  char rest[PATH_MAX], link[PATH_MAX], joined[PATH_MAX];
   char *buf = out ? out : malloc(PATH_MAX);
+  size_t blen;
+  int links = 0;
 
   if (buf == 0)
     return 0;
+  if (path == 0 || path[0] == 0) {
+    errno = ENOENT;
+    goto fail;
+  }
   if (path[0] != '/') {
-    if (getcwd(tmp, sizeof(tmp)) == 0)
+    if (getcwd(rest, sizeof(rest)) == 0)
       goto fail;
-    size_t n = strlen(tmp);
-    if (n + 1 + strlen(path) + 1 > sizeof(tmp)) {
+    size_t n = strlen(rest);
+    if (n + 1 + strlen(path) + 1 > sizeof(rest)) {
       errno = ENAMETOOLONG;
       goto fail;
     }
     if (n > 1)
-      tmp[n++] = '/';
-    strcpy(tmp + n, path);
+      rest[n++] = '/';
+    strcpy(rest + n, path);
   } else {
-    if (strlen(path) + 1 > sizeof(tmp)) {
+    if (strlen(path) + 1 > sizeof(rest)) {
       errno = ENAMETOOLONG;
       goto fail;
     }
-    strcpy(tmp, path);
+    strcpy(rest, path);
   }
 
-  char *w = buf;
-  *w++ = '/';
-  for (char *p = tmp; *p;) {
+  buf[0] = '/';
+  buf[1] = 0;
+  blen = 1;
+
+  char *p = rest;
+  while (*p) {
     while (*p == '/')
       p++;
     if (*p == 0)
@@ -662,25 +674,63 @@ realpath(const char *path, char *out)
     while (*p && *p != '/')
       p++;
     size_t len = p - comp;
+
     if (len == 1 && comp[0] == '.')
       continue;
     if (len == 2 && comp[0] == '.' && comp[1] == '.') {
-      while (w > buf + 1 && w[-1] != '/')
-        w--;
-      if (w > buf + 1)
-        w--;
+      while (blen > 1 && buf[blen - 1] != '/')
+        blen--;
+      if (blen > 1)
+        blen--;
+      buf[blen] = 0;
       continue;
     }
-    if (w > buf + 1)
-      *w++ = '/';
-    if ((size_t)(w - buf) + len + 1 > PATH_MAX) {
+    if (blen + (blen > 1 ? 1 : 0) + len + 1 > PATH_MAX) {
       errno = ENAMETOOLONG;
       goto fail;
     }
-    memcpy(w, comp, len);
-    w += len;
+    if (blen > 1)
+      buf[blen++] = '/';
+    memcpy(buf + blen, comp, len);
+    blen += len;
+    buf[blen] = 0;
+
+    struct stat st;
+    if (lstat(buf, &st) < 0)
+      goto fail;
+    if (st.type != T_SYMLINK)
+      continue;
+    if (++links > 40) {
+      errno = ELOOP;
+      goto fail;
+    }
+    ssize_t n = readlink(buf, link, sizeof(link) - 1);
+    if (n < 0)
+      goto fail;
+    link[n] = 0;
+    // what the link points at, then the rest of the path. `p` is at
+    // the separator after this component, or at the end.
+    if (strlen(link) + strlen(p) + 1 > sizeof(joined)) {
+      errno = ENAMETOOLONG;
+      goto fail;
+    }
+    strcpy(joined, link);
+    strcat(joined, p);
+    strcpy(rest, joined);
+    p = rest;
+    if (link[0] == '/') {
+      blen = 1;
+      buf[1] = 0;
+    } else {
+      // a relative link is resolved against the directory it sits in,
+      // so the component just appended comes back off
+      while (blen > 1 && buf[blen - 1] != '/')
+        blen--;
+      if (blen > 1)
+        blen--;
+      buf[blen] = 0;
+    }
   }
-  *w = 0;
 
   struct stat st;
   if (stat(buf, &st) < 0)

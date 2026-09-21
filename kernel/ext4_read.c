@@ -571,7 +571,7 @@ ext4_ext_check(const struct ext4_extent_header *eh, uint32 space, int depth_want
 // no extent covers is a hole, which is not an error.
 static int
 ext4_ext_lookup(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk,
-                int *unwritten)
+                int *unwritten, uint64 *run)
 {
   const struct ext4_extent_header *eh;
   const struct ext4_extent_idx *ix;
@@ -631,6 +631,11 @@ ext4_ext_lookup(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, 
           goto out;
         }
         *diskblk = child + (fileblk - first);
+        // how much of this extent follows: a caller walking a file can
+        // use the whole of it without asking again, which is the point
+        // of an extent.
+        if (run)
+          *run = (uint64)first + len - fileblk;
         break;
       }
       goto out;                    // found it, or it is a hole: either way done
@@ -730,13 +735,16 @@ ext4_ind_lookup(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, 
 }
 
 int
-ext4_bmap(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk)
+ext4_bmap_run(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk,
+              uint64 *run)
 {
   int unwritten = 0, r;
 
   if (fs == 0 || in == 0 || diskblk == 0)
     return -EINVAL;
   *diskblk = 0;
+  if (run)
+    *run = 1;
   // inline_data is refused at mount, but a single inode can still carry
   // the flag; its data is in the inode, not in any block, so there is no
   // mapping to give.
@@ -744,12 +752,18 @@ ext4_bmap(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64
     return -EOPNOTSUPP;
 
   if (in->flags & EXT4_EXTENTS_FL)
-    r = ext4_ext_lookup(fs, in, fileblk, diskblk, &unwritten);
+    r = ext4_ext_lookup(fs, in, fileblk, diskblk, &unwritten, run);
   else
     r = ext4_ind_lookup(fs, in, fileblk, diskblk);
   if (r < 0)
     return r;
   return unwritten ? EXT4_MAP_UNWRITTEN : EXT4_MAP_MAPPED;
+}
+
+int
+ext4_bmap(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk)
+{
+  return ext4_bmap_run(fs, in, fileblk, diskblk, 0);
 }
 
 // ---- file data ----
@@ -778,6 +792,9 @@ ext4_read_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 off, int u
   if (n > 0x7fffffffu)
     n = 0x7fffffffu;
 
+  uint64 run = 0, runblk = 0;
+  int runmap = 0;
+
   while (done < n) {
     fileblk = (off + done) >> fs->blockbits;
     boff = (uint32)((off + done) & (fs->blocksize - 1));
@@ -785,7 +802,22 @@ ext4_read_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 off, int u
     if (chunk > n - done)
       chunk = (uint32)(n - done);
 
-    r = ext4_bmap(fs, in, fileblk, &diskblk);
+    // an extent says how many blocks follow it contiguously, so a walk
+    // through a file asks the tree once per extent and not once per
+    // block.
+    if (run > 0) {
+      run--;
+      diskblk = runblk++;
+      r = runmap;
+    } else {
+      uint64 len = 1;
+      r = ext4_bmap_run(fs, in, fileblk, &diskblk, &len);
+      if (r >= 0 && diskblk != 0 && len > 1) {
+        run = len - 1;
+        runblk = diskblk + 1;
+        runmap = r;
+      }
+    }
     if (r < 0)
       return done > 0 ? (int)done : r;
     // a hole and an unwritten extent both read as zeros; that is what the
@@ -795,11 +827,21 @@ ext4_read_file(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 off, int u
       if (either_memset(user, dst + done, 0, chunk) < 0)
         return done > 0 ? (int)done : -EFAULT;
     } else {
-      b = ext4_bread(fs, diskblk);
-      if (b == 0)
-        return done > 0 ? (int)done : -EIO;
-      int e = either_copyout(user, dst + done, (uchar *)b->data + boff, chunk);
-      blk_put(b);
+      // a block already in the cache is read without taking its lock:
+      // see blk_peek. this is the whole of a cached read's cost, so it
+      // is worth the distinction.
+      int e;
+      b = blk_peek(fs->disk, diskblk);
+      if (b) {
+        e = either_copyout(user, dst + done, (uchar *)b->data + boff, chunk);
+        blk_unpeek(b);
+      } else {
+        b = ext4_bread(fs, diskblk);
+        if (b == 0)
+          return done > 0 ? (int)done : -EIO;
+        e = either_copyout(user, dst + done, (uchar *)b->data + boff, chunk);
+        blk_put(b);
+      }
       if (e < 0)
         return done > 0 ? (int)done : -EFAULT;
     }

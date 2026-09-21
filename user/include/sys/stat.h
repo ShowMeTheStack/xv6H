@@ -3,10 +3,12 @@
 #include <sys/cdefs.h>
 #include <sys/types.h>
 #include "kernel/stat.h" // struct stat and the T_* types
+#include <fcntl.h>   // AT_FDCWD and the AT_* flags
 
-// the file types, as POSIX spells them. xv6's inode type is a small
-// number rather than a mode field; ownership and permissions arrive
-// with the user milestone, and these map onto what exists today.
+// the file types, as POSIX spells them. this kernel's stat keeps the
+// kind of file in `type` and the permission bits in `mode`; the mode a
+// POSIX program expects is the two put together, which is what
+// ST_MODE gives and what st_mode is a name for.
 #define S_IFMT   0170000
 #define S_IFDIR  0040000
 #define S_IFCHR  0020000
@@ -38,21 +40,25 @@
 #define S_IWOTH 02
 #define S_IXOTH 01
 
-// the inode type of a stat, as a mode
+// the mode a POSIX program expects: the kind of file and the
+// permission bits in one word
 mode_t __type2mode(short type);
-#define ST_MODE(sb) __type2mode((sb).type)
+#define ST_MODE(sb) (__type2mode((sb).type) | ((sb).mode & 07777))
+
+// the fields keep this kernel's names -- sb.size, sb.mode, sb.uid --
+// rather than POSIX's st_ prefixed ones. macros for those would
+// rewrite every identifier called "size" or "mode" in any file that
+// includes this header, which is a trade no program here needs.
 
 int stat(const char *path, struct stat *sb);
 int lstat(const char *path, struct stat *sb);
 int fstat(int fd, struct stat *sb);
 int fstatat(int dirfd, const char *path, struct stat *sb, int flags);
-// POSIX: the mode is taken and, for now, ignored -- this kernel makes
-// a directory 0755 whatever is asked for. the argument is in the
-// interface because every program that calls mkdir passes one.
 int mkdir(const char *path, mode_t mode);
 int mkdirat(int dirfd, const char *path, mode_t mode);
 int mknod(const char *path, short major, short minor);
 int chmod(const char *path, mode_t mode);
 int fchmod(int fd, mode_t mode);
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags);
 mode_t umask(mode_t mask);
 #endif

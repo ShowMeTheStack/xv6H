@@ -1,0 +1,69 @@
+# what an init script says and does, so that every one of them says and
+# does it the same way. sourced, not run.
+
+log_daemon_msg() {
+	printf '%s' "$*"
+}
+
+log_end_msg() {
+	if [ "$1" = "0" ]; then
+		echo " ."
+	else
+		echo " failed!"
+	fi
+	return "$1"
+}
+
+log_action_msg() {
+	echo "$*"
+}
+
+# the pid of a running daemon, from its pid file or by name
+pidofproc() {
+	name="$1"
+	pidfile="$2"
+	if [ -n "$pidfile" ] && [ -f "$pidfile" ]; then
+		pid=$(cat "$pidfile")
+		if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+			echo "$pid"
+			return 0
+		fi
+	fi
+	pid=$(pgrep "$name" | head -1)
+	if [ -n "$pid" ]; then
+		echo "$pid"
+		return 0
+	fi
+	return 1
+}
+
+start_daemon() {
+	daemon="$1"
+	shift
+	"$daemon" "$@"
+}
+
+killproc() {
+	name="$1"
+	pidfile="$2"
+	signal="${3:-TERM}"
+	pid=$(pidofproc "$name" "$pidfile")
+	if [ -z "$pid" ]; then
+		return 1
+	fi
+	kill "-$signal" "$pid"
+	rm -f "$pidfile"
+	return 0
+}
+
+status_of_proc() {
+	name="$1"
+	pidfile="$2"
+	pid=$(pidofproc "$name" "$pidfile")
+	if [ -n "$pid" ]; then
+		echo "$name is running (pid $pid)"
+		return 0
+	fi
+	echo "$name is not running"
+	return 3
+}

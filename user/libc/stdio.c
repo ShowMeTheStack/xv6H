@@ -202,7 +202,7 @@ fopen(const char *path, const char *mode)
     errno = EINVAL;
     return 0;
   }
-  int fd = open(path, o);
+  int fd = open(path, o, 0666);
   if (fd < 0)
     return 0;
   FILE *f = newfile(fd, flags);
@@ -239,7 +239,7 @@ freopen(const char *path, const char *mode, FILE *f)
     errno = EINVAL; // changing the mode of an open descriptor is not supported
     return 0;
   }
-  int fd = open(path, o);
+  int fd = open(path, o, 0666);
   if (fd < 0)
     return 0;
   if (f->fd >= 0 && !(f->flags & _F_NOCLOSE))
@@ -340,14 +340,19 @@ fclose(FILE *f)
     return EOF;
   if (__stdio_flush_locked(f) == EOF)
     r = EOF;
+  // the descriptor is closed before the child is waited for. a stream
+  // from popen(cmd, "w") has that child at the other end of the pipe
+  // reading until end of file, and end of file is this descriptor
+  // closing -- so waiting first is a deadlock with each side holding
+  // what the other is waiting for.
+  if (f->fd >= 0 && !(f->flags & _F_NOCLOSE) && close(f->fd) < 0)
+    r = EOF;
   if (f->pid > 0) {
     int st;
     while (waitpid(f->pid, &st, 0) < 0 && errno == EINTR)
       ;
-    r = st;
+    r = st; // pclose answers with the child's status
   }
-  if (f->fd >= 0 && !(f->flags & _F_NOCLOSE) && close(f->fd) < 0)
-    r = EOF;
   if (f->flags & _F_MEM) {
     if (f->memptr) {
       *f->memptr = f->buf;
@@ -967,19 +972,7 @@ remove(const char *path)
   return unlink(path);
 }
 
-int
-rename(const char *from, const char *to)
-{
-  // without a rename system call, a link and an unlink do the job for
-  // a file; a directory cannot be linked, so it cannot be renamed yet.
-  if (link(from, to) < 0)
-    return -1;
-  if (unlink(from) < 0) {
-    unlink(to);
-    return -1;
-  }
-  return 0;
-}
+// rename is a system call now; the stub is generated.
 
 void
 perror(const char *s)
@@ -1029,7 +1022,7 @@ popen(const char *cmd, const char *mode)
         close(fds[0]);
     }
     char *argv[] = {"sh", "-c", (char *)cmd, 0};
-    execv("/sh", argv);
+    execv("/bin/sh", argv);
     _exit(127);
   }
   close(reading ? fds[1] : fds[0]);

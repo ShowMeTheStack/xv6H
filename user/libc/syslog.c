@@ -37,8 +37,16 @@ static int logfd = -1;
 static void
 openfd(void)
 {
-  if (logfd < 0)
-    logfd = open("/dev/log", O_WRONLY | O_CLOEXEC);
+  if (logfd >= 0)
+    return;
+  logfd = open("/dev/log", O_WRONLY | O_CLOEXEC);
+  if (logfd < 0) {
+    // no syslogd listening. the message still belongs in the log, so
+    // it goes on the end of the file syslogd would have written; only
+    // when even that cannot be opened does it go to the terminal,
+    // where it would otherwise interrupt whatever is on the screen.
+    logfd = open("/var/log/messages", O_WRONLY | O_CREAT | O_APPEND, 0666);
+  }
 }
 
 void
@@ -46,8 +54,11 @@ openlog(const char *ident, int option, int facility)
 {
   logident = ident;
   logoption = option;
-  if (facility)
-    logfacility = facility & LOG_FACMASK;
+  // POSIX says the third argument sets the facility, and LOG_KERN is
+  // zero: taking zero to mean "leave it alone" would make klogd's
+  // messages indistinguishable from any other program's, so it is
+  // taken at its word. a program that does not care passes LOG_USER.
+  logfacility = facility & LOG_FACMASK;
   // LOG_NDELAY asks for the connection now rather than at the first
   // message, which is the only difference the two delay flags make.
   if (option & LOG_NDELAY)

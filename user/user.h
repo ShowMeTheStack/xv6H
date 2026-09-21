@@ -63,6 +63,10 @@ int accept(int, uint32 *, int *);
 int sendto(int, const void *, int, uint32, int);
 int recvfrom(int, void *, int, uint32 *, int *, int);
 int netinfo(struct netinfo *);
+// SO_TTL and SO_ICMP_ERRORS live in kernel/socket.h
+int sockopt(int fd, int option, int value);
+// ptrace: the requests are in kernel/ptrace.h
+long ptrace(int request, int pid, void *addr, void *data);
 
 // user/net.c: names, addresses and whole transfers
 int dns_resolve(const char *name, uint32 *ip);

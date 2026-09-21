@@ -3,17 +3,29 @@
 
 static int force, recursive, status;
 
+// -f says to ignore an operand that is not there, and nothing else:
+// a file that exists but cannot be removed is still an error, which
+// is what makes `rm -f` on an immutable file report rather than go
+// quietly.
+static void
+complain(const char *path)
+{
+  if (force && errno == ENOENT)
+    return;
+  fprintf(stderr, "rm: %s: %s\n", path, strerror(errno));
+  status = 1;
+}
+
 // remove a directory's contents, then the directory itself
 static int
 remove_tree(const char *path)
 {
   struct stat st;
 
-  if (stat(path, &st) < 0) {
-    if (!force) {
-      fprintf(stderr, "rm: %s: %s\n", path, strerror(errno));
-      status = 1;
-    }
+  // the link itself, not what it points at: a symbolic link whose
+  // target is gone is still a name to remove
+  if (lstat(path, &st) < 0) {
+    complain(path);
     return -1;
   }
   if (st.type == T_DIR) {
@@ -24,10 +36,7 @@ remove_tree(const char *path)
     }
     DIR *d = opendir(path);
     if (d == 0) {
-      if (!force) {
-        fprintf(stderr, "rm: %s: %s\n", path, strerror(errno));
-        status = 1;
-      }
+      complain(path);
       return -1;
     }
     struct dirent *e;
@@ -42,10 +51,7 @@ remove_tree(const char *path)
     closedir(d);
   }
   if (unlink(path) < 0) {
-    if (!force) {
-      fprintf(stderr, "rm: %s: %s\n", path, strerror(errno));
-      status = 1;
-    }
+    complain(path);
     return -1;
   }
   return 0;

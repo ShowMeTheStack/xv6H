@@ -16,6 +16,7 @@ struct mbuf {
   uint len;
   uint32 arg;      // protocol-private (e.g. source ip for received UDP)
   uint16 arg16;
+  uint8 arg_type;  // an ICMP error's type; zero for an ordinary datagram
   char buf[MBUF_SIZE];
 };
 
@@ -93,7 +94,12 @@ struct ip {
 
 // ---- icmp ----
 #define ICMP_ECHOREPLY 0
+#define ICMP_UNREACH   3
+#define ICMP_SRCQUENCH 4
+#define ICMP_REDIRECT  5
 #define ICMP_ECHO      8
+#define ICMP_TIMXCEED  11
+#define ICMP_PARAMPROB 12
 
 struct icmp {
   uint8 type;
@@ -166,20 +172,32 @@ void netinit(void);
 void net_rx(struct mbuf *m);
 void net_timer(void);
 int net_tx_ip(struct mbuf *m, uint32 dst, uint8 proto);
-int net_tx_udp(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport);
-int net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n);
+int net_tx_ip_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl);
+int net_tx_udp(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport, int ttl);
+int net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n, int ttl);
 uint16 ip_checksum(void *data, int len, uint32 seed);
 uint16 l4_checksum(uint32 src, uint32 dst, uint8 proto, void *data, int len);
 int net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest);
 void net_set_static(uint32 ip, uint32 mask, uint32 gw, uint32 dns);
 void net_stats(struct netinfo *ni);
+void arp_walk(void (*fn)(uint32 ip, const uint8 *mac, int valid, void *arg), void *arg);
 extern uint64 net_rx_packets, net_tx_packets, net_rx_dropped, net_tx_dropped, net_policy_dropped;
+
+// pktcap.c: /dev/pktcap, which hands every frame to a reader
+void pktcap_init(void);
+void pktcap_register(void);
+int pktcap_active(void);
+void pktcap_frame(const void *frame, uint len);
+void pktcap_stats(uint64 *got, uint64 *lost);
 
 // sock.c
 struct sock;
 void sockinit(void);
 int sock_udp_rx(struct mbuf *m, uint32 src, uint16 sport, uint16 dport);
 int sock_icmp_rx(struct mbuf *m, uint32 src, uint16 id);
+int sock_icmp_error(uint32 src, int type, int code, uint16 id, uint16 seq);
+int sock_udp_error(uint32 src, int type, int code, uint16 sport);
+void sock_timer(void);
 
 // tcp.c
 void tcp_rx(struct mbuf *m, uint32 src, uint32 dst);

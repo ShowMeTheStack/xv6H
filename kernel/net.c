@@ -39,6 +39,7 @@ mbufalloc(uint headroom)
   m->len = 0;
   m->arg = 0;
   m->arg16 = 0;
+  m->arg_type = 0;
   return m;
 }
 
@@ -138,6 +139,14 @@ l4_checksum(uint32 src, uint32 dst, uint8 proto, void *data, int len)
 int
 net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
 {
+  // this machine talking to itself. 127.0.0.0/8 is not routable
+  // anywhere by definition and the stack never puts such a packet on
+  // the wire, so allowing it cannot reach the laptop or the network
+  // beyond it -- and a machine that cannot talk to itself cannot run
+  // a service and test it.
+  if ((dst >> 24) == 127)
+    return 1;
+
   // DHCP: broadcast discover/request, and renewals to the server.
   if (proto == IPPROTO_UDP && dport == 67 && (dst == 0xffffffff || dst == netcfg.gw))
     return 1;
@@ -150,8 +159,8 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
   if (netcfg.up && netcfg.mask && (dst & netcfg.mask) == (netcfg.ip & netcfg.mask) &&
       dst != (netcfg.ip | ~netcfg.mask))
     return 1; // a guest or the host: never leaves the switch
-  if (a == 10 || a == 127 || a == 0)
-    return 0;
+  if (a == 10 || a == 0)
+    return 0; // 127 is handled above: it is ours and goes nowhere
   if (a == 172 && b >= 16 && b < 32)
     return 0;
   if (a == 192 && b == 168)
@@ -176,6 +185,8 @@ net_tx_eth(struct mbuf *m, const uint8 *dhost, uint16 type)
   memmove(e->dhost, dhost, ETHADDR_LEN);
   memmove(e->shost, netcfg.mac, ETHADDR_LEN);
   e->type = htons(type);
+  if (pktcap_active())
+    pktcap_frame(m->head, m->len);
   return bridge_tx_host(m);
 }
 
@@ -274,13 +285,31 @@ out:
   mbuffree(m);
 }
 
+// walk the arp cache for /proc/net/arp. the caller holds netlock,
+// which is what everything else that touches the table holds.
+void
+arp_walk(void (*fn)(uint32 ip, const uint8 *mac, int valid, void *arg), void *arg)
+{
+  for (int i = 0; i < ARP_ENTRIES; i++)
+    if (arptab[i].ip)
+      fn(arptab[i].ip, arptab[i].mac, arptab[i].valid, arg);
+}
+
 // ---- ipv4 ----
 
+// loopback: a packet to one of our own addresses goes back into the
+// stack rather than to the wire (see below).
+static int loopback_send(struct mbuf *m);
+static int is_local(uint32 dst);
+
 // send m as an IP packet to dst. takes ownership. caller holds netlock.
+// `ttl` of zero means the usual 64; a smaller one makes the packet
+// expire on the way, which is how traceroute finds the routers.
 static int
-ip_send(struct mbuf *m, uint32 dst, uint8 proto)
+ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
 {
-  if (!netcfg.up && !(proto == IPPROTO_UDP)) {
+  // the interface has to be up to reach anything but ourselves
+  if (!netcfg.up && !(proto == IPPROTO_UDP) && (dst >> 24) != 127) {
     mbuffree(m);
     return -1;
   }
@@ -290,12 +319,17 @@ ip_send(struct mbuf *m, uint32 dst, uint8 proto)
   h->len = htons(m->len);
   h->id = htons(ip_id++);
   h->off = 0;
-  h->ttl = 64;
+  h->ttl = ttl > 0 && ttl < 256 ? (uint8)ttl : 64;
   h->pro = proto;
   h->sum = 0;
-  h->src = htonl(netcfg.ip);
+  // a packet to 127.x comes from 127.x, whatever this machine's own
+  // address is -- and may be sent before there is one
+  h->src = htonl((dst >> 24) == 127 ? dst : netcfg.ip);
   h->dst = htonl(dst);
   h->sum = ip_checksum(h, sizeof(*h), 0);
+
+  if (is_local(dst))
+    return loopback_send(m);
 
   if (dst == 0xffffffff)
     return net_tx_eth(m, broadcast_mac, ETHTYPE_IP);
@@ -327,10 +361,23 @@ ip_send(struct mbuf *m, uint32 dst, uint8 proto)
   return 0;
 }
 
+// the usual time to live
+static int
+ip_send(struct mbuf *m, uint32 dst, uint8 proto)
+{
+  return ip_send_ttl(m, dst, proto, 0);
+}
+
 int
 net_tx_ip(struct mbuf *m, uint32 dst, uint8 proto)
 {
   return ip_send(m, dst, proto);
+}
+
+int
+net_tx_ip_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
+{
+  return ip_send_ttl(m, dst, proto, ttl);
 }
 
 // ---- icmp ----
@@ -356,13 +403,37 @@ icmp_rx(struct mbuf *m, struct ip *iph)
   if (ic->type == ICMP_ECHOREPLY) {
     if (sock_icmp_rx(m, src, ntohs(ic->id)) == 0)
       return; // consumed
+    goto drop;
+  }
+  // an error carries the head of the packet that caused it: the IP
+  // header and the first eight bytes after it, which is enough to
+  // name the socket that sent it
+  if (ic->type == ICMP_TIMXCEED || ic->type == ICMP_UNREACH ||
+      ic->type == ICMP_PARAMPROB || ic->type == ICMP_SRCQUENCH) {
+    if (m->len < sizeof(*ic) + sizeof(struct ip) + 8)
+      goto drop;
+    struct ip *inner = (struct ip *)((char *)ic + sizeof(*ic));
+    int ihl = (inner->vhl & 0xf) * 4;
+    if (ihl < (int)sizeof(struct ip) ||
+        m->len < sizeof(*ic) + ihl + 8)
+      goto drop;
+    const unsigned char *l4 = (const unsigned char *)inner + ihl;
+    if (inner->pro == IPPROTO_ICMP) {
+      uint16 id = (l4[4] << 8) | l4[5];
+      uint16 seq = (l4[6] << 8) | l4[7];
+      sock_icmp_error(src, ic->type, ic->code, id, seq);
+    } else if (inner->pro == IPPROTO_UDP) {
+      uint16 sport = (l4[0] << 8) | l4[1];
+      sock_udp_error(src, ic->type, ic->code, sport);
+    }
+    goto drop;
   }
 drop:
   mbuffree(m);
 }
 
 int
-net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n)
+net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n, int ttl)
 {
   if (n > 1400)
     n = 1400;
@@ -378,7 +449,7 @@ net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n)
   memmove(ic + 1, data, n);
   ic->sum = ip_checksum(ic, sizeof(*ic) + n, 0);
   acquire(&netlock);
-  int r = ip_send(m, dst, IPPROTO_ICMP);
+  int r = ip_send_ttl(m, dst, IPPROTO_ICMP, ttl);
   release(&netlock);
   return r;
 }
@@ -387,7 +458,7 @@ net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n)
 
 // takes ownership of m (payload already in place). caller holds netlock.
 static int
-udp_send(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport)
+udp_send(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport, int ttl)
 {
   struct udp *u = (struct udp *)mbufpush(m, sizeof(*u));
   u->sport = htons(sport);
@@ -397,19 +468,53 @@ udp_send(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport)
   u->sum = l4_checksum(netcfg.ip, dst, IPPROTO_UDP, u, m->len);
   if (u->sum == 0)
     u->sum = 0xffff;
-  return ip_send(m, dst, IPPROTO_UDP);
+  return ip_send_ttl(m, dst, IPPROTO_UDP, ttl);
 }
 
 int
-net_tx_udp(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport)
+net_tx_udp(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport, int ttl)
 {
   acquire(&netlock);
-  int r = udp_send(m, dst, sport, dport);
+  int r = udp_send(m, dst, sport, dport, ttl);
   release(&netlock);
   return r;
 }
 
 static void dhcp_rx(struct mbuf *m, uint32 src);
+
+// an error about a packet that could not be delivered. the message
+// carries the head of the offending packet -- its IP header and the
+// first eight bytes after it -- which is how the sender tells which
+// of its packets the complaint is about. caller holds netlock.
+static void
+icmp_send_error(uint32 dst, int type, int code, const struct ip *iph,
+                const void *l4, int l4len)
+{
+  if (dst == 0 || dst == 0xffffffff || (dst >> 28) == 0xe)
+    return; // never to a broadcast or to a group
+  if (iph->pro == IPPROTO_ICMP)
+    return; // and never about an ICMP message, which would go round
+  int ihl = (iph->vhl & 0xf) * 4;
+  if (ihl < (int)sizeof(struct ip) || ihl > 60)
+    return;
+  if (l4len > 8)
+    l4len = 8;
+
+  struct mbuf *m = mbufalloc(MBUF_HEADROOM);
+  if (m == 0)
+    return;
+  int n = sizeof(struct icmp) + ihl + l4len;
+  struct icmp *ic = (struct icmp *)mbufput(m, n);
+  ic->type = (uint8)type;
+  ic->code = (uint8)code;
+  ic->sum = 0;
+  ic->id = 0;   // unused in an error, and zero is what goes there
+  ic->seq = 0;
+  memmove((char *)ic + sizeof(*ic), iph, ihl);
+  memmove((char *)ic + sizeof(*ic) + ihl, l4, l4len);
+  ic->sum = ip_checksum(ic, n, 0);
+  ip_send(m, dst, IPPROTO_ICMP);
+}
 
 static void
 udp_rx(struct mbuf *m, struct ip *iph)
@@ -429,8 +534,63 @@ udp_rx(struct mbuf *m, struct ip *iph)
   }
   if (sock_udp_rx(m, src, sport, dport) < 0) {
     net_rx_dropped++;
+    // nobody has that port. saying so is what every other stack does,
+    // and it is what makes a UDP connection fail at once rather than
+    // wait for a timeout. `u` still points at the header the pull
+    // above stepped over.
+    icmp_send_error(src, ICMP_UNREACH, 3, iph, u, sizeof(*u));
     mbuffree(m);
   }
+}
+
+// ---- loopback ----
+//
+// a packet addressed to this machine, by its own address or by one in
+// 127.0.0.0/8, never reaches the wire: it goes back into the stack. a
+// machine that cannot talk to itself is missing something every other
+// one has, and it is how a service is tested without opening a port
+// to anyone else.
+//
+// the delivery is queued rather than recursive. a packet given to the
+// stack may make it answer at once -- a SYN becomes a SYN-ACK -- and
+// answering inside the delivery of the packet that caused it would
+// nest one call frame per exchange. the outermost sender drains the
+// queue instead, so the depth is two whatever the conversation.
+static struct mbuf *lo_head, *lo_tail;
+static int lo_delivering;
+
+static void ip_rx(struct mbuf *m);
+
+static int
+loopback_send(struct mbuf *m)
+{
+  m->next = 0;
+  if (lo_tail)
+    lo_tail->next = m;
+  else
+    lo_head = m;
+  lo_tail = m;
+  if (lo_delivering)
+    return 0;
+
+  lo_delivering = 1;
+  while (lo_head) {
+    struct mbuf *p = lo_head;
+    lo_head = p->next;
+    if (lo_head == 0)
+      lo_tail = 0;
+    p->next = 0;
+    ip_rx(p);
+  }
+  lo_delivering = 0;
+  return 0;
+}
+
+// is this address one of ours?
+static int
+is_local(uint32 dst)
+{
+  return (dst >> 24) == 127 || (netcfg.up && dst == netcfg.ip);
 }
 
 static void
@@ -446,7 +606,7 @@ ip_rx(struct mbuf *m)
   if (ntohs(h->off) & 0x3fff)
     goto drop; // fragments are not supported
   uint32 dst = ntohl(h->dst);
-  if (netcfg.up && dst != netcfg.ip && dst != 0xffffffff)
+  if (netcfg.up && dst != netcfg.ip && dst != 0xffffffff && !is_local(dst))
     goto drop;
   m->len = len;
   mbufpull(m, hl);
@@ -475,6 +635,10 @@ net_rx(struct mbuf *m)
     mbuffree(m);
     return;
   }
+  // captured before anything is taken off the front, so what a reader
+  // sees is the frame as it arrived
+  if (pktcap_active())
+    pktcap_frame(m->head, m->len);
   uint16 type = ntohs(e->type);
   mbufpull(m, sizeof(*e));
   acquire(&netlock);
@@ -543,7 +707,7 @@ dhcp_send(int type)
   m->len = (char *)o - (char *)d; // trim unused option space
   uint32 saved_ip = netcfg.ip;
   netcfg.ip = 0; // source 0.0.0.0 while unconfigured
-  udp_send(m, 0xffffffff, 68, 67);
+  udp_send(m, 0xffffffff, 68, 67, 0);
   netcfg.ip = saved_ip;
   dhcp.last_tx = ticks;
 }
@@ -623,6 +787,7 @@ net_timer(void)
   }
   tcp_timer();
   release(&netlock);
+  sock_timer();
 }
 
 // static configuration (from the hypervisor's device tree or a request).
@@ -663,6 +828,8 @@ net_stats(struct netinfo *ni)
 void
 netinit(void)
 {
+  pktcap_init();
+  pktcap_register();
   initlock(&netlock, "net");
   sockinit();
   if (virtio_net_init() < 0) {

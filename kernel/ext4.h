@@ -115,6 +115,10 @@ int ext4_read_inode(struct ext4_fs *fs, uint64 ino, struct ext4_inode_info *out)
 
 // the disk block that holds file block `fileblk`, or 0 for a hole
 int ext4_bmap(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk);
+// the same, and how many file blocks from there run contiguously on the
+// disk: what an extent knows and a caller walking a file wants.
+int ext4_bmap_run(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 fileblk, uint64 *diskblk,
+                  uint64 *run);
 
 // read ahead of a sequential reader: called after a read of the file
 // blocks [first, last], it works out whether the reader is walking the
@@ -169,6 +173,9 @@ int ext4_remove_entry(struct ext4_fs *fs, struct ext4_inode_info *dir, uint64 di
 int ext4_set_device(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino, int major,
                     int minor);
 void ext4_device_of(struct ext4_inode_info *in, int *major, int *minor);
+// a symbolic link's target, in the inode when it is short enough
+int ext4_set_symlink(struct ext4_fs *fs, struct ext4_inode_info *in, uint64 ino,
+                     const char *target, int len);
 int ext4_make_inode(struct ext4_fs *fs, uint64 dirino, uint16 mode, uint64 *ino_out,
                     struct ext4_inode_info *out);
 int ext4_make_dir(struct ext4_fs *fs, struct ext4_inode_info *parent, uint64 parentino, uint64 ino,

@@ -616,7 +616,7 @@ static const char *const globfiles[] = {
 static int
 makefile(const char *path)
 {
-  int fd = open(path, O_CREATE | O_WRONLY | O_TRUNC);
+  int fd = open(path, O_CREATE | O_WRONLY | O_TRUNC, 0666);
 
   if (fd < 0)
     return -1;

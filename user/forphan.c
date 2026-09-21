@@ -17,7 +17,7 @@ main(int argc, char **argv)
   struct stat st;
   char *ff = "file0";
 
-  if ((fd = open(ff, O_CREATE | O_WRONLY)) < 0) {
+  if ((fd = open(ff, O_CREATE | O_WRONLY, 0666)) < 0) {
     printf("%s: open failed\n", s);
     exit(1);
   }

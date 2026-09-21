@@ -1,0 +1,199 @@
+#!/bin/sh
+# find, xargs, diff and patch: the four tools that walk a tree and
+# describe or change it.
+
+passed=0
+failed=0
+
+check() {
+	# check NAME EXPECTED ACTUAL
+	if [ "$2" = "$3" ]; then
+		passed=$((passed + 1))
+	else
+		failed=$((failed + 1))
+		echo "FAIL $1: wanted [$2] got [$3]"
+	fi
+}
+
+tmp=/tmp/filetest
+rm -rf $tmp
+mkdir -p $tmp/tree/sub/deeper
+cd $tmp
+
+echo one > tree/a.txt
+echo two > tree/b.log
+echo three > tree/sub/c.txt
+echo four > tree/sub/deeper/d.txt
+mkdir tree/emptydir
+ln -s a.txt tree/link
+chmod 700 tree/sub
+
+# ---- find ----
+
+check find_all 9 "$(find tree | wc -l)"
+check find_name_txt 3 "$(find tree -name '*.txt' | wc -l)"
+check find_name_one tree/a.txt "$(find tree -name 'a*')"
+check find_type_d 4 "$(find tree -type d | wc -l)"
+check find_type_f 4 "$(find tree -type f | wc -l)"
+check find_type_l tree/link "$(find tree -type l)"
+check find_path 3 "$(find tree -path '*sub*' -type f -o -path '*deeper*' -type d | wc -l)"
+check find_maxdepth 6 "$(find tree -maxdepth 1 | wc -l)"
+check find_mindepth 8 "$(find tree -mindepth 1 | wc -l)"
+check find_empty tree/emptydir "$(find tree -type d -empty)"
+check find_not 6 "$(find tree ! -name '*.txt' | wc -l)"
+check find_and tree/sub/c.txt "$(find tree -name '*.txt' -a -path '*sub*' -a ! -path '*deeper*')"
+check find_or 4 "$(find tree -name '*.log' -o -name '*.txt' | wc -l)"
+check find_paren 3 "$(find tree \( -name '*.txt' -o -name '*.log' \) -a -type f -a ! -name d.txt | wc -l)"
+check find_prune 5 "$(find tree -name sub -prune -o -print | wc -l)"
+check find_size 4 "$(find tree -type f -size -2k | wc -l)"
+check find_size_c 4 "$(find tree -type f -size -20c | wc -l)"
+check find_links 4 "$(find tree -type f -links 1 | wc -l)"
+check find_perm ok "$(find tree -perm 700 -type d | grep -c sub$ | sed 's/^1$/ok/')"
+check find_user 9 "$(find tree -user root | wc -l)"
+check find_exec 'one' "$(find tree -name a.txt -exec cat {} \;)"
+check find_exec_plus 3 "$(find tree -name '*.txt' -exec echo {} + | wc -w)"
+check find_print0 3 "$(find tree -name '*.txt' -print0 | tr '\0' '\n' | grep -c txt)"
+check find_two_paths 2 "$(find tree/a.txt tree/b.log | wc -l)"
+check find_default_dot ok "$(cd tree && find . -name a.txt | grep -c './a.txt' | sed 's/^1$/ok/')"
+check find_quit 1 "$(find tree -print -quit | wc -l)"
+# -delete takes the file away, and nothing else with it
+cp tree/a.txt tree/doomed.txt
+find tree -name doomed.txt -delete
+check find_delete '' "$(ls tree/doomed.txt 2>/dev/null)"
+check find_delete_rest one "$(cat tree/a.txt)"
+
+# ---- xargs ----
+
+printf 'a\nb\nc\n' > words
+check xargs_echo 'a b c' "$(xargs < words)"
+check xargs_cmd 'x a b c' "$(xargs echo x < words)"
+check xargs_n1 3 "$(xargs -n 1 echo < words | wc -l)"
+check xargs_n2 2 "$(xargs -n 2 echo < words | wc -l)"
+check xargs_I 'got a' "$(xargs -I@ echo got @ < words | head -1)"
+check xargs_I_lines 3 "$(xargs -I@ echo got @ < words | wc -l)"
+check xargs_0 'a b' "$(printf 'a\0b\0' | xargs -0)"
+check xargs_r '' "$(: | xargs -r echo)"
+check xargs_no_r '' "$(: | xargs echo)"
+printf '"a b" c\n' > quoted
+check xargs_quotes 'a b' "$(xargs -n1 echo < quoted | head -1)"
+check xargs_quotes2 c "$(xargs -n1 echo < quoted | sed -n 2p)"
+check xargs_status 123 "$(printf 'x\n' | xargs false > /dev/null 2>&1; echo $?)"
+check xargs_find 3 "$(find tree -name '*.txt' -print0 | xargs -0 -n1 echo | wc -l)"
+check xargs_L 2 "$(printf 'a b\nc d\n' | xargs -L 1 echo | wc -l)"
+
+# ---- diff ----
+
+printf 'one\ntwo\nthree\nfour\n' > d1
+printf 'one\n2\nthree\nfour\nfive\n' > d2
+cp d1 d3
+
+check diff_same 0 "$(diff d1 d3 > /dev/null; echo $?)"
+check diff_differ 1 "$(diff d1 d2 > /dev/null; echo $?)"
+check diff_q 'Files d1 and d2 differ' "$(diff -q d1 d2)"
+check diff_q_same '' "$(diff -q d1 d3)"
+check diff_s 'Files d1 and d3 are identical' "$(diff -s d1 d3)"
+
+# the normal form, which is what diff prints without -u
+check diff_normal_c 2c2 "$(diff -e d1 d2 | head -1)"
+check diff_normal_del '< two' "$(diff -e d1 d2 | sed -n 2p)"
+check diff_normal_sep --- "$(diff -e d1 d2 | sed -n 3p)"
+check diff_normal_add '> 2' "$(diff -e d1 d2 | sed -n 4p)"
+check diff_normal_append 4a5 "$(diff -e d1 d2 | sed -n 5p)"
+
+# unified
+check diff_u_from '--- d1' "$(diff -u d1 d2 | head -1)"
+check diff_u_to '+++ d2' "$(diff -u d1 d2 | sed -n 2p)"
+check diff_u_hunk ok "$(diff -u d1 d2 | grep -c '^@@' | sed 's/^1$/ok/')"
+check diff_u_minus '-two' "$(diff -u d1 d2 | grep '^-two')"
+check diff_u_plus '+2' "$(diff -u d1 d2 | grep '^+2$')"
+check diff_u_context ' one' "$(diff -u d1 d2 | grep '^ one')"
+
+# the shortest script, not simply "everything changed"
+printf 'a\nb\nc\nd\ne\nf\ng\nh\n' > e1
+printf 'a\nb\nc\nX\ne\nf\ng\nh\n' > e2
+check diff_minimal 1 "$(diff -u e1 e2 | grep -c '^-[^-]')"
+check diff_minimal2 1 "$(diff -u e1 e2 | grep -c '^+[^+]')"
+check diff_context_lines 2 "$(diff -U 1 e1 e2 | grep -c '^ ')"
+
+check diff_i 0 "$(printf 'ABC\n' > i1; printf 'abc\n' > i2; diff -i i1 i2 > /dev/null; echo $?)"
+check diff_w 0 "$(printf 'a b\n' > w1; printf 'ab\n' > w2; diff -w w1 w2 > /dev/null; echo $?)"
+check diff_b 0 "$(printf 'a  b\n' > b1; printf 'a b\n' > b2; diff -b b1 b2 > /dev/null; echo $?)"
+
+# whole directories
+mkdir dirA dirB
+echo same > dirA/same
+echo same > dirB/same
+echo left > dirA/onlyA
+check diff_dir_only 'Only in dirA: onlyA' "$(diff -r dirA dirB | grep Only)"
+echo right > dirB/same
+check diff_dir_content ok "$(diff -r dirA dirB | grep -c '^--- dirA/same' | sed 's/^1$/ok/')"
+
+# ---- patch ----
+
+cp d1 target
+diff -u d1 d2 > p.diff
+patch target < p.diff > /dev/null
+check patch_applied "$(cat d2)" "$(cat target)"
+
+# and backwards again
+patch -R target < p.diff > /dev/null
+check patch_reversed "$(cat d1)" "$(cat target)"
+
+# a patch still applies when the file has moved underneath it
+printf 'header\nheader2\n' > shifted
+cat d1 >> shifted
+patch shifted < p.diff > /dev/null 2>&1
+check patch_offset "$(printf 'header\nheader2\n'; cat d2)" "$(cat shifted)"
+
+# a hunk that does not fit is rejected and the rest is left alone
+printf 'completely\ndifferent\nfile\n' > nomatch
+patch nomatch < p.diff > /dev/null 2>&1
+check patch_reject 1 "$(patch nomatch < p.diff > /dev/null 2>&1; echo $?)"
+check patch_rej_file ok "$(test -f nomatch.rej && echo ok)"
+check patch_untouched "$(printf 'completely\ndifferent\nfile')" "$(cat nomatch)"
+
+# -p strips leading directories
+mkdir -p a/b
+cp d1 a/b/f
+(cd a/b && diff -u f $tmp/d2 > /dev/null 2>&1)
+printf -- '--- a/b/f\n+++ a/b/f\n' > p2.diff
+diff -u d1 d2 | tail -n +3 >> p2.diff
+(cd a/b && patch -p2 < $tmp/p2.diff > /dev/null)
+check patch_p2 "$(cat d2)" "$(cat a/b/f)"
+
+# --dry-run changes nothing
+cp d1 dry
+patch --dry-run dry < p.diff > /dev/null
+check patch_dry "$(cat d1)" "$(cat dry)"
+
+# a patch that makes a file
+printf -- '--- /dev/null\n+++ newfile\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n' > new.diff
+patch < new.diff > /dev/null
+check patch_create "alpha
+beta" "$(cat newfile)"
+
+# -b keeps the original
+cp d1 backed
+patch -b backed < p.diff > /dev/null
+check patch_backup "$(cat d1)" "$(cat backed.orig)"
+
+# what diff writes, patch reads: a round trip over a bigger file
+seq 1 200 > big1
+sed 's/^50$/fifty/;s/^150$/one-fifty/' big1 > big2
+diff -u big1 big2 > big.diff
+cp big1 bigt
+patch bigt < big.diff > /dev/null
+check patch_roundtrip same "$(cmp -s bigt big2 && echo same)"
+
+# ---- less, without a terminal, is a cat that can number ----
+check less_cat "$(cat d1)" "$(less d1)"
+check less_numbers '     1 one' "$(less -N d1 | head -1)"
+check more_cat "$(cat d1)" "$(more d1)"
+
+cd /
+rm -rf $tmp
+echo "filetest: $((passed + failed)) checks, $failed failures"
+if [ "$failed" = "0" ]; then
+	exit 0
+fi
+exit 1

@@ -10,9 +10,8 @@
 #include "time.h"
 #include "errno.h"
 #include "thread.h"
+#include "vfs.h"
 #include "posix.h"
-#define XV6H_RELEASE "1.0"
-#define XV6H_VERSION "xv6H riscv64"
 extern char hostname[64];
 #include "sleeplock.h"
 #include "fs.h"
@@ -515,6 +514,17 @@ sys_uname(void)
   return 0;
 }
 
+// the host's name, set from a string the kernel already holds. both
+// sethostname(2) and a write to /sys/kernel/hostname come here.
+int
+sethostname_str(const char *s, int n)
+{
+  if (n < 0 || n >= (int)sizeof(hostname))
+    return -1;
+  safestrcpy(hostname, s, n + 1);
+  return 0;
+}
+
 uint64
 sys_sethostname(void)
 {
@@ -528,7 +538,9 @@ sys_sethostname(void)
   if (copyin(myproc()->mm, buf, addr, n) < 0)
     return -EFAULT;
   buf[n] = 0;
-  safestrcpy(hostname, buf, sizeof(hostname));
+  if (!cap_ok(CAP_SYS_ADMIN))
+    return -EPERM;
+  sethostname_str(buf, n);
   return 0;
 }
 
@@ -580,4 +592,410 @@ sys_getrandom(void)
     done += n;
   }
   return done;
+}
+
+// ---- who a process is ----
+//
+// three user ids and three group ids. the effective one is what every
+// permission check uses; the real one is who logged in; the saved one
+// is what a set-user-id program may go back to. a process may set any
+// of them to any of the other three, and only a privileged one may set
+// them to something else.
+
+// does this process have a capability?
+int
+cap_ok(int cap)
+{
+  struct proc *p = myproc();
+
+  return (p->cred.cap_effective & CAP_BIT(cap)) != 0;
+}
+
+uint64
+sys_getuid(void)
+{
+  return myproc()->cred.uid;
+}
+
+uint64
+sys_geteuid(void)
+{
+  return myproc()->cred.euid;
+}
+
+uint64
+sys_getgid(void)
+{
+  return myproc()->cred.gid;
+}
+
+uint64
+sys_getegid(void)
+{
+  return myproc()->cred.egid;
+}
+
+// every capability goes when the effective user id becomes an ordinary
+// one, and comes back from what is permitted when it becomes root
+// again -- which is what a set-user-id root program relies on.
+static void
+cap_follow_euid(struct cred *c, uint old_euid)
+{
+  if (old_euid == 0 && c->euid != 0)
+    c->cap_effective = 0;
+  else if (old_euid != 0 && c->euid == 0)
+    c->cap_effective = c->cap_permitted;
+}
+
+uint64
+sys_setuid(void)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  int uid;
+
+  argint(0, &uid);
+  if (uid < 0)
+    return -EINVAL;
+  uint old = c->euid;
+  if (cap_ok(CAP_SETUID)) {
+    // a privileged process sets all three, and cannot go back
+    c->uid = c->euid = c->suid = (uint)uid;
+  } else if ((uint)uid == c->uid || (uint)uid == c->suid) {
+    c->euid = (uint)uid;
+  } else {
+    return -EPERM;
+  }
+  cap_follow_euid(c, old);
+  return 0;
+}
+
+uint64
+sys_setgid(void)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  int gid;
+
+  argint(0, &gid);
+  if (gid < 0)
+    return -EINVAL;
+  if (cap_ok(CAP_SETGID))
+    c->gid = c->egid = c->sgid = (uint)gid;
+  else if ((uint)gid == c->gid || (uint)gid == c->sgid)
+    c->egid = (uint)gid;
+  else
+    return -EPERM;
+  return 0;
+}
+
+// setresuid(ruid, euid, suid): -1 leaves one alone
+uint64
+sys_setresuid(void)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  int r, e, sv;
+
+  argint(0, &r);
+  argint(1, &e);
+  argint(2, &sv);
+  uint old = c->euid;
+  uint nr = r < 0 ? c->uid : (uint)r;
+  uint ne = e < 0 ? c->euid : (uint)e;
+  uint ns = sv < 0 ? c->suid : (uint)sv;
+  if (!cap_ok(CAP_SETUID)) {
+    // each new value has to be one of the three it already has
+    uint have[3] = {c->uid, c->euid, c->suid};
+    for (int i = 0; i < 3; i++) {
+      uint want = i == 0 ? nr : i == 1 ? ne : ns;
+      if (want != have[0] && want != have[1] && want != have[2])
+        return -EPERM;
+    }
+  }
+  c->uid = nr;
+  c->euid = ne;
+  c->suid = ns;
+  cap_follow_euid(c, old);
+  return 0;
+}
+
+uint64
+sys_setresgid(void)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  int r, e, sv;
+
+  argint(0, &r);
+  argint(1, &e);
+  argint(2, &sv);
+  uint nr = r < 0 ? c->gid : (uint)r;
+  uint ne = e < 0 ? c->egid : (uint)e;
+  uint ns = sv < 0 ? c->sgid : (uint)sv;
+  if (!cap_ok(CAP_SETGID)) {
+    uint have[3] = {c->gid, c->egid, c->sgid};
+    for (int i = 0; i < 3; i++) {
+      uint want = i == 0 ? nr : i == 1 ? ne : ns;
+      if (want != have[0] && want != have[1] && want != have[2])
+        return -EPERM;
+    }
+  }
+  c->gid = nr;
+  c->egid = ne;
+  c->sgid = ns;
+  return 0;
+}
+
+uint64
+sys_getresuid(void)
+{
+  struct proc *p = myproc();
+  uint64 a, b, cc;
+
+  argaddr(0, &a);
+  argaddr(1, &b);
+  argaddr(2, &cc);
+  if (copyout(p->mm, a, (char *)&p->cred.uid, sizeof(uint)) < 0 ||
+      copyout(p->mm, b, (char *)&p->cred.euid, sizeof(uint)) < 0 ||
+      copyout(p->mm, cc, (char *)&p->cred.suid, sizeof(uint)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+uint64
+sys_getresgid(void)
+{
+  struct proc *p = myproc();
+  uint64 a, b, cc;
+
+  argaddr(0, &a);
+  argaddr(1, &b);
+  argaddr(2, &cc);
+  if (copyout(p->mm, a, (char *)&p->cred.gid, sizeof(uint)) < 0 ||
+      copyout(p->mm, b, (char *)&p->cred.egid, sizeof(uint)) < 0 ||
+      copyout(p->mm, cc, (char *)&p->cred.sgid, sizeof(uint)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+// getgroups(size, list): with size 0, how many there are
+uint64
+sys_getgroups(void)
+{
+  struct proc *p = myproc();
+  uint64 addr;
+  int size;
+
+  argint(0, &size);
+  argaddr(1, &addr);
+  if (size == 0)
+    return p->cred.ngroups;
+  if (size < p->cred.ngroups)
+    return -EINVAL;
+  if (copyout(p->mm, addr, (char *)p->cred.groups, p->cred.ngroups * sizeof(uint)) < 0)
+    return -EFAULT;
+  return p->cred.ngroups;
+}
+
+uint64
+sys_setgroups(void)
+{
+  struct proc *p = myproc();
+  uint64 addr;
+  int size;
+  uint tmp[NGROUPS_MAX];
+
+  argint(0, &size);
+  argaddr(1, &addr);
+  if (size < 0 || size > NGROUPS_MAX)
+    return -EINVAL;
+  if (!cap_ok(CAP_SETGID))
+    return -EPERM;
+  if (size > 0 && copyin(p->mm, (char *)tmp, addr, size * sizeof(uint)) < 0)
+    return -EFAULT;
+  memmove(p->cred.groups, tmp, size * sizeof(uint));
+  p->cred.ngroups = size;
+  return 0;
+}
+
+// capget/capset in the shape this kernel uses: one word for each set
+uint64
+sys_capget(void)
+{
+  struct proc *p = myproc();
+  uint64 addr;
+  uint64 sets[4];
+
+  argaddr(0, &addr);
+  sets[0] = p->cred.cap_effective;
+  sets[1] = p->cred.cap_permitted;
+  sets[2] = p->cred.cap_inheritable;
+  sets[3] = p->cred.cap_bounding;
+  if (copyout(p->mm, addr, (char *)sets, sizeof(sets)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+uint64
+sys_capset(void)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  uint64 addr, sets[4];
+
+  argaddr(0, &addr);
+  if (copyin(p->mm, (char *)sets, addr, sizeof(sets)) < 0)
+    return -EFAULT;
+  // nothing may be raised that is not permitted, and the bounding set
+  // only ever shrinks
+  if ((sets[0] & ~c->cap_permitted) || (sets[1] & ~c->cap_permitted) ||
+      (sets[2] & ~c->cap_permitted) || (sets[3] & ~c->cap_bounding))
+    return -EPERM;
+  if (!cap_ok(CAP_SETPCAP) && sets[1] != c->cap_permitted)
+    return -EPERM;
+  c->cap_effective = sets[0];
+  c->cap_permitted = sets[1];
+  c->cap_inheritable = sets[2];
+  c->cap_bounding = sets[3];
+  return 0;
+}
+
+// ---- turning the machine off ----
+//
+// qemu's virt board has the "sifive,test" finisher at 0x100000: a
+// halfword written there ends the machine. 0x5555 is a clean power
+// off, 0x7777 a reset. a real board would use SBI SRST, which is the
+// same two operations behind a call; this kernel is the one under
+// SBI, so it writes the device.
+#define FINISHER_PASS 0x5555
+#define FINISHER_RESET 0x7777
+
+// ---- the nice value ----
+//
+// setpriority(which, who, value) and getpriority(which, who). the
+// value runs from -20 to 19; only a process with CAP_SYS_NICE may ask
+// for one smaller than the one it already has, which is the rule that
+// stops a program promoting itself. getpriority answers with the
+// smallest value among the processes named, as POSIX says, and -1 is
+// a real value, so a caller tells an error from it by clearing errno.
+
+// may this process change that one's value?
+static int
+may_renice(struct proc *target, int newval)
+{
+  struct proc *p = myproc();
+
+  if (cap_ok(CAP_SYS_NICE))
+    return 1;
+  // otherwise only one's own processes, and only downwards
+  if (p->cred.euid != target->cred.uid && p->cred.euid != target->cred.euid)
+    return 0;
+  return newval >= target->nice;
+}
+
+// does this process fall in the set the caller named?
+static int
+in_set(struct proc *p, int which, int who)
+{
+  struct proc *me = myproc();
+
+  switch (which) {
+  case PRIO_PROCESS:
+    return who == 0 ? p->pid == me->pid : p->pid == who;
+  case PRIO_PGRP:
+    return who == 0 ? p->pgid == me->pgid : p->pgid == who;
+  case PRIO_USER:
+    return who == 0 ? p->cred.uid == me->cred.uid
+                    : p->cred.uid == (uint)who;
+  }
+  return 0;
+}
+
+uint64
+sys_setpriority(void)
+{
+  int which, who, value;
+
+  argint(0, &which);
+  argint(1, &who);
+  argint(2, &value);
+  if (which < PRIO_PROCESS || which > PRIO_USER)
+    return -EINVAL;
+  if (value < -20)
+    value = -20;
+  if (value > 19)
+    value = 19;
+
+  int found = 0, denied = 0;
+  proc_iter_start();
+  for (struct proc *p = proc_iter_next(0); p; p = proc_iter_next(p)) {
+    if (p->state == UNUSED || !in_set(p, which, who))
+      continue;
+    found = 1;
+    if (!may_renice(p, value)) {
+      denied = 1;
+      continue;
+    }
+    p->nice = value;
+  }
+  proc_iter_end();
+  if (!found)
+    return -ESRCH;
+  return denied ? -EACCES : 0;
+}
+
+uint64
+sys_getpriority(void)
+{
+  int which, who;
+
+  argint(0, &which);
+  argint(1, &who);
+  if (which < PRIO_PROCESS || which > PRIO_USER)
+    return -EINVAL;
+
+  int best = 20, found = 0;
+
+  proc_iter_start();
+  for (struct proc *p = proc_iter_next(0); p; p = proc_iter_next(p)) {
+    if (p->state == UNUSED || !in_set(p, which, who))
+      continue;
+    found = 1;
+    if (p->nice < best)
+      best = p->nice;
+  }
+  proc_iter_end();
+  if (!found)
+    return -ESRCH;
+  // 20 - nice, so that the answer is never negative: a negative
+  // return from a system call here means -errno, and a nice value of
+  // -5 would otherwise look like an error. the library subtracts it
+  // back, which is the arrangement Linux and glibc have.
+  return 20 - best;
+}
+
+uint64
+sys_reboot(void)
+{
+  int how;
+
+  argint(0, &how);
+  if (!cap_ok(CAP_SYS_BOOT))
+    return -EPERM;
+
+  // everything that is waiting to be written goes to the disk first:
+  // a power off that loses the last minute of work is a bug, not a
+  // feature of turning a machine off.
+  vfs_sync_all();
+
+  printk("\n");
+  printk(how == XV6_REBOOT_RESTART ? "reboot: restarting\n" : "reboot: power off\n");
+  *(volatile uint32 *)SIFIVE_TEST =
+      how == XV6_REBOOT_RESTART ? FINISHER_RESET : FINISHER_PASS;
+  // the device stops the machine; if it does not, say so rather than
+  // return to a program that thinks the machine is gone
+  for (;;)
+    ;
+  return 0;
 }

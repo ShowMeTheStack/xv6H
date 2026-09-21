@@ -22,19 +22,35 @@ RUNS='~/xv6h-runs'
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cmd=$1; shift || true
 
+# the link to the build box is a few hundred kilobytes a second, so a
+# full copy of the tree costs minutes and five of them cost half an
+# hour. the tree goes over the wire once, into a seed directory that
+# rsync then updates incrementally, and each run is a local copy of
+# that seed -- which is a disk-to-disk copy on a machine with 32 cores.
 sync_tree() { # NAME
   local name=$1
-  ssh -o BatchMode=yes $HOST "mkdir -p $RUNS/$name"
-  rsync -a --delete \
-    --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
+  ssh -o BatchMode=yes $HOST "mkdir -p $RUNS/.seed"
+  # --delete-excluded as well as --delete: a file that becomes
+  # excluded (a host binary built for the laptop, say) must go from
+  # the remote tree too, or make will find it, decide it is current
+  # and try to run it.
+  # '*.d' below is the dependency files -- but it matches a directory
+  # called init.d or rc.d just as happily, so directories ending in .d
+  # are included first: a trailing slash makes a pattern match only
+  # those. that cost a whole matrix run once.
+  rsync -a --delete --delete-excluded \
+    --include '*.d/' --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
     --exclude 'fs.img' --exclude 'test-*.img' --exclude 'user/_*' --exclude 'user/usys.S' \
-    --exclude 'kernel/kernel' --exclude 'mkfs/mkfs' --exclude 'mkfs/mkext4' --exclude 'tls/obj' --exclude 'tls/libbearssl.a' \
+    --exclude 'ext4check.img' --exclude 'ext4check.mnt' --exclude '*.cow' --exclude '*.log' \
+    --exclude 'guest[0-9]*.img' --exclude 'build' --exclude '__pycache__' \
+    --exclude 'kernel/kernel' --exclude 'mkfs/mkfs' --exclude 'mkfs/mkext4' --exclude 'mkfs/mkpasswd' --exclude 'tls/obj' --exclude 'tls/libbearssl.a' \
     --exclude 'guest/*.img' --exclude 'guest/kernel' --exclude 'guest/hello' --exclude 'guest/hello.bin' \
     --exclude 'guest/fdguest' --exclude 'guest/vguest' --exclude 'guest/badguest' \
     --exclude 'linux/Image*' --exclude 'linux/linux.img' --exclude 'user/tls_date.h' \
     --exclude 'results.out' --exclude 'done' --exclude 'test-hyp.log' --exclude '.git' \
-    "$HERE/" "$HOST:$RUNS/$name/"
-  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
+    "$HERE/" "$HOST:$RUNS/.seed/"
+  ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/.seed $RUNS/$name && \
+    cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
 }
 
 case "$cmd" in
@@ -52,7 +68,7 @@ script)
   sync_tree "$name"
   scp -q "$script" "$HOST:$RUNS/$name/run_script.py"
   ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
-    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=128 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
+    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=192 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
   echo "started $name: $script $* on $HOST"
   ;;
 status)

@@ -656,7 +656,9 @@ tcp_connect(struct sock *s)
   }
   t->sock = s;
   s->tcp = t;
-  t->lip = netcfg.ip;
+  // talking to ourselves: the local address is the loopback one too,
+  // because that is what the answer will be addressed to
+  t->lip = (s->rip >> 24) == 127 ? s->rip : netcfg.ip;
   t->lport = s->lport;
   t->rip = s->rip;
   t->rport = s->rport;

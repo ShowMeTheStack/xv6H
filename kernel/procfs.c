@@ -29,6 +29,9 @@
 #include "mm.h"
 #include "platform.h"
 #include "errno.h"
+#include "net.h"
+#include "sock.h"
+#include "tcp.h"
 
 #define PROCFS_DEV 32
 
@@ -44,6 +47,15 @@
 #define PINO_DISKSTATS   9
 #define PINO_SELF       10
 #define PINO_STAT       11
+// /proc/net, and what is in it. these are the files netstat, ss, arp
+// and route read, in the shapes those programs expect.
+#define PINO_NET        12
+#define PINO_NET_DEV    13
+#define PINO_NET_ARP    14
+#define PINO_NET_ROUTE  15
+#define PINO_NET_TCP    16
+#define PINO_NET_UDP    17
+#define PINO_NET_SOCKSTAT 18
 #define PINO_FIRST_PID 1024
 
 // a process's files: the inode number is (pid << 4) + index + base
@@ -52,9 +64,35 @@
 #define PPID_CMDLINE 2
 #define PPID_STAT    3
 #define PPID_MAPS    4
-#define PPID_NFILES  5
+#define PPID_FD      5
+#define PPID_CWD     6
+#define PPID_ROOT    7
+#define PPID_NFILES  8
 
-static const char *const pid_files[PPID_NFILES] = {0, "status", "cmdline", "stat", "maps"};
+static const char *const pid_files[PPID_NFILES] = {
+    0, "status", "cmdline", "stat", "maps", "fd", "cwd", "root"};
+
+// one inode per open descriptor, in a space of its own: the top bit
+// marks it, then the process and the descriptor number. a process may
+// hold up to 1024 files, which is what the descriptor table grows to.
+#define PINO_FD_FLAG 0x80000000u
+#define PINO_FD_SHIFT 10
+
+static uint
+fd_inum(int pid, int fd)
+{
+  return PINO_FD_FLAG | ((uint)pid << PINO_FD_SHIFT) | ((uint)fd & 0x3ff);
+}
+
+static int
+is_fd_inum(uint inum, int *pid, int *fd)
+{
+  if ((inum & PINO_FD_FLAG) == 0)
+    return 0;
+  *pid = (int)((inum & ~PINO_FD_FLAG) >> PINO_FD_SHIFT);
+  *fd = (int)(inum & 0x3ff);
+  return 1;
+}
 
 struct topfile {
   const char *name;
@@ -67,6 +105,15 @@ static const struct topfile topfiles[] = {
     {"version", PINO_VERSION},       {"filesystems", PINO_FILESYSTEMS},
     {"partitions", PINO_PARTITIONS}, {"diskstats", PINO_DISKSTATS},
     {"self", PINO_SELF},             {"stat", PINO_STAT},
+    {"net", PINO_NET},
+    {0, 0},
+};
+
+// what is in /proc/net
+static const struct topfile netfiles[] = {
+    {"dev", PINO_NET_DEV},     {"arp", PINO_NET_ARP},
+    {"route", PINO_NET_ROUTE}, {"tcp", PINO_NET_TCP},
+    {"udp", PINO_NET_UDP},     {"sockstat", PINO_NET_SOCKSTAT},
     {0, 0},
 };
 
@@ -132,6 +179,208 @@ mounts_emit(const char *source, const char *path, const char *type, int readonly
 
 extern uint ticks;
 
+// ---- /proc/net ----
+
+// a number in hex, zero-padded, which is how Linux writes the
+// addresses and ports in these files
+static void
+gen_hex(struct gen *g, uint64 v, int digits)
+{
+  static const char *hex = "0123456789ABCDEF";
+
+  for (int i = digits - 1; i >= 0; i--)
+    if (g->len < g->cap - 1)
+      g->buf[g->len++] = hex[(v >> (i * 4)) & 15];
+}
+
+// an address as /proc/net writes it: four bytes, least significant
+// first, in hex -- which is the host's word order on a little-endian
+// machine, and is what every tool that reads these files expects
+static void
+gen_addr_le(struct gen *g, uint32 ip)
+{
+  gen_hex(g, ((ip & 0xff) << 24) | ((ip & 0xff00) << 8) | ((ip >> 8) & 0xff00) |
+                 (ip >> 24),
+          8);
+}
+
+static void
+gen_dotted(struct gen *g, uint32 ip)
+{
+  for (int i = 3; i >= 0; i--) {
+    gen_num(g, (ip >> (i * 8)) & 0xff);
+    if (i)
+      gen_str(g, ".");
+  }
+}
+
+struct arpctx {
+  struct gen *g;
+};
+
+static void
+arp_emit(uint32 ip, const uint8 *mac, int valid, void *arg)
+{
+  struct arpctx *c = arg;
+  char macs[18];
+
+  gen_dotted(c->g, ip);
+  // the columns are Linux's: address, type, flags, hardware address,
+  // mask, device
+  gen_str(c->g, "\t0x1\t");
+  gen_str(c->g, valid ? "0x2" : "0x0");
+  gen_str(c->g, "\t");
+  gen_str(c->g, mac2str(mac, macs));
+  gen_str(c->g, "\t*\teth0\n");
+}
+
+// the TCP state numbers Linux uses in /proc/net/tcp, which are not the
+// ones this stack numbers its own states with
+static int
+linux_tcp_state(int st)
+{
+  switch (st) {
+  case TCPS_ESTABLISHED: return 1;
+  case TCPS_SYN_SENT: return 2;
+  case TCPS_SYN_RCVD: return 3;
+  case TCPS_FIN_WAIT_1: return 4;
+  case TCPS_FIN_WAIT_2: return 5;
+  case TCPS_TIME_WAIT: return 6;
+  case TCPS_CLOSED: return 7;
+  case TCPS_CLOSE_WAIT: return 8;
+  case TCPS_LAST_ACK: return 9;
+  case TCPS_LISTEN: return 10;
+  case TCPS_CLOSING: return 11;
+  }
+  return 7;
+}
+
+struct sockctx {
+  struct gen *g;
+  int want;      // SOCK_STREAM or SOCK_DGRAM
+  int line;
+  int counts[4];
+};
+
+static void
+sock_emit(const struct sockinfo *si, void *arg)
+{
+  struct sockctx *c = arg;
+
+  if (si->type >= 0 && si->type < 4)
+    c->counts[si->type]++;
+  if (si->type != c->want)
+    return;
+  gen_str(c->g, "  ");
+  gen_num(c->g, c->line++);
+  gen_str(c->g, ": ");
+  gen_addr_le(c->g, si->lip);
+  gen_str(c->g, ":");
+  gen_hex(c->g, si->lport, 4);
+  gen_str(c->g, " ");
+  gen_addr_le(c->g, si->rip);
+  gen_str(c->g, ":");
+  gen_hex(c->g, si->rport, 4);
+  gen_str(c->g, " ");
+  gen_hex(c->g, si->state >= 0 ? linux_tcp_state(si->state) : 7, 2);
+  gen_str(c->g, " ");
+  gen_hex(c->g, si->txbytes, 8);
+  gen_str(c->g, ":");
+  gen_hex(c->g, si->type == SOCK_DGRAM ? (uint32)si->rxcount : si->rxbytes, 8);
+  gen_str(c->g, " 00:00000000 00000000     0        0 ");
+  gen_num(c->g, si->index);
+  gen_str(c->g, "\n");
+}
+
+static void
+gen_net(struct gen *g, uint inum)
+{
+  struct netinfo ni;
+
+  switch (inum) {
+  case PINO_NET_DEV:
+    net_stats(&ni);
+    gen_str(g, "Inter-|   Receive                            "
+               "                    |  Transmit\n");
+    gen_str(g, " face |bytes    packets errs drop fifo frame compressed "
+               "multicast|bytes    packets errs drop fifo colls carrier "
+               "compressed\n");
+    // bytes are not counted per interface here, so the columns that
+    // hold them are zero rather than a number that is not true
+    gen_str(g, "    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
+    gen_str(g, "  eth0: 0 ");
+    gen_num(g, ni.rx_packets);
+    gen_str(g, " 0 ");
+    gen_num(g, ni.rx_dropped);
+    gen_str(g, " 0 0 0 0 0 ");
+    gen_num(g, ni.tx_packets);
+    gen_str(g, " 0 ");
+    gen_num(g, ni.tx_dropped);
+    gen_str(g, " 0 0 0 0\n");
+    break;
+
+  case PINO_NET_ARP: {
+    struct arpctx c = {g};
+    gen_str(g, "IP address       HW type     Flags       HW address"
+               "            Mask     Device\n");
+    acquire(&netlock);
+    arp_walk(arp_emit, &c);
+    release(&netlock);
+    break;
+  }
+
+  case PINO_NET_ROUTE:
+    net_stats(&ni);
+    gen_str(g, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
+               "Mask\t\tMTU\tWindow\tIRTT\n");
+    if (ni.up) {
+      // the route to the network this interface is on, and then the
+      // default route through the gateway
+      gen_str(g, "eth0\t");
+      gen_addr_le(g, ni.ip & ni.mask);
+      gen_str(g, "\t00000000\t0001\t0\t0\t0\t");
+      gen_addr_le(g, ni.mask);
+      gen_str(g, "\t0\t0\t0\n");
+      if (ni.gw) {
+        gen_str(g, "eth0\t00000000\t");
+        gen_addr_le(g, ni.gw);
+        gen_str(g, "\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
+      }
+    }
+    break;
+
+  case PINO_NET_TCP:
+  case PINO_NET_UDP: {
+    struct sockctx c;
+    memset(&c, 0, sizeof(c));
+    c.g = g;
+    c.want = inum == PINO_NET_TCP ? SOCK_STREAM : SOCK_DGRAM;
+    gen_str(g, "  sl  local_address rem_address   st tx_queue:rx_queue "
+               "tr:tm->when retrnsmt   uid  timeout inode\n");
+    sock_walk(sock_emit, &c);
+    break;
+  }
+
+  case PINO_NET_SOCKSTAT: {
+    struct sockctx c;
+    memset(&c, 0, sizeof(c));
+    c.g = g;
+    c.want = -1;
+    sock_walk(sock_emit, &c);
+    gen_str(g, "sockets: used ");
+    gen_num(g, c.counts[SOCK_DGRAM] + c.counts[SOCK_STREAM] + c.counts[SOCK_ICMP]);
+    gen_str(g, "\nTCP: inuse ");
+    gen_num(g, c.counts[SOCK_STREAM]);
+    gen_str(g, "\nUDP: inuse ");
+    gen_num(g, c.counts[SOCK_DGRAM]);
+    gen_str(g, "\nRAW: inuse ");
+    gen_num(g, c.counts[SOCK_ICMP]);
+    gen_str(g, "\n");
+    break;
+  }
+  }
+}
+
 static void
 gen_top(struct gen *g, uint inum)
 {
@@ -142,13 +391,21 @@ gen_top(struct gen *g, uint inum)
 
   case PINO_MEMINFO: {
     struct meminfo mi;
+    // a kernel stack that has been released sits in quarantine until
+    // the harts that might still have it in a TLB have been told;
+    // draining first means this file and sysconf() agree about how
+    // much memory there is, rather than differing by a few stacks.
+    kstack_drain();
     kmem_info(&mi);
     gen_kv(g, "MemTotal", mi.total_pages * 4, "kB");
     gen_kv(g, "MemFree", mi.free_pages * 4, "kB");
-    gen_kv(g, "MemAvailable", mi.free_pages * 4, "kB");
+    gen_kv(g, "MemAvailable", (mi.free_pages + blk_reclaimable()) * 4, "kB");
     uint64 hits, misses, dirty;
     blk_cache_stats(&hits, &misses, &dirty);
-    gen_kv(g, "Cached", 0, "kB");
+    // what the block cache holds, and how much of it kalloc would take
+    // back if a page were wanted: Linux calls the second "available".
+    gen_kv(g, "Cached", blk_cache_pages() * 4, "kB");
+    gen_kv(g, "MemReclaimable", blk_reclaimable() * 4, "kB");
     gen_kv(g, "Dirty", dirty * 4, "kB");
     gen_kv(g, "PageTables", mi.db_pages * 4, "kB");
     gen_kv(g, "Reserved", mi.reserve_pages * 4, "kB");
@@ -228,6 +485,15 @@ gen_top(struct gen *g, uint inum)
     gen_str(g, "\n");
     break;
 
+  case PINO_NET_DEV:
+  case PINO_NET_ARP:
+  case PINO_NET_ROUTE:
+  case PINO_NET_TCP:
+  case PINO_NET_UDP:
+  case PINO_NET_SOCKSTAT:
+    gen_net(g, inum);
+    break;
+
   default:
     break;
   }
@@ -259,9 +525,23 @@ gen_pid(struct gen *g, int pid, int which)
     }
     gen_str(g, "\nThreads:\t");
     gen_num(g, proc_nthreads(p));
+    gen_str(g, "\nUid:\t");
+    gen_num(g, p->cred.uid);
+    gen_str(g, "\t");
+    gen_num(g, p->cred.euid);
+    gen_str(g, "\nGid:\t");
+    gen_num(g, p->cred.gid);
+    gen_str(g, "\t");
+    gen_num(g, p->cred.egid);
     gen_str(g, "\nVmSize:\t");
     gen_num(g, p->mm ? p->mm->pages * 4 : 0);
-    gen_str(g, " kB\n");
+    gen_str(g, " kB\nTty:\t");
+    gen_num(g, p->tty);
+    gen_str(g, "\nUtime:\t");
+    gen_num(g, p->utime);
+    gen_str(g, "\nStime:\t");
+    gen_num(g, p->stime);
+    gen_str(g, "\n");
     break;
 
   case PPID_CMDLINE:
@@ -273,12 +553,23 @@ gen_pid(struct gen *g, int pid, int which)
     gen_str(g, " (");
     gen_str(g, p->name);
     gen_str(g, ") ");
-    gen_str(g, p->state == RUNNING ? "R " : (p->state == SLEEPING ? "S " : "R "));
+    gen_str(g, p->state == RUNNING     ? "R "
+                : p->state == SLEEPING ? "S "
+                : p->state == ZOMBIE   ? "Z "
+                                       : "R ");
     gen_num(g, p->parent ? p->parent->pid : 0);
     gen_str(g, " ");
     gen_num(g, p->pgid);
     gen_str(g, " ");
     gen_num(g, p->sid);
+    gen_str(g, " ");
+    gen_num(g, p->tty);
+    gen_str(g, " ");
+    gen_num(g, p->utime);
+    gen_str(g, " ");
+    gen_num(g, p->stime);
+    gen_str(g, " ");
+    gen_num(g, p->mm ? p->mm->pages : 0);
     gen_str(g, "\n");
     break;
 
@@ -311,20 +602,168 @@ pid_inum(int pid, int which)
   return PINO_FIRST_PID + ((uint)pid << 4) + which;
 }
 
+// what a descriptor points at, written the way /proc has always
+// written the things that never had a name. this kernel keeps no path
+// for an open file -- there is no dentry cache -- so a file is named
+// by the numbers that identify it, which is what a program comparing
+// two descriptors actually wants.
+static void
+name_file(struct file *f, char *out, int size)
+{
+  struct gen g = {out, 0, size};
+
+  out[0] = 0;
+  if (f == 0)
+    return;
+  switch (f->type) {
+  case FD_INODE:
+    if (f->ip) {
+      gen_str(&g, f->ip->sb && f->ip->sb->type[0] ? f->ip->sb->type : "inode");
+      gen_str(&g, ":[");
+      gen_num(&g, f->ip->dev);
+      gen_str(&g, ":");
+      gen_num(&g, f->ip->inum);
+      gen_str(&g, "]");
+      break;
+    }
+    gen_str(&g, "inode:[0]");
+    break;
+  case FD_DEVICE:
+    gen_str(&g, "dev:[");
+    gen_num(&g, f->ip ? (uint64)f->ip->major : 0);
+    gen_str(&g, ":");
+    gen_num(&g, f->ip ? (uint64)f->ip->minor : 0);
+    gen_str(&g, "]");
+    break;
+  case FD_BLOCK:
+    gen_str(&g, "block:[");
+    gen_str(&g, f->disk && f->disk->name[0] ? f->disk->name : "?");
+    gen_str(&g, "]");
+    break;
+  case FD_PIPE:
+    // the pointer makes a number that is the same for both ends of
+    // one pipe and different for any other, which is all an id is for
+    gen_str(&g, "pipe:[");
+    gen_num(&g, ((uint64)f->pipe) >> 4);
+    gen_str(&g, "]");
+    break;
+  case FD_SOCK:
+    gen_str(&g, "socket:[");
+    gen_num(&g, ((uint64)f->sock) >> 4);
+    gen_str(&g, "]");
+    break;
+  default:
+    gen_str(&g, "unknown:[0]");
+    break;
+  }
+  g.buf[g.len] = 0;
+}
+
+// the same, for a directory this process is sitting in or rooted at
+static void
+name_inode(struct inode *ip, char *out, int size)
+{
+  struct gen g = {out, 0, size};
+
+  if (ip == 0) {
+    gen_str(&g, "unknown:[0]");
+  } else {
+    gen_str(&g, ip->sb && ip->sb->type[0] ? ip->sb->type : "inode");
+    gen_str(&g, ":[");
+    gen_num(&g, ip->dev);
+    gen_str(&g, ":");
+    gen_num(&g, ip->inum);
+    gen_str(&g, "]");
+  }
+  g.buf[g.len] = 0;
+}
+
+// the descriptor, with a reference held so it cannot be closed and
+// freed while it is being read
+static struct file *
+grab_fd(int pid, int fd, struct proc **held)
+{
+  struct proc *p = proc_get(pid);
+  struct file *f = 0;
+
+  *held = 0;
+  if (p == 0)
+    return 0;
+  if (p->fdt) {
+    acquire(&p->fdt->lock);
+    if (fd >= 0 && fd < p->fdt->n && p->fdt->ofile[fd])
+      f = filedup(p->fdt->ofile[fd]);
+    release(&p->fdt->lock);
+  }
+  proc_release(p);
+  return f;
+}
+
 static void
 procfs_load(struct inode *ip)
 {
   int pid, which;
 
   ip->nlink = 1;
+  // nothing here is stored, so the mode is the one every file of
+  // this file system has: readable by all, written by root alone.
+  ip->mode = 0444;
+  ip->uid = ip->gid = 0;
   ip->major = 0;
   ip->minor = 0;
   ip->size = 0;
-  if (ip->inum == PINO_ROOT) {
+  int fdnum;
+
+  if (is_fd_inum(ip->inum, &pid, &fdnum)) {
+    // a descriptor is a link to whatever it holds, and it is the
+    // owner's business alone
+    ip->type = T_SYMLINK;
+    ip->mode = 0500;
+    struct proc *p = proc_get(pid);
+    if (p) {
+      ip->uid = p->cred.euid;
+      ip->gid = p->cred.egid;
+      proc_release(p);
+    }
+    ip->valid = 1;
+    return;
+  }
+  if (ip->inum == PINO_SELF) {
+    // a link to the caller's own directory, which is what makes
+    // /proc/self/fd and the rest work for whoever asks
+    ip->type = T_SYMLINK;
+    ip->mode = 0777;
+    ip->valid = 1;
+    return;
+  }
+  if (ip->inum == PINO_ROOT || ip->inum == PINO_NET) {
     ip->type = T_DIR;
+    ip->mode = 0555;
     ip->nlink = 2;
   } else if (is_pid_dir(ip->inum, &pid, &which)) {
     ip->type = which == PPID_DIR ? T_DIR : T_FILE;
+    if (which == PPID_DIR)
+      ip->mode = 0555;
+    if (which == PPID_FD) {
+      ip->type = T_DIR;
+      ip->mode = 0500;   // what a process holds open is its own affair
+      ip->nlink = 2;
+    }
+    if (which == PPID_CWD || which == PPID_ROOT) {
+      ip->type = T_SYMLINK;
+      ip->mode = 0500;
+    }
+    // a process's directory belongs to whoever runs it, and what is in
+    // it is theirs: the environment of another user's process is not
+    // something to hand out, and Linux does not either.
+    struct proc *p = proc_get(pid);
+    if (p) {
+      ip->uid = p->cred.euid;
+      ip->gid = p->cred.egid;
+      proc_release(p);
+    }
+    if (which == PPID_CMDLINE)
+      ip->mode = 0444; // what a process was started with is not a secret
   } else {
     ip->type = T_FILE;
   }
@@ -401,6 +840,16 @@ procfs_lookup(struct inode *dp, char *name, uint *poff)
     proc_release(p);
     return procfs_iget(pid_inum(n, PPID_DIR));
   }
+  if (dp->inum == PINO_NET) {
+    if (strncmp(name, ".", 2) == 0)
+      return procfs_iget(PINO_NET);
+    if (strncmp(name, "..", 3) == 0)
+      return procfs_iget(PINO_ROOT);
+    for (int i = 0; netfiles[i].name; i++)
+      if (strncmp(name, netfiles[i].name, DIRSIZ) == 0)
+        return procfs_iget(netfiles[i].inum);
+    return 0;
+  }
   if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_DIR) {
     if (strncmp(name, ".", 2) == 0)
       return procfs_iget(dp->inum);
@@ -409,6 +858,26 @@ procfs_lookup(struct inode *dp, char *name, uint *poff)
     for (int i = 1; i < PPID_NFILES; i++)
       if (pid_files[i] && strncmp(name, pid_files[i], DIRSIZ) == 0)
         return procfs_iget(pid_inum(pid, i));
+    return 0;
+  }
+  if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_FD) {
+    if (strncmp(name, ".", 2) == 0)
+      return procfs_iget(dp->inum);
+    if (strncmp(name, "..", 3) == 0)
+      return procfs_iget(pid_inum(pid, PPID_DIR));
+    int fd = 0;
+    for (char *p = name; *p; p++) {
+      if (*p < '0' || *p > '9')
+        return 0;
+      fd = fd * 10 + (*p - '0');
+    }
+    // only a descriptor that is really open has an entry
+    struct proc *held;
+    struct file *f = grab_fd(pid, fd, &held);
+    if (f == 0)
+      return 0;
+    fileclose(f);
+    return procfs_iget(fd_inum(pid, fd));
   }
   return 0;
 }
@@ -441,7 +910,8 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     if (i < (uint64)ntop) {
       safestrcpy(name, topfiles[i].name, namemax);
       *ino = topfiles[i].inum;
-      *type = 8;
+      *type = topfiles[i].inum == PINO_NET  ? 4
+              : topfiles[i].inum == PINO_SELF ? 10 : 8;
       (*pos)++;
       return 1;
     }
@@ -480,6 +950,89 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     return 0;
   }
 
+  if (dp->inum == PINO_NET) {
+    uint64 i = *pos;
+    if (i == 0) {
+      safestrcpy(name, ".", namemax);
+      *ino = PINO_NET;
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    if (i == 1) {
+      safestrcpy(name, "..", namemax);
+      *ino = PINO_ROOT;
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    i -= 2;
+    int n = 0;
+    while (netfiles[n].name)
+      n++;
+    if (i < (uint64)n) {
+      safestrcpy(name, netfiles[i].name, namemax);
+      *ino = netfiles[i].inum;
+      *type = 8;
+      (*pos)++;
+      return 1;
+    }
+    return 0;
+  }
+
+  if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_FD) {
+    uint64 i = *pos;
+    if (i == 0) {
+      safestrcpy(name, ".", namemax);
+      *ino = dp->inum;
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    if (i == 1) {
+      safestrcpy(name, "..", namemax);
+      *ino = pid_inum(pid, PPID_DIR);
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    // one entry per open descriptor, walked from where the last call
+    // left off rather than counted from the start
+    struct proc *p = proc_get(pid);
+    if (p == 0 || p->fdt == 0) {
+      if (p)
+        proc_release(p);
+      return 0;
+    }
+    int found = -1;
+    acquire(&p->fdt->lock);
+    for (int fd = (int)(i - 2); fd < p->fdt->n; fd++)
+      if (p->fdt->ofile[fd]) {
+        found = fd;
+        break;
+      }
+    release(&p->fdt->lock);
+    proc_release(p);
+    if (found < 0)
+      return 0;
+    char tmp[16];
+    int n = 0, v = found;
+    if (v == 0)
+      tmp[n++] = '0';
+    while (v) {
+      tmp[n++] = '0' + v % 10;
+      v /= 10;
+    }
+    int k = 0;
+    while (n > 0 && k < namemax - 1)
+      name[k++] = tmp[--n];
+    name[k] = 0;
+    *ino = fd_inum(pid, found);
+    *type = 10;   // a symbolic link
+    *pos = (uint64)found + 3;
+    return 1;
+  }
+
   if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_DIR) {
     uint64 i = *pos;
     if (i == 0) {
@@ -500,13 +1053,71 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     if (i < PPID_NFILES && pid_files[i]) {
       safestrcpy(name, pid_files[i], namemax);
       *ino = pid_inum(pid, i);
-      *type = 8;
+      *type = i == PPID_FD ? 4 : (i == PPID_CWD || i == PPID_ROOT) ? 10 : 8;
       (*pos)++;
       return 1;
     }
     return 0;
   }
   return 0;
+}
+
+// where a link under /proc points
+static int
+procfs_readlink(struct inode *ip, char *buf, int max)
+{
+  char name[64];
+  int pid, which, fdnum;
+
+  name[0] = 0;
+  if (ip->inum == PINO_SELF) {
+    struct gen g = {name, 0, sizeof(name)};
+    gen_num(&g, myproc()->pid);
+    g.buf[g.len] = 0;
+    int n = strlen(name);
+    if (n > max)
+      n = max;
+    memmove(buf, name, n);
+    return n;
+  }
+  if (is_fd_inum(ip->inum, &pid, &fdnum)) {
+    struct proc *held;
+    struct file *f = grab_fd(pid, fdnum, &held);
+    if (f == 0)
+      return -ENOENT;
+    name_file(f, name, sizeof(name));
+    fileclose(f);
+  } else if (is_pid_dir(ip->inum, &pid, &which) &&
+             (which == PPID_CWD || which == PPID_ROOT)) {
+    struct proc *p = proc_get(pid);
+    if (p == 0)
+      return -ENOENT;
+    struct inode *dir = 0;
+    int is_root_dir = 0;
+    if (p->fs) {
+      acquire(&p->fs->lock);
+      dir = which == PPID_CWD ? p->fs->cwd : p->fs->root;
+      release(&p->fs->lock);
+    }
+    if (which == PPID_ROOT && dir == 0)
+      is_root_dir = 1;   // not chrooted: the file system's own root
+    if (is_root_dir) {
+      struct gen g = {name, 0, sizeof(name)};
+      gen_str(&g, "root:[/]");
+      g.buf[g.len] = 0;
+    } else {
+      name_inode(dir, name, sizeof(name));
+    }
+    proc_release(p);
+  } else {
+    return -EINVAL;
+  }
+
+  int n = strlen(name);
+  if (n > max)
+    n = max;
+  memmove(buf, name, n);
+  return n;
 }
 
 static int
@@ -526,6 +1137,7 @@ static const struct inode_ops procfs_iops = {
     .write = procfs_write,
     .lookup = procfs_lookup,
     .readdir = procfs_readdir,
+    .readlink = procfs_readlink,
 };
 
 static struct inode *

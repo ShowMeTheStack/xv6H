@@ -22,6 +22,21 @@ void            virtio_disk_register(void);
 void            blkinit(void);
 uint32          crc32c(uint32 crc, const void *data, int len);
 void            procfs_init(void);
+void            devfs_init(void);
+
+// logdev.c
+void            loginit(void);
+void            kmsg_note(const char *s, int n);
+
+// ramfs.c
+void            ramfs_init(void);
+
+// sysfs.c
+void            sysfs_init(void);
+
+// overlayfs.c
+void            overlayfs_init(void);
+void            loopinit(void);
 void            ext4_init(void);
 int             ext4_probe(struct gendisk *);
 void            vfs_init(void);
@@ -57,11 +72,14 @@ void            iunlockput(struct inode*);
 void            iupdate(struct inode*);
 int             namecmp(const char*, const char*);
 struct inode*   namei(char*);
+struct inode*   namei_nofollow(char*);
+struct inode*   namei_from(struct inode *, char *, int, int, char *);
 struct inode*   nameiparent(char*, char*);
 int             readi(struct inode*, int, uint64, uint, uint);
 void            stati(struct inode*, struct stat*);
 int             writei(struct inode*, int, uint64, uint, uint);
 void            itrunc(struct inode*);
+int             isetsize(struct inode*, uint64);
 
 // kalloc.c
 void*           kalloc(void);
@@ -77,6 +95,13 @@ int             pipewrite(struct pipe*, uint64, int);
 // printk.c
 int             printk(char*, ...) __attribute__ ((format (printf, 1, 2)));
 void            panic(char*) __attribute__((noreturn));
+void            backtrace(void);
+
+// sysproc.c / sysfile.c: who a process is, and what it may do
+int             cap_ok(int cap);
+int             sethostname_str(const char *s, int n);
+int             inode_permitted(struct inode *ip, int want);
+int             sticky_permitted(struct inode *dp, struct inode *ip);
 void            printkinit(void);
 
 // proc.c
@@ -205,6 +230,8 @@ struct fsinfo * fsinfo_dup(struct fsinfo *);
 struct fsinfo * fsinfo_copy(struct fsinfo *);
 void            fsinfo_put(struct fsinfo *);
 struct inode *  proc_cwd(struct proc *);
+struct inode *  proc_root(struct proc *);
+void            proc_set_root(struct proc *, struct inode *);
 struct inode *  proc_set_cwd(struct proc *, struct inode *);
 struct file *   fdtake(struct proc *, int);
 struct file *   fdput(struct proc *, int, struct file *, int);
@@ -262,6 +289,11 @@ void            do_signals(void);
 void            proc_make_runnable(struct proc *);
 void            proc_notify_parent(struct proc *);
 void            sched_stopped(void);
+// ptrace.c
+void            ptrace_syscall_entry(struct proc *);
+void            ptrace_syscall_exit(struct proc *);
+void            ptrace_exec_stop(struct proc *);
+void            ptrace_exit(struct proc *);
 void            sigq_free_all(struct proc *);
 struct proc *   proc_get(int);
 void            proc_release(struct proc *);

@@ -10,13 +10,16 @@
 #include "param.h"
 #include "stat.h"
 #include "spinlock.h"
+#include "cred.h"
 #include "proc.h"
 #include "fs.h"
 #include "sleeplock.h"
 #include "file.h"
 #include "vfs.h"
 #include "blk.h"
+#include "blkdev.h"
 #include "fcntl.h"
+#include "xattr.h"
 #include "posix.h"
 #include "signal.h"
 #include "errno.h"
@@ -109,17 +112,20 @@ sys_fstat(void)
   return filestat(f, st);
 }
 
+// the directory an *at call resolves a relative path from; defined with
+// the rest of that family at the end of this file.
+static struct inode *at_lookup(int dirfd, char *path, int parent, int nofollow, char *name);
+
 // Create the path new as a link to the same inode as old.
-uint64
-sys_link(void)
+static int
+do_link(int oldfd, char *old, int newfd, char *new, int flags)
 {
-  char name[DIRSIZ], new[MAXPATH], old[MAXPATH];
+  char name[DIRSIZ];
   struct inode *dp, *ip;
 
-  if (argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
-    return -1;
-
-  if ((ip = namei(old)) == 0) {
+  // a hard link names an inode, so a symbolic link at the end of the
+  // old path is followed only when AT_SYMLINK_FOLLOW says to.
+  if ((ip = at_lookup(oldfd, old, 0, !(flags & AT_SYMLINK_FOLLOW), name)) == 0) {
     return -1;
   }
 
@@ -127,6 +133,12 @@ sys_link(void)
   if (ip->type == T_DIR) {
     iunlockput(ip);
     return -1;
+  }
+  // an immutable or append-only file may not have another name made
+  // for it: a second name is a second way to reach it
+  if (ip->attr & (ATTR_IMMUTABLE | ATTR_APPEND)) {
+    iunlockput(ip);
+    return -EPERM;
   }
 
   if (ip->nlink >= NLINK_MAX) {
@@ -138,8 +150,12 @@ sys_link(void)
   iupdate(ip);
   iunlock(ip);
 
-  if ((dp = nameiparent(new, name)) == 0)
+  if ((dp = at_lookup(newfd, new, 1, 0, name)) == 0)
     goto bad;
+  if (vfs_readonly(dp)) {
+    iput(dp);
+    goto bad;
+  }
   ilock(dp);
   // the link count was raised and written above, so all that is left is
   // the name itself, which the file system adds. dp may have been
@@ -167,6 +183,32 @@ bad:
   return -1;
 }
 
+// Create the path new as a link to the same inode as old.
+uint64
+sys_link(void)
+{
+  char new[MAXPATH], old[MAXPATH];
+
+  if (argstr(0, old, MAXPATH) < 0 || argstr(1, new, MAXPATH) < 0)
+    return -1;
+  return do_link(AT_FDCWD, old, AT_FDCWD, new, AT_SYMLINK_FOLLOW);
+}
+
+// linkat(oldfd, old, newfd, new, flags)
+uint64
+sys_linkat(void)
+{
+  char new[MAXPATH], old[MAXPATH];
+  int oldfd, newfd, flags;
+
+  argint(0, &oldfd);
+  argint(2, &newfd);
+  argint(4, &flags);
+  if (argstr(1, old, MAXPATH) < 0 || argstr(3, new, MAXPATH) < 0)
+    return -EFAULT;
+  return do_link(oldfd, old, newfd, new, flags);
+}
+
 uint64
 sys_unlink(void)
 {
@@ -180,6 +222,10 @@ sys_unlink(void)
   if ((dp = nameiparent(path, name)) == 0)
     return -1;
 
+  if (vfs_readonly(dp)) {
+    iput(dp);
+    return -EROFS;
+  }
   ilock(dp);
   // "." and ".." are not names a file system may be asked to remove:
   // one of them is the directory itself and the other is its parent.
@@ -187,22 +233,61 @@ sys_unlink(void)
     r = -EPERM;
   else if (dp->ops == 0 || dp->ops->unlink == 0)
     r = -EPERM;
-  else
-    r = dp->ops->unlink(dp, name);
+  else if ((r = inode_permitted(dp, 2 | 1)) == 0) {
+    struct inode *victim = dirlookup(dp, name, 0);
+    if (victim == 0)
+      r = -ENOENT;
+    else {
+      ilock(victim);
+      r = sticky_permitted(dp, victim);
+      // neither an immutable nor an append-only file may be taken
+      // away: a file that may only be added to may not be removed
+      if (r == 0 && (victim->attr & (ATTR_IMMUTABLE | ATTR_APPEND)))
+        r = -EPERM;
+      iunlockput(victim);
+      if (r == 0)
+        r = dp->ops->unlink(dp, name);
+    }
+  }
   iunlockput(dp);
   return r;
 }
 
 static struct inode *
-create(char *path, short type, short major, short minor)
+create_at(int dirfd, char *path, short type, short major, short minor, int perm)
 {
   struct inode *ip, *dp;
   char name[DIRSIZ];
 
-  if ((dp = nameiparent(path, name)) == 0)
+  if ((dp = at_lookup(dirfd, path, 1, 0, name)) == 0)
     return 0;
 
   ilock(dp);
+
+  // the name may already be there, in which case nothing is being
+  // created and the directory is not being changed: opening an
+  // existing file with O_CREATE must not need permission to write to
+  // the directory it is in, or no ordinary program could open
+  // /dev/null for writing.
+  if ((ip = dirlookup(dp, name, 0)) != 0) {
+    iunlockput(dp);
+    ilock(ip);
+    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
+
+  if (vfs_readonly(dp)) {
+    iunlockput(dp);
+    return 0;
+  }
+
+  // a new name in a directory is a change to that directory
+  if (inode_permitted(dp, 2 | 1) < 0) {
+    iunlockput(dp);
+    return 0;
+  }
 
   if (dp->nlink == 0) {
     iunlockput(dp);
@@ -215,15 +300,6 @@ create(char *path, short type, short major, short minor)
     return 0;
   }
 
-  if ((ip = dirlookup(dp, name, 0)) != 0) {
-    iunlockput(dp);
-    ilock(ip);
-    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
-      return ip;
-    iunlockput(ip);
-    return 0;
-  }
-
   // the file system makes the whole thing: the inode, the directory
   // entry, and the two entries a directory needs. it comes back locked.
   if (dp->ops == 0 || dp->ops->create == 0) {
@@ -231,37 +307,108 @@ create(char *path, short type, short major, short minor)
     return 0;
   }
   ip = dp->ops->create(dp, name, type, major, minor);
+  if (ip) {
+    // it belongs to whoever made it, with the permissions the process
+    // asked for less the ones its umask takes away. a new directory in
+    // a set-group-id directory belongs to that directory's group and
+    // is itself set-group-id, which is how a shared directory stays
+    // shared.
+    struct proc *p = myproc();
+    ip->mode = (uint)perm & 07777 & ~(uint)p->umask;
+    ip->uid = p->cred.euid;
+    ip->gid = (dp->mode & 02000) ? dp->gid : p->cred.egid;
+    if (type == T_DIR && (dp->mode & 02000))
+      ip->mode |= 02000;
+    iupdate(ip);
+  }
   iunlockput(dp);
   return ip;
 }
 
-uint64
-sys_open(void)
+static struct inode *
+create(char *path, short type, short major, short minor, int perm)
 {
-  char path[MAXPATH];
-  int fd, omode;
+  return create_at(AT_FDCWD, path, type, major, minor, perm);
+}
+
+// open, whatever names the directory a relative path starts from.
+static int
+do_open(int dirfd, char *path, int omode, int perm)
+{
+  int fd;
   struct file *f;
   struct inode *ip;
-  int n;
-
-  argint(1, &omode);
-  if ((n = argstr(0, path, MAXPATH)) < 0)
-    return -1;
-
+  char name[DIRSIZ];
 
   if (omode & O_CREATE) {
-    ip = create(path, T_FILE, 0, 0);
+    ip = create_at(dirfd, path, T_FILE, 0, 0, perm);
     if (ip == 0) {
       return -1;
     }
   } else {
-    if ((ip = namei(path)) == 0) {
+    if ((ip = at_lookup(dirfd, path, 0, (omode & O_NOFOLLOW) != 0, name)) == 0) {
       return -1;
     }
     ilock(ip);
-    if (ip->type == T_DIR && omode != O_RDONLY) {
+    if (ip->type == T_DIR && (omode & (O_WRONLY | O_RDWR | O_TRUNC | O_CREATE))) {
       iunlockput(ip);
-      return -1;
+      return -EISDIR;
+    }
+    // O_NOFOLLOW is about the last element only, and a link found
+    // there is an error rather than something to open.
+    if ((omode & O_NOFOLLOW) && ip->type == T_SYMLINK && !(omode & O_PATH)) {
+      iunlockput(ip);
+      return -ELOOP;
+    }
+    if ((omode & O_DIRECTORY) && ip->type != T_DIR) {
+      iunlockput(ip);
+      return -ENOTDIR;
+    }
+  }
+
+  // what the mount was made with. nodev means a device node on it is
+  // a file with no device behind it, which is what stops an image
+  // somebody else wrote from carrying a way into the kernel.
+  if (ip->sb && (ip->sb->flags & MS_NODEV) && ip->type == T_DEVICE) {
+    iunlockput(ip);
+    return -EACCES;
+  }
+  if (ip->sb && ip->sb->readonly && (omode & (O_WRONLY | O_RDWR | O_TRUNC))) {
+    iunlockput(ip);
+    return -EROFS;
+  }
+
+  // an immutable file cannot be opened for writing at all; an
+  // append-only one can, but only to append -- so O_APPEND is
+  // required and O_TRUNC refused. root is bound by this too: that is
+  // the point of the flag, and only clearing it lifts it.
+  if (omode & (O_WRONLY | O_RDWR | O_TRUNC)) {
+    if (ip->attr & ATTR_IMMUTABLE) {
+      iunlockput(ip);
+      return -EPERM;
+    }
+    if ((ip->attr & ATTR_APPEND) &&
+        ((omode & O_TRUNC) || !(omode & O_APPEND))) {
+      iunlockput(ip);
+      return -EPERM;
+    }
+  }
+
+  // what the file itself allows. a file created by this call has just
+  // been given the caller's own permissions, so the check is the same
+  // one either way.
+  {
+    int want = 0;
+    if (!(omode & O_WRONLY))
+      want |= 4;
+    if (omode & (O_WRONLY | O_RDWR))
+      want |= 2;
+    if ((omode & O_TRUNC) && ip->type == T_FILE)
+      want |= 2;
+    int e = want ? inode_permitted(ip, want) : 0;
+    if (e < 0) {
+      iunlockput(ip);
+      return e;
     }
   }
 
@@ -277,9 +424,32 @@ sys_open(void)
     return -1;
   }
 
-  if (ip->type == T_DEVICE) {
+  if (ip->type == T_DEVICE && ip->major == DEV_BLOCK) {
+    // a disk opened as a file: reads and writes go through the block
+    // cache at the file's own offset, so lseek works on it and a
+    // mount of the same device sees what was written.
+    f->disk = blk_by_index(ip->minor);
+    if (f->disk == 0) {
+      fdput(myproc(), fd, 0, 1);
+      fileclose(f);
+      iunlockput(ip);
+      return -ENXIO;
+    }
+    f->type = FD_BLOCK;
+    f->major = ip->major;
+    f->off = 0;
+  } else if (ip->type == T_DEVICE) {
     f->type = FD_DEVICE;
     f->major = ip->major;
+    if (ip->major >= 0 && ip->major < NDEV && devsw[ip->major].open) {
+      int r = devsw[ip->major].open();
+      if (r < 0) {
+        f->type = FD_NONE;
+        fileclose(f);
+        iunlockput(ip);
+        return r;
+      }
+    }
   } else {
     f->type = FD_INODE;
     f->off = 0;
@@ -301,14 +471,66 @@ sys_open(void)
 }
 
 uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int omode, perm = 0666;
+
+  argint(1, &omode);
+  // the third argument is the mode a file created here is given; it is
+  // only there when O_CREATE is, which is what POSIX says of it
+  if (omode & O_CREATE)
+    argint(2, &perm);
+  if (argstr(0, path, MAXPATH) < 0)
+    return -1;
+  return do_open(AT_FDCWD, path, omode, perm);
+}
+
+// openat(dirfd, path, flags)
+uint64
+sys_openat(void)
+{
+  char path[MAXPATH];
+  int dirfd, omode, perm = 0666;
+
+  argint(0, &dirfd);
+  argint(2, &omode);
+  if (omode & O_CREATE)
+    argint(3, &perm);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  return do_open(dirfd, path, omode, perm);
+}
+
+uint64
 sys_mkdir(void)
 {
   char path[MAXPATH];
   struct inode *ip;
+  int perm;
 
-  if (argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0) {
+  argint(1, &perm);
+  if (argstr(0, path, MAXPATH) < 0 || (ip = create(path, T_DIR, 0, 0, perm)) == 0) {
     return -1;
   }
+  iunlockput(ip);
+  return 0;
+}
+
+// mkdirat(dirfd, path, mode)
+uint64
+sys_mkdirat(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+  int dirfd, mode;
+
+  argint(0, &dirfd);
+  argint(2, &mode);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((ip = create_at(dirfd, path, T_DIR, 0, 0, mode)) == 0)
+    return -EEXIST;
   iunlockput(ip);
   return 0;
 }
@@ -323,7 +545,7 @@ sys_mknod(void)
   argint(1, &major);
   argint(2, &minor);
   if ((argstr(0, path, MAXPATH)) < 0 ||
-      (ip = create(path, T_DEVICE, major, minor)) == 0) {
+      (ip = create(path, T_DEVICE, major, minor, 0666)) == 0) {
     return -1;
   }
   iunlockput(ip);
@@ -507,7 +729,7 @@ sys_lseek(void)
   argint(2, &whence);
   if ((f = fdget(myproc(), fd)) == 0)
     return -EBADF;
-  if (f->type != FD_INODE)
+  if (f->type != FD_INODE && f->type != FD_BLOCK)
     return -ESPIPE;
   int64 target;
   switch (whence) {
@@ -518,6 +740,10 @@ sys_lseek(void)
     target = (int64)f->off + (int64)off;
     break;
   case SEEK_END: {
+    if (f->type == FD_BLOCK) {
+      target = (int64)blkdev_size(f->disk) + (int64)off;
+      break;
+    }
     ilock(f->ip);
     target = (int64)f->ip->size + (int64)off;
     iunlock(f->ip);
@@ -545,7 +771,7 @@ sys_pread(void)
   argaddr(3, &off);
   if ((f = fdget(myproc(), fd)) == 0)
     return -EBADF;
-  if (f->type != FD_INODE)
+  if (f->type != FD_INODE && f->type != FD_BLOCK)
     return -ESPIPE;
   saved = f->off;
   f->off = off;
@@ -566,7 +792,7 @@ sys_pwrite(void)
   argaddr(3, &off);
   if ((f = fdget(myproc(), fd)) == 0)
     return -EBADF;
-  if (f->type != FD_INODE)
+  if (f->type != FD_INODE && f->type != FD_BLOCK)
     return -ESPIPE;
   saved = f->off;
   f->off = off;
@@ -758,12 +984,12 @@ sys_ftruncate(void)
     return -EINVAL;
   if (!f->writable)
     return -EBADF;
-  if (len != 0)
-    return -EINVAL; // only truncation to zero, until the new file system
+  if ((int64)len < 0)
+    return -EINVAL;
   ilock(f->ip);
-  itrunc(f->ip);
+  int r = isetsize(f->ip, len);
   iunlock(f->ip);
-  return 0;
+  return r;
 }
 
 // ioctl(fd, request, arg)
@@ -788,7 +1014,47 @@ sys_ioctl(void)
       return -EFAULT;
     return 0;
   }
+
+  // the flags chattr(1) and lsattr(1) read and write
+  case FS_IOC_GETFLAGS: {
+    if (f->type != FD_INODE && f->type != FD_DEVICE)
+      return -ENOTTY;
+    ilock(f->ip);
+    uint v = f->ip->attr;
+    iunlock(f->ip);
+    if (copyout(p->mm, arg, (char *)&v, sizeof(v)) < 0)
+      return -EFAULT;
+    return 0;
   }
+  case FS_IOC_SETFLAGS: {
+    uint v;
+
+    if (f->type != FD_INODE && f->type != FD_DEVICE)
+      return -ENOTTY;
+    if (copyin(p->mm, (char *)&v, arg, sizeof(v)) < 0)
+      return -EFAULT;
+    ilock(f->ip);
+    // only the owner may change them, and only someone with
+    // CAP_LINUX_IMMUTABLE may set or clear the two that stop a file
+    // being changed -- otherwise a file could make itself immutable
+    // and then let itself go again
+    if (f->ip->uid != p->cred.euid && !cap_ok(CAP_FOWNER)) {
+      iunlock(f->ip);
+      return -EPERM;
+    }
+    uint locked = ATTR_IMMUTABLE | ATTR_APPEND;
+    if (((f->ip->attr ^ v) & locked) && !cap_ok(CAP_LINUX_IMMUTABLE)) {
+      iunlock(f->ip);
+      return -EPERM;
+    }
+    f->ip->attr = v;
+    iupdate(f->ip);
+    iunlock(f->ip);
+    return 0;
+  }
+  }
+  if (f->type == FD_BLOCK)
+    return blkdev_ioctl(f->disk, req, arg);
   if (f->type == FD_DEVICE && f->major >= 0 && f->major < NDEV && devsw[f->major].ioctl)
     return devsw[f->major].ioctl(req, arg);
   return -ENOTTY;
@@ -970,7 +1236,7 @@ sys_select(void)
 uint64
 sys_mount(void)
 {
-  char source[MAXPATH], target[MAXPATH], type[32], opts[64];
+  char source[MAXPATH], target[MAXPATH], type[32], opts[256];
   int flags;
 
   if (argstr(0, source, sizeof(source)) < 0 || argstr(1, target, sizeof(target)) < 0 ||
@@ -983,7 +1249,7 @@ sys_mount(void)
   if (optaddr && copyinstr(myproc()->mm, opts, optaddr, sizeof(opts)) < 0)
     opts[0] = 0;
 
-  struct super *sb = vfs_mount(source, target, type, (flags & MS_RDONLY) != 0, opts);
+  struct super *sb = vfs_mount(source, target, type, flags, opts);
   return sb ? 0 : -EINVAL;
 }
 
@@ -1133,4 +1399,836 @@ uint64
 sys_sync(void)
 {
   return vfs_sync_all();
+}
+
+// symlink(target, path): a file whose contents are the path it names.
+// the target is not looked at: a link may name something that is not
+// there, and often does.
+static int
+do_symlink(char *target, int dirfd, char *path)
+{
+  char name[DIRSIZ];
+  struct inode *dp;
+  int r;
+
+  if ((dp = at_lookup(dirfd, path, 1, 0, name)) == 0)
+    return -ENOENT;
+  if (vfs_readonly(dp)) {
+    iput(dp);
+    return -EROFS;
+  }
+  ilock(dp);
+  if (dp->ops == 0 || dp->ops->symlink == 0)
+    r = -EPERM;
+  else
+    r = dp->ops->symlink(dp, name, target);
+  iunlockput(dp);
+  return r;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  return do_symlink(target, AT_FDCWD, path);
+}
+
+// symlinkat(target, dirfd, path)
+uint64
+sys_symlinkat(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  int dirfd;
+
+  argint(1, &dirfd);
+  if (argstr(0, target, MAXPATH) < 0 || argstr(2, path, MAXPATH) < 0)
+    return -EFAULT;
+  return do_symlink(target, dirfd, path);
+}
+
+// readlink(path, buf, size): where a symbolic link points. the last
+// element of the path is not followed, or this could never see one.
+uint64
+sys_readlink(void)
+{
+  char path[MAXPATH], buf[MAXPATH];
+  uint64 addr;
+  int size, n;
+  struct inode *ip;
+
+  if (argstr(0, path, MAXPATH) < 0)
+    return -EFAULT;
+  argaddr(1, &addr);
+  argint(2, &size);
+  if (size <= 0)
+    return -EINVAL;
+  if ((ip = namei_nofollow(path)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  if (ip->type != T_SYMLINK) {
+    iunlockput(ip);
+    return -EINVAL;
+  }
+  n = ip->ops && ip->ops->readlink ? ip->ops->readlink(ip, buf, sizeof(buf)) : -EINVAL;
+  iunlockput(ip);
+  if (n < 0)
+    return n;
+  if (n > size)
+    n = size;
+  if (either_copyout(1, addr, buf, n) < 0)
+    return -EFAULT;
+  return n;
+}
+
+// rename(from, to): one name for a file becomes another. this is the
+// form that a file system can do in one transaction; doing it with a
+// link and an unlink, which is what the library did without it, cannot
+// rename a directory and is not atomic.
+static int
+do_rename(int fromfd, char *from, int tofd, char *to)
+{
+  char fname[DIRSIZ], tname[DIRSIZ];
+  struct inode *fdp = 0, *tdp = 0, *ip = 0, *victim = 0;
+  int r = 0;
+
+  if (fromfd == tofd && strncmp(from, to, MAXPATH) == 0)
+    return 0;
+
+  if ((fdp = at_lookup(fromfd, from, 1, 0, fname)) == 0)
+    return -ENOENT;
+  if ((tdp = at_lookup(tofd, to, 1, 0, tname)) == 0) {
+    iput(fdp);
+    return -ENOENT;
+  }
+  if (vfs_readonly(fdp) || vfs_readonly(tdp)) {
+    iput(fdp);
+    iput(tdp);
+    return -EROFS;
+  }
+  if (fdp->dev != tdp->dev) {
+    iput(fdp);
+    iput(tdp);
+    return -EXDEV; // a rename does not move a file between file systems
+  }
+  if (namecmp(fname, ".") == 0 || namecmp(fname, "..") == 0 || namecmp(tname, ".") == 0 ||
+      namecmp(tname, "..") == 0) {
+    iput(fdp);
+    iput(tdp);
+    return -EINVAL;
+  }
+
+  // the two directories are locked in order of inode number, so that
+  // two renames crossing each other cannot wait for one another.
+  struct inode *first = fdp->inum <= tdp->inum ? fdp : tdp;
+  struct inode *second = fdp->inum <= tdp->inum ? tdp : fdp;
+  ilock(first);
+  if (second != first)
+    ilock(second);
+
+  ip = dirlookup(fdp, fname, 0);
+  if (ip == 0) {
+    r = -ENOENT;
+    goto out;
+  }
+  // a file that may not be changed may not be moved either, and the
+  // same goes for one it would replace
+  {
+    ilock(ip);
+    int locked = (ip->attr & (ATTR_IMMUTABLE | ATTR_APPEND)) != 0;
+    iunlock(ip);
+    if (locked) {
+      r = -EPERM;
+      goto out;
+    }
+  }
+  victim = dirlookup(tdp, tname, 0);
+  if (victim) {
+    // the name is taken. it is replaced, unless what is there is a
+    // directory with something in it.
+    ilock(victim);
+    int vdir = victim->type == T_DIR;
+    int vlocked = (victim->attr & (ATTR_IMMUTABLE | ATTR_APPEND)) != 0;
+    iunlock(victim);
+    if (vlocked) {
+      r = -EPERM;
+      goto out;
+    }
+    if (vdir) {
+      struct inode *ipv = ip;
+      ilock(ipv);
+      int sdir = ipv->type == T_DIR;
+      iunlock(ipv);
+      if (!sdir) {
+        r = -EISDIR;
+        goto out;
+      }
+    }
+    if (tdp->ops == 0 || tdp->ops->unlink == 0) {
+      r = -EPERM;
+      goto out;
+    }
+    r = tdp->ops->unlink(tdp, tname);
+    if (r < 0)
+      goto out;
+  }
+
+  if (tdp->ops == 0 || tdp->ops->link == 0 || fdp->ops == 0 || fdp->ops->unlink == 0) {
+    r = -EPERM;
+    goto out;
+  }
+  // the new name first: if it cannot be made, the old one is still
+  // there and nothing has been lost.
+  ilock(ip);
+  ip->nlink++;
+  iupdate(ip);
+  iunlock(ip);
+  r = tdp->ops->link(tdp, tname, ip);
+  if (r < 0) {
+    ilock(ip);
+    ip->nlink--;
+    iupdate(ip);
+    iunlock(ip);
+    goto out;
+  }
+  r = fdp->ops->unlink(fdp, fname);
+
+out:
+  if (second != first)
+    iunlock(second);
+  iunlock(first);
+  if (victim)
+    iput(victim);
+  if (ip)
+    iput(ip);
+  iput(fdp);
+  iput(tdp);
+  return r;
+}
+
+uint64
+sys_rename(void)
+{
+  char from[MAXPATH], to[MAXPATH];
+
+  if (argstr(0, from, MAXPATH) < 0 || argstr(1, to, MAXPATH) < 0)
+    return -EFAULT;
+  return do_rename(AT_FDCWD, from, AT_FDCWD, to);
+}
+
+// renameat(fromfd, from, tofd, to)
+uint64
+sys_renameat(void)
+{
+  char from[MAXPATH], to[MAXPATH];
+  int fromfd, tofd;
+
+  argint(0, &fromfd);
+  argint(2, &tofd);
+  if (argstr(1, from, MAXPATH) < 0 || argstr(3, to, MAXPATH) < 0)
+    return -EFAULT;
+  return do_rename(fromfd, from, tofd, to);
+}
+
+// ---- the *at family ----
+//
+// a relative path is resolved from the directory a descriptor names
+// rather than from the process's own. AT_FDCWD means the current
+// directory, which is what every call that is not an *at call uses.
+//
+// the descriptor is looked at only long enough to take a reference to
+// its inode; namei_from releases that reference itself.
+static struct inode *
+at_lookup(int dirfd, char *path, int parent, int nofollow, char *name)
+{
+  struct inode *start = 0;
+
+  if (path[0] != '/' && dirfd != AT_FDCWD) {
+    struct file *f = fdget(myproc(), dirfd);
+    if (f == 0 || f->type != FD_INODE || f->ip == 0)
+      return 0;
+    ilock(f->ip);
+    int isdir = f->ip->type == T_DIR;
+    iunlock(f->ip);
+    if (!isdir)
+      return 0;
+    start = idup(f->ip);
+  }
+  return namei_from(start, path, parent, nofollow, name);
+}
+
+// fstatat(dirfd, path, statbuf, flags): what stat, lstat and fstat all
+// are underneath. AT_SYMLINK_NOFOLLOW asks about the link itself,
+// AT_EMPTY_PATH about the descriptor.
+uint64
+sys_fstatat(void)
+{
+  char path[MAXPATH], name[DIRSIZ];
+  uint64 addr;
+  int dirfd, flags;
+  struct inode *ip;
+  struct stat st;
+
+  argint(0, &dirfd);
+  argaddr(2, &addr);
+  argint(3, &flags);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+
+  if (path[0] == 0 && (flags & AT_EMPTY_PATH)) {
+    struct file *f = fdget(myproc(), dirfd);
+    if (f == 0)
+      return -EBADF;
+    return filestat(f, addr) < 0 ? -EFAULT : 0;
+  }
+
+  ip = at_lookup(dirfd, path, 0, (flags & AT_SYMLINK_NOFOLLOW) != 0, name);
+  if (ip == 0)
+    return -ENOENT;
+  ilock(ip);
+  stati(ip, &st);
+  iunlockput(ip);
+  if (either_copyout(1, addr, &st, sizeof(st)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+// readlinkat(dirfd, path, buf, size)
+uint64
+sys_readlinkat(void)
+{
+  char path[MAXPATH], name[DIRSIZ], buf[MAXPATH];
+  uint64 addr;
+  int dirfd, size, n;
+  struct inode *ip;
+
+  argint(0, &dirfd);
+  argaddr(2, &addr);
+  argint(3, &size);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if (size <= 0)
+    return -EINVAL;
+  if ((ip = at_lookup(dirfd, path, 0, 1, name)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  if (ip->type != T_SYMLINK) {
+    iunlockput(ip);
+    return -EINVAL;
+  }
+  n = ip->ops && ip->ops->readlink ? ip->ops->readlink(ip, buf, sizeof(buf)) : -EINVAL;
+  iunlockput(ip);
+  if (n < 0)
+    return n;
+  if (n > size)
+    n = size;
+  if (either_copyout(1, addr, buf, n) < 0)
+    return -EFAULT;
+  return n;
+}
+
+// unlinkat(dirfd, path, flags): AT_REMOVEDIR makes it rmdir.
+uint64
+sys_unlinkat(void)
+{
+  char path[MAXPATH], name[DIRSIZ];
+  int dirfd, flags, r;
+  struct inode *dp;
+
+  argint(0, &dirfd);
+  argint(2, &flags);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((dp = at_lookup(dirfd, path, 1, 0, name)) == 0)
+    return -ENOENT;
+  if (vfs_readonly(dp)) {
+    iput(dp);
+    return -EROFS;
+  }
+  ilock(dp);
+  if (namecmp(name, ".") == 0 || namecmp(name, "..") == 0)
+    r = -EPERM;
+  else if (dp->ops == 0 || dp->ops->unlink == 0)
+    r = -EPERM;
+  else {
+    // the flag says which of the two calls this is, and a mismatch is
+    // an error rather than something to do anyway.
+    struct inode *ip = dirlookup(dp, name, 0);
+    if (ip == 0)
+      r = -ENOENT;
+    else {
+      ilock(ip);
+      int isdir = ip->type == T_DIR;
+      // neither an immutable nor an append-only file may be taken
+      // away: a file that may only be added to may not be removed
+      int locked = (ip->attr & (ATTR_IMMUTABLE | ATTR_APPEND)) != 0;
+      iunlockput(ip);
+      if (locked)
+        r = -EPERM;
+      else if ((flags & AT_REMOVEDIR) && !isdir)
+        r = -ENOTDIR;
+      else if (!(flags & AT_REMOVEDIR) && isdir)
+        r = -EISDIR;
+      else
+        r = dp->ops->unlink(dp, name);
+    }
+  }
+  iunlockput(dp);
+  return r;
+}
+
+// faccessat(dirfd, path, mode, flags): whether the name resolves. with
+// no users yet there are no permissions to check, so this says what
+// every unix says for root: the file is there, or it is not.
+uint64
+sys_faccessat(void)
+{
+  char path[MAXPATH], name[DIRSIZ];
+  int dirfd, mode, flags;
+  struct inode *ip;
+
+  argint(0, &dirfd);
+  argint(2, &mode);
+  argint(3, &flags);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  (void)mode;
+  ip = at_lookup(dirfd, path, 0, (flags & AT_SYMLINK_NOFOLLOW) != 0, name);
+  if (ip == 0)
+    return -ENOENT;
+  iput(ip);
+  return 0;
+}
+
+// ---- extended attributes ----
+//
+// twelve calls in POSIX, four here: the first argument says whether the
+// file is named by a descriptor, by a path, or by a path whose last
+// element is a symbolic link not to be followed. the library spells
+// out the twelve.
+static struct inode *
+xattr_inode(int fd, char *path)
+{
+  struct inode *ip;
+
+  if (fd >= 0) {
+    struct file *f = fdget(myproc(), fd);
+    if (f == 0 || f->type != FD_INODE || f->ip == 0)
+      return 0;
+    return idup(f->ip);
+  }
+  ip = fd == XATTR_AT_LPATH ? namei_nofollow(path) : namei(path);
+  return ip;
+}
+
+// setxattr(fd_or_flag, path, name, value, size, flags). a null value
+// removes the name, which is what removexattr is.
+uint64
+sys_setxattr(void)
+{
+  char path[MAXPATH], name[XATTR_NAME_MAX + 1];
+  uint64 addr;
+  int fd, size, flags, r;
+  struct inode *ip;
+  char *buf = 0;
+
+  argint(0, &fd);
+  argaddr(3, &addr);
+  argint(4, &size);
+  argint(5, &flags);
+  if (argstr(1, path, MAXPATH) < 0 || argstr(2, name, sizeof(name)) < 0)
+    return -EFAULT;
+  if (size < 0 || size > PGSIZE)
+    return -E2BIG;
+  if (addr != 0) {
+    if ((buf = kalloc()) == 0)
+      return -ENOMEM;
+    if (size > 0 && either_copyin(buf, 1, addr, size) < 0) {
+      kfree(buf);
+      return -EFAULT;
+    }
+  }
+  if ((ip = xattr_inode(fd, path)) == 0) {
+    if (buf)
+      kfree(buf);
+    return fd >= 0 ? -EBADF : -ENOENT;
+  }
+  ilock(ip);
+  if (ip->sb && ip->sb->readonly)
+    r = -EROFS;
+  else if (ip->ops == 0 || ip->ops->setxattr == 0)
+    r = -EOPNOTSUPP;
+  else
+    r = ip->ops->setxattr(ip, name, buf, size, flags);
+  iunlockput(ip);
+  if (buf)
+    kfree(buf);
+  return r;
+}
+
+uint64
+sys_removexattr(void)
+{
+  char path[MAXPATH], name[XATTR_NAME_MAX + 1];
+  int fd, r;
+  struct inode *ip;
+
+  argint(0, &fd);
+  if (argstr(1, path, MAXPATH) < 0 || argstr(2, name, sizeof(name)) < 0)
+    return -EFAULT;
+  if ((ip = xattr_inode(fd, path)) == 0)
+    return fd >= 0 ? -EBADF : -ENOENT;
+  ilock(ip);
+  if (ip->ops == 0 || ip->ops->setxattr == 0)
+    r = -EOPNOTSUPP;
+  else
+    r = ip->ops->setxattr(ip, name, 0, 0, 0);
+  iunlockput(ip);
+  return r;
+}
+
+// getxattr(fd_or_flag, path, name, buf, size). size 0 asks how long
+// the value is without copying it.
+uint64
+sys_getxattr(void)
+{
+  char path[MAXPATH], name[XATTR_NAME_MAX + 1];
+  uint64 addr;
+  int fd, size, r;
+  struct inode *ip;
+  char *buf = 0;
+
+  argint(0, &fd);
+  argaddr(3, &addr);
+  argint(4, &size);
+  if (argstr(1, path, MAXPATH) < 0 || argstr(2, name, sizeof(name)) < 0)
+    return -EFAULT;
+  if (size < 0)
+    return -EINVAL;
+  if (size > PGSIZE)
+    size = PGSIZE;
+  if (size > 0 && (buf = kalloc()) == 0)
+    return -ENOMEM;
+  if ((ip = xattr_inode(fd, path)) == 0) {
+    if (buf)
+      kfree(buf);
+    return fd >= 0 ? -EBADF : -ENOENT;
+  }
+  ilock(ip);
+  if (ip->ops == 0 || ip->ops->getxattr == 0)
+    r = -EOPNOTSUPP;
+  else
+    r = ip->ops->getxattr(ip, name, buf, size);
+  iunlockput(ip);
+  if (r > 0 && size > 0 && either_copyout(1, addr, buf, r) < 0)
+    r = -EFAULT;
+  if (buf)
+    kfree(buf);
+  return r;
+}
+
+// listxattr(fd_or_flag, path, buf, size): every name, each ending in a
+// zero byte. size 0 reports how much room they need.
+uint64
+sys_listxattr(void)
+{
+  char path[MAXPATH];
+  uint64 addr;
+  int fd, size, r;
+  struct inode *ip;
+  char *buf = 0;
+
+  argint(0, &fd);
+  argaddr(2, &addr);
+  argint(3, &size);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if (size < 0)
+    return -EINVAL;
+  if (size > PGSIZE)
+    size = PGSIZE;
+  if (size > 0 && (buf = kalloc()) == 0)
+    return -ENOMEM;
+  if ((ip = xattr_inode(fd, path)) == 0) {
+    if (buf)
+      kfree(buf);
+    return fd >= 0 ? -EBADF : -ENOENT;
+  }
+  ilock(ip);
+  if (ip->ops == 0 || ip->ops->listxattr == 0)
+    r = -EOPNOTSUPP;
+  else
+    r = ip->ops->listxattr(ip, buf, size);
+  iunlockput(ip);
+  if (r > 0 && size > 0 && either_copyout(1, addr, buf, r) < 0)
+    r = -EFAULT;
+  if (buf)
+    kfree(buf);
+  return r;
+}
+
+// ---- ownership and permission ----
+//
+// the checks every path goes through. the effective ids are what is
+// asked about, because that is what POSIX says a check uses; the real
+// ones are only who the process started as.
+
+// may this process do `want` (a mask of 4 read, 2 write, 1 execute or
+// search) to this inode?
+int
+inode_permitted(struct inode *ip, int want)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+  uint mode = ip->mode;
+
+  if (ip->sb && ip->sb->readonly && (want & 2))
+    return -EROFS;
+
+  // the owner's bits, the group's, or everyone else's -- the first of
+  // the three that applies, not the most generous
+  if (c->euid == ip->uid) {
+    mode >>= 6;
+  } else {
+    int ingroup = c->egid == ip->gid;
+    for (int i = 0; !ingroup && i < c->ngroups; i++)
+      if (c->groups[i] == ip->gid)
+        ingroup = 1;
+    if (ingroup)
+      mode >>= 3;
+  }
+  if ((mode & (uint)want) == (uint)want)
+    return 0;
+
+  // a capability can override the bits. reading and searching are one
+  // capability and writing another, because a process that is allowed
+  // to look at everything is not thereby allowed to change it.
+  if (cap_ok(CAP_DAC_OVERRIDE)) {
+    // even root may not execute a file no one may execute
+    if (!(want & 1) || ip->type == T_DIR || (ip->mode & 0111))
+      return 0;
+  }
+  if (!(want & 2) && cap_ok(CAP_DAC_READ_SEARCH))
+    return 0;
+  return -EACCES;
+}
+
+// the check a directory entry's removal or replacement needs: the
+// sticky bit on a directory says only the owner of a file may take it
+// out, which is what /tmp is for.
+int
+sticky_permitted(struct inode *dp, struct inode *ip)
+{
+  struct proc *p = myproc();
+
+  if (!(dp->mode & 01000))
+    return 0;
+  if (p->cred.euid == ip->uid || p->cred.euid == dp->uid || cap_ok(CAP_FOWNER))
+    return 0;
+  return -EPERM;
+}
+
+// chmod: the owner or a process with CAP_FOWNER
+static int
+do_chmod(struct inode *ip, int mode)
+{
+  struct proc *p = myproc();
+
+  if (p->cred.euid != ip->uid && !cap_ok(CAP_FOWNER))
+    return -EPERM;
+  if (ip->sb && ip->sb->readonly)
+    return -EROFS;
+  ip->mode = (uint)mode & 07777;
+  // a group-executable file that is set-group-id and not the caller's
+  // group loses the bit, as it does everywhere: it is the one way a
+  // process could give itself a group it is not in.
+  if (!cap_ok(CAP_FSETID) && ip->type != T_DIR && p->cred.egid != ip->gid) {
+    int ingroup = 0;
+    for (int i = 0; i < p->cred.ngroups; i++)
+      if (p->cred.groups[i] == ip->gid)
+        ingroup = 1;
+    if (!ingroup)
+      ip->mode &= ~02000u;
+  }
+  iupdate(ip);
+  return 0;
+}
+
+// chown: only a privileged process may give a file away; the owner may
+// change its group to one of its own.
+static int
+do_chown(struct inode *ip, int uid, int gid)
+{
+  struct proc *p = myproc();
+  struct cred *c = &p->cred;
+
+  if (ip->sb && ip->sb->readonly)
+    return -EROFS;
+  if (uid >= 0 && (uint)uid != ip->uid && !cap_ok(CAP_CHOWN))
+    return -EPERM;
+  if (gid >= 0 && (uint)gid != ip->gid && !cap_ok(CAP_CHOWN)) {
+    if (c->euid != ip->uid)
+      return -EPERM;
+    int ingroup = c->egid == (uint)gid;
+    for (int i = 0; !ingroup && i < c->ngroups; i++)
+      if (c->groups[i] == (uint)gid)
+        ingroup = 1;
+    if (!ingroup)
+      return -EPERM;
+  }
+  if (uid >= 0)
+    ip->uid = (uint)uid;
+  if (gid >= 0)
+    ip->gid = (uint)gid;
+  // giving a file away takes its set-user-id and set-group-id bits
+  // with it, or it would run as its new owner
+  if (!cap_ok(CAP_FSETID) && ip->type != T_DIR)
+    ip->mode &= ~06000u;
+  iupdate(ip);
+  return 0;
+}
+
+uint64
+sys_chmod(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+  int mode, r;
+
+  argint(1, &mode);
+  if (argstr(0, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((ip = namei(path)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  r = do_chmod(ip, mode);
+  iunlockput(ip);
+  return r;
+}
+
+uint64
+sys_fchmod(void)
+{
+  struct file *f;
+  int mode, r;
+
+  if (argfd(0, 0, &f) < 0)
+    return -EBADF;
+  argint(1, &mode);
+  if (f->type != FD_INODE || f->ip == 0)
+    return -EINVAL;
+  ilock(f->ip);
+  r = do_chmod(f->ip, mode);
+  iunlock(f->ip);
+  return r;
+}
+
+uint64
+sys_fchmodat(void)
+{
+  char path[MAXPATH], name[DIRSIZ];
+  struct inode *ip;
+  int dirfd, mode, flags, r;
+
+  argint(0, &dirfd);
+  argint(2, &mode);
+  argint(3, &flags);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((ip = at_lookup(dirfd, path, 0, (flags & AT_SYMLINK_NOFOLLOW) != 0, name)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  r = do_chmod(ip, mode);
+  iunlockput(ip);
+  return r;
+}
+
+uint64
+sys_chown(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+  int uid, gid, r;
+
+  argint(1, &uid);
+  argint(2, &gid);
+  if (argstr(0, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((ip = namei(path)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  r = do_chown(ip, uid, gid);
+  iunlockput(ip);
+  return r;
+}
+
+uint64
+sys_fchown(void)
+{
+  struct file *f;
+  int uid, gid, r;
+
+  if (argfd(0, 0, &f) < 0)
+    return -EBADF;
+  argint(1, &uid);
+  argint(2, &gid);
+  if (f->type != FD_INODE || f->ip == 0)
+    return -EINVAL;
+  ilock(f->ip);
+  r = do_chown(f->ip, uid, gid);
+  iunlock(f->ip);
+  return r;
+}
+
+uint64
+sys_fchownat(void)
+{
+  char path[MAXPATH], name[DIRSIZ];
+  struct inode *ip;
+  int dirfd, uid, gid, flags, r;
+
+  argint(0, &dirfd);
+  argint(2, &uid);
+  argint(3, &gid);
+  argint(4, &flags);
+  if (argstr(1, path, MAXPATH) < 0)
+    return -EFAULT;
+  if ((ip = at_lookup(dirfd, path, 0, (flags & AT_SYMLINK_NOFOLLOW) != 0, name)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  r = do_chown(ip, uid, gid);
+  iunlockput(ip);
+  return r;
+}
+
+// chroot(path): "/" means this directory for this process and every
+// one it starts. only a process with CAP_SYS_CHROOT may do it, because
+// a directory that holds a set-user-id program and a passwd file of
+// its own would otherwise be a way to become anyone.
+uint64
+sys_chroot(void)
+{
+  char path[MAXPATH];
+  struct inode *ip;
+
+  if (argstr(0, path, MAXPATH) < 0)
+    return -EFAULT;
+  if (!cap_ok(CAP_SYS_CHROOT))
+    return -EPERM;
+  if ((ip = namei(path)) == 0)
+    return -ENOENT;
+  ilock(ip);
+  if (ip->type != T_DIR) {
+    iunlockput(ip);
+    return -ENOTDIR;
+  }
+  if (inode_permitted(ip, 1) < 0) {
+    iunlockput(ip);
+    return -EACCES;
+  }
+  iunlock(ip);
+  proc_set_root(myproc(), ip); // it takes the reference
+  return 0;
 }

@@ -78,6 +78,7 @@
 #define ETIME    62
 #define EBADMSG  74
 #define ENOTSUP  EOPNOTSUPP
+#define EUCLEAN  117  // a structure on the disk is not one this format allows
 #define EWOULDBLOCK EAGAIN
 
 #endif

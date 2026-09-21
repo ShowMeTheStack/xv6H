@@ -183,12 +183,16 @@ check test_ne 0 "$(test abc != abd; echo $?)"
 check test_num 0 "$(test 5 -gt 3; echo $?)"
 check test_z 0 "$(test -z ''; echo $?)"
 check test_n 0 "$(test -n x; echo $?)"
-check test_file 0 "$(test -e /init; echo $?)"
+check test_file 0 "$(test -e /sbin/init; echo $?)"
 check test_dir 0 "$(test -d /; echo $?)"
 check test_nofile 1 "$(test -e /no-such-file; echo $?)"
 check test_and 0 "$([ 1 -eq 1 -a 2 -eq 2 ]; echo $?)"
 check test_or 0 "$([ 1 -eq 2 -o 2 -eq 2 ]; echo $?)"
 check test_bang 0 "$([ ! 1 -eq 2 ]; echo $?)"
+
+# an arithmetic expansion must not eat the character after it
+check arith_space "x6y" "x$((2*3))y"
+check arith_space2 "a 2 b" "a $((1+1)) b"
 
 # ---- built-ins ----
 check echo_n "ab" "$(echo -n a; echo -n b)"
@@ -238,6 +242,39 @@ check subshell_out "x" "$( (echo x) )"
 # ---- exit code of a pipeline is the last command's ----
 check pipe_status 0 "$(false | true; echo $?)"
 check pipe_status2 1 "$(true | false; echo $?)"
+
+# ---- test: a word that begins with a dash is still a word ----
+# POSIX reads three arguments as a binary expression whenever the
+# middle one is an operator, so a negative number on the left is a
+# value and not an attempt at an operator called -1
+check test_neg_eq 0 "$([ -1 = -1 ]; echo $?)"
+check test_neg_ne 0 "$([ -1 != -2 ]; echo $?)"
+check test_neg_num 0 "$([ -1 -lt 0 ]; echo $?)"
+check test_neg_false 1 "$([ -1 = -2 ]; echo $?)"
+check test_dash_word 0 "$([ -x = -x ]; echo $?)"
+check test_double_dash 0 "$([ -- = -- ]; echo $?)"
+check test_unary_still 0 "$([ -n hello ]; echo $?)"
+check test_unary_z 0 "$([ -z '' ]; echo $?)"
+check test_unary_f 0 "$(: > /tmp/shtest.t; [ -f /tmp/shtest.t ]; echo $?)"
+check test_one_arg 0 "$([ -1 ]; echo $?)"
+check test_empty 1 "$([ '' ]; echo $?)"
+rm -f /tmp/shtest.t
+
+# ---- a bracket inside quotes is a character, not a bracket ----
+# the scanner that finds the end of a $( ) used to count every
+# parenthesis, so a pattern with one in it ended the substitution in
+# the wrong place
+printf 'a(b\nc)d\n' > /tmp/shtest.p
+check subst_paren_open 1 "$(grep -c 'a(' /tmp/shtest.p)"
+check subst_paren_close 1 "$(grep -c ')d' /tmp/shtest.p)"
+check subst_paren_both 2 "$(grep -c '[()]' /tmp/shtest.p)"
+check subst_paren_word 'has ( paren' "$(echo 'has ( paren')"
+check subst_paren_dquote 'has ) paren' "$(echo "has ) paren")"
+check subst_nested_real inner "$(echo $(echo inner))"
+check subst_paren_escaped 'a(b' "$(echo a\(b)"
+check arith_paren 20 "$(( (2 + 3) * 4 ))"
+check arith_in_subst 12 "$(echo $(( 3 * 4 )))"
+rm -f /tmp/shtest.p
 
 echo "shtest: $passed checks, $failed failures"
 if [ $failed -eq 0 ]; then

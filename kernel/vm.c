@@ -100,6 +100,11 @@ kvmmake(void)
 
   // CLINT, for inter-processor interrupts (msip)
   kvmmap(kpgtbl, plat.clint_base, plat.clint_base, 0x10000, PTE_R | PTE_W);
+
+  // the finisher: a halfword written here stops the machine. it is one
+  // page and it is what reboot(2) uses, so it has to be mapped before
+  // anyone asks to turn the machine off.
+  kvmmap(kpgtbl, SIFIVE_TEST, SIFIVE_TEST, PGSIZE, PTE_R | PTE_W);
   if (plat.rtc_base)
     kvmmap(kpgtbl, plat.rtc_base, plat.rtc_base, PGSIZE, PTE_R | PTE_W);
 

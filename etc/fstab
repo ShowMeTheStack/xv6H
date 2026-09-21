@@ -1,0 +1,6 @@
+# what is mounted at boot, besides what init mounts itself.
+#
+#   device  mountpoint  type  options  dump  pass
+#
+# the root, /proc, /sys, /dev and /tmp are init's own and are not
+# listed here; anything else a machine wants goes below.

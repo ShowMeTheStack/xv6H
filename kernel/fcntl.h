@@ -17,4 +17,12 @@
 #define O_NOFOLLOW  0x10000
 #define O_SYNC      0x20000
 #define O_PATH      0x40000
+
+// the *at family: the directory a relative path is resolved from, and
+// what each call may be told to do differently.
+#define AT_FDCWD             (-100)
+#define AT_SYMLINK_NOFOLLOW  0x100
+#define AT_REMOVEDIR         0x200
+#define AT_SYMLINK_FOLLOW    0x400
+#define AT_EMPTY_PATH        0x1000
 #endif

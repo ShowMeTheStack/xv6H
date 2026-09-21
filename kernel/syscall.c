@@ -115,6 +115,10 @@ extern uint64 sys_accept(void);
 extern uint64 sys_sendto(void);
 extern uint64 sys_recvfrom(void);
 extern uint64 sys_netinfo(void);
+extern uint64 sys_sockopt(void);
+extern uint64 sys_setpriority(void);
+extern uint64 sys_getpriority(void);
+extern uint64 sys_ptrace(void);
 extern uint64 sys_clock_gettime(void);
 extern uint64 sys_sysconf(void);
 extern uint64 sys_mmap(void);
@@ -174,6 +178,45 @@ extern uint64 sys_umount(void);
 extern uint64 sys_getdents(void);
 extern uint64 sys_statfs(void);
 extern uint64 sys_fsync(void);
+extern uint64 sys_symlink(void);
+extern uint64 sys_readlink(void);
+extern uint64 sys_rename(void);
+extern uint64 sys_fstatat(void);
+extern uint64 sys_readlinkat(void);
+extern uint64 sys_unlinkat(void);
+extern uint64 sys_faccessat(void);
+extern uint64 sys_openat(void);
+extern uint64 sys_mkdirat(void);
+extern uint64 sys_renameat(void);
+extern uint64 sys_linkat(void);
+extern uint64 sys_symlinkat(void);
+extern uint64 sys_setxattr(void);
+extern uint64 sys_getxattr(void);
+extern uint64 sys_listxattr(void);
+extern uint64 sys_removexattr(void);
+extern uint64 sys_getuid(void);
+extern uint64 sys_geteuid(void);
+extern uint64 sys_getgid(void);
+extern uint64 sys_getegid(void);
+extern uint64 sys_setuid(void);
+extern uint64 sys_setgid(void);
+extern uint64 sys_setresuid(void);
+extern uint64 sys_setresgid(void);
+extern uint64 sys_getresuid(void);
+extern uint64 sys_getresgid(void);
+extern uint64 sys_getgroups(void);
+extern uint64 sys_setgroups(void);
+extern uint64 sys_capget(void);
+extern uint64 sys_capset(void);
+extern uint64 sys_chmod(void);
+extern uint64 sys_fchmod(void);
+extern uint64 sys_fchmodat(void);
+extern uint64 sys_chown(void);
+extern uint64 sys_fchown(void);
+extern uint64 sys_fchownat(void);
+extern uint64 sys_chroot(void);
+extern uint64 sys_reboot(void);
+
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -212,6 +255,10 @@ static uint64 (*syscalls[])(void) = {
   [SYS_sendto]     = sys_sendto,
   [SYS_recvfrom]   = sys_recvfrom,
   [SYS_netinfo]    = sys_netinfo,
+  [SYS_sockopt]    = sys_sockopt,
+  [SYS_setpriority] = sys_setpriority,
+  [SYS_getpriority] = sys_getpriority,
+  [SYS_ptrace]     = sys_ptrace,
   [SYS_clock_gettime] = sys_clock_gettime,
   [SYS_sysconf]    = sys_sysconf,
   [SYS_mmap]       = sys_mmap,
@@ -271,6 +318,45 @@ static uint64 (*syscalls[])(void) = {
   [SYS_getdents] = sys_getdents,
   [SYS_statfs]  = sys_statfs,
   [SYS_fsync]   = sys_fsync,
+  [SYS_symlink] = sys_symlink,
+  [SYS_readlink] = sys_readlink,
+  [SYS_rename]  = sys_rename,
+  [SYS_fstatat] = sys_fstatat,
+  [SYS_readlinkat] = sys_readlinkat,
+  [SYS_unlinkat] = sys_unlinkat,
+  [SYS_faccessat] = sys_faccessat,
+  [SYS_openat]  = sys_openat,
+  [SYS_mkdirat] = sys_mkdirat,
+  [SYS_renameat] = sys_renameat,
+  [SYS_linkat]  = sys_linkat,
+  [SYS_symlinkat] = sys_symlinkat,
+  [SYS_setxattr] = sys_setxattr,
+  [SYS_getxattr] = sys_getxattr,
+  [SYS_listxattr] = sys_listxattr,
+  [SYS_removexattr] = sys_removexattr,
+  [SYS_getuid] = sys_getuid,
+  [SYS_geteuid] = sys_geteuid,
+  [SYS_getgid] = sys_getgid,
+  [SYS_getegid] = sys_getegid,
+  [SYS_setuid] = sys_setuid,
+  [SYS_setgid] = sys_setgid,
+  [SYS_setresuid] = sys_setresuid,
+  [SYS_setresgid] = sys_setresgid,
+  [SYS_getresuid] = sys_getresuid,
+  [SYS_getresgid] = sys_getresgid,
+  [SYS_getgroups] = sys_getgroups,
+  [SYS_setgroups] = sys_setgroups,
+  [SYS_capget] = sys_capget,
+  [SYS_capset] = sys_capset,
+  [SYS_chmod] = sys_chmod,
+  [SYS_fchmod] = sys_fchmod,
+  [SYS_fchmodat] = sys_fchmodat,
+  [SYS_chown] = sys_chown,
+  [SYS_fchown] = sys_fchown,
+  [SYS_fchownat] = sys_fchownat,
+  [SYS_chroot]  = sys_chroot,
+  [SYS_reboot]  = sys_reboot,
+
   // clang-format on
 };
 
@@ -284,6 +370,10 @@ syscall(void)
   p->syscall_a0 = p->trapframe->a0; // kept in case a signal restarts the call
   p->restartable = 0;
   p->norestart = 0;
+  // a watched process stops on the way in, so a tracer can see the
+  // number and the arguments before anything happens
+  if (p->traced)
+    ptrace_syscall_entry(p);
   if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
@@ -294,4 +384,7 @@ syscall(void)
     printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
     p->trapframe->a0 = -1;
   }
+  // and on the way out, where the answer is
+  if (p->traced)
+    ptrace_syscall_exit(p);
 }

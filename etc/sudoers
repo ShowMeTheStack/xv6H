@@ -1,0 +1,8 @@
+# who may run what as whom.
+#
+#   USER  HOST = (RUNAS) COMMANDS
+#   %GROUP HOST = (RUNAS) COMMANDS
+#
+# NOPASSWD: before a command means it is run without asking.
+root    ALL = (ALL) ALL
+%wheel  ALL = (ALL) ALL

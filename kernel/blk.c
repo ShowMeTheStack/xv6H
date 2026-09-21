@@ -49,6 +49,8 @@ static struct {
   struct blkbuf *buckets[NBUCKET];
   struct blkbuf *lru_head, *lru_tail;  // least recently used at the tail
   uint64 nbufs, maxbufs;
+  uint64 total_pages;  // what the allocator manages, for the percentage
+  int pct;             // how much of it the cache may hold
   uint64 hits, misses;
   uint64 ndirty;
   struct blkbuf *dirty_head, *dirty_tail;
@@ -79,6 +81,34 @@ blk_register(const char *name, const struct disk_ops *ops, void *priv, uint64 ns
   }
   release(&disks.lock);
   return 0;
+}
+
+// a disk that is going away: its cached blocks are dropped and its slot
+// freed. a loop device that has been detached is the only caller.
+void
+blk_unregister(struct gendisk *disk)
+{
+  if (disk == 0)
+    return;
+  blk_sync(disk);
+  blk_forget(disk);
+  acquire(&disks.lock);
+  disk->used = 0;
+  disk->nparts = 0;
+  release(&disks.lock);
+}
+
+// a disk whose size has changed: a loop device given a file, or given
+// a different offset into one.
+void
+blk_resize(struct gendisk *disk, uint64 nsectors, int readonly)
+{
+  if (disk == 0)
+    return;
+  acquire(&disks.lock);
+  disk->nsectors = nsectors;
+  disk->readonly = readonly;
+  release(&disks.lock);
 }
 
 struct gendisk *
@@ -127,6 +157,31 @@ static const struct disk_ops part_ops = {
     .submit = part_submit,
     .flush = part_flush,
 };
+
+// forget the partitions of a disk: the table may be about to be read
+// again, or the disk may be about to have nothing behind it.
+void
+blk_drop_partitions(struct gendisk *disk)
+{
+  if (disk == 0)
+    return;
+  acquire(&disks.lock);
+  for (int i = 0; i < MAXDISK; i++) {
+    struct gendisk *d = &disks.disks[i];
+    if (!d->used || d->ops != &part_ops)
+      continue;
+    struct partdisk *pd = d->priv;
+    if (pd && pd->parent == disk) {
+      release(&disks.lock);
+      blk_sync(d);
+      blk_forget(d);
+      acquire(&disks.lock);
+      d->used = 0;
+    }
+  }
+  disk->nparts = 0;
+  release(&disks.lock);
+}
 
 // register one partition as a disk of its own
 static void
@@ -218,6 +273,17 @@ blk_read_block(struct gendisk *disk, uint64 blkno, void *page)
 {
   struct bio bio;
 
+  // a cached copy is the truth. the block may have been written
+  // through the cache and not yet reached the disk -- dd writing an
+  // image onto a partition is exactly that -- and a caller that went
+  // straight to the device would read what was there before.
+  struct blkbuf *cached = blk_peek(disk, blkno);
+  if (cached) {
+    memmove(page, cached->data, BLKSIZE);
+    blk_unpeek(cached);
+    return 0;
+  }
+
   memset(&bio, 0, sizeof(bio));
   bio.sector = blkno * SECTORS_PER_BLOCK;
   bio.nsectors = SECTORS_PER_BLOCK;
@@ -239,7 +305,14 @@ blk_write_block(struct gendisk *disk, uint64 blkno, void *page)
   bio.npages = 1;
   bio.pages[0] = page;
   bio.write = 1;
-  return blk_submit_wait(disk, &bio);
+  int r = blk_submit_wait(disk, &bio);
+
+  // and a cached copy of what was just written must not survive with
+  // the older content. a dirty one is left alone: whoever dirtied it
+  // has a change of their own that has not been written yet.
+  if (r == 0)
+    blk_invalidate_clean(disk, blkno);
+  return r;
 }
 
 int
@@ -319,6 +392,31 @@ hash_find(struct gendisk *disk, uint64 blkno)
   return 0;
 }
 
+// how much of memory the cache may hold, as a percentage. changing it
+// does not free anything at once: the cache shrinks as pages are
+// wanted elsewhere, which is what reclaim is for.
+int
+blk_set_cache_pct(int pct)
+{
+  if (pct < 1 || pct > 90)
+    return -1;
+  acquire(&cache.lock);
+  cache.pct = pct;
+  cache.maxbufs = cache.total_pages * (uint64)pct / 100;
+  if (cache.maxbufs < 256)
+    cache.maxbufs = 256;
+  if (cache.maxbufs > 262144)
+    cache.maxbufs = 262144; // a gigabyte of cache is enough for anyone here
+  release(&cache.lock);
+  return 0;
+}
+
+int
+blk_cache_pct(void)
+{
+  return cache.pct;
+}
+
 void
 blkinit(void)
 {
@@ -332,11 +430,9 @@ blkinit(void)
   // so large that a machine with little memory cannot run.
   struct meminfo mi;
   kmem_info(&mi);
-  cache.maxbufs = mi.total_pages * CACHE_TARGET_PCT / 100;
-  if (cache.maxbufs < 256)
-    cache.maxbufs = 256;
-  if (cache.maxbufs > 262144)
-    cache.maxbufs = 262144; // a gigabyte of cache is enough for anyone here
+  cache.total_pages = mi.total_pages;
+  cache.pct = CACHE_TARGET_PCT;
+  blk_set_cache_pct(CACHE_TARGET_PCT);
   printk("blk: cache up to %ld blocks (%ld MB)\n", cache.maxbufs, cache.maxbufs * BLKSIZE >> 20);
 }
 
@@ -476,6 +572,65 @@ blk_get(struct gendisk *disk, uint64 blkno)
     b->valid = 1;
   }
   return b;
+}
+
+// a cached block that is already valid, for a caller that will only
+// read it. the reference keeps the buffer from being reused; the
+// sleeplock is not taken, because what it protects is a block being
+// read from or written to the disk, and a valid block's contents do
+// not change under a reader except when something writes the same
+// block -- which for file data is a race the caller already has, and
+// which is why this is only ever used for file data.
+//
+// returns 0 when the block is not here or not valid yet, and the
+// caller falls back to blk_get.
+struct blkbuf *
+blk_peek(struct gendisk *disk, uint64 blkno)
+{
+  struct blkbuf *b;
+
+  acquire(&cache.lock);
+  b = hash_find(disk, blkno);
+  if (b && b->valid) {
+    b->refs++;
+    lru_remove(b);
+    lru_push_front(b);
+    cache.hits++;
+    release(&cache.lock);
+    return b;
+  }
+  release(&cache.lock);
+  return 0;
+}
+
+void
+blk_unpeek(struct blkbuf *b)
+{
+  acquire(&cache.lock);
+  b->refs--;
+  release(&cache.lock);
+}
+
+// drop a clean cached copy of one block, for a caller that has written
+// it straight to the device and would otherwise leave the cache with
+// what was there before.
+void
+blk_invalidate_clean(struct gendisk *disk, uint64 blkno)
+{
+  struct blkbuf *b;
+
+  if (holding(&cache.lock))
+    return;
+  acquire(&cache.lock);
+  b = hash_find(disk, blkno);
+  if (b && b->refs == 0 && !b->dirty && !(b->flags & BLK_JBD2_JOURNALED)) {
+    hash_remove(b);
+    lru_remove(b);
+    b->valid = 0;
+    b->disk = 0;
+    lru_push_front(b);
+  }
+  release(&cache.lock);
 }
 
 // is this block in the cache already? asked before readahead does any
@@ -860,6 +1015,68 @@ droppable(struct blkbuf *b)
   return b->refs == 0 && !b->dirty && !(b->flags & BLK_JBD2_JOURNALED);
 }
 
+// write back whatever of [start, start+n) is dirty, in as few requests
+// as it can: the blocks that lie next to one another go together. this
+// is what fsync is built out of, and writing a file's blocks one
+// request at a time was the whole cost of it.
+int
+blk_sync_range(struct gendisk *disk, uint64 start, uint64 n)
+{
+  struct blkbuf *run[BIO_MAXPAGES];
+  int err = 0;
+
+  for (uint64 i = 0; i < n;) {
+    int k = 0;
+
+    acquire(&cache.lock);
+    while (i + k < n && k < BIO_MAXPAGES) {
+      struct blkbuf *b = hash_find(disk, start + i + k);
+      if (b == 0 || !b->dirty || (b->flags & BLK_JBD2_JOURNALED))
+        break;
+      // the first of a run is waited for; the rest are taken only if
+      // they are free, so this never waits while holding a lock.
+      if (k == 0) {
+        b->refs++;
+        release(&cache.lock);
+        acquiresleep(&b->lock);
+        acquire(&cache.lock);
+        if (!b->dirty || (b->flags & BLK_JBD2_JOURNALED)) {
+          release(&cache.lock);
+          releasesleep(&b->lock);
+          acquire(&cache.lock);
+          b->refs--;
+          break;
+        }
+      } else {
+        if (!tryacquiresleep(&b->lock))
+          break;
+        b->refs++;
+      }
+      run[k++] = b;
+    }
+    release(&cache.lock);
+
+    if (k == 0) {
+      i++; // not dirty, or not here: nothing to write
+      continue;
+    }
+
+    int r = writeback_run(run, k);
+    if (r < 0)
+      err = r;
+    for (int j = k - 1; j >= 0; j--)
+      releasesleep(&run[j]->lock);
+    acquire(&cache.lock);
+    for (int j = 0; j < k; j++)
+      run[j]->refs--;
+    release(&cache.lock);
+    if (r < 0)
+      break;
+    i += k;
+  }
+  return err;
+}
+
 // write one block back to its home, if it is cached and dirty and the
 // journal does not own it. this is what fsync is built out of: a file's
 // blocks, one at a time, rather than the whole cache.
@@ -905,6 +1122,11 @@ blk_sync_block(struct gendisk *disk, uint64 blkno)
 // its commit puts them home, and sync_disk skips them.
 #define BLK_FLUSH_SECS 5
 
+// how often the flusher runs, and how much of memory the cache may
+// hold: both settable through /sys, because the right answer depends
+// on the machine and on what it is doing.
+int blk_flush_secs = BLK_FLUSH_SECS;
+
 static void
 blk_flusher(void *arg)
 {
@@ -917,7 +1139,7 @@ blk_flusher(void *arg)
     acquire(&tickslock);
     now = ticks;
     release(&tickslock);
-    if (now - last >= (uint)(BLK_FLUSH_SECS * TICK_HZ)) {
+    if (now - last >= (uint)(blk_flush_secs * TICK_HZ)) {
       last = now;
       if (cache.ndirty > 0)
         sync_disk(0);
@@ -943,28 +1165,41 @@ blk_start_flusher(void)
     printk("blk: no writeback thread; dirty blocks will wait for sync\n");
 }
 
+// how many pages the cache would give back. this is the count it
+// keeps rather than a walk of the list: a cache of a gigabyte is a
+// quarter of a million buffers, and walking them under the cache's
+// spinlock to answer a question about free memory would stop every
+// other processor for as long as it took. a block that is not dirty is
+// very nearly always droppable -- the ones held or owned by the
+// journal at any instant are a handful -- and what this number is for
+// is a report of how much memory is available.
 uint64
 blk_reclaimable(void)
 {
-  uint64 n = 0;
+  uint64 n, d;
 
-  if (holding(&cache.lock))
-    return 0;
   acquire(&cache.lock);
-  for (struct blkbuf *b = cache.lru_head; b; b = b->lru_next)
-    if (droppable(b))
-      n++;
+  n = (uint64)cache.nbufs;
+  d = cache.ndirty;
   release(&cache.lock);
-  return n;
+  return n > d ? n - d : 0;
 }
 
 // give back up to `want` pages, oldest first; zero means everything
 // that can go. this is reached from kalloc, which alloc_buf calls, so
 // it does nothing at all when this cpu is already inside the cache.
+//
+// it looks at a bounded number of buffers, not all of them. the oldest
+// end of the list is where the droppable ones are, so a short look
+// finds them if they are there; and a long one would hold the cache's
+// spinlock across a quarter of a million buffers every time memory ran
+// short, which is exactly when nothing else can afford to wait.
+#define BLK_RECLAIM_SCAN 512
+
 uint64
 blk_reclaim(uint64 want)
 {
-  uint64 freed = 0;
+  uint64 freed = 0, looked = 0;
   struct blkbuf *b, *prev;
 
   if (holding(&cache.lock))
@@ -972,6 +1207,8 @@ blk_reclaim(uint64 want)
   acquire(&cache.lock);
   for (b = cache.lru_tail; b && (want == 0 || freed < want); b = prev) {
     prev = b->lru_prev;
+    if (want != 0 && ++looked > BLK_RECLAIM_SCAN)
+      break;
     if (!droppable(b))
       continue;
     if (b->disk) // blk_forget leaves a dropped buffer out of the hash

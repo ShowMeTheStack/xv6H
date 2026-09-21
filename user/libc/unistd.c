@@ -29,36 +29,19 @@ struct disk_dirent {
 
 // ---- files ----
 
+// stat, lstat and fstatat are one system call: fstatat names the
+// directory a relative path starts from, and says whether to follow a
+// symbolic link at the end of it.
 int
 stat(const char *path, struct stat *sb)
 {
-  int fd = open(path, O_RDONLY);
-
-  if (fd < 0)
-    return -1;
-  int r = fstat(fd, sb);
-  int e = errno;
-  close(fd);
-  errno = e;
-  return r;
+  return fstatat(AT_FDCWD, path, sb, 0);
 }
 
-// there are no symbolic links yet, so this is stat.
 int
 lstat(const char *path, struct stat *sb)
 {
-  return stat(path, sb);
-}
-
-int
-fstatat(int dirfd, const char *path, struct stat *sb, int flags)
-{
-  (void)flags;
-  if (dirfd != AT_FDCWD && path[0] != '/') {
-    errno = ENOSYS;
-    return -1;
-  }
-  return stat(path, sb);
+  return fstatat(AT_FDCWD, path, sb, AT_SYMLINK_NOFOLLOW);
 }
 
 // the inode type of a stat, as the mode POSIX programs expect.
@@ -67,36 +50,27 @@ __type2mode(short type)
 {
   switch (type) {
   case T_DIR:
-    return S_IFDIR | 0755;
+    return S_IFDIR;
   case T_DEVICE:
-    return S_IFCHR | 0666;
+    return S_IFCHR;
+  case T_SYMLINK:
+    return S_IFLNK;
   default:
-    return S_IFREG | 0644;
+    return S_IFREG;
   }
 }
 
 int
 access(const char *path, int mode)
 {
-  struct stat sb;
-
-  (void)mode; // permissions arrive with users and groups
-  return stat(path, &sb) < 0 ? -1 : 0;
+  return faccessat(AT_FDCWD, path, mode, 0);
 }
 
 // xv6's unlink removes an empty directory as well as a file.
 int
 rmdir(const char *path)
 {
-  struct stat sb;
-
-  if (stat(path, &sb) < 0)
-    return -1;
-  if (sb.type != T_DIR) {
-    errno = ENOTDIR;
-    return -1;
-  }
-  return unlink(path);
+  return unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 int
@@ -121,92 +95,87 @@ fdatasync(int fd)
   return fsync(fd);
 }
 
-int
-symlink(const char *from, const char *to)
-{
-  (void)from;
-  (void)to;
-  errno = ENOSYS;
-  return -1;
-}
+// symlink and readlink are system calls now; the stubs are generated.
 
-ssize_t
-readlink(const char *path, char *buf, size_t n)
-{
-  (void)path;
-  (void)buf;
-  (void)n;
-  errno = EINVAL; // nothing here is a symbolic link
-  return -1;
-}
+
+
+
+// permission and ownership are the kernel's now; these are the calls,
+// with the ones that take a directory descriptor underneath.
+int __chmod(const char *path, int mode);
+int __fchmod(int fd, int mode);
+int __fchmodat(int dirfd, const char *path, int mode, int flags);
+int __chown(const char *path, int uid, int gid);
+int __fchown(int fd, int uid, int gid);
+int __fchownat(int dirfd, const char *path, int uid, int gid, int flags);
 
 int
 chmod(const char *path, mode_t mode)
 {
-  (void)path;
-  (void)mode;
-  return 0; // permissions are not enforced yet: succeed quietly
+  return __chmod(path, (int)mode);
 }
 
 int
 fchmod(int fd, mode_t mode)
 {
-  (void)fd;
-  (void)mode;
-  return 0;
+  return __fchmod(fd, (int)mode);
+}
+
+int
+fchmodat(int dirfd, const char *path, mode_t mode, int flags)
+{
+  return __fchmodat(dirfd, path, (int)mode, flags);
 }
 
 int
 chown(const char *path, uid_t u, gid_t g)
 {
-  (void)path;
-  (void)u;
-  (void)g;
-  return 0;
+  return __chown(path, (int)u, (int)g);
 }
 
 int
 fchown(int fd, uid_t u, gid_t g)
 {
-  (void)fd;
-  (void)u;
-  (void)g;
-  return 0;
+  return __fchown(fd, (int)u, (int)g);
 }
 
 int
 lchown(const char *path, uid_t u, gid_t g)
 {
-  return chown(path, u, g);
+  return __fchownat(AT_FDCWD, path, (int)u, (int)g, AT_SYMLINK_NOFOLLOW);
+}
+
+int
+fchownat(int dirfd, const char *path, uid_t u, gid_t g, int flags)
+{
+  return __fchownat(dirfd, path, (int)u, (int)g, flags);
+}
+
+// the group list, as POSIX spells it
+int __getgroups(int size, unsigned *list);
+int __setgroups(int size, const unsigned *list);
+
+int
+getgroups(int size, gid_t *list)
+{
+  return __getgroups(size, (unsigned *)list);
+}
+
+int
+setgroups(size_t size, const gid_t *list)
+{
+  return __setgroups((int)size, (const unsigned *)list);
 }
 
 int
 creat(const char *path, mode_t mode)
 {
   (void)mode;
-  return open(path, O_CREAT | O_WRONLY | O_TRUNC);
+  return open(path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 }
 
-int
-mkdirat(int dirfd, const char *path, mode_t mode)
-{
-  (void)mode;
-  if (dirfd != AT_FDCWD && path[0] != '/') {
-    errno = ENOSYS;
-    return -1;
-  }
-  return mkdir(path, 0777);
-}
-
-int
-openat(int dirfd, const char *path, int flags, ...)
-{
-  if (dirfd != AT_FDCWD && path[0] != '/') {
-    errno = ENOSYS;
-    return -1;
-  }
-  return open(path, flags);
-}
+// openat, mkdirat and the rest of the *at family are system calls;
+// the stubs are generated.
 
 // walk up from the working directory, finding each name in its parent
 // by inode number, until the root. without a system call for it, this
@@ -330,7 +299,7 @@ isatty(int fd)
 char *
 ttyname(int fd)
 {
-  static char name[] = "/console";
+  static char name[] = "/dev/console";
 
   return isatty(fd) ? name : 0;
 }
@@ -593,82 +562,44 @@ vfork(void)
   return fork(); // a real vfork needs the parent to block; fork is safe
 }
 
-// ---- identity, which users and groups will fill in ----
+// ---- identity ----
+//
+// getuid, setuid and the rest are system calls now; the library gives
+// the forms POSIX names that the kernel does not, over setresuid.
 
-uid_t
-getuid(void)
-{
-  return 0;
-}
-
-uid_t
-geteuid(void)
-{
-  return 0;
-}
-
-gid_t
-getgid(void)
-{
-  return 0;
-}
-
-gid_t
-getegid(void)
-{
-  return 0;
-}
-
-int
-setuid(uid_t u)
-{
-  return u == 0 ? 0 : (errno = EPERM, -1);
-}
+int setresuid(int r, int e, int sv);
+int setresgid(int r, int e, int sv);
 
 int
 seteuid(uid_t u)
 {
-  return setuid(u);
-}
-
-int
-setgid(gid_t g)
-{
-  return g == 0 ? 0 : (errno = EPERM, -1);
+  return setresuid(-1, (int)u, -1);
 }
 
 int
 setegid(gid_t g)
 {
-  return setgid(g);
+  return setresgid(-1, (int)g, -1);
 }
 
+// POSIX: when the effective id changes, the saved one follows it, so
+// that the change cannot be undone.
 int
 setreuid(uid_t r, uid_t e)
 {
-  return (r == 0 || r == (uid_t)-1) && (e == 0 || e == (uid_t)-1) ? 0 : (errno = EPERM, -1);
+  int rr = (r == (uid_t)-1) ? -1 : (int)r;
+  int ee = (e == (uid_t)-1) ? -1 : (int)e;
+
+  return setresuid(rr, ee, ee);
 }
 
 int
 setregid(gid_t r, gid_t e)
 {
-  return (r == 0 || r == (gid_t)-1) && (e == 0 || e == (gid_t)-1) ? 0 : (errno = EPERM, -1);
-}
+  int rr = (r == (gid_t)-1) ? -1 : (int)r;
+  int ee = (e == (gid_t)-1) ? -1 : (int)e;
 
-int
-getgroups(int n, gid_t *list)
-{
-  if (n > 0 && list)
-    list[0] = 0;
-  return n > 0 ? 1 : 1;
-}
-
-int
-setgroups(size_t n, const gid_t *list)
-{
-  (void)n;
-  (void)list;
-  return 0;
+  return setresgid(rr, ee, ee);
 }
 
 char *
@@ -758,21 +689,21 @@ setrlimit(int res, const struct rlimit *rl)
   return 0;
 }
 
+// setpriority is a system call of its own. getpriority needs a turn
+// of the hand: the kernel answers with 20 - nice so that the value is
+// never negative, because a negative return from a system call is
+// -errno. POSIX says -1 is a real answer here, so a caller clears
+// errno first and looks at it afterwards.
+int __getpriority(int which, id_t who);
+
 int
 getpriority(int which, id_t who)
 {
-  (void)which;
-  (void)who;
-  return 0;
-}
+  int r = __getpriority(which, who);
 
-int
-setpriority(int which, id_t who, int prio)
-{
-  (void)which;
-  (void)who;
-  (void)prio;
-  return 0;
+  if (r < 0)
+    return -1;    // the stub has set errno
+  return 20 - r;
 }
 
 int

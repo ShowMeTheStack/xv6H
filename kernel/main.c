@@ -15,6 +15,7 @@ main()
   if (cpuid() == 0) {
     consoleinit();
     devnullinit();
+    loginit();
     printkinit();
     printk("\n");
     printk("xv6 kernel is booting\n");
@@ -46,6 +47,11 @@ main()
     blkinit();
     vfs_init();
     procfs_init();
+    devfs_init();
+    ramfs_init();
+    sysfs_init();
+    overlayfs_init();
+    loopinit();
     ext4_init();
     rtcinit();          // the real-time clock
     randominit();       // the random generator

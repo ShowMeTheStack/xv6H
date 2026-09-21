@@ -899,7 +899,12 @@ walk_path(struct image *img, struct node *root, char *path, char **leaf)
 //                             leading underscore the build uses to keep
 //                             the host from running a riscv binary
 //   TARGET:SOURCE             put SOURCE at TARGET
+//   TARGET::mode:MODE:SOURCE  put SOURCE at TARGET with that mode, in
+//                             octal: the host file system cannot carry
+//                             a set-user-id bit through a build, and a
+//                             program like su needs one
 //   TARGET::dir               an empty directory
+//   TARGET::dir:MODE          ... with that mode
 //   TARGET::sym:LINKTARGET    a symbolic link
 //   TARGET::dev:c:MAJOR:MINOR a character device, or b for a block device
 static void
@@ -945,7 +950,8 @@ add_spec(struct image *img, struct node *root, char *spec)
   if (*leaf == 0)
     fail("no name in the spec %s", target);
 
-  if (strcmp(rest, "dir") == 0) {
+  if (strcmp(rest, "dir") == 0 || strncmp(rest, "dir:", 4) == 0) {
+    int mode = rest[3] == ':' ? (int)strtol(rest + 4, NULL, 8) : 0755;
     np = lookup(dir, leaf);
     if (np) {
       if (np->type != NODE_DIR)
@@ -953,7 +959,22 @@ add_spec(struct image *img, struct node *root, char *spec)
       return;
     }
     np = new_node(img, dir, leaf, NODE_DIR);
-    np->mode = 0755;
+    np->mode = mode;
+  } else if (strncmp(rest, "mode:", 5) == 0) {
+    char *p = rest + 5;
+    char *sep = strchr(p, ':');
+    if (sep == NULL)
+      fail("the spec %s has no source file", spec);
+    *sep = 0;
+    int mode = (int)strtol(p, NULL, 8);
+    const char *source = sep + 1;
+    if (stat(source, &st) < 0)
+      die(source);
+    if (lookup(dir, leaf))
+      fail("%s is already in the image", leaf);
+    np = new_node(img, dir, leaf, NODE_FILE);
+    np->source = xstrdup(source);
+    np->mode = mode;
   } else if (strncmp(rest, "sym:", 4) == 0) {
     if (lookup(dir, leaf))
       fail("%s is already in the image", leaf);
@@ -1913,7 +1934,7 @@ main(int argc, char *argv[])
   struct node *root, *lpf;
   uint64_t blocks = DEFAULT_BLOCKS;
   uint32_t bytes_per_inode = DEFAULT_BYTES_PER_INODE;
-  uint32_t journal_blocks = DEFAULT_JOURNAL_BLOCKS;
+  uint32_t journal_blocks = 0;   // 0: chosen from the size, below
   const char *label = "";
   const char *uuidstr = 0;
   const char *epoch;
@@ -1963,6 +1984,18 @@ main(int argc, char *argv[])
          (unsigned long long)blocks);
   if (bytes_per_inode < BLOCK_SIZE)
     fail("bytes per inode must be at least the block size");
+  // with no -j, the journal is sized from the image, as mke2fs sizes
+  // it: a fixed 4096 blocks is more than a small image has to give.
+  if (journal_blocks == 0) {
+    if (blocks < 2048)
+      journal_blocks = JBD2_MIN_JOURNAL_BLOCKS;
+    else if (blocks < 32768)
+      journal_blocks = 1024;
+    else if (blocks < 262144)
+      journal_blocks = 4096;
+    else
+      journal_blocks = 8192;
+  }
   if (journal_blocks < JBD2_MIN_JOURNAL_BLOCKS)
     fail("a journal of fewer than %d blocks is refused by the kernel", JBD2_MIN_JOURNAL_BLOCKS);
   if (strlen(label) > 16)

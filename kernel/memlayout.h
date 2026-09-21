@@ -88,4 +88,10 @@
 #define THREAD_TF_TOP   (SIGTRAMP - PGSIZE)
 #define THREAD_TF_BOT   (THREAD_TF_TOP - THREAD_TF_SLOTS * PGSIZE)
 #endif
+// qemu's virt board puts the "sifive,test" finisher here: a halfword
+// written to it ends the machine, 0x5555 for a power off and 0x7777
+// for a reset. a real board would use SBI SRST instead; this kernel is
+// the one under SBI.
+#define SIFIVE_TEST 0x100000L
+
 #endif
