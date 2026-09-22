@@ -1,0 +1,113 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          networking
+# Required-Start:
+# Default-Start:     2
+# Short-Description: bring up the interfaces of /etc/network/interfaces
+### END INIT INFO
+. /lib/init/functions
+
+CONF=/etc/network/interfaces
+
+# every interface an "auto" line names
+autos() {
+	[ -f "$CONF" ] || return 0
+	while read key rest; do
+		case "$key" in
+		auto) echo "$rest" ;;
+		esac
+	done < "$CONF"
+}
+
+# the method and settings of one interface
+config_of() {
+	want="$1"
+	found=0
+	method=""
+	addr=""
+	mask=""
+	gw=""
+	dns=""
+	[ -f "$CONF" ] || return 1
+	while read key a b c; do
+		case "$key" in
+		iface)
+			if [ "$a" = "$want" ]; then
+				found=1
+				method="$c"
+			else
+				found=0
+			fi
+			;;
+		address) [ "$found" = 1 ] && addr="$a" ;;
+		netmask) [ "$found" = 1 ] && mask="$a" ;;
+		gateway) [ "$found" = 1 ] && gw="$a" ;;
+		dns|dns-nameservers) [ "$found" = 1 ] && dns="$a" ;;
+		esac
+	done < "$CONF"
+	[ -n "$method" ] || return 1
+	echo "$method $addr $mask $gw $dns"
+}
+
+# what a resolver reads. a real system writes this from whatever the
+# interface was given, and so does this one: the name server comes
+# from the lease when the address did, and from the interface file
+# when it was set by hand.
+write_resolv() {
+	ns="$1"
+	if [ -z "$ns" ]; then
+		ns=$(ifconfig eth0 2>/dev/null | awk '/ dns /{print $NF}')
+	fi
+	case "$ns" in
+	"" | 0.0.0.0) return 0 ;;
+	esac
+	{
+		echo "# written by /etc/init.d/networking"
+		echo "nameserver $ns"
+	} > /etc/resolv.conf
+}
+
+start_one() {
+	iface="$1"
+	set -- $(config_of "$iface") || return 1
+	method="$1"
+	case "$method" in
+	dhcp)
+		ifconfig "$iface" dhcp
+		write_resolv
+		;;
+	static)
+		ifconfig "$iface" "$2" netmask "$3"
+		[ -n "$4" ] && route add default "$4"
+		write_resolv "$5"
+		;;
+	loopback|"")
+		;;
+	esac
+}
+
+case "$1" in
+start)
+	for i in $(autos); do
+		log_daemon_msg "Configuring $i"
+		start_one "$i"
+		log_end_msg $?
+	done
+	;;
+stop)
+	for i in $(autos); do
+		ifconfig "$i" down 2>/dev/null
+	done
+	;;
+restart|force-reload)
+	"$0" stop
+	"$0" start
+	;;
+status)
+	ifconfig
+	;;
+*)
+	echo "usage: $0 {start|stop|restart|status}" >&2
+	exit 1
+	;;
+esac

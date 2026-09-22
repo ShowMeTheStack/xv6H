@@ -1,15 +1,18 @@
 //
-// sockets: UDP, ICMP echo ("ping" sockets) and TCP streams as file
-// descriptors, plus the socket system calls.
+// sockets on the network: UDP, ICMP echo ("ping" sockets) and TCP
+// streams.
 //
-//   socket(type)                       SOCK_DGRAM, SOCK_STREAM, SOCK_ICMP
-//   bind(fd, port)                     local port (0: pick one)
-//   connect(fd, ip, port)              TCP: three-way handshake; UDP: default peer
-//   listen(fd, backlog) / accept(fd, &ip, &port)
-//   sendto(fd, buf, n, ip, port)       UDP/ICMP (ICMP: port is the sequence number)
-//   recvfrom(fd, buf, n, &ip, &port, timeout_ticks)
-//   read/write/close                   TCP streams (and UDP with a default peer)
-//   netinfo(&info)
+// what is here is the network half of a socket and nothing else. the
+// calls are plain functions over `struct sock` -- ipsock_new, _bind,
+// _connect, _listen, _accept, _sendto, _recvfrom, _setopt, _getopt --
+// taking an address as a raw IPv4 address and a port. sockapi.c sits
+// above this and over unixsock.c, turns sockaddrs into those, and is
+// the only file that knows what a file descriptor or an address
+// family is. keeping the split here means the network code never has
+// to think about AF_UNIX, and the POSIX shapes are written once.
+//
+//   read/write/close on the descriptor still land in sockread,
+//   sockwrite and sockclose below, as they always did.
 //
 
 #include "types.h"
@@ -30,13 +33,6 @@
 struct sock socks[NSOCK];
 static struct spinlock socklock;
 static uint16 next_port = 49152;
-
-// allocate a file descriptor for f in the current process.
-static int
-sock_fdalloc(struct file *f)
-{
-  return fdalloc(f);
-}
 
 void
 sockinit(void)
@@ -96,6 +92,8 @@ sockalloc(int type)
       s->ttl = 0;
       s->want_errors = 0;
       s->deadline = 0;
+      s->rcvtimeo = 0;
+      s->shut_rd = s->shut_wr = 0;
       s->tcp = 0;
       s->closed = 0;
       s->id = i;
@@ -122,6 +120,28 @@ port_alloc(void)
     if (!used)
       return p;
   }
+  return 0;
+}
+
+// shutdown(2): stop one direction without giving up the descriptor.
+// on a stream the write side sends the FIN, which is the point of it;
+// a datagram socket has nothing to tell the other end, so what
+// changes is only what this end will do from now on.
+int
+sockshutdown(struct sock *s, int how)
+{
+  if (s == 0 || s->type == SOCK_NONE)
+    return -ENOTCONN;
+  acquire(&s->lock);
+  if (how == SHUT_RD || how == SHUT_RDWR)
+    s->shut_rd = 1;
+  if (how == SHUT_WR || how == SHUT_RDWR)
+    s->shut_wr = 1;
+  int stream = s->type == SOCK_STREAM && s->tcp != 0;
+  release(&s->lock);
+  if (stream && (how == SHUT_WR || how == SHUT_RDWR))
+    tcp_shutdown(s);
+  wakeup(s);
   return 0;
 }
 
@@ -277,173 +297,111 @@ wait_up(int timeout)
   return 0;
 }
 
-// ---- system calls ----
+// ---- the calls, as sockapi.c uses them ----
 
-static struct sock *
-fdsock(int fd, struct file **fp)
+// a socket on the network. the descriptor is made by the layer above,
+// which is the one that knows about address families.
+struct sock *
+ipsock_new(int type)
 {
-  struct file *f;
-  if ((f = fdget(myproc(), fd)) == 0 || f->type != FD_SOCK)
-    return 0;
-  if (fp)
-    *fp = f;
-  return f->sock;
-}
-
-uint64
-sys_socket(void)
-{
-  int type;
-  argint(0, &type);
   if (type != SOCK_DGRAM && type != SOCK_STREAM && type != SOCK_ICMP)
-    return -1;
+    return 0;
   if (!virtio_net_present())
-    return -1;
+    return 0;
   struct sock *s = sockalloc(type);
   if (s == 0)
-    return -1;
-  struct file *f = filealloc();
-  int fd;
-  if (f == 0 || (fd = sock_fdalloc(f)) < 0) {
-    if (f)
-      fileclose(f);
-    sockclose(s);
-    return -1;
-  }
-  f->type = FD_SOCK;
-  f->sock = s;
-  f->readable = 1;
-  f->writable = 1;
+    return 0;
   if (type == SOCK_ICMP)
     s->lport = 0x5800 | s->id; // echo identifier
-  return fd;
+  return s;
 }
 
-uint64
-sys_bind(void)
+int
+ipsock_bind(struct sock *s, int port)
 {
-  int fd, port;
-  argint(0, &fd);
-  argint(1, &port);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0 || port < 0 || port > 65535)
-    return -1;
+    return -EINVAL;
   acquire(&socklock);
   if (port == 0)
     port = port_alloc();
   for (int i = 0; i < NSOCK; i++)
     if (&socks[i] != s && socks[i].type == s->type && socks[i].lport == port) {
       release(&socklock);
-      return -1;
+      return -EADDRINUSE;
     }
   s->lport = port;
   release(&socklock);
   return 0;
 }
 
-uint64
-sys_connect(void)
+int
+ipsock_connect(struct sock *s, uint32 ip, int port)
 {
-  int fd, port;
-  uint64 ip;
-  argint(0, &fd);
-  argaddr(1, &ip);
-  argint(2, &port);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0 || port <= 0 || port > 65535)
-    return -1;
+    return -EINVAL;
   if (wait_up(300) < 0)
-    return -1;
+    return -ENETDOWN;
   if (s->lport == 0) {
     acquire(&socklock);
     s->lport = port_alloc();
     release(&socklock);
   }
-  s->rip = (uint32)ip;
+  s->rip = ip;
   s->rport = port;
   if (s->type == SOCK_STREAM)
     return tcp_connect(s);
   return 0;
 }
 
-uint64
-sys_listen(void)
+int
+ipsock_listen(struct sock *s, int backlog)
 {
-  int fd, backlog;
-  argint(0, &fd);
-  argint(1, &backlog);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0 || s->type != SOCK_STREAM || s->lport == 0)
-    return -1;
+    return -EINVAL;
   return tcp_listen(s, backlog);
 }
 
-uint64
-sys_accept(void)
+// the connection at the head of the queue. the descriptor for it is
+// made by the caller, which is the layer that knows about families.
+struct sock *
+ipsock_accept(struct sock *s, int *err)
 {
-  int fd;
-  uint64 ipp, portp;
-  argint(0, &fd);
-  argaddr(1, &ipp);
-  argaddr(2, &portp);
-  struct sock *s = fdsock(fd, 0);
-  if (s == 0 || s->type != SOCK_STREAM)
-    return -1;
-  struct sock *ns = tcp_accept(s);
-  if (ns == 0)
-    return -1;
-  struct file *f = filealloc();
-  int nfd;
-  if (f == 0 || (nfd = sock_fdalloc(f)) < 0) {
-    if (f)
-      fileclose(f);
-    sockclose(ns);
-    return -1;
+  if (s == 0 || s->type != SOCK_STREAM) {
+    *err = -EINVAL;
+    return 0;
   }
-  f->type = FD_SOCK;
-  f->sock = ns;
-  f->readable = 1;
-  f->writable = 1;
-  if (ipp && either_copyout(1, ipp, &ns->rip, 4) < 0)
-    return -1;
-  int rp = ns->rport;
-  if (portp && either_copyout(1, portp, &rp, 4) < 0)
-    return -1;
-  return nfd;
+  struct sock *ns = tcp_accept(s);
+  if (ns == 0) {
+    *err = -EINVAL;
+    return 0;
+  }
+  *err = 0;
+  return ns;
 }
 
-uint64
-sys_sendto(void)
+int
+ipsock_sendto(struct sock *s, int user, uint64 buf, int n, uint32 dst, int port)
 {
-  int fd, n, port;
-  uint64 buf, ip;
-  argint(0, &fd);
-  argaddr(1, &buf);
-  argint(2, &n);
-  argaddr(3, &ip);
-  argint(4, &port);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0 || n < 0 || n > 1400)
-    return -1;
-  uint32 dst = (uint32)ip;
+    return -EINVAL;
   if (s->type == SOCK_ICMP) {
     char data[64];
     if (n > sizeof(data))
       n = sizeof(data);
-    if (either_copyin(data, 1, buf, n) < 0)
-      return -1;
+    if (either_copyin(data, user, buf, n) < 0)
+      return -EFAULT;
     if (wait_up(300) < 0)
-      return -1;
+      return -ENETDOWN;
     if (!net_policy_ok(dst, IPPROTO_ICMP, 0, 0)) {
       net_policy_dropped++;
       return -EACCES; // the egress policy refused it
     }
-    return net_tx_icmp_echo(dst, s->lport, port, data, n, s->ttl) < 0 ? -1 : n;
+    return net_tx_icmp_echo(dst, s->lport, port, data, n, s->ttl) < 0 ? -EIO : n;
   }
   if (s->type != SOCK_DGRAM)
-    return -1;
+    return -EOPNOTSUPP;
   if (wait_up(300) < 0)
-    return -1;
+    return -ENETDOWN;
   if (s->lport == 0) {
     acquire(&socklock);
     s->lport = port_alloc();
@@ -455,32 +413,28 @@ sys_sendto(void)
   }
   struct mbuf *m = mbufalloc(MBUF_HEADROOM);
   if (m == 0)
-    return -1;
+    return -ENOMEM;
   char *p = mbufput(m, n);
-  if (either_copyin(p, 1, buf, n) < 0) {
+  if (either_copyin(p, user, buf, n) < 0) {
     mbuffree(m);
-    return -1;
+    return -EFAULT;
   }
   if (net_tx_udp(m, dst, s->lport, port, s->ttl) < 0)
-    return -1;
+    return -EIO;
   return n;
 }
 
-// recvfrom(fd, buf, n, &ip, &port, timeout): timeout in ticks, 0 = forever.
-uint64
-sys_recvfrom(void)
+// one datagram. `timeout` is in ticks, 0 meaning wait as long as it
+// takes; `nowait` returns at once when nothing has arrived.
+int
+ipsock_recvfrom(struct sock *s, int user, uint64 buf, int n, uint32 *rip,
+                int *rport, int timeout, int nowait)
 {
-  int fd, n, timeout;
-  uint64 buf, ipp, portp;
-  argint(0, &fd);
-  argaddr(1, &buf);
-  argint(2, &n);
-  argaddr(3, &ipp);
-  argaddr(4, &portp);
-  argint(5, &timeout);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0 || n < 0 || (s->type != SOCK_DGRAM && s->type != SOCK_ICMP))
-    return -1;
+    return -EINVAL;
+
+  if (s->shut_rd)
+    return 0;
 
   uint t0 = ticks;
   acquire(&s->lock);
@@ -489,11 +443,20 @@ sys_recvfrom(void)
   // is told to look at this socket (see sock_timer).
   s->deadline = timeout ? t0 + (uint)timeout : 0;
   while (s->rxq == 0) {
-    if (killed(myproc()) || signal_pending(myproc()) ||
-        (timeout && ticks - t0 >= (uint)timeout)) {
+    if (nowait) {
       s->deadline = 0;
       release(&s->lock);
-      return -1;
+      return -EAGAIN;
+    }
+    if (killed(myproc()) || signal_pending(myproc())) {
+      s->deadline = 0;
+      release(&s->lock);
+      return -EINTR;
+    }
+    if (timeout && ticks - t0 >= (uint)timeout) {
+      s->deadline = 0;
+      release(&s->lock);
+      return -EAGAIN;
     }
     sleep_prepare(s);
     release(&s->lock);
@@ -507,32 +470,27 @@ sys_recvfrom(void)
   release(&s->lock);
 
   int len = m->len < n ? m->len : n;
-  if (either_copyout(1, buf, m->head, len) < 0)
-    len = -1;
+  int ok = either_copyout(user, buf, m->head, len) >= 0;
   uint32 src = m->arg;
   // an ICMP error puts its type above the sequence number, so that one
   // call can hand back both what answered and what it said
   int sport = m->arg16 | ((int)m->arg_type << 16);
   mbuffree(m);
-  if (len < 0)
-    return -1;
-  if (ipp && either_copyout(1, ipp, &src, 4) < 0)
-    return -1;
-  if (portp && either_copyout(1, portp, &sport, 4) < 0)
-    return -1;
+  if (!ok)
+    return -EFAULT;
+  if (rip)
+    *rip = src;
+  if (rport)
+    *rport = sport;
   return len;
 }
 
-// sockopt(fd, option, value): the few knobs a socket here has
-uint64
-sys_sockopt(void)
+// the few knobs a socket on the network has. the names are the ones
+// in socket.h; the POSIX layer above turns IP_TTL and the rest into
+// these.
+int
+ipsock_setopt(struct sock *s, int opt, int value)
 {
-  int fd, opt, value;
-
-  argint(0, &fd);
-  argint(1, &opt);
-  argint(2, &value);
-  struct sock *s = fdsock(fd, 0);
   if (s == 0)
     return -EBADF;
   acquire(&s->lock);
@@ -546,6 +504,36 @@ sys_sockopt(void)
     break;
   case SO_ICMP_ERRORS:
     s->want_errors = value != 0;
+    break;
+  case SO_RCVTIMEO_TICKS:
+    if (value < 0)
+      r = -EINVAL;
+    else
+      s->rcvtimeo = value;
+    break;
+  default:
+    r = -ENOPROTOOPT;
+  }
+  release(&s->lock);
+  return r;
+}
+
+int
+ipsock_getopt(struct sock *s, int opt, int *value)
+{
+  if (s == 0)
+    return -EBADF;
+  acquire(&s->lock);
+  int r = 0;
+  switch (opt) {
+  case SO_TTL:
+    *value = s->ttl ? s->ttl : 64;
+    break;
+  case SO_ICMP_ERRORS:
+    *value = s->want_errors;
+    break;
+  case SO_RCVTIMEO_TICKS:
+    *value = s->rcvtimeo;
     break;
   default:
     r = -ENOPROTOOPT;
@@ -571,12 +559,14 @@ sys_netinfo(void)
 int
 sockread(struct sock *s, int user, uint64 addr, int n)
 {
+  if (s->shut_rd)
+    return 0;   // end of file: this end has said it wants no more
   if (s->type == SOCK_STREAM)
     return tcp_read(s, user, addr, n);
   // datagram: next message, source discarded
   acquire(&s->lock);
   while (s->rxq == 0) {
-    if (killed(myproc()) || s->closed) {
+    if (killed(myproc()) || s->closed || s->shut_rd) {
       release(&s->lock);
       return -1;
     }
@@ -599,6 +589,8 @@ sockread(struct sock *s, int user, uint64 addr, int n)
 int
 sockwrite(struct sock *s, int user, uint64 addr, int n)
 {
+  if (s->shut_wr)
+    return -EPIPE;
   if (s->type == SOCK_STREAM)
     return tcp_write(s, user, addr, n);
   if (s->type != SOCK_DGRAM || s->rport == 0 || n > 1400)
@@ -625,6 +617,8 @@ int
 sockready(struct sock *s, int write)
 {
   if (s == 0)
+    return -1;
+  if (write ? s->shut_wr : s->shut_rd)
     return -1;
   if (s->type == SOCK_STREAM)
     return tcp_ready(s->tcp, write);

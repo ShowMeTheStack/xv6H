@@ -5183,6 +5183,12 @@ drivetests(int quick, int continuous, char *justone)
     // itself between runs (object cache slabs): allow that.
     for (int i = 0; i < 300 && sysconf(_SC_XV6_NPROCS) > nprocs0; i++)
       ticksleep(10);
+    // and the disk is written before counting. A dirty block is not
+    // leaked memory, it is memory that cannot be given back until the
+    // disk has it, and the tests above wrote a great deal; counting
+    // without this measures how busy the writeback thread happens to
+    // be, which is not what anybody wants to know.
+    sync();
     if ((free1 = countfree()) < free0 - 64) {
       printf("FAILED -- lost some free pages %d (out of %d)\n", free1, free0);
       if (continuous != 2) {

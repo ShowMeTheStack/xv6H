@@ -5,6 +5,7 @@
 #include "defs.h"
 #include "platform.h"
 #include "intc.h"
+#include "unixsock.h"
 
 volatile static int started = 0;
 
@@ -43,6 +44,7 @@ main()
     intc_inithart();    // ask it for device interrupts
     iinit();            // inode table
     fileinit();         // file table
+    unixsock_init();    // sockets that never leave the machine
     virtio_disk_init();
     blkinit();
     vfs_init();
@@ -57,8 +59,13 @@ main()
     randominit();       // the random generator
     bridgeinit();       // software switch between host, guests and the NIC
     netinit();          // network device and stack
+    ksm_init();         // same-page merging between guests (off until asked)
     hypinit();          // hypervisor (if the H extension is present)
     userinit();         // first user process
+    // after userinit, because its thread belongs to init like every
+    // other kernel thread. only a guest has a balloon; on a machine
+    // without one the probe finds nothing and that is the whole of it.
+    virtio_balloon_init();
     kthread_selftest(); // two kernel threads take turns, then print
 
     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);

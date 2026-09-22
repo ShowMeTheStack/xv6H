@@ -5,6 +5,7 @@
 #define T_FILE   2 // File
 #define T_DEVICE 3 // Device
 #define T_SYMLINK 4 // Symbolic link: its contents are the path it names
+#define T_SOCK    5 // a socket bound to this name (AF_UNIX)
 
 // the major number a block device has, so that a program looking at a
 // stat can tell one from a character device without asking the kernel

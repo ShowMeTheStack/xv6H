@@ -1,0 +1,31 @@
+#!/bin/sh
+# rc N: start the services of runlevel N, and stop the ones that are
+# not in it.
+#
+# /etc/rc.d/rcN.d holds links to /etc/init.d: SNNname to start,
+# KNNname to stop, run in name order, which is what the numbers are
+# for.
+
+PATH=/bin:/sbin:/usr/bin
+export PATH
+
+level="$1"
+if [ -z "$level" ]; then
+	echo "usage: rc RUNLEVEL" >&2
+	exit 1
+fi
+dir="/etc/rc.d/rc${level}.d"
+if [ ! -d "$dir" ]; then
+	exit 0
+fi
+
+for script in $(ls "$dir" | sort); do
+	case "$script" in
+	K*)
+		"$dir/$script" stop
+		;;
+	S*)
+		"$dir/$script" start
+		;;
+	esac
+done

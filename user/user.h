@@ -53,18 +53,11 @@ int vm_stats(uint64 *, int);
 struct hwinfo;
 int hwinfo(struct hwinfo *);
 
-// the network stack (kernel/net.h, kernel/socket.h)
+// the network. the sockets themselves are POSIX and are declared in
+// <sys/socket.h>, <netinet/in.h> and <netdb.h>; what is left here is
+// this system's own look at the stack.
 struct netinfo;
-int socket(int);
-int bind(int, int);
-int connect(int, uint32, int);
-int listen(int, int);
-int accept(int, uint32 *, int *);
-int sendto(int, const void *, int, uint32, int);
-int recvfrom(int, void *, int, uint32 *, int *, int);
 int netinfo(struct netinfo *);
-// SO_TTL and SO_ICMP_ERRORS live in kernel/socket.h
-int sockopt(int fd, int option, int value);
 // ptrace: the requests are in kernel/ptrace.h
 long ptrace(int request, int pid, void *addr, void *data);
 

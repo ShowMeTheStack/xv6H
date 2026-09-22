@@ -97,11 +97,19 @@ entry("socket");
 entry("bind");
 entry("connect");
 entry("listen");
-entry("accept");
+# accept() is accept4() with no flags, and the library writes that
+entry("accept4", "accept");
 entry("sendto");
 entry("recvfrom");
 entry("netinfo");
-entry("sockopt");
+entry("setsockopt");
+entry("getsockopt");
+entry("sendmsg");
+entry("recvmsg");
+entry("socketpair");
+entry("getsockname");
+entry("getpeername");
+entry("shutdown");
 entry("setpriority");
 # a nice value may be negative, and the stubs read a negative return
 # as -errno; the kernel hands back 20 - nice and the library turns

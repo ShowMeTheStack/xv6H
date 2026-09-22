@@ -1,0 +1,11 @@
+#!/bin/sh
+# keep one old copy of each log and start a new one.
+for f in /var/log/messages /var/log/auth.log /var/log/kern.log; do
+	if [ -f "$f" ]; then
+		mv "$f" "$f.0"
+		: > "$f"
+		chmod 640 "$f"
+	fi
+done
+kill -HUP "$(cat /var/run/syslogd.pid 2>/dev/null)" 2>/dev/null
+exit 0

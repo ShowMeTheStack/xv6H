@@ -33,9 +33,9 @@ static void
 usage(void)
 {
   fprintf(stderr, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
-             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-d]\n"
+             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-M mb] [-d]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
-             "       vmm ps VM | info VM | stats\n");
+             "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n");
   exit(1);
 }
 
@@ -310,6 +310,9 @@ start(int argc, char *argv[])
     } else if (strcmp(a, "-m") == 0 && v) {
       cfg.mem_mb = atoi(v);
       i++;
+    } else if (strcmp(a, "-M") == 0 && v) {
+      cfg.mem_limit_mb = atoi(v);
+      i++;
     } else if (strcmp(a, "-r") == 0 && v) {
       cfg.flags |= VMF_RAW;
       cfg.load_addr = parse_addr(v);
@@ -340,6 +343,8 @@ start(int argc, char *argv[])
       cfg.flags |= VMF_HSM;
     } else if (strcmp(a, "-s") == 0) {
       cfg.flags |= VMF_SOFTIMSIC;
+    } else if (strcmp(a, "-4") == 0) {
+      cfg.flags |= VMF_NOHUGE;
     } else if (strcmp(a, "-d") == 0) {
       detach = 1;
     } else {
@@ -402,6 +407,15 @@ info(int id)
   printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB (%d MB resident), intc %s%s\n", id, vi.cfg.name,
          states[vi.state % 5], vi.nvcpu, vi.mem_mb, vi.resident_mb, intcs[vi.intc % 3],
          vi.imsic_hw ? " (hardware guest files)" : "");
+  printf("  memory: %d chunks split to pages, %d table pages%s%s",
+         vi.split_chunks, vi.table_pages,
+         (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "", "");
+  if (vi.mem_limit_mb)
+    printf(", limit %d MB", vi.mem_limit_mb);
+  printf("\n");
+  if (vi.balloon_target_mb || vi.balloon_actual_mb)
+    printf("  balloon: %d MB asked for, %d MB given back\n",
+           vi.balloon_target_mb, vi.balloon_actual_mb);
   printf("  kernel %s%s entry 0x%lx, disk %s (%ld sectors)%s\n", vi.cfg.kernel,
          (vi.cfg.flags & VMF_RAW) ? " (raw)" : "", vi.entry,
          vi.cfg.disk[0] ? vi.cfg.disk : "none", vi.disk_sectors,
@@ -438,17 +452,23 @@ info(int id)
 static void
 stats(void)
 {
-  uint64 s[2 + MAXVM];
+  uint64 s[7 + MAXVM];
   memset(s, 0, sizeof(s));
-  if (vm_stats(s, 2 + MAXVM) < 0) {
+  if (vm_stats(s, 7 + MAXVM) < 0) {
     fprintf(stderr, "vmm: vm_stats failed\n");
     exit(1);
   }
-  printf("free guest memory: %ld MB, ipis: %ld, exits:", s[0], s[1]);
+  // in pages as well as megabytes: a megabyte is 256 pages, and
+  // anything looking for a leak needs the finer number
+  printf("free guest memory: %ld MB (%ld pages), ipis: %ld, exits:", s[0],
+         s[2 + MAXVM], s[1]);
   for (int i = 0; i < MAXVM; i++)
     if (s[2 + i])
       printf(" vm%d=%ld", i, s[2 + i]);
   printf("\n");
+  printf("same-page merging: %s, %ld pages scanned, %ld merged, %ld shared\n",
+         s[3 + MAXVM] ? "on" : "off", s[4 + MAXVM], s[5 + MAXVM],
+         s[6 + MAXVM]);
 }
 
 static void
@@ -536,6 +556,25 @@ main(int argc, char *argv[])
   } else if (argc == 3 && strcmp(cmd, "kill") == 0 &&
              (strcmp(argv[2], "--all") == 0 || strcmp(argv[2], "-a") == 0)) {
     killall();
+  } else if (argc == 3 && strcmp(cmd, "ksm") == 0) {
+    int on = strcmp(argv[2], "on") == 0;
+    if (!on && strcmp(argv[2], "off") != 0)
+      usage();
+    if (vm_ctl(0, on ? VMCTL_KSM_ON : VMCTL_KSM_OFF) < 0) {
+      fprintf(stderr, "vmm: cannot turn same-page merging %s\n", argv[2]);
+      exit(1);
+    }
+    printf("same-page merging %s\n", on ? "on" : "off");
+  } else if (argc == 4 && strcmp(cmd, "balloon") == 0) {
+    int id = must_lookup(argv[2]);
+    int mb = atoi(argv[3]);
+    if (mb < 0)
+      usage();
+    if (vm_ctl(id, VMCTL_BALLOON + mb) < 0) {
+      fprintf(stderr, "vmm: vm %d has no balloon\n", id);
+      exit(1);
+    }
+    printf("vm %d: asked for %d MB back\n", id, mb);
   } else if (argc == 3) {
     int id = must_lookup(argv[2]);
     if (strcmp(cmd, "attach") == 0)

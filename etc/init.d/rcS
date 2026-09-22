@@ -1,0 +1,33 @@
+#!/bin/sh
+# rcS: everything a machine needs before its services start.
+
+PATH=/bin:/sbin:/usr/bin
+export PATH
+
+echo "rcS: starting"
+
+# the mounts listed in /etc/fstab, on top of the ones init made
+if [ -f /etc/fstab ]; then
+	while read src dst type opts rest; do
+		case "$src" in
+		\#*|"") continue ;;
+		esac
+		case "$dst" in
+		/|/proc|/sys|/dev|/tmp) continue ;;
+		esac
+		mkdir -p "$dst"
+		mount -t "$type" -o "$opts" "$src" "$dst" || echo "rcS: cannot mount $dst"
+	done < /etc/fstab
+fi
+
+# the name of this machine
+if [ -f /etc/hostname ]; then
+	hostname "$(cat /etc/hostname)"
+fi
+
+# the settings
+if [ -f /etc/sysctl.conf ]; then
+	sysctl -p /etc/sysctl.conf > /dev/null
+fi
+
+echo "rcS: done"

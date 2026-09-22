@@ -131,8 +131,15 @@
 #define SYS_fchownat   128
 #define SYS_chroot     129
 #define SYS_reboot     130
-#define SYS_sockopt    131
+#define SYS_setsockopt 131
 #define SYS_setpriority 132
 #define SYS_getpriority 133
 #define SYS_ptrace     134
+#define SYS_getsockopt 135
+#define SYS_sendmsg    136
+#define SYS_recvmsg    137
+#define SYS_socketpair 138
+#define SYS_getsockname 139
+#define SYS_getpeername 140
+#define SYS_shutdown   141
 #endif

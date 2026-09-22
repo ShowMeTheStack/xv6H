@@ -100,6 +100,8 @@
 #define G_VIRTIO_IRQ 1
 #define G_VNET_BASE  0x10002000L
 #define G_VNET_IRQ   2
+#define G_BALLOON_BASE 0x10003000L
+#define G_BALLOON_IRQ  3
 #define G_RTC_BASE   0x101000L
 #define G_RTC_IRQ    11
 #define G_CLINT_BASE 0x02000000L
@@ -113,6 +115,14 @@
 #define HGATP_MODE_SV48X4 (9L << 60)
 #define HCHUNK       (2L * 1024 * 1024) // guest RAM granule (G-stage megapage)
 #define HCHUNK_ORDER 9                   // as a buddy order
+#define HCHUNK_PAGES 512                 // 4 KB pages in a chunk
+
+// a chunk table entry: a 2 MB block, or (with the low bit set) a
+// pointer to a page of 512 frames.  A page is 4 KB aligned, so the
+// low bit is free to say which.
+#define GC_SPLIT 1
+#define gc_split(c) ((c) & GC_SPLIT)
+#define gc_pages(c) ((uint64 *)((c) & ~(uint64)GC_SPLIT))
 #define VM_MAXMEM    (256UL << 30)       // 256 GiB per VM at most
 #define VM_DTB_MAX   0x10000
 
@@ -120,8 +130,9 @@ enum vic_kind { VIC_PLIC = 0, VIC_APLIC = 1, VIC_IMSIC = 2 };
 
 #define HSM_STARTED 0
 #define HSM_STOPPED 1
-#define FENCE_I   1
-#define FENCE_VMA 2
+#define FENCE_I    1
+#define FENCE_VMA  2
+#define FENCE_GVMA 4  // the G-stage mapping changed under a running vcpu
 
 // ---- virtual devices ----
 
@@ -158,6 +169,12 @@ struct vvirtio {
   uint64 capacity;          // sectors (0: no disk)
   struct sleeplock qlock;   // serializes queue processing
   char *bounce;             // one page for data transfers
+  // the queue is worked by a thread of its own, so that a guest which
+  // has asked for a block goes straight back to running while the
+  // host reads it
+  int wake;                 // the guest rang the doorbell
+  int stop;                 // the VM is going: leave
+  int running;              // the thread exists and has not left yet
 };
 
 struct vq_state {
@@ -175,6 +192,29 @@ struct vvnet {
   uint32 intr_status, status;
   uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
 };
+
+// virtio-balloon: the host says how much of the guest's memory it
+// would like back, the guest hands over pages, and the host takes them
+// away. Nothing is forced: a balloon is a request, and a guest that
+// ignores it keeps its memory.
+struct vballoon {
+  int present;
+  uint32 device_features_sel, driver_features_sel;
+  uint64 driver_features;
+  uint32 queue_sel;
+  struct vq_state q[3];     // 0: inflate, 1: deflate, 2: statistics
+  uint32 intr_status, status;
+  uint32 target;            // pages the host is asking for (config num_pages)
+  uint32 actual;            // pages the guest has handed over
+  uint32 config_gen;
+  uint64 inflated, deflated; // pages taken and given back, in total
+  uint64 stats[8];          // what the guest last reported, if it does
+  int have_stats;
+};
+
+#define VIRTIO_BALLOON_F_MUST_TELL_HOST 0
+#define VIRTIO_BALLOON_F_STATS_VQ       1
+#define VIRTIO_BALLOON_F_DEFLATE_ON_OOM 2
 
 #define VPLIC_NIRQ 32
 struct vplic {
@@ -246,7 +286,7 @@ struct vcpu {
 
   // SBI HSM state and remote fences
   int hsm_state;          // HSM_STARTED / HSM_STOPPED
-  volatile int fence_req; // FENCE_I / FENCE_VMA to execute on the next entry
+  volatile int fence_req; // FENCE_I / FENCE_VMA / FENCE_GVMA on the next entry
   int last_hart;          // hart of the previous entry (-1: none)
 
   // emulated machine-mode state (the guest's own start() runs in VS mode).
@@ -265,6 +305,14 @@ struct gendisk;
 
 struct vm {
   struct spinlock lock;
+  // guest memory -- the chunk table and the G-stage page tables -- has
+  // a lock of its own, and not because two locks are faster than one.
+  // A device model writes into guest memory while it holds vm->lock,
+  // and the page it writes into may be one the guest has posted but
+  // never touched, so the write has to be able to back it. One lock
+  // for both would be that write asking for a lock it already holds.
+  // The order is vm->lock then memlock, never the other way.
+  struct spinlock memlock;
   int id;
   volatile int state;
   struct vmconfig cfg;    // how it was created
@@ -277,10 +325,18 @@ struct vm {
 
   uint64 ram_size;
   int nchunks;
-  uint64 *chunk;          // host physical address of each 2 MB chunk, 0 until touched
+  // one entry per 2 MB of guest RAM, 0 until touched.  An entry is
+  // either the host physical address of a 2 MB block -- a G-stage
+  // megapage -- or, with GC_SPLIT set, a pointer to a page holding
+  // the 512 frames the chunk is backed by one page at a time.  See
+  // gstage_split for why a chunk ever becomes the second kind.
+  uint64 *chunk;
   uint64 resident;        // bytes of guest RAM currently backed
-  uint64 ptchunk;         // 2 MB chunk holding the G-stage page tables
-  uint64 ptnext;          // next free page in ptchunk
+  int prefer_huge;        // back a chunk with one 2 MB block when one can be had
+  uint64 mem_limit;       // host memory it may hold at once, in bytes (0: none)
+  uint64 stalls;          // faults that waited for the limit to come down
+  uint64 nsplit;          // chunks backed a page at a time
+  uint64 pttables;        // G-stage table pages below the root
   uint64 *hgatp_root;     // 16 KB, 16 KB-aligned
   uint64 hgatp;
 
@@ -289,6 +345,7 @@ struct vm {
   struct vuart uart;
   struct vvirtio blk;
   struct vvnet vnet;
+  struct vballoon balloon;
   uint64 rtc_latch;       // virtual RTC: TIME_HIGH latched by a TIME_LOW read
   struct vplic plic;
   struct vaplic aplic;
@@ -307,6 +364,11 @@ struct vm {
 
 extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used
 
+// vballoon.c
+void vballoon_init(struct vm *vm);
+int vballoon_set(struct vm *vm, uint64 bytes); // ask for this much back
+int vballoon_request(struct vm *vm, uint64 bytes); // the same, asked for by a person
+
 // hyp.c
 void hypinithart(void);
 struct vm *vm_lookup(int id);
@@ -317,7 +379,18 @@ int vm_destroy(struct vm *vm);
 int vm_pause(struct vm *vm);
 int vm_resume(struct vm *vm);
 int vm_gpa2hpa(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len);
-int vm_touch(struct vm *vm, uint64 gpa); // back the chunk holding gpa, if it is guest RAM
+int vm_touch(struct vm *vm, uint64 gpa); // back the granule holding gpa, if it is guest RAM
+int vm_split(struct vm *vm, uint64 gpa);   // make the chunk holding gpa page-granular
+int vm_unback(struct vm *vm, uint64 gpa);  // take one page of guest RAM away
+void vm_fence(struct vm *vm);              // every vcpu flushes its G-stage TLB
+void vm_fence_sync(struct vm *vm);         // and wait until they have
+int vm_reclaim(struct vm *vm, int tries);  // at the limit: ask the guest, then wait
+
+// what same-page merging (ksm.c) needs from hyp.c
+uint64 vm_protect_page(struct vm *vm, uint64 gpa);
+void vm_unprotect_page(struct vm *vm, uint64 gpa, uint64 frame);
+int vm_share_page(struct vm *vm, uint64 gpa, uint64 frame);
+int vm_unshare(struct vm *vm, uint64 gpa);
 int vm_copyin(struct vm *vm, void *dst, uint64 gpa, uint64 n);
 int vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n);
 void vcpu_kick(struct vcpu *v);
@@ -361,6 +434,7 @@ int vm_cons_getc(struct vm *vm);
 
 // vvirtio.c
 void vvirtio_init(struct vm *vm);
+void vvirtio_stop(struct vm *vm);   // wait for the queue thread to leave
 
 // vrtc.c
 void vrtc_init(struct vm *vm);

@@ -219,6 +219,18 @@ check strace_many ok "$(strace /bin/ls / > /dev/null 2>tr2.out; grep -c 'exited 
 # ptrace itself refuses what it should
 check ptrace_not_parent 1 "$(strace -p $$ > /dev/null 2>&1; echo $?)"
 
+# ---- usleep ----
+
+# it waits, it takes microseconds, and it refuses anything that is not
+# a number of them
+check usleep_runs ok "$(usleep 1000 && echo ok)"
+check usleep_zero ok "$(usleep 0 && echo ok)"
+# a wait of a second and a half really does take about that long
+check usleep_waits ok "$(b=$(cut -d' ' -f1 /proc/uptime); usleep 1500000; e=$(cut -d' ' -f1 /proc/uptime); awk -v b=$b -v e=$e 'BEGIN{print (e-b >= 1.2 && e-b < 6) ? "ok" : "no " (e-b)}')"
+check usleep_bad 1 "$(usleep zzz > /dev/null 2>&1; echo $?)"
+check usleep_negative 1 "$(usleep -5 > /dev/null 2>&1; echo $?)"
+check usleep_noargs 1 "$(usleep > /dev/null 2>&1; echo $?)"
+
 # ---- vmstat and the rest read /proc, so /proc has to have it ----
 
 check proc_meminfo ok "$(grep -c MemTotal /proc/meminfo | sed 's/^1$/ok/')"

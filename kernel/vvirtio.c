@@ -214,6 +214,65 @@ process_queue(struct vm *vm, struct vvirtio *b)
   }
 }
 
+// ---- the queue thread ----
+//
+// the guest writes to QUEUE_NOTIFY and the host reads a block from a
+// disk, which sleeps. Doing that on the vcpu's own exit stops the
+// guest for the length of the I/O even when it had other work to do,
+// which is the thing an operating system exists to avoid. So the
+// notification only wakes a thread, and the vcpu goes straight back
+// into the guest; the interrupt that says the block has arrived is
+// raised by the thread when it has.
+static void
+blk_worker(void *arg)
+{
+  struct vm *vm = arg;
+  struct vvirtio *b = &vm->blk;
+
+  for (;;) {
+    acquire(&vm->lock);
+    while (!b->wake && !b->stop) {
+      sleep_prepare(&b->wake);
+      release(&vm->lock);
+      sleep();
+      acquire(&vm->lock);
+    }
+    if (b->stop) {
+      b->running = 0;
+      release(&vm->lock);
+      wakeup(&b->stop);
+      return;
+    }
+    b->wake = 0;
+    release(&vm->lock);
+    process_queue(vm, b);
+  }
+}
+
+// the VM is going. the thread is told to leave and waited for, because
+// what it is holding -- the disk, the bounce page -- is about to be
+// freed underneath it.
+void
+vvirtio_stop(struct vm *vm)
+{
+  struct vvirtio *b = &vm->blk;
+
+  acquire(&vm->lock);
+  if (!b->running) {
+    release(&vm->lock);
+    return;
+  }
+  b->stop = 1;
+  wakeup(&b->wake);
+  while (b->running) {
+    sleep_prepare(&b->stop);
+    release(&vm->lock);
+    sleep();
+    acquire(&vm->lock);
+  }
+  release(&vm->lock);
+}
+
 // ---- mmio transport ----
 
 static int
@@ -261,8 +320,16 @@ vvirtio_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
   struct vvirtio *b = &vm->blk;
 
   if (off == VIRTIO_MMIO_QUEUE_NOTIFY) {
-    if (val == 0)
-      process_queue(vm, b);
+    if (val == 0) {
+      acquire(&vm->lock);
+      b->wake = 1;
+      int running = b->running;
+      release(&vm->lock);
+      if (running)
+        wakeup(&b->wake);
+      else
+        process_queue(vm, b);   // no thread: do it here, as it used to
+    }
     return 0;
   }
   if (size != 4)
@@ -346,4 +413,8 @@ vvirtio_init(struct vm *vm)
     iunlock(vm->disk_ip);
   }
   vm_add_dev(vm, G_VIRTIO_BASE, 0x1000, vvirtio_read, vvirtio_write, 0);
+  if (b->capacity && kthread_create(blk_worker, vm, "vblk") >= 0)
+    b->running = 1;
+  else if (b->capacity)
+    printk("hyp: vm %d: no disk thread; its I/O will stop its vcpu\n", vm->id);
 }

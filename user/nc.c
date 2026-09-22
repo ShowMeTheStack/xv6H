@@ -17,7 +17,9 @@
 // sent, which is the whole of what nc is for.
 #include "user/user.h"
 #include "kernel/net.h"
-#include "kernel/socket.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/un.h>
 
 static int use_udp, do_listen, keep_open, quiet_scan, verbose, no_names;
 static int timeout_secs = 0;
@@ -35,6 +37,16 @@ say(const char *fmt, const char *a, int n)
 
 // move bytes both ways until one end is done. `peer` is the socket and
 // the terminal is 0 and 1.
+// an address in one line, which is all this program ever needs
+static void
+mkaddr(struct sockaddr_in *sa, uint32 ip, int port)
+{
+  memset(sa, 0, sizeof(*sa));
+  sa->sin_family = AF_INET;
+  sa->sin_port = htons((uint16)port);
+  sa->sin_addr.s_addr = htonl(ip);
+}
+
 static int
 pump(int peer, uint32 raddr, int rport)
 {
@@ -65,13 +77,15 @@ pump(int peer, uint32 raddr, int rport)
     if (pfd[0].revents & (POLLIN | POLLHUP)) {
       int r;
       if (use_udp) {
-        uint32 from = 0;
-        int fport = 0;
-        r = recvfrom(peer, buf, sizeof(buf), &from, &fport, 0);
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        memset(&from, 0, sizeof(from));
+        r = recvfrom(peer, buf, sizeof(buf), 0, (struct sockaddr *)&from,
+                     &fromlen);
         if (r > 0 && raddr == 0) {
           // a server learns who it is talking to from the first packet
-          raddr = from;
-          rport = fport;
+          raddr = ntohl(from.sin_addr.s_addr);
+          rport = ntohs(from.sin_port);
         }
       } else {
         r = read(peer, buf, sizeof(buf));
@@ -93,10 +107,13 @@ pump(int peer, uint32 raddr, int rport)
         continue;
       }
       int w;
-      if (use_udp)
-        w = sendto(peer, buf, r, raddr, rport);
-      else
+      if (use_udp) {
+        struct sockaddr_in to;
+        mkaddr(&to, raddr, rport);
+        w = sendto(peer, buf, r, 0, (struct sockaddr *)&to, sizeof(to));
+      } else {
         w = write(peer, buf, r);
+      }
       if (w != r) {
         fprintf(stderr, "nc: write: %s\n", strerror(errno));
         return 1;
@@ -130,12 +147,14 @@ scan(const char *host, int from_port, int to_port)
   if (resolve(host, &ip) < 0)
     return 1;
   for (int p = from_port; p <= to_port; p++) {
-    int fd = socket(use_udp ? SOCK_DGRAM : SOCK_STREAM);
+    int fd = socket(AF_INET, use_udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd < 0) {
       fprintf(stderr, "nc: socket: %s\n", strerror(errno));
       return 1;
     }
-    int ok = connect(fd, ip, p) >= 0;
+    struct sockaddr_in to;
+    mkaddr(&to, ip, p);
+    int ok = connect(fd, (struct sockaddr *)&to, sizeof(to)) >= 0;
     if (ok) {
       any = 1;
       if (verbose)
@@ -155,13 +174,15 @@ scan(const char *host, int from_port, int to_port)
 static int
 do_server(int port)
 {
-  int fd = socket(use_udp ? SOCK_DGRAM : SOCK_STREAM);
+  int fd = socket(AF_INET, use_udp ? SOCK_DGRAM : SOCK_STREAM, 0);
+  struct sockaddr_in me;
 
   if (fd < 0) {
     fprintf(stderr, "nc: socket: %s\n", strerror(errno));
     return 1;
   }
-  if (bind(fd, port) < 0) {
+  mkaddr(&me, INADDR_ANY, port);
+  if (bind(fd, (struct sockaddr *)&me, sizeof(me)) < 0) {
     fprintf(stderr, "nc: bind %d: %s\n", port, strerror(errno));
     return 1;
   }
@@ -179,9 +200,12 @@ do_server(int port)
   do {
     if (verbose)
       fprintf(stderr, "Listening on 0.0.0.0 %d\n", port);
-    uint32 raddr = 0;
-    int rport = 0;
-    int c = accept(fd, &raddr, &rport);
+    struct sockaddr_in peer;
+    socklen_t peerlen = sizeof(peer);
+    memset(&peer, 0, sizeof(peer));
+    int c = accept(fd, (struct sockaddr *)&peer, &peerlen);
+    uint32 raddr = ntohl(peer.sin_addr.s_addr);
+    int rport = ntohs(peer.sin_port);
     if (c < 0) {
       if (errno == EINTR)
         continue;
@@ -207,13 +231,15 @@ do_client(const char *host, int port)
 
   if (resolve(host, &ip) < 0)
     return 1;
-  int fd = socket(use_udp ? SOCK_DGRAM : SOCK_STREAM);
+  int fd = socket(AF_INET, use_udp ? SOCK_DGRAM : SOCK_STREAM, 0);
   if (fd < 0) {
     fprintf(stderr, "nc: socket: %s\n", strerror(errno));
     return 1;
   }
   if (!use_udp) {
-    if (connect(fd, ip, port) < 0) {
+    struct sockaddr_in to;
+    mkaddr(&to, ip, port);
+    if (connect(fd, (struct sockaddr *)&to, sizeof(to)) < 0) {
       char a[20];
       fprintf(stderr, "nc: connect to %s port %d failed: %s\n",
               ip2str(ip, a), port, strerror(errno));

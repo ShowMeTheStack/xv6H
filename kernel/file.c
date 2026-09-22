@@ -16,6 +16,7 @@
 #include "slab.h"
 #include "net.h"
 #include "sock.h"
+#include "unixsock.h"
 #include "stat.h"
 #include "proc.h"
 
@@ -81,6 +82,8 @@ fileclose(struct file *f)
 
   if (ff.type == FD_SOCK) {
     sockclose(ff.sock);
+  } else if (ff.type == FD_UNIX) {
+    unixsock_close(ff.un);
   } else if (ff.type == FD_PIPE) {
     pipeclose(ff.pipe, ff.writable);
   } else if (ff.type == FD_INODE || ff.type == FD_DEVICE || ff.type == FD_BLOCK) {
@@ -104,7 +107,24 @@ filestat(struct file *f, uint64 addr)
       return -1;
     return 0;
   }
-  return -1;
+  // a socket has no inode to describe. what fstat says about one is
+  // that it is a socket and nothing more, which is what a program
+  // asking `is this a socket?' wants; everything else still fails,
+  // as it always has.
+  memset(&st, 0, sizeof(st));
+  st.nlink = 1;
+  st.ino = ((uint64)f) >> 4;
+  switch (f->type) {
+  case FD_SOCK:
+  case FD_UNIX:
+    st.type = T_SOCK;
+    break;
+  default:
+    return -1;
+  }
+  if (copyout(p->mm, addr, (char *)&st, sizeof(st)) < 0)
+    return -1;
+  return 0;
 }
 
 // Read from file f.
@@ -119,6 +139,8 @@ fileread(struct file *f, uint64 addr, int n)
 
   if (f->type == FD_SOCK) {
     r = sockread(f->sock, 1, addr, n);
+  } else if (f->type == FD_UNIX) {
+    r = unixsock_recv(f->un, 1, addr, n, 0, 0, 0, 0, 0, 0);
   } else if (f->type == FD_PIPE) {
     r = piperead(f->pipe, addr, n);
   } else if (f->type == FD_BLOCK) {
@@ -153,6 +175,8 @@ filewrite(struct file *f, uint64 addr, int n)
 
   if (f->type == FD_SOCK) {
     ret = sockwrite(f->sock, 1, addr, n);
+  } else if (f->type == FD_UNIX) {
+    ret = unixsock_send(f->un, 1, addr, n, 0, 0, 0, 0);
   } else if (f->type == FD_PIPE) {
     ret = pipewrite(f->pipe, addr, n);
   } else if (f->type == FD_BLOCK) {
@@ -215,6 +239,8 @@ fileready(struct file *f, int write)
     return piperready(f->pipe, write);
   case FD_SOCK:
     return sockready(f->sock, write);
+  case FD_UNIX:
+    return unixsock_ready(f->un, write);
   case FD_DEVICE:
     if (f->major >= 0 && f->major < NDEV && devsw[f->major].ready)
       return devsw[f->major].ready(write);

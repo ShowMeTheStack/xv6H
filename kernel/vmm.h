@@ -19,12 +19,14 @@
 #define VMF_SOFTIMSIC 1 // IMSIC mode: use the software interrupt file model
 #define VMF_RAW       2 // kernel is a raw binary loaded at load_addr (also the entry)
 #define VMF_HSM       4 // secondary vcpus start stopped, to be started via SBI HSM (Linux)
+#define VMF_NOHUGE    8 // back guest RAM 4 KB at a time, never with megapages
 
 struct vmconfig {
   char name[VM_NAMELEN];   // optional
   char kernel[VM_PATHLEN]; // ELF (any load address) or raw image, in the host file system
   char disk[VM_PATHLEN];   // disk image file in the host file system, "" for no disk
   int mem_mb;
+  int mem_limit_mb;        // host memory this VM may hold at once (0: no limit)
   int nvcpu;
   int flags;
   uint64 load_addr;        // VMF_RAW: guest-physical load address
@@ -37,6 +39,13 @@ enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
 
 #define VMCTL_PAUSE  0
 #define VMCTL_RESUME 1
+// vm_ctl(id, VMCTL_BALLOON + megabytes): ask the guest to give that
+// much of its memory back. The guest answers in its own time, and
+// vm_info reports how far it has got.
+#define VMCTL_BALLOON 0x10000
+// same-page merging is the host's, not a VM's: the id is ignored
+#define VMCTL_KSM_OFF 2
+#define VMCTL_KSM_ON  3
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -45,6 +54,11 @@ enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
 struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
   int resident_mb;        // guest RAM actually backed by host memory
+  int split_chunks;       // 2 MB chunks backed a page at a time
+  int table_pages;        // G-stage page table pages below the root
+  int balloon_target_mb;  // how much the host has asked the guest to give back
+  int balloon_actual_mb;  // how much the guest has given back so far
+  int mem_limit_mb;       // the limit, if it has one
   struct vmconfig cfg;
   uint64 entry;
   uint64 disk_sectors;

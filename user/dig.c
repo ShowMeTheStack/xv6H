@@ -11,7 +11,9 @@
 // address and dig is the program for everything else.
 #include "user/user.h"
 #include "kernel/net.h"
-#include "kernel/socket.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/time.h>
 
 #define T_A     1
 #define T_NS    2
@@ -177,21 +179,26 @@ ask(const char *name, int qtype)
   q[n++] = 0;
   q[n++] = 1;           // class IN
 
-  int fd = socket(SOCK_DGRAM);
+  int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
     fprintf(stderr, "dig: socket: %s\n", strerror(errno));
     return 1;
   }
+  struct sockaddr_in to;
+  memset(&to, 0, sizeof(to));
+  to.sin_family = AF_INET;
+  to.sin_port = htons((uint16)port);
+  to.sin_addr.s_addr = htonl(server);
+  struct timeval tv = {3, 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   int len = -1;
   for (int attempt = 0; attempt < 3 && len < 0; attempt++) {
-    if (sendto(fd, q, n, server, port) < 0) {
+    if (sendto(fd, q, n, 0, (struct sockaddr *)&to, sizeof(to)) < 0) {
       fprintf(stderr, "dig: sendto: %s\n", strerror(errno));
       close(fd);
       return 1;
     }
-    uint32 src;
-    int sport;
-    int got = recvfrom(fd, r, sizeof(r), &src, &sport, 30);
+    int got = recvfrom(fd, r, sizeof(r), 0, 0, 0);
     if (got < 12 || r[0] != (xid >> 8) || r[1] != (xid & 0xff))
       continue;
     len = got;

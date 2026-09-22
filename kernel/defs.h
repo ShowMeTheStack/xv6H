@@ -217,6 +217,11 @@ void            kstack_flush_ack(void);
 void            kstack_drain(void);
 void            kstack_stats(uint64 *, uint64 *);
 
+// ksm.c: guests sharing pages that hold the same bytes
+void            ksm_init(void);
+int             ksm_set(int on);
+void            ksm_stats(uint64 *, int);
+
 // proc.c (more)
 struct file;
 struct fdtable;
@@ -332,6 +337,11 @@ void            random_add(const void *, int);
 void            netinit(void);
 void            net_timer(void);
 void            virtio_net_intr(int);
+
+// virtio_balloon.c: a guest giving its memory back to the host
+int             virtio_balloon_init(void);
+void            virtio_balloon_intr(int);
+uint64          virtio_balloon_pages(void);
 void            bridgeinit(void);
 
 // fpu.S

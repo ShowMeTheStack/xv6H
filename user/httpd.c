@@ -13,7 +13,8 @@
 // published-port tests: something that listens, says what it is, and
 // can be asked for a file whose contents are known.
 //
-#include "kernel/socket.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include "user/user.h"
 #include <signal.h>
 #include <syslog.h>
@@ -197,12 +198,17 @@ main(int argc, char *argv[])
     }
   }
 
-  int s = socket(SOCK_STREAM);
+  int s = socket(AF_INET, SOCK_STREAM, 0);
   if (s < 0) {
     fprintf(stderr, "httpd: socket: %s\n", strerror(errno));
     exit(1);
   }
-  if (bind(s, port) < 0) {
+  struct sockaddr_in me;
+  memset(&me, 0, sizeof(me));
+  me.sin_family = AF_INET;
+  me.sin_port = htons((uint16)port);
+  me.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (bind(s, (struct sockaddr *)&me, sizeof(me)) < 0) {
     fprintf(stderr, "httpd: port %d: %s\n", port, strerror(errno));
     exit(1);
   }
@@ -230,9 +236,11 @@ main(int argc, char *argv[])
   syslog(LOG_NOTICE, "listening on port %d, serving %s", port, docroot);
 
   for (;;) {
-    uint32 from = 0;
-    int fromport = 0;
-    int c = accept(s, &from, &fromport);
+    struct sockaddr_in peer;
+    socklen_t peerlen = sizeof(peer);
+    memset(&peer, 0, sizeof(peer));
+    int c = accept(s, (struct sockaddr *)&peer, &peerlen);
+    uint32 from = ntohl(peer.sin_addr.s_addr);
     if (c < 0) {
       if (errno == EINTR)
         continue;

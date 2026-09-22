@@ -50,36 +50,245 @@ void kernelvec(void);
 _Static_assert(__builtin_offsetof(struct vcpu, hostctx) == 256, "vcpu layout");
 _Static_assert(__builtin_offsetof(struct vcpu, host_tp) == 368, "vcpu layout");
 
-// ---- guest memory: 2 MB chunks from the buddy allocator, on demand ----
+// ---- guest memory, on demand, 2 MB at a time or 4 KB at a time ----
+//
+// a chunk of guest RAM is 2 MB, which is what a G-stage megapage
+// covers, and backing one with a single block of host memory is the
+// cheap thing to do: one page table entry, one allocation, and the
+// hardware walks one level less. That is what happens while the host
+// still has 2 MB blocks to give and the VM did not ask for otherwise.
+//
+// but a megapage is one thing: it cannot be given back in pieces, and
+// two guests cannot be made to share half of it. A balloon taking a
+// page back, same-page merging pointing two guests at one frame, and
+// copy-on-write after a snapshot all need the page to be the unit. So
+// a chunk has a second form -- 512 frames, mapped one at a time -- and
+// gstage_split turns the first into the second without moving
+// anything: the block stays where it is, the page database is told it
+// is now 512 separate pages (kmem_split), and the megapage entry is
+// replaced by a table of 512 leaves.
+//
+// which form a chunk has is in the low bit of its entry in vm->chunk;
+// nothing above this file needs to know, because vm_gpa2hpa answers
+// with a host address and the length that is contiguous from it.
 
-static void gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa);
+static int gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa);
+static int gstage_map_page(struct vm *vm, uint64 gpa, uint64 hpa);
+static void gstage_unmap_page(struct vm *vm, uint64 gpa);
+static int gstage_split(struct vm *vm, int k, uint64 *pages);
 
-// back the 2 MB chunk holding gpa, if gpa is guest RAM and the chunk is not
-// backed yet. returns 0 when the chunk is backed (now or before), 1 when
-// gpa is not guest RAM, -1 when no memory could be had.
+// may this VM hold `bytes` more of the host's memory?
+//
+// the limit is the whole of a VM's memory control: it may be given
+// more memory than it will ever be allowed to hold, because nothing
+// is backed until it is touched, and this is where the promise is
+// kept. Over the limit the answer is no, and the fault handler --
+// which, unlike this, is allowed to wait -- asks the guest for memory
+// back and tries again.
+static int
+mem_charge(struct vm *vm, uint64 bytes)
+{
+  int ok;
+
+  if (vm->mem_limit == 0)
+    return 0;
+  acquire(&vm->memlock);
+  ok = vm->resident + bytes <= vm->mem_limit;
+  release(&vm->memlock);
+  return ok ? 0 : -2;
+}
+
+// back one 4 KB page of chunk k, giving the chunk its array of frames
+// first if it has none. returns 0 when the page is backed.
+static int
+touch_page(struct vm *vm, int k, uint64 in)
+{
+  uint64 *pages;
+  int i = in / PGSIZE;
+
+  // the common case is a page that is already there. an entry only
+  // ever goes from zero to a frame under the lock, and reading an
+  // aligned word cannot tear, so seeing a frame here means there is
+  // one; seeing zero means taking the lock and looking properly.
+  uint64 c = vm->chunk[k];
+  if (c && gc_split(c) && gc_pages(c)[i])
+    return 0;
+
+  acquire(&vm->memlock);
+  if (vm->chunk[k] && !gc_split(vm->chunk[k])) {
+    release(&vm->memlock);
+    return 0;   // it became a megapage while we were on our way here
+  }
+  pages = gc_split(vm->chunk[k]) ? gc_pages(vm->chunk[k]) : 0;
+  release(&vm->memlock);
+
+  if (pages == 0) {
+    uint64 *np = (uint64 *)kalloc();
+    if (np == 0)
+      return -1;
+    memset(np, 0, PGSIZE);
+    acquire(&vm->memlock);
+    if (vm->chunk[k] == 0) {
+      vm->chunk[k] = (uint64)np | GC_SPLIT;
+      vm->nsplit++;
+      np = 0;
+    }
+    pages = gc_split(vm->chunk[k]) ? gc_pages(vm->chunk[k]) : 0;
+    release(&vm->memlock);
+    if (np)
+      kfree(np);
+    if (pages == 0)
+      return 0;   // another vcpu made it a megapage
+  }
+
+  if (pages[i])
+    return 0;
+  int over = mem_charge(vm, PGSIZE);
+  if (over < 0)
+    return over;
+  void *pa = kalloc_guest(0);
+  if (pa == 0)
+    return -1;
+  memset(pa, 0, PGSIZE);
+  acquire(&vm->memlock);
+  if (pages[i] == 0) {
+    if (gstage_map_page(vm, G_RAM_BASE + (uint64)k * HCHUNK + in,
+                        (uint64)pa) == 0) {
+      pages[i] = (uint64)pa;
+      vm->resident += PGSIZE;
+      pa = 0;
+    }
+  }
+  release(&vm->memlock);
+  if (pa) {
+    kfree(pa);
+    return pages[i] ? 0 : -1;
+  }
+  return 0;
+}
+
+// back the granule holding gpa, if gpa is guest RAM and it is not
+// backed yet. returns 0 when it is backed (now or before), 1 when gpa
+// is not guest RAM, -1 when no memory could be had.
 int
 vm_touch(struct vm *vm, uint64 gpa)
 {
   if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
     return 1;
-  int k = (gpa - G_RAM_BASE) / HCHUNK;
-  if (vm->chunk[k])
+  uint64 off = gpa - G_RAM_BASE;
+  int k = off / HCHUNK;
+  uint64 c = vm->chunk[k];
+
+  if (c && !gc_split(c))
     return 0;
-  // allocate and zero outside the lock; another vcpu may win the race.
-  void *pa = kalloc_guest(HCHUNK_ORDER);
-  if (pa == 0)
-    return -1;
-  memset(pa, 0, HCHUNK);
-  acquire(&vm->lock);
-  if (vm->chunk[k] == 0) {
-    vm->chunk[k] = (uint64)pa;
-    vm->resident += HCHUNK;
-    gstage_map_chunk(vm, G_RAM_BASE + (uint64)k * HCHUNK, (uint64)pa);
-    pa = 0;
+  if (c == 0 && vm->prefer_huge && mem_charge(vm, HCHUNK) == 0) {
+    // allocate and zero outside the lock; another vcpu may win the race
+    void *pa = kalloc_guest(HCHUNK_ORDER);
+    if (pa) {
+      memset(pa, 0, HCHUNK);
+      acquire(&vm->memlock);
+      if (vm->chunk[k] == 0) {
+        if (gstage_map_chunk(vm, G_RAM_BASE + (uint64)k * HCHUNK,
+                             (uint64)pa) == 0) {
+          vm->chunk[k] = (uint64)pa;
+          vm->resident += HCHUNK;
+          pa = 0;
+        }
+      }
+      release(&vm->memlock);
+      if (pa) {
+        kfree_order(pa, HCHUNK_ORDER);
+        return vm->chunk[k] ? 0 : -1;
+      }
+      return 0;
+    }
+    // no 2 MB block to be had. what is left of memory is in smaller
+    // pieces, and a guest that can run on those is better than a
+    // guest that cannot run at all.
   }
-  release(&vm->lock);
-  if (pa)
-    kfree_order(pa, HCHUNK_ORDER);
+  return touch_page(vm, k, off % HCHUNK);
+}
+
+// make the chunk holding gpa page-granular, backing it first if it is
+// not backed at all. 0 on success.
+int
+vm_split(struct vm *vm, uint64 gpa)
+{
+  int r;
+
+  if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
+    return -1;
+  int k = (gpa - G_RAM_BASE) / HCHUNK;
+  if ((r = vm_touch(vm, gpa)) != 0)
+    return r;
+  if (gc_split(vm->chunk[k]))
+    return 0;
+  // the page that will hold the 512 frames, allocated before the lock
+  // is taken because kalloc may ask the block cache for memory back
+  uint64 *pages = (uint64 *)kalloc();
+  if (pages == 0)
+    return -1;
+  acquire(&vm->memlock);
+  r = gstage_split(vm, k, pages);
+  release(&vm->memlock);
+  if (r != 0)
+    kfree(pages);
+  if (r == 0)
+    vm_fence(vm);
+  return r < 0 ? -1 : 0;
+}
+
+// take one 4 KB page of guest RAM away: the guest's next touch of it
+// faults and gets a fresh zeroed page. this is what a balloon
+// inflating does, and what a page that has been merged away no longer
+// needs. the chunk is split first if it is still a megapage.
+int
+vm_unback(struct vm *vm, uint64 gpa)
+{
+  uint64 frame = 0;
+
+  if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
+    return -1;
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK;
+  int i = (off % HCHUNK) / PGSIZE;
+
+  if (vm->chunk[k] == 0)
+    return 0;   // nothing there to take
+  uint64 *spare = 0;
+  if (!gc_split(vm->chunk[k]) && (spare = (uint64 *)kalloc()) == 0)
+    return -1;
+
+  acquire(&vm->memlock);
+  if (vm->chunk[k] == 0) {
+    release(&vm->memlock);
+    if (spare)
+      kfree(spare);
+    return 0;
+  }
+  if (!gc_split(vm->chunk[k])) {
+    if (spare == 0 || gstage_split(vm, k, spare) < 0) {
+      release(&vm->memlock);
+      if (spare)
+        kfree(spare);
+      return -1;
+    }
+    spare = 0;   // the chunk owns it now
+  }
+  uint64 *pages = gc_pages(vm->chunk[k]);
+  frame = pages[i];
+  if (frame) {
+    pages[i] = 0;
+    vm->resident -= PGSIZE;
+    gstage_unmap_page(vm, G_RAM_BASE + off);
+  }
+  release(&vm->memlock);
+  if (spare)
+    kfree(spare);
+  // the frame goes back to the host only once no vcpu can reach it
+  vm_fence_sync(vm);
+  if (frame)
+    kfree((void *)frame);
   return 0;
 }
 
@@ -129,53 +338,383 @@ hypinithart(void)
 
 // ---- G-stage page tables (Sv48x4 when the host runs Sv48, else Sv39x4) ----
 
+// a page for a G-stage table. the tables are ordinary pages: one per
+// 2 MB of a chunk that has been split, which is unbounded in a way
+// that a fixed pool is not, and each one is given back by
+// gstage_free_tables when the VM goes.
+//
+// kalloc_order(0) rather than kalloc(): this runs with vm->lock held,
+// and kalloc may ask the block cache to give pages back, which sleeps.
+// The order-0 path takes km.lock and nothing else.
 static uint64 *
 pt_page(struct vm *vm)
 {
-  if (vm->ptnext + PGSIZE > vm->ptchunk + HCHUNK)
-    panic("hyp: page table chunk exhausted");
-  uint64 *p = (uint64 *)vm->ptnext;
-  vm->ptnext += PGSIZE;
+  uint64 *p = kalloc_order(0);
+
+  if (p == 0)
+    return 0;
+  memset(p, 0, PGSIZE);
+  vm->pttables++;
   return p;
 }
 
-// map one 2 MB guest-physical chunk to host physical hpa (vm->lock held,
-// or the VM not yet running). the root has 2048 entries (11 index bits):
-// Sv48x4 walks root(bits 39..49) -> level 2 -> level 1 leaf; Sv39x4 walks
-// root(bits 30..40) -> level 1 leaf.
-static void
-gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa)
+// G-stage leaf bits: U is required of a leaf, and A and D are preset
+// because nothing here reads them.
+#define GPTE_LEAF (PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | (1L << 6) | (1L << 7))
+
+// the entry that translates gpa at `level`, making the tables above it
+// if `alloc`. level 1 is a 2 MB entry, level 0 a 4 KB one. the root has
+// 2048 entries (11 index bits): Sv48x4 walks root(bits 39..49) -> level
+// 2 -> level 1; Sv39x4 walks root(bits 30..40) -> level 1. vm->lock is
+// held, or the VM is not running yet.
+static uint64 *
+gstage_pte(struct vm *vm, uint64 gpa, int level, int alloc)
 {
   uint64 *t = vm->hgatp_root;
   int top = (plat.mmu_levels == 4) ? 3 : 2;
-  for (int l = top; l > 1; l--) {
+
+  for (int l = top; l > level; l--) {
     uint64 idx = (l == top) ? ((gpa >> (12 + 9 * l)) & 0x7ff) : PX(l, gpa);
     uint64 *next;
     if (t[idx] & PTE_V) {
+      if (t[idx] & (PTE_R | PTE_W | PTE_X))
+        return 0;   // a bigger leaf already covers it
       next = (uint64 *)PTE2PA(t[idx]);
     } else {
+      if (!alloc)
+        return 0;
       next = pt_page(vm);
+      if (next == 0)
+        return 0;
       t[idx] = PA2PTE(next) | PTE_V;
     }
     t = next;
   }
-  // G-stage leaf PTEs must have U set; preset A and D.
-  t[PX(1, gpa)] = PA2PTE(hpa) | PTE_V | PTE_R | PTE_W | PTE_X | PTE_U | (1L << 6) | (1L << 7);
+  return &t[level == top ? ((gpa >> (12 + 9 * level)) & 0x7ff) : PX(level, gpa)];
 }
 
+// map one 2 MB guest-physical chunk to host physical hpa. 0, or -1
+// when the tables above it could not be made.
+static int
+gstage_map_chunk(struct vm *vm, uint64 gpa, uint64 hpa)
+{
+  uint64 *pte = gstage_pte(vm, gpa, 1, 1);
+
+  if (pte == 0)
+    return -1;
+  *pte = PA2PTE(hpa) | GPTE_LEAF;
+  return 0;
+}
+
+// map one 4 KB page
+static int
+gstage_map_page(struct vm *vm, uint64 gpa, uint64 hpa)
+{
+  uint64 *pte = gstage_pte(vm, gpa, 0, 1);
+
+  if (pte == 0)
+    return -1;
+  *pte = PA2PTE(hpa) | GPTE_LEAF;
+  return 0;
+}
+
+// unmap one 4 KB page. the caller flushes.
+static void
+gstage_unmap_page(struct vm *vm, uint64 gpa)
+{
+  uint64 *pte = gstage_pte(vm, gpa, 0, 0);
+
+  if (pte)
+    *pte = 0;
+}
+
+// a megapage becomes 512 pages of the same memory: one entry becomes a
+// table of 512 leaves, the buddy block is broken up in the page
+// database so its frames can be freed on their own, and nothing is
+// copied or moved.
+//
+// `pages` is the page that will hold the 512 frames, allocated by the
+// caller because this runs with vm->lock held. returns 0 when it was
+// used, 1 when it was not needed, -1 on failure.
+static int
+gstage_split(struct vm *vm, int k, uint64 *pages)
+{
+  uint64 c = vm->chunk[k];
+
+  if (c == 0 || gc_split(c))
+    return 1;
+  uint64 gpa = G_RAM_BASE + (uint64)k * HCHUNK;
+  uint64 *pte = gstage_pte(vm, gpa, 1, 0);
+  if (pte == 0)
+    return -1;
+  uint64 *t0 = pt_page(vm);
+  if (t0 == 0)
+    return -1;
+  for (int i = 0; i < HCHUNK_PAGES; i++) {
+    pages[i] = c + (uint64)i * PGSIZE;
+    t0[i] = PA2PTE(pages[i]) | GPTE_LEAF;
+  }
+  *pte = PA2PTE(t0) | PTE_V;
+  kmem_split((void *)c, HCHUNK_ORDER);
+  vm->chunk[k] = (uint64)pages | GC_SPLIT;
+  vm->nsplit++;
+  return 0;
+}
+
+// free a table and everything below it. `below` is how many levels of
+// table are under this one: an entry that is a leaf names guest
+// memory, which vm_free_resources gives back, not this.
+static void
+free_subtable(struct vm *vm, uint64 *t, int below)
+{
+  if (below > 0)
+    for (int i = 0; i < 512; i++) {
+      uint64 pte = t[i];
+      if ((pte & PTE_V) && !(pte & (PTE_R | PTE_W | PTE_X)))
+        free_subtable(vm, (uint64 *)PTE2PA(pte), below - 1);
+    }
+  kfree((void *)t);
+  vm->pttables--;
+}
+
+static void
+gstage_free_tables(struct vm *vm)
+{
+  uint64 *root = vm->hgatp_root;
+  int below = (plat.mmu_levels == 4) ? 2 : 1;
+
+  if (root == 0)
+    return;
+  for (int i = 0; i < 2048; i++) {
+    uint64 pte = root[i];
+    if ((pte & PTE_V) && !(pte & (PTE_R | PTE_W | PTE_X)))
+      free_subtable(vm, (uint64 *)PTE2PA(pte), below);
+  }
+  kfree_order(root, 2);   // 16 KB, 16 KB-aligned
+  vm->hgatp_root = 0;
+}
+
+// ---- pages shared between guests (ksm.c) ----
+//
+// the four calls below are the whole of what same-page merging needs
+// from this file: write-protect a page and hold on to its frame,
+// let it be written again, point a page at somebody else's frame, and
+// undo that when the guest writes. Everything about the G-stage and
+// about locking stays here.
+
+// write-protect the page holding gpa and return its frame with a
+// reference taken, splitting the chunk if it is still a megapage.
+// 0 if there is nothing there or it cannot be split.
+uint64
+vm_protect_page(struct vm *vm, uint64 gpa)
+{
+  uint64 frame = 0;
+
+  if (vm_split(vm, gpa) < 0)
+    return 0;
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK, i = (off % HCHUNK) / PGSIZE;
+
+  acquire(&vm->memlock);
+  uint64 c = vm->chunk[k];
+  if (c && gc_split(c) && (frame = gc_pages(c)[i]) != 0) {
+    uint64 *pte = gstage_pte(vm, G_RAM_BASE + off, 0, 0);
+    if (pte && (*pte & PTE_V)) {
+      *pte &= ~(uint64)PTE_W;
+      page_get(PA2PAGE(frame));
+    } else {
+      frame = 0;
+    }
+  }
+  release(&vm->memlock);
+  if (frame)
+    vm_fence_sync(vm);
+  return frame;
+}
+
+// let the page be written again, and drop the reference
+// vm_protect_page took.
+void
+vm_unprotect_page(struct vm *vm, uint64 gpa, uint64 frame)
+{
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK, i = (off % HCHUNK) / PGSIZE;
+
+  acquire(&vm->memlock);
+  uint64 c = vm->chunk[k];
+  if (c && gc_split(c) && gc_pages(c)[i] == frame) {
+    uint64 *pte = gstage_pte(vm, G_RAM_BASE + off, 0, 0);
+    if (pte && (*pte & PTE_V) && !(PA2PAGE(frame)->flags & PG_KSM))
+      *pte |= PTE_W;
+  }
+  release(&vm->memlock);
+  if (frame)
+    page_put(PA2PAGE(frame));
+}
+
+// point this VM's page at `frame`, read-only, and give up the frame it
+// had. the caller has write-protected both and found them equal.
+// returns 0 on success.
 int
-vm_gpa2hpa(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
+vm_share_page(struct vm *vm, uint64 gpa, uint64 frame)
+{
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK, i = (off % HCHUNK) / PGSIZE;
+  uint64 old = 0;
+
+  acquire(&vm->memlock);
+  uint64 c = vm->chunk[k];
+  uint64 *pte = c && gc_split(c) ? gstage_pte(vm, G_RAM_BASE + off, 0, 0) : 0;
+  if (pte == 0 || !(*pte & PTE_V) || gc_pages(c)[i] == 0 ||
+      gc_pages(c)[i] == frame) {
+    release(&vm->memlock);
+    return -1;
+  }
+  old = gc_pages(c)[i];
+  gc_pages(c)[i] = frame;
+  *pte = PA2PTE(frame) | (GPTE_LEAF & ~(uint64)PTE_W);
+  // the frame is shared from now on, and the count says by how many
+  PA2PAGE(frame)->flags |= PG_KSM;
+  page_get(PA2PAGE(frame));
+  release(&vm->memlock);
+
+  // the old frame goes back only once no vcpu can still reach it
+  vm_fence_sync(vm);
+  if (PA2PAGE(old)->flags & PG_KSM)
+    page_put(PA2PAGE(old));
+  else
+    kfree((void *)old);
+  return 0;
+}
+
+// a store to a page this VM maps read-only. if it is shared, the VM is
+// given a copy of its own; if it was only write-protected while it was
+// being compared, it becomes writable again. returns 1 when something
+// was done, 0 when the page was already writable (another hart got
+// there first), -1 when it is not a page this can help with.
+int
+vm_unshare(struct vm *vm, uint64 gpa)
+{
+  if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
+    return -1;
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK, i = (off % HCHUNK) / PGSIZE;
+  void *fresh = 0;
+  uint64 old = 0;
+  int r = 0;
+
+  // a copy may be needed, and allocating is not something to do with
+  // the lock held; an unused page costs one kfree
+  fresh = kalloc();
+
+  acquire(&vm->memlock);
+  uint64 c = vm->chunk[k];
+  uint64 *pte = c && gc_split(c) ? gstage_pte(vm, G_RAM_BASE + off, 0, 0) : 0;
+  if (pte == 0 || !(*pte & PTE_V)) {
+    r = -1;
+  } else if (*pte & PTE_W) {
+    r = 0;   // already writable
+  } else {
+    uint64 frame = gc_pages(c)[i];
+    struct page *pg = PA2PAGE(frame);
+    if ((pg->flags & PG_KSM) && pg->refcount > 1) {
+      if (fresh == 0) {
+        r = -1;
+      } else {
+        memmove(fresh, (void *)frame, PGSIZE);
+        gc_pages(c)[i] = (uint64)fresh;
+        *pte = PA2PTE(fresh) | GPTE_LEAF;
+        old = frame;
+        fresh = 0;
+        r = 1;
+      }
+    } else {
+      // nobody else has it: writing again is all it takes
+      pg->flags &= ~(uint16)PG_KSM;
+      *pte |= PTE_W;
+      r = 1;
+    }
+  }
+  release(&vm->memlock);
+
+  if (r == 1)
+    vm_fence_sync(vm);
+  if (old)
+    page_put(PA2PAGE(old));
+  if (fresh)
+    kfree(fresh);
+  return r;
+}
+
+// where gpa is in host memory, and how many bytes are contiguous from
+// there. memlock held, and nothing is backed here: a chunk backed by
+// one block answers with the rest of the chunk, a chunk backed a page
+// at a time with the rest of the page, and an unbacked one with -1.
+static int
+gpa2hpa_locked(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
 {
   if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
     return -1;
   uint64 off = gpa - G_RAM_BASE;
-  int k = off / HCHUNK;
+  uint64 c = vm->chunk[off / HCHUNK];
   uint64 in = off % HCHUNK;
-  if (vm->chunk[k] == 0 && vm_touch(vm, gpa) != 0)
+
+  if (c == 0)
     return -1;
-  *hpa = vm->chunk[k] + in;
-  *len = HCHUNK - in;
+  if (!gc_split(c)) {
+    *hpa = c + in;
+    *len = HCHUNK - in;
+    return 0;
+  }
+  uint64 frame = gc_pages(c)[in / PGSIZE];
+  if (frame == 0)
+    return -1;
+  *hpa = frame + (in % PGSIZE);
+  *len = PGSIZE - (in % PGSIZE);
   return 0;
+}
+
+// the same, backing what is not backed, and answering with a bare
+// pointer that is only good while nothing takes the page away.
+//
+// that is true for the whole of a VM's creation, which is the only
+// thing that uses this: the guest is not running, so its balloon
+// cannot be inflating. Everything that runs alongside a guest goes
+// through vm_copyin and vm_copyout, which hold the lock across the
+// copy for exactly this reason.
+int
+vm_gpa2hpa(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
+{
+  int r;
+
+  if (vm_touch(vm, gpa) != 0)
+    return -1;
+  acquire(&vm->memlock);
+  r = gpa2hpa_locked(vm, gpa, hpa, len);
+  release(&vm->memlock);
+  return r;
+}
+
+// one step of a copy: back the page if it is not backed, then take the
+// lock and find it. returns with memlock held on success, because the
+// address is only meaningful while it is: a balloon inflating on
+// another hart could otherwise take the page away and free it between
+// finding it and reading it, and a guest that arranged for that would
+// have the host reading memory it had given back.
+static int
+copy_step(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
+{
+  for (int tries = 0; tries < 2; tries++) {
+    if (vm_touch(vm, gpa) != 0)
+      return -1;
+    acquire(&vm->memlock);
+    if (gpa2hpa_locked(vm, gpa, hpa, len) == 0)
+      return 0;
+    release(&vm->memlock);
+    // it was taken away between backing it and looking: once is a
+    // race worth retrying, twice is a guest doing it on purpose
+  }
+  return -1;
 }
 
 int
@@ -183,11 +722,12 @@ vm_copyin(struct vm *vm, void *dst, uint64 gpa, uint64 n)
 {
   while (n > 0) {
     uint64 hpa, len;
-    if (vm_gpa2hpa(vm, gpa, &hpa, &len) < 0)
+    if (copy_step(vm, gpa, &hpa, &len) < 0)
       return -1;
     if (len > n)
       len = n;
     memmove(dst, (void *)hpa, len);
+    release(&vm->memlock);
     dst = (char *)dst + len;
     gpa += len;
     n -= len;
@@ -200,11 +740,12 @@ vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n)
 {
   while (n > 0) {
     uint64 hpa, len;
-    if (vm_gpa2hpa(vm, gpa, &hpa, &len) < 0)
+    if (copy_step(vm, gpa, &hpa, &len) < 0)
       return -1;
     if (len > n)
       len = n;
     memmove((void *)hpa, src, len);
+    release(&vm->memlock);
     src = (char *)src + len;
     gpa += len;
     n -= len;
@@ -231,18 +772,42 @@ vm_free_resources(struct vm *vm)
   vm->vnet.present = 0;
   vm->vnet.q[0].ready = 0;
   vm->vnet.q[1].ready = 0;
+  acquire(&vm->memlock);
   if (vm->chunk) {
-    for (int i = 0; i < vm->nchunks; i++)
-      if (vm->chunk[i])
-        kfree_order((void *)vm->chunk[i], HCHUNK_ORDER);
+    for (int i = 0; i < vm->nchunks; i++) {
+      uint64 c = vm->chunk[i];
+      if (c == 0)
+        continue;
+      if (gc_split(c)) {
+        // `frames' rather than `pages': PA2PAGE names the page
+        // database, and a local of that name would hide it
+        uint64 *frames = gc_pages(c);
+        for (int j = 0; j < HCHUNK_PAGES; j++) {
+          if (frames[j] == 0)
+            continue;
+          // a frame another guest is also mapping goes back only when
+          // the last of them lets go of it
+          if (PA2PAGE(frames[j])->flags & PG_KSM)
+            page_put(PA2PAGE(frames[j]));
+          else
+            kfree((void *)frames[j]);
+        }
+        kfree((void *)frames);
+      } else {
+        kfree_order((void *)c, HCHUNK_ORDER);
+      }
+      vm->chunk[i] = 0;
+    }
     kfree((void *)vm->chunk);
     vm->chunk = 0;
   }
   vm->nchunks = 0;
   vm->resident = 0;
-  if (vm->ptchunk)
-    kfree_order((void *)vm->ptchunk, HCHUNK_ORDER);
-  vm->ptchunk = 0;
+  vm->nsplit = 0;
+  // the tables come last: freeing them walks them, and a chunk's
+  // memory is named by vm->chunk rather than by what they say
+  gstage_free_tables(vm);
+  release(&vm->memlock);
   if (vm->blk.bounce)
     kfree(vm->blk.bounce);
   vm->blk.bounce = 0;
@@ -360,6 +925,84 @@ vcpu_request_fence(struct vcpu *v, int what)
   vcpu_kick(v);
 }
 
+// the VM is at its memory limit and a vcpu is waiting to go further.
+// ask the guest, through its balloon, to give back the difference
+// between what it has been given and what it may hold, and wait a
+// tick for it to answer. returns 0 if it is worth trying again.
+//
+// the order is the only one that is fair: the guest is asked first,
+// because it knows which of its pages matter and the host does not;
+// only when it will not or cannot answer is the VM stopped.
+int
+vm_reclaim(struct vm *vm, int tries)
+{
+  if (vm->mem_limit == 0 || tries > 100)
+    return -1;
+  vm->stalls++;
+  if (vm->balloon.present && vm->ram_size > vm->mem_limit)
+    vballoon_set(vm, vm->ram_size - vm->mem_limit);
+  acquire(&tickslock);
+  sleep_prepare(&ticks);
+  release(&tickslock);
+  sleep();
+  return 0;
+}
+
+// the G-stage mapping of this VM has changed, so every vcpu of it must
+// throw away what it has cached about guest-physical addresses. a vcpu
+// inside the guest is kicked out to do it; one that is not running
+// does it when it next goes in.
+//
+// the fence is asked for rather than executed here because a G-stage
+// TLB entry belongs to the hart that walked it, and this hart is not
+// necessarily one of them.
+void
+vm_fence(struct vm *vm)
+{
+  acquire(&vm->lock);
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_request_fence(&vm->vcpu[i], FENCE_GVMA);
+  release(&vm->lock);
+}
+
+// the same, and then wait until no vcpu can still be using what the
+// mapping used to say.
+//
+// asking is not enough when the page is about to be given back to the
+// host: a vcpu inside the guest still has the old translation in its
+// TLB and would go on writing to a page that by then belonged to
+// somebody else. So this waits until every vcpu has either taken the
+// fence -- which it does on its way in, before any guest instruction
+// -- or left the guest, which it must do to take one.
+//
+// it terminates because a vcpu cannot stay in the guest: the kick is
+// an interrupt, and failing that the timer is.
+void
+vm_fence_sync(struct vm *vm)
+{
+  vm_fence(vm);
+  for (int round = 0; round < 1000; round++) {
+    int busy = 0;
+    acquire(&vm->lock);
+    for (int i = 0; i < vm->nvcpu; i++) {
+      struct vcpu *v = &vm->vcpu[i];
+      if (v->running_hart >= 0 && v->running_hart != cpuid() &&
+          (__atomic_load_n(&v->fence_req, __ATOMIC_SEQ_CST) & FENCE_GVMA))
+        busy = 1;
+    }
+    release(&vm->lock);
+    if (!busy)
+      return;
+    if (round < 64)
+      continue;   // the IPI is on its way; spinning is cheaper than sleeping
+    acquire(&tickslock);
+    sleep_prepare(&ticks);
+    release(&tickslock);
+    sleep();
+  }
+  printk("hyp: vm %d: a vcpu will not take a G-stage fence\n", vm->id);
+}
+
 static int vm_load(struct vm *vm);
 
 // create a VM from cfg: memory, devices, the disk image file, and the
@@ -393,6 +1036,7 @@ vm_create(struct vmconfig *cfg)
         break;
       memset(nv, 0, sizeof(*nv));
       initlock(&nv->lock, "vm");
+      initlock(&nv->memlock, "vmmem");
       nv->id = i;
       nv->state = VM_FREE;
       vmtab[i] = nv;
@@ -408,9 +1052,10 @@ vm_create(struct vmconfig *cfg)
     return -1;
 
   int id = vm->id;
-  struct spinlock lk = vm->lock;
+  struct spinlock lk = vm->lock, mlk = vm->memlock;
   memset(vm, 0, sizeof(*vm));
   vm->lock = lk;
+  vm->memlock = mlk;
   vm->id = id;
   vm->state = VM_NEW;
   vm->cfg = *cfg;
@@ -418,6 +1063,10 @@ vm_create(struct vmconfig *cfg)
   vm->ram_size = mem_bytes;
   vm->nchunks = mem_bytes / HCHUNK;
   vm->resident = 0;
+  vm->prefer_huge = (cfg->flags & VMF_NOHUGE) == 0;
+  vm->mem_limit = (uint64)cfg->mem_limit_mb * 1024 * 1024;
+  if (vm->mem_limit > mem_bytes)
+    vm->mem_limit = 0;   // a limit above the memory it has is no limit
 
   // the chunk table: one host address per 2 MB of guest RAM, filled in as
   // the guest touches its memory (vm_touch).
@@ -432,14 +1081,15 @@ vm_create(struct vmconfig *cfg)
     memset(vm->chunk, 0, (uint64)PGSIZE << order);
   }
 
-  vm->ptchunk = (uint64)kalloc_guest(HCHUNK_ORDER);
-  if (vm->ptchunk == 0)
+  // the G-stage root: 16 KB, naturally aligned, which is what an
+  // x4 root has to be. everything below it is an ordinary page.
+  vm->hgatp_root = kalloc_order(2);
+  if (vm->hgatp_root == 0)
     goto fail;
-  memset((void *)vm->ptchunk, 0, HCHUNK);
-  vm->hgatp_root = (uint64 *)vm->ptchunk; // 16 KB, 2 MB aligned
-  vm->ptnext = vm->ptchunk + 4 * PGSIZE;
+  memset(vm->hgatp_root, 0, 4 * PGSIZE);
   vm->hgatp = (plat.mmu_levels == 4 ? HGATP_MODE_SV48X4 : HGATP_MODE_SV39X4) |
-              ((uint64)(id + 1) << HGATP_VMID_SHIFT) | (vm->ptchunk >> 12);
+              ((uint64)(id + 1) << HGATP_VMID_SHIFT) |
+              ((uint64)vm->hgatp_root >> 12);
 
   // the guest device tree sits in the last 64 KB of guest RAM.
   vm->dtb_gpa = G_RAM_BASE + vm->ram_size - 0x10000;
@@ -490,6 +1140,7 @@ vm_create(struct vmconfig *cfg)
   vic_init(vm);
   vvirtio_init(vm);
   vvnet_init(vm);
+  vballoon_init(vm);
   vrtc_init(vm);
   if (vm->blk.bounce == 0)
     goto fail;
@@ -506,6 +1157,7 @@ vm_create(struct vmconfig *cfg)
   return id;
 
 fail:
+  vvirtio_stop(vm);
   vm_free_resources(vm);
   {
     struct inode *ip = vm->disk_ip;
@@ -675,6 +1327,9 @@ vm_resume(struct vm *vm)
 int
 vm_destroy(struct vm *vm)
 {
+  // before anything: the disk thread reads and writes guest memory,
+  // and this may be about to free it
+  vvirtio_stop(vm);
   acquire(&vm->lock);
   if (vm->state == VM_FREE) {
     release(&vm->lock);
@@ -794,6 +1449,8 @@ vcpu_enter(struct vcpu *v)
   int fences = __atomic_exchange_n(&v->fence_req, 0, __ATOMIC_SEQ_CST);
   if (v->last_hart != hart || (fences & FENCE_VMA))
     asm volatile("hfence.vvma zero, zero" ::: "memory");
+  if (fences & FENCE_GVMA)
+    asm volatile("hfence.gvma zero, zero" ::: "memory");
   if (fences & FENCE_I)
     asm volatile("fence.i" ::: "memory");
   v->last_hart = hart;
@@ -983,8 +1640,32 @@ handle_exit(struct vcpu *v)
     // the chunk (before intr_on: the fetch below must stay on this hart).
     uint64 gpa = (htval << 2) | (stval & 3);
     int t = vm_touch(v->vm, gpa);
-    if (t == 0)
+    if (t == -2) {
+      // at its limit. asking the guest for memory back means waiting
+      // for it, and waiting means letting interrupts in -- so this is
+      // done here and not with the rest, which runs with them off so
+      // that the fetch below stays on this hart. Nothing after this
+      // fetches: either the page is there and we go back to the run
+      // loop, which re-enters the guest with the CSRs set up for
+      // whichever hart we are on by then, or the VM is stopped.
+      intr_on();
+      for (int tries = 0; t == -2 && vm_reclaim(v->vm, tries) == 0; tries++)
+        t = vm_touch(v->vm, gpa);
+      if (t == 0)
+        return 0;
+      printk("hyp: vm %d: at its %ld MB limit and it will not come down; halting the vm\n",
+             v->vm->id, (long)(v->vm->mem_limit >> 20));
+      vm_halt(v->vm);
+      return -1;
+    }
+    if (t == 0) {
+      // the page is there. a store that still faulted is a store to a
+      // page mapped read-only because it is shared, and the writer
+      // gets a copy of its own (see vm_unshare).
+      if (scause == EXC_STORE_GPF)
+        vm_unshare(v->vm, gpa);
       return 0;
+    }
     if (t < 0) {
       printk("hyp: vm %d: out of memory backing guest RAM at gpa 0x%lx; halting the vm\n", v->vm->id, gpa);
       vm_halt(v->vm);
@@ -1106,7 +1787,17 @@ vm_run(struct vm *vm, int vcpuid)
       vcpu_kick(&vm->vcpu[i]);
   }
   struct gendisk *dev = 0;
-  if (vm->vcpus_running == 0) {
+  int last = vm->vcpus_running == 0;
+  release(&vm->lock);
+
+  if (last) {
+    // the disk thread is reading and writing this guest's memory, so
+    // it has to be gone before the memory is. Waiting is something
+    // only a thread with no lock may do, which is why the lock was
+    // dropped first; no vcpu is running by now, so nothing can start
+    // the VM up again in between.
+    vvirtio_stop(vm);
+    acquire(&vm->lock);
     vm_free_resources(vm);
     ip = vm->disk_ip;
     dev = vm->disk;
@@ -1114,8 +1805,8 @@ vm_run(struct vm *vm, int vcpuid)
     vm->disk = 0;
     vm->state = VM_FREE;
     wakeup(&vm->cons_out); // an attached console reader sees the end
+    release(&vm->lock);
   }
-  release(&vm->lock);
   vm_put_disk(ip);
   vm_put_device(dev);
   return rc;
@@ -1138,6 +1829,14 @@ hyp_stats(uint64 *out, int n)
       t += ipi_count[i];
     out[1] = t;
   }
+  // the same number as out[0] but in pages, which is what a test for
+  // a leak has to compare: a megabyte is 256 pages, and rounding to
+  // megabytes hides everything smaller than that
+  if (n > 2 + NVM)
+    out[2 + NVM] = kmem_free_pages() + blk_reclaimable();
+  // 3+NVM..6+NVM: same-page merging -- on, scanned, merged, shared
+  if (n > 3 + NVM)
+    ksm_stats(&out[3 + NVM], n - (3 + NVM));
   for (int i = 0; i < NVM && 2 + i < n; i++) {
     uint64 e = 0;
     struct vm *vm = vmtab[i];

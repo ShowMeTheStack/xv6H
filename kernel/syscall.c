@@ -115,7 +115,14 @@ extern uint64 sys_accept(void);
 extern uint64 sys_sendto(void);
 extern uint64 sys_recvfrom(void);
 extern uint64 sys_netinfo(void);
-extern uint64 sys_sockopt(void);
+extern uint64 sys_setsockopt(void);
+extern uint64 sys_getsockopt(void);
+extern uint64 sys_sendmsg(void);
+extern uint64 sys_recvmsg(void);
+extern uint64 sys_socketpair(void);
+extern uint64 sys_getsockname(void);
+extern uint64 sys_getpeername(void);
+extern uint64 sys_shutdown(void);
 extern uint64 sys_setpriority(void);
 extern uint64 sys_getpriority(void);
 extern uint64 sys_ptrace(void);
@@ -255,7 +262,14 @@ static uint64 (*syscalls[])(void) = {
   [SYS_sendto]     = sys_sendto,
   [SYS_recvfrom]   = sys_recvfrom,
   [SYS_netinfo]    = sys_netinfo,
-  [SYS_sockopt]    = sys_sockopt,
+  [SYS_setsockopt] = sys_setsockopt,
+  [SYS_getsockopt] = sys_getsockopt,
+  [SYS_sendmsg]    = sys_sendmsg,
+  [SYS_recvmsg]    = sys_recvmsg,
+  [SYS_socketpair] = sys_socketpair,
+  [SYS_getsockname] = sys_getsockname,
+  [SYS_getpeername] = sys_getpeername,
+  [SYS_shutdown]   = sys_shutdown,
   [SYS_setpriority] = sys_setpriority,
   [SYS_getpriority] = sys_getpriority,
   [SYS_ptrace]     = sys_ptrace,

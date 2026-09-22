@@ -406,6 +406,17 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     node_end(&w);
   }
 
+  if (vm->balloon.present) {
+    node_begin(&w, "virtio_mmio@10003000");
+    prop_str(&w, "compatible", "virtio,mmio");
+    prop_reg(&w, G_BALLOON_BASE, 0x1000);
+    prop_u32(&w, "interrupt-parent", ic_phandle);
+    cells[0] = G_BALLOON_IRQ;
+    cells[1] = 4;
+    prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
+    node_end(&w);
+  }
+
   if (vm->vnet.present) {
     node_begin(&w, "virtio_mmio@10002000");
     prop_str(&w, "compatible", "virtio,mmio");

@@ -39,10 +39,14 @@ bswap32(uint32 x)
 {
   return ((x & 0xff) << 24) | ((x & 0xff00) << 8) | ((x >> 8) & 0xff00) | (x >> 24);
 }
+// a user program that has included <netinet/in.h> already has these
+// as functions, which are the same four swaps; do not shadow them
+#ifndef htons
 #define htons(x) bswap16(x)
 #define ntohs(x) bswap16(x)
 #define htonl(x) bswap32(x)
 #define ntohl(x) bswap32(x)
+#endif
 
 // ---- ethernet ----
 #define ETHADDR_LEN 6
@@ -73,6 +77,7 @@ struct arp {
 } __attribute__((packed));
 
 // ---- ipv4 ----
+#define IPPROTO_IP   0
 #define IPPROTO_ICMP 1
 #define IPPROTO_TCP  6
 #define IPPROTO_UDP  17

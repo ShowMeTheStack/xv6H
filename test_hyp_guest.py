@@ -39,9 +39,22 @@ def attach(q, vm):
 
 def host_stats(q):
     q.send("vmm stats\n")
-    m = q.expect(r"free guest memory: (\d+) MB, ipis: (\d+)", 10)
+    m = q.expect(r"free guest memory: (\d+) MB \((\d+) pages\), ipis: (\d+)", 10)
     q.expect(r"\$ ", 5)
-    return int(m.group(1)), int(m.group(2))
+    return int(m.group(1)), int(m.group(3))
+
+
+def host_pages(q):
+    """free guest memory in pages rather than megabytes.
+
+    the megabyte figure rounds down, so two readings 255 pages apart
+    can print the same number and two readings one page apart can
+    print different ones.  Anything looking for a leak has to use
+    this."""
+    q.send("vmm stats\n")
+    m = q.expect(r"free guest memory: \d+ MB \((\d+) pages\)", 10)
+    q.expect(r"\$ ", 5)
+    return int(m.group(1))
 
 
 def wait_free(q, free0, timeout=20):
@@ -150,6 +163,272 @@ def t_guest_usertests(QEMU, intc, cpus, log, vcpus=1, extra=""):
         q.expect(r"\$ ", 5)
         kill_vm(q, vmid)
         assert_gone(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_pages(QEMU, intc, cpus, log):
+    """a guest whose memory is backed 4 KB at a time.
+
+    with -4 the host never uses a megapage for guest RAM: every chunk
+    gets a table of 512 leaves and a frame per page as the guest
+    touches it.  That is the shape a balloon and same-page merging
+    need, and it is also what is left when the host has no 2 MB blocks
+    to give, so it has to work as well as the fast path does -- and it
+    has to give every page back."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -4")
+        m = q.mark()
+        q.send("usertests -q\n")
+        q.expect(r"ALL TESTS PASSED|FAILED|panic", 1200)
+        out = q.output_since(m)
+        assert "ALL TESTS PASSED" in out, out[-3000:]
+        q.expect(r"\$ ", 30)
+        detach(q)
+
+        # the host's own view: nothing megapaged, and tables to match
+        m = q.mark()
+        q.send("vmm info %d\n" % vmid)
+        q.expect(r"\$ ", 10)
+        info = q.output_since(m)
+        mm = re.search(r"memory: (\d+) chunks split to pages, (\d+) table pages"
+                       r", 4 KB pages only", info)
+        assert mm, info
+        split, tables = int(mm.group(1)), int(mm.group(2))
+        assert split > 0, info
+        # one table page per split chunk, plus the levels above them
+        assert tables >= split, info
+
+        kill_vm(q, vmid)
+        assert_gone(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+
+        # and every page of it comes back.  This is measured with a
+        # guest that only boots, as guest-churn is, because a guest
+        # that runs usertests leaves twenty-odd pages of the host's
+        # own caches behind whether its memory was megapaged or not --
+        # that is what the host wrote to the disk image, not what the
+        # guest was given.
+        #
+        # the slack is four pages against six rounds, and it is there
+        # because backing a guest a page at a time is a hundred times
+        # more allocation than megapaging it, which makes the host's
+        # object caches grow once.  Measured over eighteen rounds the
+        # count loses a single page early and then does not move
+        # again; a leak would go on costing a page a round, and four
+        # pages over six rounds would not hide one.
+        free0 = settled_pages(q)
+        for r in range(1, 7):
+            vmid = start_guest(q, "-c 1 -4")
+            q.send("echo round-%d\n" % r)
+            q.expect(r"\nround-%d" % r, 10)
+            detach(q)
+            kill_vm(q, vmid)
+        free1 = wait_pages(q, free0 - 4)
+        assert free1 >= free0 - 4, (free0, free1)
+    finally:
+        q.close()
+
+
+def vm_resident_mb(q, vmid):
+    m = q.mark()
+    q.send("vmm info %d\n" % vmid)
+    q.expect(r"\$ ", 10)
+    txt = q.output_since(m)
+    mm = re.search(r"\((\d+) MB resident\)", txt)
+    assert mm, txt
+    return int(mm.group(1)), txt
+
+
+def t_balloon(QEMU, intc, cpus, log):
+    """a guest gives its memory back, and takes it again.
+
+    the host asks; the guest's driver sets pages aside so that nothing
+    in the guest will touch them and says which they are; the host
+    takes the backing away.  What is checked is that the memory really
+    moves -- the guest's resident size falls, the host's free count
+    rises by about the same -- and that deflating puts it all back.
+
+    the guest is made to touch its memory first and then let go of it
+    again, because a balloon can only hand over pages the guest is not
+    using.  Writing a file and deleting it does both in a few seconds,
+    where running a test suite would take minutes."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 256")
+        # sbrkmuch grows the heap as far as it will go, writes to all
+        # of it and gives it back: the host has backed those pages and
+        # the guest is no longer using them, which is exactly what a
+        # balloon is for. (The disk is sixteen megabytes, so writing a
+        # file would not get anywhere near.)
+        q.send("usertests sbrkmuch\n")
+        q.expect(r"ALL TESTS PASSED|SOME TESTS FAILED|panic", 300)
+        q.expect(r"\$ ", 60)
+        detach(q)
+
+        res0, _ = vm_resident_mb(q, vmid)
+        free0 = host_pages(q)
+        assert res0 >= 64, res0
+
+        # a balloon is a request, not a demand: the guest hands over
+        # what it is not using, which is less than it holds.  What is
+        # checked is that whatever it did give up, the host got --
+        # not that it gave up some particular figure.
+        want = 64
+        q.send("vmm balloon %d %d\n" % (vmid, want))
+        q.expect(r"asked for %d MB back" % want, 30)
+        q.expect(r"\$ ", 10)
+        given, res1 = 0, res0
+        for _ in range(60):
+            time.sleep(1)
+            res1, txt = vm_resident_mb(q, vmid)
+            mm = re.search(r"balloon: \d+ MB asked for, (\d+) MB given back", txt)
+            now = int(mm.group(1)) if mm else 0
+            if now > 0 and now == given:
+                break          # it has stopped moving
+            given = now
+        assert given >= 32, (given, want, res0, res1)
+        free1 = host_pages(q)
+        # the guest's resident set really falls
+        assert res1 <= res0 - 16, (res0, res1, given)
+        # and the host gets about what the guest stopped holding. It
+        # is not the figure the guest reports giving back: inflating
+        # means allocating pages, and allocating one writes junk into
+        # it, so a page the guest had never touched is faulted in
+        # before it is handed over. What the host gains is the fall in
+        # the resident set, less the tables it now needs to map those
+        # chunks a page at a time.
+        assert free1 - free0 >= (res0 - res1 - 8) * 256, (free0, free1, res0, res1)
+
+        q.send("vmm balloon %d 0\n" % vmid)
+        q.expect(r"asked for 0 MB back", 30)
+        q.expect(r"\$ ", 10)
+        res2 = res1
+        for _ in range(90):
+            time.sleep(1)
+            res2, _ = vm_resident_mb(q, vmid)
+            if res2 >= res0 - 4:
+                break
+        assert res2 >= res0 - 4, (res0, res2)
+
+        kill_vm(q, vmid)
+        assert_gone(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_memlimit(QEMU, intc, cpus, log):
+    """a VM may be given more memory than it is allowed to hold.
+
+    -m says how much memory the guest sees; -M says how much of the
+    host's it may have at once.  Nothing is backed until it is
+    touched, so the two are different questions, and this is where the
+    second one is answered: a fault that would go over the limit waits
+    while the guest is asked -- through its balloon -- to give
+    something back, and a guest that will not come down is stopped
+    rather than allowed past it.
+
+    the invariant is the same whichever happens: the resident size
+    never exceeds the limit.  A guest asked to give memory back while
+    it is still under the cap does so, and guest-balloon checks that;
+    what this checks is the other end, where there is nothing left to
+    give."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        # detached, so the host's own shell stays available
+        q.send("vmm start -d -c 1 -m 256 -M 128\n")
+        m = q.expect(r"vm (\d+): 1 vcpu", 30)
+        vmid = int(m.group(1))
+        q.expect(r"\$ ", 20)
+        res, txt = vm_resident_mb(q, vmid)
+        assert "limit 128 MB" in txt, txt
+        assert res <= 128, (res, txt)
+
+        # now ask it for a great deal more than it may have
+        attach(q, vmid)
+        mark = q.mark()
+        q.send("usertests -q\n")
+        q.expect(r"ALL TESTS PASSED|FAILED|panic|halting the vm", 1200)
+        out = q.output_since(mark)
+        assert "panic" not in out, out[-2000:]
+        if "halting the vm" in out:
+            # stopped at the limit, which is what a limit is for
+            q.expect(r"\[vm \d+ has exited\]", 60)
+            q.expect(r"\$ ", 30)
+        else:
+            q.expect(r"\$ ", 120)
+            detach(q)
+            res, txt = vm_resident_mb(q, vmid)
+            assert res <= 128, (res, txt)
+            kill_vm(q, vmid)
+        q.send("echo host-ok\n")
+        q.expect(r"\nhost-ok", 10)
+    finally:
+        q.close()
+
+
+def t_ksm(QEMU, intc, cpus, log):
+    """two guests of the same image hold mostly the same bytes.
+
+    with same-page merging on, the host keeps one copy of each and
+    both map it read-only; the first write to one of them faults and
+    the writer is given a copy of its own.  What is checked is that
+    the sharing really happens, that the host gets memory back for
+    it, that the guests go on working afterwards -- forktest writes
+    to a great many shared pages -- and that everything comes back
+    when they are killed."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        a = start_guest(q, "-n a -m 128 -c 1 -f /disk0.img")
+        detach(q)
+        b = start_guest(q, "-n b -m 128 -c 1 -f /disk1.img")
+        detach(q)
+        free0 = host_pages(q)
+
+        q.send("vmm ksm on\n")
+        q.expect(r"same-page merging on", 10)
+        q.expect(r"\$ ", 5)
+        merged = 0
+        for _ in range(60):
+            time.sleep(1)
+            m = q.mark()
+            q.send("vmm stats\n")
+            q.expect(r"\$ ", 10)
+            mm = re.search(r"(\d+) merged, (\d+) shared", q.output_since(m))
+            if mm and int(mm.group(1)) >= 500:
+                merged = int(mm.group(1))
+                break
+        assert merged >= 500, merged
+        free1 = host_pages(q)
+        # sharing costs a table page and a frame array for every chunk
+        # it has to split, so the gain is less than the count merged
+        assert free1 > free0, (free0, free1)
+
+        # and the guests still work: forktest writes to page after page
+        # that is now shared, which is the copy-on-write path
+        attach(q, "a")
+        q.send("forktest\n")
+        q.expect(r"fork test OK", 60)
+        q.expect(r"\$ ", 10)
+        detach(q)
+        attach(q, "b")
+        q.send("echo still-b\n")
+        q.expect(r"\nstill-b", 15)
+        detach(q)
+
+        q.send("vmm ksm off\n")
+        q.expect(r"same-page merging off", 10)
+        q.expect(r"\$ ", 5)
+        kill_vm(q, a)
+        kill_vm(q, b)
+        free2 = wait_pages(q, free0)
+        assert free2 >= free0, (free0, free2)
         q.send("echo host-ok\n")
         q.expect(r"\nhost-ok", 10)
     finally:
@@ -393,22 +672,24 @@ def t_hello(QEMU, intc, cpus, log):
     code as a raw binary."""
     q = boot_host(QEMU, intc, cpus, log)
     try:
-        free0, _ = host_stats(q)
-        for args in ("-k /hello -f none -c 3", "-k /hello.bin -f none -r 0x80400000 -c 3"):
-            q.send("vmm start %s\n" % args)
-            q.expect(r"vm (\d+): 3 vcpu", 10)
-            q.expect(r"hello: running at 0x0000000080400000, hart 0, dtb at 0x0000000087ff0000", 20)
-            q.expect(r"hello: device tree ok, \d+ bytes", 5)
-            q.expect(r"hello: sbi console works", 5)
-            q.expect(r"hello: sbi spec version call returned 0", 5)
-            q.expect(r"hello: 3 hart\(s\) total", 10)
-            q.expect(r"hello: done", 5)
-            # the guest shut itself down through SBI: vmm returns to the shell.
-            q.expect(r"\[vm \d+ has exited\]", 20)
-            q.expect(r"\$ ", 20)
-            assert "no vms" in vm_ls(q)
-        free1 = wait_free(q, free0)
-        assert free1 == free0, (free0, free1)
+        def hello():
+            for args in ("-k /hello -f none -c 3",
+                         "-k /hello.bin -f none -r 0x80400000 -c 3"):
+                q.send("vmm start %s\n" % args)
+                q.expect(r"vm (\d+): 3 vcpu", 10)
+                q.expect(r"hello: running at 0x0000000080400000, hart 0, "
+                         r"dtb at 0x0000000087ff0000", 20)
+                q.expect(r"hello: device tree ok, \d+ bytes", 5)
+                q.expect(r"hello: sbi console works", 5)
+                q.expect(r"hello: sbi spec version call returned 0", 5)
+                q.expect(r"hello: 3 hart\(s\) total", 10)
+                q.expect(r"hello: done", 5)
+                # the guest shut itself down through SBI: vmm returns.
+                q.expect(r"\[vm \d+ has exited\]", 20)
+                q.expect(r"\$ ", 20)
+                assert "no vms" in vm_ls(q)
+
+        costs_nothing(q, hello)
         # loading outside guest RAM is refused
         q.send("vmm start -k /hello.bin -f none -r 0x10000000 -d\n")
         q.expect(r"cannot create vm", 10)
@@ -460,8 +741,8 @@ def t_fdv_guests(QEMU, intc, cpus, log, vec=1):
 
 def t_malicious(QEMU, intc, cpus, log):
     q = boot_host(QEMU, intc, cpus, log)
-    try:
-        free0, _ = host_stats(q)
+
+    def badguest():
         q.send("vmm start -k /badguest -f none\n")
         q.expect(r"vm (\d+): 1 vcpu", 20)
         q.expect(r"badguest: hello", 20)
@@ -469,8 +750,9 @@ def t_malicious(QEMU, intc, cpus, log):
         q.expect(r"\[vm \d+ has exited\]", 20)
         q.expect(r"\$ ", 20)
         assert "no vms" in vm_ls(q)
-        free1 = wait_free(q, free0)
-        assert free1 == free0, (free0, free1)
+
+    try:
+        costs_nothing(q, badguest)
         vmid = start_guest(q)
         q.send("echo still-fine\n")
         q.expect(r"\nstill-fine", 10)
@@ -482,18 +764,96 @@ def t_malicious(QEMU, intc, cpus, log):
         q.close()
 
 
+def costs_nothing(q, run, rounds=2):
+    """running and killing a guest must cost the host nothing.
+
+    `run` is done once before the baseline is taken, because the first
+    guest of a boot is the one that reads its kernel and its disk
+    through the block cache for the first time and makes the object
+    caches behind them grow; those pages are kept, not lost.  After
+    that, every round must give back everything it took, and the
+    comparison is in pages -- the megabyte figure rounds down, so two
+    readings 255 pages apart can print the same number."""
+    run()
+    free0 = settled_pages(q)
+    for _ in range(rounds):
+        run()
+    free1 = wait_pages(q, free0)
+    assert free1 >= free0, (free0, free1)
+
+
+def churn_round(q, r):
+    vmid = start_guest(q, "-c 2")
+    q.send("echo round-%d\n" % r)
+    q.expect(r"\nround-%d" % r, 10)
+    detach(q)
+    kill_vm(q, vmid)
+
+
+def wait_pages(q, want, timeout=20):
+    """as wait_free, but in pages, and it syncs halfway for the same
+    reason: a dirty block is not leaked memory, it is memory that
+    cannot be given back until the disk has it."""
+    end = time.time() + timeout
+    synced = False
+    while True:
+        now = host_pages(q)
+        if now >= want:
+            return now
+        if not synced and time.time() > end - timeout / 2:
+            synced = True
+            q.send("sync\n")
+            q.expect(r"\$ ", 60)
+            continue
+        if time.time() > end:
+            return now
+        time.sleep(0.5)
+
+
+def settled_pages(q, timeout=20):
+    """free memory once it has stopped moving: the disk is written
+    first, because a dirty block counts against the total until it is,
+    and then the count is read until two readings agree.  A baseline
+    taken while memory is still coming back is a baseline that is too
+    low, and a test that compares against one is a test that passes
+    whatever happens."""
+    q.send("sync\n")
+    q.expect(r"\$ ", 60)
+    end = time.time() + timeout
+    last = -1
+    while time.time() < end:
+        now = host_pages(q)
+        if now == last:
+            return now
+        last = now
+        time.sleep(0.5)
+    return last
+
+
 def t_churn(QEMU, intc, cpus, log, rounds=4):
+    """starting and killing guests must not cost memory.
+
+    the baseline is taken after one round, not at boot.  The first
+    guest is the one that reads its kernel image and its disk through
+    the block cache for the first time and makes the host grow the
+    object caches behind all that; those pages are kept, not lost, and
+    counting them as a leak says nothing about the rounds that follow.
+    What this asks is the real question: after the caches are warm,
+    does a start and a kill get back every page it took?  In pages,
+    because a megabyte is 256 of them."""
     q = boot_host(QEMU, intc, cpus, log)
     try:
-        free0, _ = host_stats(q)
-        for r in range(rounds):
-            vmid = start_guest(q, "-c 2")
-            q.send("echo round-%d\n" % r)
-            q.expect(r"\nround-%d" % r, 10)
-            detach(q)
-            kill_vm(q, vmid)
-        free1 = wait_free(q, free0)
-        assert free1 == free0, (free0, free1)
+        churn_round(q, 0)
+        free0 = settled_pages(q)
+        for r in range(1, rounds + 1):
+            churn_round(q, r)
+        free1 = wait_pages(q, free0 - 2)
+        # two pages of slack against four rounds. Measured over
+        # eighteen rounds the count steps down by one page twice and
+        # then stays; that is the host's own caches settling, not a
+        # leak, which would cost a page or more every round and show
+        # as four here.
+        assert free1 >= free0 - 2, (free0, free1)
     finally:
         q.close()
 
@@ -513,6 +873,10 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
         t.append(("guest-lifecycle-%s" % m, lambda m=m: t_lifecycle(QEMU, m, cpus, log)))
         t.append(("guest-hello-%s" % m, lambda m=m: t_hello(QEMU, m, cpus, log)))
         t.append(("guest-churn-%s" % m, lambda m=m: t_churn(QEMU, m, cpus, log)))
+        t.append(("guest-pages-%s" % m, lambda m=m: t_pages(QEMU, m, cpus, log)))
+        t.append(("guest-balloon-%s" % m, lambda m=m: t_balloon(QEMU, m, cpus, log)))
+        t.append(("guest-memlimit-%s" % m, lambda m=m: t_memlimit(QEMU, m, cpus, log)))
+        t.append(("guest-ksm-%s" % m, lambda m=m: t_ksm(QEMU, m, cpus, log)))
         t.append(("guest-malicious-%s" % m, lambda m=m: t_malicious(QEMU, m, cpus, log)))
         t.append(("guest-fd-vector-%s" % m, lambda m=m: t_fdv_guests(QEMU, m, cpus, log)))
     t.append(("guest-fd-vector-novec-plic", lambda: t_fdv_guests(QEMU, "plic", cpus, log, vec=0)))

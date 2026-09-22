@@ -1,7 +1,12 @@
 *~
 _*
 *.o
+# the compiler's dependency files -- but not a directory whose name
+# ends in .d, which is what etc/init.d, etc/rc.d and etc/cron.d are.
+# Ignoring those kept every init script out of the repository, and a
+# fresh clone could not be built.
 *.d
+!*.d/
 *.asm
 *.sym
 *.img

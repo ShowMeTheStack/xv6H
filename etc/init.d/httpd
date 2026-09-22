@@ -1,0 +1,38 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          httpd
+# Required-Start:    networking syslogd
+# Default-Start:     2
+# Short-Description: a web server for the files in /srv/www
+### END INIT INFO
+. /lib/init/functions
+
+NAME=httpd
+DAEMON=/bin/httpd
+PIDFILE=/var/run/httpd.pid
+PORT=80
+[ -f /etc/default/httpd ] && . /etc/default/httpd
+
+case "$1" in
+start)
+	log_daemon_msg "Starting $NAME"
+	start_daemon "$DAEMON" -p "$PORT" || true
+	log_end_msg $?
+	;;
+stop)
+	log_daemon_msg "Stopping $NAME"
+	killproc "$NAME" "$PIDFILE"
+	log_end_msg $?
+	;;
+restart|force-reload)
+	"$0" stop
+	"$0" start
+	;;
+status)
+	status_of_proc "$NAME" "$PIDFILE"
+	;;
+*)
+	echo "usage: $0 {start|stop|restart|status}" >&2
+	exit 1
+	;;
+esac

@@ -83,6 +83,8 @@ fill_inode(struct inode *ip, struct ext4_inode_info *info)
     ip->type = T_DEVICE;
   else if (fmt == 0xa000)
     ip->type = T_SYMLINK;
+  else if (fmt == 0xc000)
+    ip->type = T_SOCK;
   else
     ip->type = T_FILE;
   ip->nlink = info->nlink;

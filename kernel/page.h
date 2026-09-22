@@ -55,6 +55,7 @@ void *kalloc(void);                  // one page (order 0), filled with junk
 void kfree(void *pa);                // free a block from kalloc() or kalloc_order()
 void *kalloc_order(int order);       // 2^order pages, naturally aligned, not zeroed
 void kfree_order(void *pa, int order);
+void kmem_split(void *pa, int order); // one block becomes 2^order pages
 void *kalloc_guest(int order);       // like kalloc_order, but leaves the host its reserve
 void page_get(struct page *pg);
 void page_put(struct page *pg);      // frees the block at zero

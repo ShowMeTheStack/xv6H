@@ -2,8 +2,10 @@
 #include "kernel/types.h"
 #include "kernel/stat.h"
 #include "kernel/net.h"
-#include "kernel/socket.h"
 #include "user/user.h"
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/time.h>
 
 int
 main(int argc, char *argv[])
@@ -20,18 +22,31 @@ main(int argc, char *argv[])
   }
   char s[20];
   printf("PING %s (%s)\n", argv[1], ip2str(ip, s));
-  int fd = socket(SOCK_ICMP);
+  // an ICMP socket: what Linux calls a ping socket, and what this
+  // kernel gives a program that asks for datagrams of ICMP
+  int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
   if (fd < 0) {
     fprintf(stderr, "ping: no network\n");
     exit(1);
   }
+  struct timeval tv = {2, 0};   // two seconds for an answer
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  struct sockaddr_in to;
+  memset(&to, 0, sizeof(to));
+  to.sin_family = AF_INET;
+  to.sin_addr.s_addr = htonl(ip);
   int ok = 0;
   for (int seq = 1; seq <= count; seq++) {
     char data[32];
     for (int i = 0; i < sizeof(data); i++)
       data[i] = 'a' + i % 26;
     int t0 = uptime();
-    int rc = sendto(fd, data, sizeof(data), ip, seq);
+    // an echo socket carries the sequence number where the port goes:
+    // there is no port in an ICMP message, and the sequence is what
+    // an answer has to be matched against
+    to.sin_port = htons((uint16)seq);
+    int rc = sendto(fd, data, sizeof(data), 0, (struct sockaddr *)&to,
+                    sizeof(to));
     if (rc < 0 && errno == EACCES) {
       printf("ping: %s is blocked by the network policy\n", s);
       exit(2);
@@ -40,17 +55,24 @@ main(int argc, char *argv[])
       printf("ping: send failed\n");
       exit(1);
     }
-    uint32 src;
-    int rseq;
+    struct sockaddr_in from;
+    socklen_t fromlen;
     char reply[64];
     int n;
-    // wait up to 2 s for the reply with this sequence number
-    while ((n = recvfrom(fd, reply, sizeof(reply), &src, &rseq, 20)) >= 0 && rseq != seq)
-      ;
+    // wait for the reply with this sequence number
+    for (;;) {
+      fromlen = sizeof(from);
+      n = recvfrom(fd, reply, sizeof(reply), 0, (struct sockaddr *)&from,
+                   &fromlen);
+      if (n < 0 || ntohs(from.sin_port) == seq)
+        break;
+    }
     if (n < 0) {
       printf("seq %d: timeout\n", seq);
     } else {
-      printf("%d bytes from %s: seq %d time %d ms\n", n, ip2str(src, s), seq, (uptime() - t0) * 100);
+      printf("%d bytes from %s: seq %d time %d ms\n", n,
+             ip2str(ntohl(from.sin_addr.s_addr), s), seq,
+             (uptime() - t0) * 100);
       ok++;
     }
     if (seq < count)

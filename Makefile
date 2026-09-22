@@ -68,9 +68,12 @@ OBJS = \
   $K/fpu.o \
   $K/hypsbi.o \
   $K/virtio_net.o \
+  $K/virtio_balloon.o \
   $K/net.o \
   $K/bridge.o \
   $K/vvnet.o \
+  $K/vballoon.o \
+  $K/ksm.o \
   $K/rtc.o \
   $K/slab.o \
   $K/kstack.o \
@@ -82,6 +85,8 @@ OBJS = \
   $K/sock.o \
   $K/pktcap.o \
   $K/ptrace.o \
+  $K/unixsock.o \
+  $K/sockapi.o \
   $K/tcp.o
 
 # riscv64-unknown-elf- or riscv64-linux-gnu-
@@ -432,6 +437,7 @@ UPROGS=\
 	$U/_uname\
 	$U/_hostname\
 	$U/_sleep\
+	$U/_usleep\
 	$U/_head\
 	$U/_tail\
 	$U/_touch\
@@ -671,7 +677,8 @@ USERPW ?= user
 PWSALT ?= xv6hbuildsalt
 
 ETCFILES = etc/passwd etc/group etc/login.defs etc/profile etc/sudoers etc/hostname \
-	   etc/sysctl.conf etc/inittab etc/fstab etc/crontab
+	   etc/sysctl.conf etc/inittab etc/fstab etc/crontab \
+	   etc/hosts etc/services etc/protocols
 INITSCRIPTS = etc/init.d/rcS:etc/init.d/rcS etc/init.d/syslogd:etc/init.d/syslogd \
 	      etc/init.d/klogd:etc/init.d/klogd etc/rc.d/rc:etc/rc.d/rc \
 	      lib/init/functions:lib/init/functions \

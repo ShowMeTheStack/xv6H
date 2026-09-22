@@ -1,0 +1,36 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          klogd
+# Required-Start:    syslogd
+# Default-Start:     2
+# Short-Description: the kernel log reader
+### END INIT INFO
+. /lib/init/functions
+
+NAME=klogd
+DAEMON=/bin/klogd
+PIDFILE=/var/run/klogd.pid
+
+case "$1" in
+start)
+	log_daemon_msg "Starting $NAME"
+	start_daemon "$DAEMON" || true
+	log_end_msg $?
+	;;
+stop)
+	log_daemon_msg "Stopping $NAME"
+	killproc "$NAME" "$PIDFILE"
+	log_end_msg $?
+	;;
+restart|force-reload)
+	"$0" stop
+	"$0" start
+	;;
+status)
+	status_of_proc "$NAME" "$PIDFILE"
+	;;
+*)
+	echo "usage: $0 {start|stop|restart|status}" >&2
+	exit 1
+	;;
+esac

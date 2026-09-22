@@ -58,6 +58,10 @@ sys_vm_ctl(void)
   int vmid, op;
   argint(0, &vmid);
   argint(1, &op);
+  // same-page merging belongs to the host, so it is answered before a
+  // VM is looked up and the id means nothing
+  if (op == VMCTL_KSM_ON || op == VMCTL_KSM_OFF)
+    return ksm_set(op == VMCTL_KSM_ON);
   struct vm *vm = vm_lookup(vmid);
   if (vm == 0)
     return -1;
@@ -67,6 +71,8 @@ sys_vm_ctl(void)
   case VMCTL_RESUME:
     return vm_resume(vm);
   }
+  if (op >= VMCTL_BALLOON)
+    return vballoon_request(vm, (uint64)(op - VMCTL_BALLOON) * 1024 * 1024);
   return -1;
 }
 
@@ -128,6 +134,11 @@ sys_vm_info(void)
     info.nvcpu = vm->nvcpu;
     info.mem_mb = vm->ram_size / (1024 * 1024);
     info.resident_mb = vm->resident / (1024 * 1024);
+    info.split_chunks = vm->nsplit;
+    info.table_pages = vm->pttables;
+    info.balloon_target_mb = (uint64)vm->balloon.target * PGSIZE / (1024 * 1024);
+    info.balloon_actual_mb = (uint64)vm->balloon.actual * PGSIZE / (1024 * 1024);
+    info.mem_limit_mb = vm->mem_limit / (1024 * 1024);
     info.intc = vm->vic_kind;
     info.imsic_hw = vm->imsic_hw;
     info.cfg = vm->cfg;
@@ -184,18 +195,21 @@ sys_vm_info(void)
   return 0;
 }
 
-// hypervisor statistics: buf[0] free pool chunks, buf[1] IPIs, buf[2+i] exits of vm i.
+// hypervisor statistics: buf[0] free guest memory in MB, buf[1] IPIs,
+// buf[2+i] exits of vm i, buf[2+NVM] free guest memory in pages, and
+// buf[3+NVM]..buf[6+NVM] same-page merging (on, scanned, merged,
+// shared).
 uint64
 sys_vm_stats(void)
 {
-  uint64 addr, out[2 + NVM];
+  uint64 addr, out[7 + NVM];
   int n;
   argaddr(0, &addr);
   argint(1, &n);
   if (n <= 0)
     return -1;
-  if (n > 2 + NVM)
-    n = 2 + NVM;
+  if (n > 7 + NVM)
+    n = 7 + NVM;
   memset(out, 0, sizeof(out));
   hyp_stats(out, n);
   if (either_copyout(1, addr, out, n * sizeof(uint64)) < 0)

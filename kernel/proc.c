@@ -1141,9 +1141,11 @@ kexit(int status)
   fsinfo_put(p->fs);
   p->fs = 0;
 
-  // a zombie keeps only its object, pid and kernel stack: the address
-  // space, trapframe, vector state and file table go now, so a parent
-  // slow to wait() (init, after a fork storm) holds no memory hostage.
+  // a zombie keeps only its object, its pid and its exit status: the
+  // address space, trapframe, vector state and file table go now, and
+  // the kernel stack goes as soon as it has stepped off it (see the
+  // scheduler). A parent slow to wait() -- init, after a fork storm --
+  // holds no memory hostage.
   if (p->mm)
     proc_mm_free(p->mm);
   p->mm = 0;
@@ -1340,6 +1342,7 @@ scheduler(void)
     }
     acquire(&p->lock);
     p->on_rq = 0;
+    uint64 zombie_stack = 0;
     if (p->state == RUNNABLE) {
       // Switch to chosen process.  It is the process's job
       // to release its lock and then reacquire it
@@ -1361,8 +1364,31 @@ scheduler(void)
         proc_put(p);
         continue;
       }
+      if (p->state == ZOMBIE && p->kstack) {
+        // and a zombie that somebody will wait for has no use for a
+        // stack either: it has just left the CPU for the last time,
+        // and this is the first moment it is not standing on it.
+        //
+        // it matters more than it sounds. Eighty thousand orphans of
+        // a fork storm are init's to reap, one at a time, and until
+        // it gets to each one the thirty-two kilobytes underneath it
+        // are the host's memory held hostage -- two gigabytes of an
+        // eight gigabyte machine, which is what usertests was
+        // measuring when it said pages had been lost.
+        //
+        // the address is taken here and the stack is freed below,
+        // after the lock: giving a stack back ends in an IPI round
+        // that waits for every hart to answer, and a hart holding a
+        // lock is a hart with interrupts off, which cannot. Clearing
+        // p->kstack under the lock is what keeps the parent's wait()
+        // from freeing it as well.
+        zombie_stack = p->kstack;
+        p->kstack = 0;
+      }
     }
     release(&p->lock);
+    if (zombie_stack)
+      kstack_free(zombie_stack);
   }
 }
 

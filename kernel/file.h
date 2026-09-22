@@ -3,7 +3,8 @@
 struct gendisk;
 
 struct file {
-  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_BLOCK, FD_SOCK } type;
+  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_BLOCK, FD_SOCK,
+         FD_UNIX } type;
   int ref; // reference count
   char readable;
   char writable;
@@ -13,7 +14,13 @@ struct file {
   int flags;         // the open() flags this description was made with
   short major;       // FD_DEVICE
   struct gendisk *disk; // FD_BLOCK: the disk this file is a view of
-  struct sock *sock; // FD_SOCK
+  // a socket is one kind or the other and never both, so the two
+  // share their word: a file that grows costs a page here and there
+  // in the cache it comes from, for nothing
+  union {
+    struct sock *sock;   // FD_SOCK
+    struct unsock *un;   // FD_UNIX
+  };
 };
 
 #define major(dev)  ((dev) >> 16 & 0xFFFF)

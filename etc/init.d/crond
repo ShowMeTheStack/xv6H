@@ -1,0 +1,36 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          crond
+# Required-Start:    syslogd
+# Default-Start:     2
+# Short-Description: run things on a schedule
+### END INIT INFO
+. /lib/init/functions
+
+NAME=crond
+DAEMON=/bin/crond
+PIDFILE=/var/run/crond.pid
+
+case "$1" in
+start)
+	log_daemon_msg "Starting $NAME"
+	start_daemon "$DAEMON" || true
+	log_end_msg $?
+	;;
+stop)
+	log_daemon_msg "Stopping $NAME"
+	killproc "$NAME" "$PIDFILE"
+	log_end_msg $?
+	;;
+restart|force-reload)
+	"$0" stop
+	"$0" start
+	;;
+status)
+	status_of_proc "$NAME" "$PIDFILE"
+	;;
+*)
+	echo "usage: $0 {start|stop|restart|status}" >&2
+	exit 1
+	;;
+esac

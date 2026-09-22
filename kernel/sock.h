@@ -23,6 +23,8 @@ struct sock {
   int ttl;            // what to put in the IP header; 0 for the usual 64
   int want_errors;    // deliver ICMP errors here as well as replies
   uint deadline;      // a waiting receive gives up at this tick; 0 for none
+  int rcvtimeo;       // SO_RCVTIMEO, in ticks; 0 to wait as long as it takes
+  int shut_rd, shut_wr; // shutdown(2) has closed this direction
 };
 
 // one socket as /proc/net sees it, copied out under the socket's lock
@@ -41,6 +43,18 @@ extern struct sock socks[NSOCK];
 void sock_walk(void (*fn)(const struct sockinfo *si, void *arg), void *arg);
 void sock_timer(void);
 void sockclose(struct sock *s);
+int sockshutdown(struct sock *s, int how);
+struct sock *ipsock_new(int type);
+int ipsock_bind(struct sock *s, int port);
+int ipsock_connect(struct sock *s, uint32 ip, int port);
+int ipsock_listen(struct sock *s, int backlog);
+struct sock *ipsock_accept(struct sock *s, int *err);
+int ipsock_sendto(struct sock *s, int user, uint64 buf, int n, uint32 dst,
+                  int port);
+int ipsock_recvfrom(struct sock *s, int user, uint64 buf, int n, uint32 *rip,
+                    int *rport, int timeout, int nowait);
+int ipsock_setopt(struct sock *s, int opt, int value);
+int ipsock_getopt(struct sock *s, int opt, int *value);
 int sockread(struct sock *s, int user, uint64 addr, int n);
 int sockwrite(struct sock *s, int user, uint64 addr, int n);
 #endif

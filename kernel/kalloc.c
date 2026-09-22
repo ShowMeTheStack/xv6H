@@ -196,14 +196,40 @@ kinit(void)
 
 // ---- the interface ----
 
+// a block of 2^order pages, and if there is none, the block cache is
+// asked to give back what it is holding only because it might be
+// useful again.
+//
+// kalloc() has always done this and kalloc_order() did not, which is
+// how a machine with a gigabyte of clean cached blocks and no free
+// pages could panic in the object cache: the slab allocator asks for
+// its pages here. blk_reclaim takes no sleeping lock and refuses to
+// run inside the cache's own lock, so this is safe wherever an
+// allocation is.
+static struct page *
+alloc_or_reclaim(int order, uint64 floor)
+{
+  struct page *pg = 0;
+
+  acquire(&km.lock);
+  if (km.free_pages >= floor + (1UL << order))
+    pg = alloc_block(order);
+  release(&km.lock);
+  if (pg || blk_reclaim(64UL << order) == 0)
+    return pg;
+  acquire(&km.lock);
+  if (km.free_pages >= floor + (1UL << order))
+    pg = alloc_block(order);
+  release(&km.lock);
+  return pg;
+}
+
 void *
 kalloc_order(int order)
 {
   if (order < 0 || order > MAXORDER)
     panic("kalloc_order");
-  acquire(&km.lock);
-  struct page *pg = alloc_block(order);
-  release(&km.lock);
+  struct page *pg = alloc_or_reclaim(order, 0);
   return pg ? (void *)PAGE2PA(pg) : 0;
 }
 
@@ -211,12 +237,42 @@ kalloc_order(int order)
 void *
 kalloc_guest(int order)
 {
-  acquire(&km.lock);
-  struct page *pg = 0;
-  if (km.free_pages >= km.reserve + (1UL << order))
-    pg = alloc_block(order);
-  release(&km.lock);
+  struct page *pg = alloc_or_reclaim(order, km.reserve);
   return pg ? (void *)PAGE2PA(pg) : 0;
+}
+
+// break an allocated block into single pages, each of which can be
+// freed on its own afterwards.
+//
+// the buddy allocator hands out a 2 MB block as one thing and takes
+// it back as one thing.  A guest whose memory is being reclaimed a
+// page at a time -- by a balloon, or by same-page merging -- needs
+// the pieces separable.  Nothing moves and nothing is copied: the
+// frames are where they were, and what changes is what the page
+// database says about them, which is what kfree reads.  The free
+// lists and the free count do not change, so km.lock is not needed;
+// these entries belong to the block's owner, who is calling.
+void
+kmem_split(void *pa, int order)
+{
+  uint64 a = (uint64)pa;
+
+  if (order <= 0)
+    return;
+  if (a < km.alloc_start || a + BLOCK_BYTES(order) > km.alloc_end ||
+      (a & (BLOCK_BYTES(order) - 1)))
+    panic("kmem_split: bad block");
+  struct page *head = PA2PAGE(a);
+  if ((head->flags & (PG_INIT | PG_HEAD)) != (PG_INIT | PG_HEAD) ||
+      head->order != order)
+    panic("kmem_split: not an allocated block of that order");
+  uint64 n = 1UL << order;
+  for (uint64 i = 0; i < n; i++) {
+    struct page *pg = head + i;
+    pg->flags = PG_INIT | PG_HEAD;
+    pg->order = 0;
+    pg->refcount = 1;
+  }
 }
 
 void
@@ -385,23 +441,44 @@ page_put(struct page *pg)
   }
 }
 
+// how many pages are free: the global lists plus what the harts are
+// holding in their caches.
+//
+// every count is read under its own lock. Reading them loose is
+// cheaper and almost always right, but "almost always right" is no use
+// to the thing this number is for -- a test that starts a guest, kills
+// it, and asks whether every page came back. A page of slack there is
+// a page of leak that nobody notices. The lock order is the one kfree
+// uses: a hart's cache first, then the global lists.
 uint64
 kmem_free_pages(void)
 {
-  uint64 n = km.free_pages;
-  for (int i = 0; i < NCPU; i++)
+  uint64 n = 0;
+
+  for (int i = 0; i < NCPU; i++) {
+    acquire(&pcache[i].lock);
     n += pcache[i].n;
+    release(&pcache[i].lock);
+  }
+  acquire(&km.lock);
+  n += km.free_pages;
+  release(&km.lock);
   return n;
 }
 
 void
 kmem_info(struct meminfo *mi)
 {
+  uint64 cached = 0;
+
+  for (int i = 0; i < NCPU; i++) {
+    acquire(&pcache[i].lock);
+    cached += pcache[i].n;
+    release(&pcache[i].lock);
+  }
   acquire(&km.lock);
   mi->total_pages = km.total;
-  mi->free_pages = km.free_pages;
-  for (int i = 0; i < NCPU; i++)
-    mi->free_pages += pcache[i].n;
+  mi->free_pages = km.free_pages + cached;
   mi->db_pages = km.db_pages;
   mi->reserve_pages = km.reserve;
   for (int o = 0; o <= MAXORDER; o++)

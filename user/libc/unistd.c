@@ -55,6 +55,8 @@ __type2mode(short type)
     return S_IFCHR;
   case T_SYMLINK:
     return S_IFLNK;
+  case T_SOCK:
+    return S_IFSOCK;
   default:
     return S_IFREG;
   }

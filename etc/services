@@ -1,0 +1,26 @@
+# the well-known ports, as /etc/services has listed them since the
+# ARPANET. name, then port/protocol, then any other names for it.
+echo		7/tcp
+echo		7/udp
+discard		9/tcp		sink null
+discard		9/udp		sink null
+daytime		13/tcp
+daytime		13/udp
+ftp		21/tcp
+ssh		22/tcp
+telnet		23/tcp
+smtp		25/tcp		mail
+time		37/tcp		timserver
+time		37/udp		timserver
+domain		53/tcp
+domain		53/udp
+bootps		67/udp
+bootpc		68/udp
+tftp		69/udp
+http		80/tcp		www
+pop3		110/tcp
+ntp		123/udp
+imap2		143/tcp		imap
+snmp		161/udp
+https		443/tcp
+syslog		514/udp

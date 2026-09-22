@@ -1,0 +1,4 @@
+# the names this machine answers to, and the ones it knows without
+# asking anybody. a resolver looks here before it looks at the network.
+127.0.0.1	localhost
+127.0.1.1	xv6h

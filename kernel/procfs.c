@@ -32,6 +32,7 @@
 #include "net.h"
 #include "sock.h"
 #include "tcp.h"
+#include "unixsock.h"
 
 #define PROCFS_DEV 32
 
@@ -56,6 +57,7 @@
 #define PINO_NET_TCP    16
 #define PINO_NET_UDP    17
 #define PINO_NET_SOCKSTAT 18
+#define PINO_NET_UNIX   19
 #define PINO_FIRST_PID 1024
 
 // a process's files: the inode number is (pid << 4) + index + base
@@ -114,6 +116,7 @@ static const struct topfile netfiles[] = {
     {"dev", PINO_NET_DEV},     {"arp", PINO_NET_ARP},
     {"route", PINO_NET_ROUTE}, {"tcp", PINO_NET_TCP},
     {"udp", PINO_NET_UDP},     {"sockstat", PINO_NET_SOCKSTAT},
+    {"unix", PINO_NET_UNIX},
     {0, 0},
 };
 
@@ -259,15 +262,47 @@ struct sockctx {
   struct gen *g;
   int want;      // SOCK_STREAM or SOCK_DGRAM
   int line;
-  int counts[4];
+  int counts[SOCK_NTYPES];
 };
+
+// one AF_UNIX socket, in the shape Linux's /proc/net/unix has: an
+// identifier, the reference count, the protocol (always zero), the
+// flags (0x10000 for one that accepts connections), the type, the
+// state, an inode number and the name, if it has one. an abstract
+// name is written with an @ where its leading zero byte is, which is
+// what Linux does and what makes it readable at all.
+static void
+unix_emit(const struct unsockinfo *si, void *arg)
+{
+  struct gen *g = arg;
+
+  gen_hex(g, 0xffff0000u | (uint)si->index, 8);
+  gen_str(g, ": ");
+  gen_hex(g, si->refs, 8);
+  gen_str(g, " 00000000 ");
+  gen_hex(g, si->listening ? 0x10000 : 0, 8);
+  gen_str(g, " ");
+  gen_hex(g, si->type, 4);
+  gen_str(g, " ");
+  // 01 is unconnected (which is what a listening socket shows as),
+  // 03 is connected; there is nothing in between here
+  gen_hex(g, si->connected ? 3 : 1, 2);
+  gen_str(g, " ");
+  gen_num(g, (uint64)si->index + 1);
+  if (si->pathlen > 0) {
+    gen_str(g, " ");
+    for (int i = 0; i < si->pathlen && g->len < g->cap - 1; i++)
+      g->buf[g->len++] = (i == 0 && si->abstract) ? '@' : si->path[i];
+  }
+  gen_str(g, "\n");
+}
 
 static void
 sock_emit(const struct sockinfo *si, void *arg)
 {
   struct sockctx *c = arg;
 
-  if (si->type >= 0 && si->type < 4)
+  if (si->type >= 0 && si->type < SOCK_NTYPES)
     c->counts[si->type]++;
   if (si->type != c->want)
     return;
@@ -361,6 +396,11 @@ gen_net(struct gen *g, uint inum)
     break;
   }
 
+  case PINO_NET_UNIX:
+    gen_str(g, "Num       RefCount Protocol Flags    Type St Inode Path\n");
+    unixsock_walk(unix_emit, g);
+    break;
+
   case PINO_NET_SOCKSTAT: {
     struct sockctx c;
     memset(&c, 0, sizeof(c));
@@ -407,6 +447,13 @@ gen_top(struct gen *g, uint inum)
     gen_kv(g, "Cached", blk_cache_pages() * 4, "kB");
     gen_kv(g, "MemReclaimable", blk_reclaimable() * 4, "kB");
     gen_kv(g, "Dirty", dirty * 4, "kB");
+    // the stacks of the tasks that exist, as Linux reports them: a
+    // slot is in use from the moment a task is made until the pages
+    // under it are given back, which is where a fork storm that has
+    // not finished winding down shows up.
+    uint64 ksused, ksslots;
+    kstack_stats(&ksused, &ksslots);
+    gen_kv(g, "KernelStack", ksused * KSTACK_PAGES * 4, "kB");
     gen_kv(g, "PageTables", mi.db_pages * 4, "kB");
     gen_kv(g, "Reserved", mi.reserve_pages * 4, "kB");
     break;
@@ -428,9 +475,15 @@ gen_top(struct gen *g, uint inum)
 
   case PINO_UPTIME: {
     uint64 ns = clock_monotonic_ns();
+    uint64 hundredths = (ns / 10000000UL) % 100;
     gen_num(g, ns / 1000000000UL);
     gen_str(g, ".");
-    gen_num(g, (ns / 10000000UL) % 100);
+    // both digits, always: a reader that subtracts two of these gets
+    // nonsense from `3.7' when what was meant was three and seven
+    // hundredths
+    if (hundredths < 10)
+      gen_str(g, "0");
+    gen_num(g, hundredths);
     gen_str(g, " 0.00\n");
     break;
   }
@@ -491,6 +544,7 @@ gen_top(struct gen *g, uint inum)
   case PINO_NET_TCP:
   case PINO_NET_UDP:
   case PINO_NET_SOCKSTAT:
+  case PINO_NET_UNIX:
     gen_net(g, inum);
     break;
 
@@ -650,6 +704,11 @@ name_file(struct file *f, char *out, int size)
   case FD_SOCK:
     gen_str(&g, "socket:[");
     gen_num(&g, ((uint64)f->sock) >> 4);
+    gen_str(&g, "]");
+    break;
+  case FD_UNIX:
+    gen_str(&g, "socket:[");
+    gen_num(&g, ((uint64)f->un) >> 4);
     gen_str(&g, "]");
     break;
   default:

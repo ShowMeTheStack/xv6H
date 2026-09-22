@@ -55,3 +55,4 @@ int tcp_read(struct sock *s, int user, uint64 addr, int n);
 int tcp_ready(struct tcpcb *t, int write);
 int tcp_write(struct sock *s, int user, uint64 addr, int n);
 void tcp_close(struct sock *s);
+void tcp_shutdown(struct sock *s);

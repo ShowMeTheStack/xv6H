@@ -863,6 +863,31 @@ tcp_write(struct sock *s, int user, uint64 addr, int n)
   return total;
 }
 
+// half of a close: the FIN goes out, and the connection stays attached
+// to the socket so that what the other end is still sending can be
+// read. this is what shutdown(fd, SHUT_WR) means, and it is what a
+// protocol that says "that is the whole request" over a stream needs.
+void
+tcp_shutdown(struct sock *s)
+{
+  acquire(&netlock);
+  struct tcpcb *t = s->tcp;
+  if (t == 0) {
+    release(&netlock);
+    return;
+  }
+  if (t->state == TCPS_ESTABLISHED) {
+    t->state = TCPS_FIN_WAIT_1;
+    t->fin_queued = 1;
+    tcp_output(t);
+  } else if (t->state == TCPS_CLOSE_WAIT) {
+    t->state = TCPS_LAST_ACK;
+    t->fin_queued = 1;
+    tcp_output(t);
+  }
+  release(&netlock);
+}
+
 void
 tcp_close(struct sock *s)
 {

@@ -246,6 +246,7 @@ extintr(int irq)
   } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
     virtio_disk_intr(idx);
     virtio_net_intr(idx);
+    virtio_balloon_intr(idx);
   } else {
     printk("unexpected interrupt irq=%d\n", irq);
   }
