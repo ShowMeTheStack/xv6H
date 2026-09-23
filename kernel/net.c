@@ -354,7 +354,9 @@ ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
     mbuffree(m);
     net_tx_dropped++;
   }
-  if (ticks - e->requested >= 1 || e->requested == 0) {
+  // one request in flight per tenth of a second, whatever a tick is
+  if (ticks - e->requested >= (uint)(tick_hz / 10 ? tick_hz / 10 : 1) ||
+      e->requested == 0) {
     e->requested = ticks ? ticks : 1;
     arp_send(ARP_OP_REQUEST, broadcast_mac, nexthop, broadcast_mac);
   }
@@ -779,7 +781,8 @@ net_timer(void)
   if (!virtio_net_present())
     return;
   acquire(&netlock);
-  if ((dhcp.state == 1 || dhcp.state == 2) && ticks - dhcp.last_tx >= 20) {
+  if ((dhcp.state == 1 || dhcp.state == 2) &&
+      ticks - dhcp.last_tx >= (uint)(2 * tick_hz)) {
     // no answer in 2 seconds: try again (from the start after a while).
     if (++dhcp.attempts % 4 == 0)
       dhcp.state = 1;

@@ -56,8 +56,10 @@ uint64
 sys_vm_ctl(void)
 {
   int vmid, op;
+  uint64 arg;
   argint(0, &vmid);
   argint(1, &op);
+  argaddr(2, &arg);
   // same-page merging belongs to the host, so it is answered before a
   // VM is looked up and the id means nothing
   if (op == VMCTL_KSM_ON || op == VMCTL_KSM_OFF)
@@ -70,9 +72,14 @@ sys_vm_ctl(void)
     return vm_pause(vm);
   case VMCTL_RESUME:
     return vm_resume(vm);
+  case VMCTL_BALLOON:
+    return vballoon_request(vm, arg * 1024 * 1024);
+  case VMCTL_WEIGHT:
+    return sched_group_set_weight(vm->sg, (uint32)arg);
+  case VMCTL_CPUMAX:
+    // hundredths of one processor, 0 for no ceiling
+    return sched_group_set_max(vm->sg, arg * 1000, 0);
   }
-  if (op >= VMCTL_BALLOON)
-    return vballoon_request(vm, (uint64)(op - VMCTL_BALLOON) * 1024 * 1024);
   return -1;
 }
 
@@ -139,6 +146,15 @@ sys_vm_info(void)
     info.balloon_target_mb = (uint64)vm->balloon.target * PGSIZE / (1024 * 1024);
     info.balloon_actual_mb = (uint64)vm->balloon.actual * PGSIZE / (1024 * 1024);
     info.mem_limit_mb = vm->mem_limit / (1024 * 1024);
+    {
+      uint64 gs[7];
+      sched_group_stat(vm->sg, gs, 7);
+      info.weight = (int)gs[1];
+      info.cpu_max_us = (int)gs[2];
+      info.cpu_period_us = (int)gs[3];
+      info.throttles = gs[4];
+      info.frozen = (int)gs[5];
+    }
     info.intc = vm->vic_kind;
     info.imsic_hw = vm->imsic_hw;
     info.cfg = vm->cfg;
@@ -151,6 +167,8 @@ sys_vm_info(void)
       info.csr += v->csr_emul;
       info.wfi += v->wfi_sleeps;
       info.injected += v->injected;
+      info.exit_throttles += v->exit_throttles;
+      info.nudges += v->nudges;
     }
     struct vcpu *v = &vm->vcpu[0];
     info.pc = v->pc;

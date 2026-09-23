@@ -1127,7 +1127,7 @@ sys_setsockopt(void)
       return -EINVAL;
     // one tick is a tenth of a second here; a timeout that is not
     // zero and rounds to nothing waits one tick rather than for ever
-    int64 ticks10 = tv.tv_sec * 10 + tv.tv_usec / 100000;
+    int64 ticks10 = tv.tv_sec * tick_hz + tv.tv_usec * tick_hz / 1000000;
     if (ticks10 < 0 || ticks10 > 0x7fffffff)
       return -EINVAL;
     if (ticks10 == 0 && (tv.tv_sec || tv.tv_usec))

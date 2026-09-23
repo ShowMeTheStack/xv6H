@@ -10,6 +10,7 @@
 #   ./test-hyp.py net               # networking: host, guests, TLS, egress policy
 #   ./test-hyp.py mm                # memory: allocator, Sv48/Sv39, 16G and 512G hosts, on-demand guests
 #   ./test-hyp.py proc              # processes: thousands at once, pid wraparound, everything reaped
+#   ./test-hyp.py sched             # the scheduler: fairness, latency, affinity, the tick rate
 #   ./test-hyp.py all               # everything
 #
 import argparse, os, re, select, shutil, subprocess, sys, time
@@ -1133,6 +1134,9 @@ def main():
     if args.suite in ("proc", "all"):
         import test_hyp_proc
         tests += test_hyp_proc.tests(modes, args.cpus, log, QEMU)
+    if args.suite in ("sched", "all"):
+        import test_hyp_sched
+        tests += test_hyp_sched.tests(modes, args.cpus, log, QEMU)
 
     if args.test:
         tests = [t for t in tests if args.test in t[0]]

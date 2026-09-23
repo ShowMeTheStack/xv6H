@@ -8,6 +8,8 @@
 //
 struct slab;
 
+#define MAXCACHES 64
+
 struct kmem_cache {
   char name[16];
   uint objsize;           // rounded up to the alignment
@@ -25,5 +27,8 @@ struct kmem_cache *kmem_cache_create(const char *name, uint size, uint align, vo
 void *kmem_cache_alloc(struct kmem_cache *c);   // not zeroed unless the ctor zeroes
 void kmem_cache_free(struct kmem_cache *c, void *obj);
 void kmem_cache_stats(struct kmem_cache *c, uint64 *nslabs, uint64 *nalloc);
+// every cache, five numbers each: object size, objects per slab, slabs,
+// objects handed out, pages held. See /proc/slabinfo.
+int kmem_cache_list(uint64 *out, int max, char names[][16]);
 
 #endif

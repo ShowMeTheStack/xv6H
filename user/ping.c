@@ -21,6 +21,11 @@ main(int argc, char *argv[])
     exit(1);
   }
   char s[20];
+  // uptime() counts timer ticks, and how many there are in a second
+  // is a setting of this kernel's (/sys/kernel/tick_hz)
+  long hz = sysconf(_SC_CLK_TCK);
+  if (hz <= 0)
+    hz = 100;
   printf("PING %s (%s)\n", argv[1], ip2str(ip, s));
   // an ICMP socket: what Linux calls a ping socket, and what this
   // kernel gives a program that asks for datagrams of ICMP
@@ -72,11 +77,11 @@ main(int argc, char *argv[])
     } else {
       printf("%d bytes from %s: seq %d time %d ms\n", n,
              ip2str(ntohl(from.sin_addr.s_addr), s), seq,
-             (uptime() - t0) * 100);
+             (int)((uptime() - t0) * 1000 / hz));
       ok++;
     }
     if (seq < count)
-      ticksleep(10);
+      ticksleep((int)hz);   // a second between probes
   }
   printf("%d packets transmitted, %d received\n", count, ok);
   exit(ok ? 0 : 1);

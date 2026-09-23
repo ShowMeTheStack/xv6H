@@ -34,8 +34,10 @@ usage(void)
 {
   fprintf(stderr, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
              "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-M mb] [-d]\n"
+             "                 [-w weight] [--cpu-max pct]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
-             "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n");
+             "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
+             "       vmm weight VM N | vmm cpumax VM PCT\n");
   exit(1);
 }
 
@@ -313,6 +315,16 @@ start(int argc, char *argv[])
     } else if (strcmp(a, "-M") == 0 && v) {
       cfg.mem_limit_mb = atoi(v);
       i++;
+    } else if (strcmp(a, "-w") == 0 && v) {
+      // the machine's share of the host's processors, whatever its
+      // vcpu count: 1024 is one nice-0 task's worth
+      cfg.weight = atoi(v);
+      i++;
+    } else if (strcmp(a, "--cpu-max") == 0 && v) {
+      // and a ceiling, in hundredths of one processor
+      cfg.cpu_max_us = atoi(v) * 1000;   // per 100 ms
+      cfg.cpu_period_us = 100000;
+      i++;
     } else if (strcmp(a, "-r") == 0 && v) {
       cfg.flags |= VMF_RAW;
       cfg.load_addr = parse_addr(v);
@@ -413,6 +425,14 @@ info(int id)
   if (vi.mem_limit_mb)
     printf(", limit %d MB", vi.mem_limit_mb);
   printf("\n");
+  printf("  cpu: weight %d", vi.weight);
+  if (vi.cpu_max_us > 0 && vi.cpu_period_us > 0)
+    printf(", at most %d%% of one processor (%ld throttle%s)",
+           vi.cpu_max_us * 100 / vi.cpu_period_us, vi.throttles,
+           vi.throttles == 1 ? "" : "s");
+  if (vi.frozen)
+    printf(", frozen");
+  printf("\n");
   if (vi.balloon_target_mb || vi.balloon_actual_mb)
     printf("  balloon: %d MB asked for, %d MB given back\n",
            vi.balloon_target_mb, vi.balloon_actual_mb);
@@ -431,8 +451,14 @@ info(int id)
   } else {
     printf("  net: guest default (xv6: dhcp)\n");
   }
-  printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld\n", vi.exits, vi.mmio, vi.csr,
+  printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld", vi.exits, vi.mmio, vi.csr,
          vi.wfi, vi.injected);
+  if (vi.exit_throttles)
+    printf(", %ld exit-rate throttle%s", vi.exit_throttles,
+           vi.exit_throttles == 1 ? "" : "s");
+  if (vi.nudges)
+    printf(", %ld sibling nudge%s", vi.nudges, vi.nudges == 1 ? "" : "s");
+  printf("\n");
   printf("  vcpu0: pc 0x%lx last cause 0x%lx gpa 0x%lx hart %d idle %d mmode %d\n", vi.pc,
          vi.last_cause, vi.last_gpa, vi.running_hart, vi.idle, vi.mmode);
   printf("         vsatp 0x%lx vstvec 0x%lx vsepc 0x%lx vscause 0x%lx vsstatus 0x%lx vstval 0x%lx\n",
@@ -560,17 +586,44 @@ main(int argc, char *argv[])
     int on = strcmp(argv[2], "on") == 0;
     if (!on && strcmp(argv[2], "off") != 0)
       usage();
-    if (vm_ctl(0, on ? VMCTL_KSM_ON : VMCTL_KSM_OFF) < 0) {
+    if (vm_ctl(0, on ? VMCTL_KSM_ON : VMCTL_KSM_OFF, 0) < 0) {
       fprintf(stderr, "vmm: cannot turn same-page merging %s\n", argv[2]);
       exit(1);
     }
     printf("same-page merging %s\n", on ? "on" : "off");
+  } else if (argc == 4 && strcmp(cmd, "weight") == 0) {
+    int id = lookup(argv[2]);
+    int w = atoi(argv[3]);
+    if (id < 0) {
+      fprintf(stderr, "vmm: no vm '%s'\n", argv[2]);
+      exit(1);
+    }
+    if (vm_ctl(id, VMCTL_WEIGHT, w) < 0) {
+      fprintf(stderr, "vmm: weight %d refused\n", w);
+      exit(1);
+    }
+    printf("vm %d weight %d\n", id, w);
+  } else if (argc == 4 && strcmp(cmd, "cpumax") == 0) {
+    int id = lookup(argv[2]);
+    int pct = atoi(argv[3]);
+    if (id < 0) {
+      fprintf(stderr, "vmm: no vm '%s'\n", argv[2]);
+      exit(1);
+    }
+    if (vm_ctl(id, VMCTL_CPUMAX, pct) < 0) {
+      fprintf(stderr, "vmm: cpu ceiling %d%% refused\n", pct);
+      exit(1);
+    }
+    if (pct)
+      printf("vm %d at most %d%% of one processor\n", id, pct);
+    else
+      printf("vm %d no processor ceiling\n", id);
   } else if (argc == 4 && strcmp(cmd, "balloon") == 0) {
     int id = must_lookup(argv[2]);
     int mb = atoi(argv[3]);
     if (mb < 0)
       usage();
-    if (vm_ctl(id, VMCTL_BALLOON + mb) < 0) {
+    if (vm_ctl(id, VMCTL_BALLOON, mb) < 0) {
       fprintf(stderr, "vmm: vm %d has no balloon\n", id);
       exit(1);
     }
@@ -584,9 +637,9 @@ main(int argc, char *argv[])
     else if (strcmp(cmd, "restart") == 0)
       restart(id);
     else if (strcmp(cmd, "pause") == 0)
-      printf("vm %d %s\n", id, vm_ctl(id, VMCTL_PAUSE) == 0 ? "paused" : "not paused");
+      printf("vm %d %s\n", id, vm_ctl(id, VMCTL_PAUSE, 0) == 0 ? "paused" : "not paused");
     else if (strcmp(cmd, "resume") == 0)
-      printf("vm %d %s\n", id, vm_ctl(id, VMCTL_RESUME) == 0 ? "resumed" : "not resumed");
+      printf("vm %d %s\n", id, vm_ctl(id, VMCTL_RESUME, 0) == 0 ? "resumed" : "not resumed");
     else if (strcmp(cmd, "ps") == 0)
       ps(id);
     else if (strcmp(cmd, "info") == 0)

@@ -13,6 +13,37 @@
 struct spinlock tickslock;
 uint ticks;
 
+// how often the timer interrupts, and the same figure in the units
+// the time counter uses. Everything the kernel counts in ticks --
+// alarms, poll and select deadlines, futex waits, the writeback and
+// journal timers, the processor time a process is charged -- is in
+// units of one of these, so changing the rate changes what an already
+// counted tick meant. It is a thing to set at boot and leave alone;
+// it is settable because the plan asks for it and because the way to
+// find out what a hundred hertz costs is to be able to try ten.
+int tick_hz = TICK_HZ;
+uint64 tick_interval;
+
+void
+tickinit(void)
+{
+  uint64 hz = plat.timebase ? plat.timebase : 10000000;
+
+  tick_interval = hz / (tick_hz > 0 ? tick_hz : 1);
+}
+
+// change the rate. The next interrupt on each hart is the first one
+// at the new interval.
+int
+tick_set_hz(int hz)
+{
+  if (hz < 1 || hz > 10000)
+    return -1;
+  tick_hz = hz;
+  tickinit();
+  return 0;
+}
+
 extern char trampoline[], uservec[];
 
 // in kernelvec.S, calls kerneltrap().
@@ -24,6 +55,7 @@ void
 trapinit(void)
 {
   initlock(&tickslock, "time");
+  tickinit();
 }
 
 // set up to take exceptions and traps while in the kernel.
@@ -104,10 +136,21 @@ usertrap(void)
   if (killed(p))
     kexit(0);
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2) {
+  // a tick is not by itself a reason to give up the processor: the
+  // scheduler says when this task has had its slice, or when
+  // something with less virtual time is waiting (sched.c). Nor is
+  // every timer interrupt a tick any more -- the timer also ends
+  // slices -- so what is charged is the tick the interrupt crossed.
+  if (which_dev == 2 && mycpu()->tick) {
+    mycpu()->tick = 0;
     p->utime++; // the tick interrupted user code
-    yield();
+  }
+  {
+    int r = mycpu()->resched;
+    if (r || (which_dev == 2 && sched_tick_expired())) {
+      sched_count_yield(r);
+      yield();
+    }
   }
 
   // deliver a pending signal before going back to user space
@@ -194,9 +237,22 @@ kerneltrap()
     panic("kerneltrap");
   }
 
-  // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2 && myproc() != 0)
-    yield();
+  if (which_dev == 2 && mycpu()->tick) {
+    mycpu()->tick = 0;
+    struct proc *p = myproc();
+    if (p)
+      p->stime++; // the tick interrupted this task in the kernel
+  }
+
+  // the same in the kernel: only when the slice is up or somebody
+  // asked for this hart
+  if (myproc() != 0) {
+    int r = mycpu()->resched;
+    if (r || (which_dev == 2 && sched_tick_expired())) {
+      sched_count_yield(r);
+      yield();
+    }
+  }
 
   // the yield() may have caused some traps to occur,
   // so restore trap registers for use by kernelvec.S's sepc instruction.
@@ -204,32 +260,84 @@ kerneltrap()
   w_sstatus(sstatus);
 }
 
+// when this hart owes the world its next tick. The timer may be asked
+// to fire sooner than that -- for the end of a task's slice, or for a
+// guest whose own timer is due -- so the tick is a deadline that is
+// counted when it passes, not every time the timer goes off.
+static uint64 next_tick[NCPU];
+static uint64 programmed[NCPU];   // what stimecmp is set to
+
+// program the timer for the first of: the tick this hart owes, the
+// end of the running task's slice, and anything a guest is waiting
+// for. Called from the timer interrupt and whenever a task goes on
+// the processor with a slice that ends sooner than the timer is set.
+void
+timer_rearm(void)
+{
+  int me = cpuid();
+  uint64 now = r_time();
+
+  if (next_tick[me] <= now)
+    next_tick[me] = now + tick_interval;
+  // a hart with nothing to run has no reason to be woken on a
+  // schedule: what gives it something to do is an interrupt, and an
+  // interrupt ends wfi whether a timer was set or not. Hart 0 keeps
+  // ticking, because it is the one that counts `ticks' and runs the
+  // timers everything else waits on.
+  if (me != 0 && sched_hart_idle())
+    next_tick[me] = now + tick_interval * 64;
+  uint64 next = next_tick[me];
+  uint64 slice = sched_slice_deadline();
+  if (slice > now && slice < next)
+    next = slice;
+  next = hyp_next_deadline(next);
+  if (next < now + 100)
+    next = now + 100;
+  programmed[me] = next;
+  w_stimecmp(next);
+}
+
+// a task has just gone on the processor. If its slice ends before the
+// timer is already set to fire there is nothing to do: an interrupt
+// that comes early costs one trip through clockintr, which re-arms
+// properly, and writing stimecmp and walking the guests' timers on
+// every context switch costs more than that comes to.
+void
+timer_slice(uint64 deadline)
+{
+  int me = cpuid();
+
+  if (deadline && deadline < programmed[me])
+    timer_rearm();
+}
+
 void
 clockintr()
 {
-  if (cpuid() == 0) {
-    acquire(&tickslock);
-    ticks++;
-    wakeup(&ticks);
-    release(&tickslock);
+  int me = cpuid();
+  uint64 now = r_time();
+
+  // a tick is owed only when one has actually gone by: the timer is
+  // also used for slice ends, which are far more frequent.
+  if (now >= next_tick[me]) {
+    next_tick[me] = now + tick_interval;
+    mycpu()->tick = 1;    // one to charge whoever this interrupted
+    sched_balance();      // work waiting here and a hart idle next door
+    if (me == 0) {
+      acquire(&tickslock);
+      ticks++;
+      wakeup(&ticks);
+      release(&tickslock);
+      net_timer();
+      signal_timers();      // SIGALRM where it is due
+      sched_bandwidth_tick(); // groups whose period has turned over
+    }
   }
 
   // let the hypervisor wake guests whose virtual timers expired.
   hyp_tick();
-  if (cpuid() == 0)
-    net_timer();
 
-  // ask for the next timer interrupt. this also clears
-  // the interrupt request. 1000000 is about a tenth
-  // of a second; an idle guest's timer may need to fire sooner.
-  uint64 now = r_time();
-  uint64 next = hyp_next_deadline(now + 1000000);
-  if (next < now + 100)
-    next = now + 100;
-  w_stimecmp(next);
-  if (cpuid() == 0)
-    signal_timers(); // SIGALRM where it is due
-
+  timer_rearm();
 }
 
 // dispatch one external interrupt identity from the interrupt controller.
@@ -241,6 +349,8 @@ extintr(int irq)
     uint64 reasons = ipi_handle();
     if (reasons & IPI_TLBFLUSH)
       kstack_flush_ack();
+    if (reasons & IPI_RESCHED)
+      mycpu()->resched = 1;
   } else if (irq == plat.uart_irq) {
     uartintr();
   } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
@@ -280,6 +390,8 @@ devintr()
     uint64 reasons = ipi_handle();
     if (reasons & IPI_TLBFLUSH)
       kstack_flush_ack();
+    if (reasons & IPI_RESCHED)
+      mycpu()->resched = 1;
     return 1;
   } else if (scause == 0x8000000000000005L) {
     // timer interrupt.

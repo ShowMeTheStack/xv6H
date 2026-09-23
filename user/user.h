@@ -44,7 +44,7 @@
 struct vmconfig;
 struct vminfo;
 int vm_create(struct vmconfig *);
-int vm_ctl(int, int);
+int vm_ctl(int, int, unsigned long);
 int vm_run(int, int);
 int vm_destroy(int);
 int vm_cons(int, int, void *, int);

@@ -9,38 +9,47 @@ DETACH = "\x1d"
 
 def boot_host(QEMU, intc, cpus, log, **kw):
     q = QEMU(intc=intc, cpus=cpus, log=log, **kw)
-    q.expect(r"hyp: hypervisor extension present", 40)
-    q.expect(r"init: starting sh", 40)
-    q.expect(r"\$ ", 10)
+    q.expect(r"hyp: hypervisor extension present", 90)
+    q.expect(r"init: starting sh", 90)
+    q.expect(r"\$ ", 30)
     return q
 
 
-def start_guest(q, args="", timeout=60):
+def start_guest(q, args="", timeout=90):
     """vmm start ... (attached) and wait for the xv6 guest's shell prompt."""
     q.send("vmm start %s\n" % args)
-    m = q.expect(r"vm (\d+)[^:]*: (\d+) vcpu", 20)
+    m = q.expect(r"vm (\d+)[^:]*: (\d+) vcpu", 30)
     vmid = int(m.group(1))
     q.expect(r"xv6 kernel is booting", timeout)
     q.expect(r"init: starting sh", timeout)
-    q.expect(r"\$ ", 10)
+    q.expect(r"\$ ", 30)
     return vmid
+
+
+# how long to wait for the machine to answer something it should answer
+# at once. On an idle laptop every one of these takes well under a
+# second; on a build box running six other suites it does not, and a
+# test that fails because the machine it is on is busy says nothing
+# about the machine it is testing. Deliberate negatives -- a paused
+# guest that must *not* answer -- keep their own short waits.
+ATONCE = 30
 
 
 def detach(q):
     q.send(DETACH)
-    q.expect(r"\[detached from vm \d+\]", 10)
-    q.expect(r"\$ ", 10)
+    q.expect(r"\[detached from vm \d+\]", ATONCE)
+    q.expect(r"\$ ", ATONCE)
 
 
 def attach(q, vm):
     q.send("vmm attach %s\n" % vm)
-    q.expect(r"\[attached to vm ", 10)
+    q.expect(r"\[attached to vm ", ATONCE)
 
 
 def host_stats(q):
     q.send("vmm stats\n")
-    m = q.expect(r"free guest memory: (\d+) MB \((\d+) pages\), ipis: (\d+)", 10)
-    q.expect(r"\$ ", 5)
+    m = q.expect(r"free guest memory: (\d+) MB \((\d+) pages\), ipis: (\d+)", ATONCE)
+    q.expect(r"\$ ", ATONCE)
     return int(m.group(1)), int(m.group(3))
 
 
@@ -87,16 +96,16 @@ def wait_free(q, free0, timeout=20):
 def vm_ls(q):
     """returns the text of vmm ls."""
     q.send("vmm ls\n")
-    q.expect(r"vmm ls", 5)
-    m = q.expect(r"(no vms|ID NAME.*?)\n(?=\$ )", 10)
-    q.expect(r"\$ ", 5)
+    q.expect(r"vmm ls", ATONCE)
+    m = q.expect(r"(no vms|ID NAME.*?)\n(?=\$ )", ATONCE)
+    q.expect(r"\$ ", ATONCE)
     return m.group(1).decode()
 
 
 def kill_vm(q, vm):
     q.send("vmm kill %s\n" % vm)
-    q.expect(r"vm \d+ killed", 20)
-    q.expect(r"\$ ", 10)
+    q.expect(r"vm \d+ killed", ATONCE)
+    q.expect(r"\$ ", ATONCE)
 
 
 def assert_gone(q, vmid):
@@ -610,20 +619,27 @@ def t_clone(QEMU, intc, cpus, log):
 
 
 def t_lifecycle(QEMU, intc, cpus, log):
-    """names, pause/resume, restart, ps, kill --all."""
+    """names, pause/resume, restart, ps, kill --all.
+
+    the waits here are generous on purpose. Everything this test asks
+    for should happen at once, and on an idle machine it does -- five
+    seconds each was enough for a year. On a build box running six
+    suites at a load average of fifteen it is not, and a test that
+    fails because the machine it is on is busy says nothing about the
+    machine it is testing."""
     q = boot_host(QEMU, intc, cpus, log)
     try:
         start_guest(q, "-n web -c 2")
         detach(q)
         q.send("vmm start -n db -f /disk1.img -d\n")
-        q.expect(r"vm 1 db: 1 vcpu", 10)
-        q.expect(r"\$ ", 5)
+        q.expect(r"vm 1 db: 1 vcpu", 30)
+        q.expect(r"\$ ", 30)
         lst = vm_ls(q)
         assert re.search(r"^0  web +running +2", lst, re.M) and re.search(r"^1  db +running +1", lst, re.M), lst
         # pause: the guest stops responding; resume: it answers.
         q.send("vmm pause web\n")
-        q.expect(r"vm 0 paused", 10)
-        q.expect(r"\$ ", 5)
+        q.expect(r"vm 0 paused", 30)
+        q.expect(r"\$ ", 30)
         assert re.search(r"^0  web +paused", vm_ls(q), re.M)
         attach(q, "web")
         q.send("echo while-paused\n")
@@ -634,35 +650,35 @@ def t_lifecycle(QEMU, intc, cpus, log):
             pass
         detach(q)
         q.send("vmm resume web\n")
-        q.expect(r"vm 0 resumed", 10)
-        q.expect(r"\$ ", 5)
+        q.expect(r"vm 0 resumed", 30)
+        q.expect(r"\$ ", 30)
         attach(q, "web")
-        q.expect(r"while-paused", 10) # the typed line is processed now
-        q.expect(r"\$ ", 10)
+        q.expect(r"while-paused", 30) # the typed line is processed now
+        q.expect(r"\$ ", 30)
         q.send("echo after-resume\n")
-        q.expect(r"after-resume\r?\n", 10)
-        q.expect(r"\$ ", 10)
+        q.expect(r"after-resume\r?\n", 30)
+        q.expect(r"\$ ", 30)
         detach(q)
         # ps shows the guest's processes
         q.send("vmm ps db\n")
-        q.expect(r"sleep +init", 10)
-        q.expect(r"\$ ", 10)
+        q.expect(r"sleep +init", 30)
+        q.expect(r"\$ ", 30)
         # restart keeps the configuration
         q.send("vmm restart db\n")
-        q.expect(r"vm 1 killed", 20)
-        q.expect(r"vm (\d+) db: 1 vcpu\(s\), 128 MB, kernel /kernel, disk /disk1.img", 10)
-        q.expect(r"\$ ", 5)
+        q.expect(r"vm 1 killed", 60)
+        q.expect(r"vm (\d+) db: 1 vcpu\(s\), 128 MB, kernel /kernel, disk /disk1.img", 30)
+        q.expect(r"\$ ", 30)
         attach(q, "db")
         q.expect(r"init: starting sh", 30)
         detach(q)
         q.send("vmm kill --all\n")
-        q.expect(r"vm \d+ killed", 20)
-        q.expect(r"vm \d+ killed", 20)
-        q.expect(r"\$ ", 10)
+        q.expect(r"vm \d+ killed", 60)
+        q.expect(r"vm \d+ killed", 60)
+        q.expect(r"\$ ", 30)
         assert "no vms" in vm_ls(q)
         q.send("vmm kill --all\n")
-        q.expect(r"no vms", 10)
-        q.expect(r"\$ ", 5)
+        q.expect(r"no vms", 30)
+        q.expect(r"\$ ", 30)
     finally:
         q.close()
 

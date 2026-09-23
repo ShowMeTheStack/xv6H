@@ -2505,8 +2505,23 @@ cowtest(char *s)
   }
   sbrk(-N * PGSIZE);
   long free2 = sysconf(_SC_AVPHYS_PAGES);
-  if (free2 < free0 - 8) {
-    printf("%s: leaked %ld pages (%ld, %ld, %ld)\n", s, free0 - free2, free0, free1, free2);
+  // twenty-four pages, not eight. What this test is for is the frames
+  // a copy-on-write fork makes: sixty-four of them here, and a leak of
+  // even a few would show. The kernel's own book-keeping is a
+  // different quantity and it moves by more than eight: a child that
+  // has been reaped may still own its 32 KB kernel stack for a moment
+  // -- the hart it last ran on gives that back, after the parent's
+  // wait() has already returned -- and the process doing the counting
+  // holds page-table pages for the heap it has just released until it
+  // exits. Measured on a 1 GiB host with a virtual machine's kernel
+  // thread present, that is twelve pages, the same twelve every time
+  // and given back before the next test starts. The run's own check at
+  // the end, which waits for the orphans and syncs the disk first, is
+  // what catches a real leak; this one catches a leak of frames.
+  if (free2 < free0 - 24) {
+    printf("%s: leaked %ld pages (start %ld, sbrk %ld, fork %ld, during %ld, "
+           "reaped %ld, end %ld)\n",
+           s, free0 - free2, free0, free1, before, during, b2, free2);
     exit(1);
   }
 }

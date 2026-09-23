@@ -82,43 +82,8 @@ waitq_of(void *chan)
   return &waitqs[(h >> 40) % NWAITQ];
 }
 
-// ---- the run queue ----
-
-static struct {
-  struct spinlock lock;
-  struct proc *head, *tail; // singly linked through rq_next
-} rq;
-
-// p->lock held; p->state is RUNNABLE.
-static void
-rq_push(struct proc *p)
-{
-  if (p->on_rq)
-    return;
-  p->on_rq = 1;
-  p->rq_next = 0;
-  acquire(&rq.lock);
-  if (rq.tail)
-    rq.tail->rq_next = p;
-  else
-    rq.head = p;
-  rq.tail = p;
-  release(&rq.lock);
-}
-
-static struct proc *
-rq_pop(void)
-{
-  acquire(&rq.lock);
-  struct proc *p = rq.head;
-  if (p) {
-    rq.head = p->rq_next;
-    if (rq.head == 0)
-      rq.tail = 0;
-  }
-  release(&rq.lock);
-  return p;
-}
+// the run queue lives in sched.c: a red-black tree per hart, ordered
+// by virtual time.
 
 // ---- init ----
 
@@ -128,7 +93,6 @@ procinit(void)
   initlock(&pid_lock, "pid");
   initlock(&wait_lock, "wait_lock");
   initlock(&proc_lock, "procs");
-  initlock(&rq.lock, "runq");
   for (int i = 0; i < NWAITQ; i++)
     initlock(&waitqs[i].lock, "waitq");
   proc_cache = kmem_cache_create("proc", sizeof(struct proc), 64, 0);
@@ -671,6 +635,10 @@ allocproc(void)
   }
   memset(p, 0, sizeof(*p));
   initlock(&p->lock, "proc");
+  // no hart yet: the scheduler places it where it is made, not on
+  // hart 0, which is what a zeroed field would mean.
+  p->cpu = -1;
+  p->cpus = ~0UL;    // no affinity: any hart will do
   p->pid = allocpid();
   if (p->pid < 0) {
     kmem_cache_free(proc_cache, p);
@@ -766,6 +734,10 @@ complain:
 static void
 freeproc(struct proc *p)
 {
+  // out of its scheduler group: what it is counted for there goes
+  // with it (kernel/sched.c)
+  if (p->sg)
+    sched_group_join(p, 0);
   if (p->trapframe)
     kfree((void *)p->trapframe);
   p->trapframe = 0;
@@ -911,7 +883,7 @@ userinit(void)
   p->cred.cap_bounding = CAP_FULL;
 
   p->state = RUNNABLE;
-  rq_push(p);
+  sched_enqueue(p, SCHED_NEW);
 
   release(&p->lock);
 }
@@ -1012,6 +984,9 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
   np->umask = p->umask;
   np->cred = p->cred; // a child is whoever its parent was
   np->nice = p->nice; // and starts with the same claim on the processor
+  np->cpus = p->cpus; // and on the same harts
+  np->sg = 0;
+  sched_group_join(np, p->sg); // and in the same group, if it is in one
   // a child is not watched because its parent is: ptrace(TRACEME) is
   // something a process does for itself
   np->traced = 0;
@@ -1042,7 +1017,7 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
 
   acquire(&np->lock);
   np->state = RUNNABLE;
-  rq_push(np);
+  sched_enqueue(np, SCHED_NEW);
   release(&np->lock);
 
   return tid;
@@ -1334,14 +1309,15 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    p = rq_pop();
+    // the runnable task of this hart with the least virtual time,
+    // or one stolen from a busier hart (see sched.c)
+    p = sched_pick();
     if (p == 0) {
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
       continue;
     }
     acquire(&p->lock);
-    p->on_rq = 0;
     uint64 zombie_stack = 0;
     if (p->state == RUNNABLE) {
       // Switch to chosen process.  It is the process's job
@@ -1349,7 +1325,10 @@ scheduler(void)
       // before jumping back to us.
       p->state = RUNNING;
       c->proc = p;
+      c->resched = 0;
+      sched_begin(p);
       swtch(&c->context, &p->context);
+      sched_end(p);
 
       // Don't re-enable interrupts on release.
       mycpu()->intena = 0;
@@ -1385,6 +1364,11 @@ scheduler(void)
         zombie_stack = p->kstack;
         p->kstack = 0;
       }
+    } else {
+      // picked, and by the time its lock was taken it was not
+      // runnable any more. sched_pick took it off the tree; this puts
+      // the hart's books straight again (sched.c).
+      sched_unpick(p);
     }
     release(&p->lock);
     if (zombie_stack)
@@ -1426,7 +1410,10 @@ yield(void)
   struct proc *p = myproc();
   acquire(&p->lock);
   p->state = RUNNABLE;
-  rq_push(p);
+  // giving up the processor is not sleeping: it keeps the virtual
+  // time it has, so a task cannot gain by yielding in a loop. It goes
+  // back in the tree in sched_end, once it is really off the
+  // processor -- see kernel/sched.c.
   sched();
   release(&p->lock);
 }
@@ -1494,7 +1481,7 @@ proc_make_runnable(struct proc *p)
     // and simply carry on, so there is nothing to queue.
     if (stopped && !p->stop_parked)
       return;
-    rq_push(p);
+    sched_enqueue(p, SCHED_WAKE);
   }
 }
 
@@ -1633,7 +1620,7 @@ kthread_create(void (*fn)(void *), void *arg, const char *name)
 
   acquire(&p->lock);
   p->state = RUNNABLE;
-  rq_push(p);
+  sched_enqueue(p, SCHED_NEW);
   release(&p->lock);
   return pid;
 }
@@ -1876,7 +1863,7 @@ wake_proc(struct proc *p)
     p->chan = 0;
     if (p->state == SLEEPING) {
       p->state = RUNNABLE;
-      rq_push(p);
+      sched_enqueue(p, SCHED_WAKE);
     }
   }
   release(&p->lock);
@@ -1916,7 +1903,7 @@ wakeup_n(void *chan, int n)
       p->chan = 0;
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
-        rq_push(p);
+        sched_enqueue(p, SCHED_WAKE);
       }
       release(&p->lock);
       woken++;
@@ -1954,7 +1941,7 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNABLE.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
-        rq_push(p);
+        sched_enqueue(p, SCHED_WAKE);
       }
       release(&p->lock);
     }

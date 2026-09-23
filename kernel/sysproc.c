@@ -21,6 +21,7 @@ extern char hostname[64];
 #include "vm.h"
 #include "page.h"
 #include "sysconf.h"
+#include "schedgroup.h"
 
 uint64
 sys_exit(void)
@@ -369,7 +370,7 @@ sys_sysconf(void)
     // this is what Linux calls available rather than free.
     return kmem_free_pages() + blk_reclaimable();
   case _SC_NPROCESSORS_ONLN: return plat.ncpu;
-  case _SC_CLK_TCK: return 10;
+  case _SC_CLK_TCK: return tick_hz;
   case _SC_XV6_MAXVA: return plat.maxva;
   case _SC_XV6_TRAPFRAME: return TRAPFRAME;
   case _SC_XV6_BRK_MAX: return mm_brk_max(myproc()->mm); // the heap may grow to here
@@ -484,10 +485,10 @@ sys_getrusage(void)
   memset(&ru, 0, sizeof(ru));
   uint64 u = who == RUSAGE_CHILDREN ? p->cutime : p->utime;
   uint64 st = who == RUSAGE_CHILDREN ? p->cstime : p->stime;
-  ru.ru_utime.tv_sec = u / TICK_HZ;
-  ru.ru_utime.tv_usec = (u % TICK_HZ) * (1000000 / TICK_HZ);
-  ru.ru_stime.tv_sec = st / TICK_HZ;
-  ru.ru_stime.tv_usec = (st % TICK_HZ) * (1000000 / TICK_HZ);
+  ru.ru_utime.tv_sec = u / tick_hz;
+  ru.ru_utime.tv_usec = (u % tick_hz) * (1000000 / tick_hz);
+  ru.ru_stime.tv_sec = st / tick_hz;
+  ru.ru_stime.tv_usec = (st % tick_hz) * (1000000 / tick_hz);
   if (who != RUSAGE_CHILDREN && p->mm)
     ru.ru_maxrss = p->mm->pages * (PGSIZE / 1024);
   ru.ru_minflt = p->minflt;
@@ -912,6 +913,188 @@ in_set(struct proc *p, int which, int who)
   return 0;
 }
 
+// sched_setaffinity(pid, size, mask): the harts this task may run on.
+// pid 0 means the caller. The mask is a bitmap of harts, as Linux's
+// cpu_set_t is; a mask naming no hart this machine has is refused
+// rather than silently leaving a task nowhere to run.
+uint64
+sys_sched_setaffinity(void)
+{
+  int pid;
+  uint64 size, addr, mask = 0;
+
+  argint(0, &pid);
+  argaddr(1, &size);
+  argaddr(2, &addr);
+  if (size < sizeof(uint64))
+    return -EINVAL;
+  if (either_copyin(&mask, 1, addr, sizeof(mask)) < 0)
+    return -EFAULT;
+  if ((mask & ((plat.ncpu >= 64 ? ~0UL : (1UL << plat.ncpu) - 1))) == 0)
+    return -EINVAL;
+
+  struct proc *me = myproc();
+  if (pid == 0 || pid == me->pid) {
+    acquire(&me->lock);
+    sched_set_affinity(me, mask);
+    release(&me->lock);
+    return 0;
+  }
+
+  struct proc *p = proc_get(pid);
+  if (p == 0)
+    return -ESRCH;
+  // the same rule as renicing somebody: the owner or a privileged
+  // caller, and nobody else.
+  if (p->cred.euid != me->cred.euid && p->cred.uid != me->cred.euid &&
+      !cap_ok(CAP_SYS_NICE)) {
+    proc_release(p);
+    return -EPERM;
+  }
+  acquire(&p->lock);
+  sched_set_affinity(p, mask);
+  release(&p->lock);
+  proc_release(p);
+  return 0;
+}
+
+// sched_getaffinity(pid, size, mask): and the bytes written, the way
+// Linux answers it.
+uint64
+sys_sched_getaffinity(void)
+{
+  int pid;
+  uint64 size, addr, mask;
+
+  argint(0, &pid);
+  argaddr(1, &size);
+  argaddr(2, &addr);
+  if (size < sizeof(uint64))
+    return -EINVAL;
+
+  struct proc *me = myproc();
+  if (pid == 0 || pid == me->pid) {
+    mask = sched_affinity(me);
+  } else {
+    struct proc *p = proc_get(pid);
+    if (p == 0)
+      return -ESRCH;
+    mask = sched_affinity(p);
+    proc_release(p);
+  }
+  if (either_copyout(1, addr, &mask, sizeof(mask)) < 0)
+    return -EFAULT;
+  return sizeof(mask);
+}
+
+// sched_yield(): give the rest of this slice to whoever is next.
+uint64
+sys_sched_yield(void)
+{
+  yield();
+  return 0;
+}
+
+// getcpu(): the hart this task is on. It may be somewhere else by the
+// time the answer is read, which is true of Linux's answer too.
+uint64
+sys_getcpu(void)
+{
+  return cpuid();
+}
+
+// sched_group(op, id, a, b): the scheduler's groups from user space.
+//
+// this is what `cgrun' uses and what the cgroup file system of
+// section 8 will sit on: a group is made, a process joins it, and
+// from then on the group's share of the processor is divided among
+// whatever is in it rather than each of them competing separately.
+//
+//   SGC_CREATE  a = the name           -> the group's id
+//   SGC_JOIN    id (-1: back to the root)
+//   SGC_WEIGHT  id, a = weight
+//   SGC_MAX     id, a = quota us, b = period us (a = 0: no ceiling)
+//   SGC_FREEZE  id, a = 0 or 1
+//   SGC_DESTROY id
+//   SGC_INFO    id, a = where to put eight numbers
+uint64
+sys_sched_group(void)
+{
+  int op, id;
+  uint64 a, b;
+  char name[SCHED_GROUP_NAMELEN];
+
+  argint(0, &op);
+  argint(1, &id);
+  argaddr(2, &a);
+  argaddr(3, &b);
+
+  // everything but joining the root and asking questions is a
+  // privileged operation: a group is a claim on the machine.
+  if (op != SGC_JOIN && op != SGC_INFO && !cap_ok(CAP_SYS_NICE))
+    return -EPERM;
+
+  struct proc *p = myproc();
+  struct sched_group *g;
+
+  switch (op) {
+  case SGC_CREATE:
+    name[0] = 0;
+    if (a && fetchstr(a, name, sizeof(name)) < 0)
+      return -EFAULT;
+    g = sched_group_create(name, 0);
+    return g ? sched_group_id(g) : -ENOSPC;
+  case SGC_JOIN:
+    if (id < 0) {
+      acquire(&p->lock);
+      sched_group_join(p, 0);
+      release(&p->lock);
+      return 0;
+    }
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    if (!cap_ok(CAP_SYS_NICE))
+      return -EPERM;
+    acquire(&p->lock);
+    sched_group_join(p, g);
+    release(&p->lock);
+    return 0;
+  case SGC_WEIGHT:
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    return sched_group_set_weight(g, (uint32)a) < 0 ? -EINVAL : 0;
+  case SGC_MAX:
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    return sched_group_set_max(g, a, b) < 0 ? -EINVAL : 0;
+  case SGC_FREEZE:
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    return sched_group_freeze(g, (int)a) < 0 ? -EINVAL : 0;
+  case SGC_DESTROY:
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    sched_group_destroy(g);
+    return 0;
+  case SGC_INFO: {
+    uint64 out[8];
+    g = sched_group_by_id(id);
+    if (g == 0)
+      return -ESRCH;
+    sched_group_stat(g, out, 8);
+    if (either_copyout(1, a, out, sizeof(out)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  }
+  return -EINVAL;
+}
+
 uint64
 sys_setpriority(void)
 {
@@ -938,6 +1121,7 @@ sys_setpriority(void)
       continue;
     }
     p->nice = value;
+    sched_renice(p);
   }
   proc_iter_end();
   if (!found)

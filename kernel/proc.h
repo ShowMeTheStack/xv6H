@@ -1,3 +1,4 @@
+#include "rbtree.h"
 #include "cred.h"
 #include "signal.h"
 // Saved registers for kernel context switches.
@@ -26,6 +27,8 @@ struct cpu {
   struct context context; // swtch() here to enter scheduler().
   int noff;               // Depth of push_off() nesting.
   int intena;             // Were interrupts enabled before push_off()?
+  int resched;            // something with less virtual time is waiting
+  int tick;               // a whole timer tick passed at the last interrupt
 };
 
 extern struct cpu cpus[NCPU];
@@ -133,6 +136,23 @@ struct fsinfo {
   struct inode *root;
 };
 
+
+// what a hart's tree holds. Two things go in it: a task, and a group
+// of tasks standing in for all of them (sched.c). Both embed one of
+// these as their first scheduler field, and rb.tag says which.
+#define SE_TASK  0
+#define SE_GROUP 1
+struct sched_ent {
+  struct rb_node rb;      // rb.key is the virtual time below
+  uint64 vruntime;
+  uint32 weight;          // from the nice value, or the group's
+  uint32 inv_weight;      // 2^32 / weight, so dividing by it is a multiply
+  uint32 load_weight;     // the weight it is counted for in the hart's
+                          // load, which is not weight once nice has
+                          // changed under it
+  int on_rq;              // in the tree (as opposed to on the processor)
+  int counted;            // counted in the load and nr_running
+};
 // Per-process state
 struct proc {
   struct spinlock lock;
@@ -196,11 +216,9 @@ struct proc {
   struct cred cred;      // who this process is (cred.h)
   // the nice value, -20 (most of the processor) to 19 (least), as
   // setpriority(2) sets it and nice(1) asks for. it is inherited by
-  // fork and kept across exec. the scheduler does not weight by it
-  // yet -- that arrives with the fair scheduler of section 6 -- so
-  // for now it is state that is faithfully kept and reported rather
-  // than acted upon, which is what lets nice, renice, ps and top be
-  // written and tested against it.
+  // fork and kept across exec. The scheduler turns it into a weight
+  // (sched.c): one step of nice is worth about a tenth of the
+  // processor between two tasks that want all of it.
   int nice;
 
   // proc_lock (proc.c) must be held when using these:
@@ -211,9 +229,16 @@ struct proc {
   struct waitq *wq;                 // the queue p is on, or 0
   struct proc *wq_next, *wq_prev;
 
-  // the run queue's lock:
-  struct proc *rq_next;
-  int on_rq;
+  // the run queue's lock (sched.c). A task's place in the queue is
+  // its virtual time: the processor time it has had, divided by its
+  // weight. See kernel/sched.c.
+  struct sched_ent se;    // its place in a hart's tree
+  uint64 exec_start;      // when it last went on the processor
+  uint64 sum_exec;        // processor time it has had
+  uint64 slice_end;       // when the hart should look again
+  int cpu;                // the hart whose queue it is on, or last ran on
+  uint64 cpus;            // the harts it may run on, a bit each (affinity)
+  struct sched_group *sg; // the group it belongs to, or 0 for the root
 
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack

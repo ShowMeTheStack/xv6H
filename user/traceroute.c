@@ -23,6 +23,16 @@
 #include <sys/time.h>
 #include <sys/uio.h>
 
+// uptime() counts timer ticks; how many make a second is this
+// kernel's to say (/sys/kernel/tick_hz).
+static long
+tick_hz(void)
+{
+  long hz = sysconf(_SC_CLK_TCK);
+
+  return hz > 0 ? hz : 100;
+}
+
 static int numeric, tries = 3, maxhops = 30, firsthop = 1, wait_secs = 2;
 
 static void
@@ -154,7 +164,7 @@ main(int argc, char *argv[])
             memcpy(&ee, CMSG_DATA(c), sizeof(ee));
             type = ee.ee_type;
           }
-        int ms = (uptime() - t0) * 100;
+        int ms = (int)((uptime() - t0) * 1000 / tick_hz());
         if (from != last) {
           char s[20];
           printf(" %s", ip2str(from, s));

@@ -226,12 +226,17 @@ needs_more(const char *text)
     }
     word_start = (*p == '\n' || *p == ';' || *p == '&' || *p == '|' || *p == ' ' || *p == '\t');
   }
-  // a line ending in a pipe or a logical operator also continues
+  // a line ending in a pipe or a logical operator also continues --
+  // but a line ending in a single `&' does not. `sleep 1 &' is a
+  // whole command, and asking for more after it is how a shell stops
+  // being able to put anything in the background.
   const char *end = text + strlen(text);
   while (end > text && (end[-1] == '\n' || end[-1] == ' ' || end[-1] == '\t'))
     end--;
-  if (end > text && (end[-1] == '|' || end[-1] == '&') && !(end - 1 > text && end[-2] == '|'))
-    return 1;
+  if (end > text && end[-1] == '|')
+    return 1;                               // `|' and `||' both continue
+  if (end - text >= 2 && end[-1] == '&' && end[-2] == '&')
+    return 1;                               // `&&' continues
   if (end > text && end[-1] == '\\')
     return 1;
   return quote || depth > 0 || nk > 0;

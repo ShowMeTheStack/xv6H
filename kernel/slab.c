@@ -26,7 +26,7 @@ struct slab {
   char *objs;
 };
 
-#define MAXCACHES 64
+
 static struct kmem_cache caches[MAXCACHES];
 static int ncaches;
 static struct spinlock caches_lock;
@@ -57,6 +57,36 @@ list_del(struct slab **head, struct slab *s)
       *head = s->next;
   }
   s->next = s->prev = 0;
+}
+
+// every cache, for /proc/slabinfo: the name, the object size, how many
+// fit in a slab, how many slabs it owns, how many objects are out, and
+// the pages it holds. Returns how many caches were written.
+//
+// the kernel keeps a little for itself between one thing and the next
+// -- a cache that has grown does not shrink below one slab -- and a
+// test that counts free pages and calls the difference a leak wants to
+// be able to see that rather than guess at it.
+int
+kmem_cache_list(uint64 *out, int max, char names[][16])
+{
+  int n = 0;
+
+  for (int i = 0; i < ncaches && n < max; i++) {
+    struct kmem_cache *c = &caches[i];
+    acquire(&c->lock);
+    uint64 *o = &out[n * 5];
+    o[0] = c->objsize;
+    o[1] = c->per_slab;
+    o[2] = c->nslabs;
+    o[3] = c->nalloc;
+    o[4] = c->nslabs << c->order;   // pages
+    release(&c->lock);
+    if (names)
+      safestrcpy(names[n], c->name, 16);
+    n++;
+  }
+  return n;
 }
 
 struct kmem_cache *

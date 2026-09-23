@@ -1,3 +1,4 @@
+#include "param.h"
 #include "signal.h"
 // clang-format off
 struct mm;
@@ -11,6 +12,7 @@ struct inode;
 struct pipe;
 struct proc;
 struct spinlock;
+struct sched_group;
 struct sleeplock;
 struct stat;
 struct gendisk;
@@ -167,7 +169,13 @@ void            syscall();
 
 // trap.c
 extern uint     ticks;
+extern int      tick_hz;        // timer interrupts a second
+extern uint64   tick_interval;  // ... in the time counter's units
+void            tickinit(void);
+int             tick_set_hz(int hz);
 void            trapinit(void);
+void            timer_rearm(void);
+void            timer_slice(uint64 deadline);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            prepare_return(void);
@@ -216,6 +224,51 @@ void            kstack_free(uint64);
 void            kstack_flush_ack(void);
 void            kstack_drain(void);
 void            kstack_stats(uint64 *, uint64 *);
+
+// sched.c: weighted fair scheduling
+void            schedinit(void);
+// two-level groups: a VM, a container or a cgroup is one of these,
+// and everything in none of them is in the root (kernel/sched.c).
+void            schedgroupinit(void);
+struct sched_group *sched_group_create(const char *name, uint32 weight);
+void            sched_group_destroy(struct sched_group *);
+struct sched_group *sched_group_by_id(int id);
+int             sched_group_id(struct sched_group *);
+void            sched_group_join(struct proc *, struct sched_group *);
+int             sched_group_set_weight(struct sched_group *, uint32 weight);
+uint32          sched_group_weight(struct sched_group *);
+int             sched_group_set_max(struct sched_group *, uint64 quota_us, uint64 period_us);
+void            sched_group_max(struct sched_group *, uint64 *quota_us, uint64 *period_us);
+int             sched_group_freeze(struct sched_group *, int on);
+int             sched_group_frozen(struct sched_group *);
+void            sched_group_stat(struct sched_group *, uint64 *, int n);
+const char *    sched_group_name(struct sched_group *);
+void            sched_bandwidth_tick(void);
+void            sched_balance(void);
+int             sched_hart_idle(void);
+int             sched_group_list(uint64 *, int max, char names[][SCHED_GROUP_NAMELEN]);
+uint32          sched_weight_of(int nice);
+#define SCHED_NEW     0   // a task that has just been made
+#define SCHED_WAKE    1   // one that has been asleep
+#define SCHED_MOVE    2   // one already running, being put somewhere else
+void            sched_enqueue(struct proc *, int how);
+int             sched_set_affinity(struct proc *, uint64 mask);
+uint64          sched_affinity(struct proc *);
+void            sched_renice(struct proc *);
+struct proc *   sched_pick(void);
+void            sched_begin(struct proc *);
+void            sched_end(struct proc *);
+void            sched_unpick(struct proc *);
+int             sched_tick_expired(void);
+uint64          sched_slice_deadline(void);
+void            sched_kick(int cpu);
+void            sched_need_resched(void);
+#define SCHED_STAT_FIELDS 7
+void            sched_stats(uint64 *, int);
+void            sched_count_yield(int resched);
+
+// rbtest.c
+void            rbtest(void);
 
 // ksm.c: guests sharing pages that hold the same bytes
 void            ksm_init(void);

@@ -1,8 +1,18 @@
 #define ARG_MAX     (16 * 4096)       // bytes of arguments exec accepts
-#define TICK_HZ     10                // timer ticks per second
+// timer interrupts a second, which is the resolution of every timeout
+// the kernel counts in ticks and the rate at which the scheduler gets
+// to look at what is running. Ten was xv6's; a hundred is Linux's,
+// and a scheduler whose slices are three and twenty-four milliseconds
+// cannot mean anything if it is only asked once every hundred.
+//
+// this is the default. The rate is a variable (trap.c), and
+// /sys/kernel/tick_hz changes it while the machine runs.
+#define TICK_HZ     100               // timer ticks per second
 #define PID_MAX     4194304           // pids are allocated below this (pidmax=N on the command line)
 #define KSTACK_PAGES 8                // kernel stack per process: 32 KB, plus a guard page
 #define NCPU        8                 // maximum number of CPUs
+#define NSCHEDGROUP 64                // scheduler groups: VMs, containers, cgroups
+#define SCHED_GROUP_NAMELEN 16
 #define NOFILE      1024              // open files per process, at most
 #define NOFILE_INIT 64                // ... initially (the table grows on demand)
 // (open files come from an object cache; there is no system-wide limit)

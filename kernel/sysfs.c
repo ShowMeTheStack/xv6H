@@ -72,6 +72,7 @@ enum {
   S_W_HOSTNAME,
   S_W_CACHE_PCT,
   S_W_FLUSH_SECS,
+  S_W_TICK_HZ,
 };
 
 struct sysent {
@@ -231,6 +232,7 @@ rebuild(void)
   add_rw("mm/cache_pct", S_W_CACHE_PCT, 0, 0, 0, 1);
   add("fs", S_DIR, 1, 0, 0);
   add_rw("fs/writeback_secs", S_W_FLUSH_SECS, 0, 0, 0, 1);
+  add_rw("kernel/tick_hz", S_W_TICK_HZ, 0, 0, 0, 1);
 
   // what the machine has
   add("hypervisor", S_DIR, 1, 0, 0);
@@ -349,6 +351,10 @@ generate(struct gen *g, struct sysent *e)
     break;
   case S_W_FLUSH_SECS:
     gn(g, blk_flush_secs);
+    gs(g, "\n");
+    break;
+  case S_W_TICK_HZ:
+    gn(g, tick_hz);
     gs(g, "\n");
     break;
   case S_PAGESIZE:
@@ -565,12 +571,17 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
   char buf[128];
   int r = -EACCES;
 
+  uint whole = n;   // what the caller wrote, which is what it is told
+
   if (off != 0 || n == 0 || n >= sizeof(buf))
     return -EINVAL;
   if (either_copyin(buf, user_src, src, n) < 0)
     return -EFAULT;
   buf[n] = 0;
-  // a value written with a newline is the same value
+  // a value written with a newline is the same value. The newline is
+  // still bytes the caller wrote, though: reporting fewer bytes than
+  // were handed over sends stdio round again with the tail, which
+  // arrives at a non-zero offset and is refused.
   while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' '))
     buf[--n] = 0;
 
@@ -579,7 +590,7 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
   if ((e = find_inum(ip->inum)) != 0 && e->writable) {
     switch (e->kind) {
     case S_W_HOSTNAME:
-      r = sethostname_str(buf, n) < 0 ? -EINVAL : (int)n;
+      r = sethostname_str(buf, n) < 0 ? -EINVAL : (int)whole;
       break;
     case S_W_CACHE_PCT: {
       int v = 0;
@@ -590,7 +601,7 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
         }
         v = v * 10 + (buf[i] - '0');
       }
-      r = (v < 0 || blk_set_cache_pct(v) < 0) ? -EINVAL : (int)n;
+      r = (v < 0 || blk_set_cache_pct(v) < 0) ? -EINVAL : (int)whole;
       break;
     }
     case S_W_FLUSH_SECS: {
@@ -602,7 +613,22 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
         }
         v = v * 10 + (buf[i] - '0');
       }
-      r = (v < 1 || v > 600) ? -EINVAL : (blk_flush_secs = v, (int)n);
+      r = (v < 1 || v > 600) ? -EINVAL : (blk_flush_secs = v, (int)whole);
+      break;
+    }
+    case S_W_TICK_HZ: {
+      int v = 0;
+      for (int i = 0; i < (int)n; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+          v = -1;
+          break;
+        }
+        v = v * 10 + (buf[i] - '0');
+      }
+      // ticks already counted keep the meaning they had; what this
+      // changes is what the ones from here on are worth. It is a knob
+      // for measuring, not something to turn under a running load.
+      r = (v < 1 || tick_set_hz(v) < 0) ? -EINVAL : (int)whole;
       break;
     }
     default:

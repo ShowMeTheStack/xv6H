@@ -123,6 +123,11 @@ extern uint64 sys_socketpair(void);
 extern uint64 sys_getsockname(void);
 extern uint64 sys_getpeername(void);
 extern uint64 sys_shutdown(void);
+extern uint64 sys_sched_setaffinity(void);
+extern uint64 sys_sched_getaffinity(void);
+extern uint64 sys_sched_yield(void);
+extern uint64 sys_getcpu(void);
+extern uint64 sys_sched_group(void);
 extern uint64 sys_setpriority(void);
 extern uint64 sys_getpriority(void);
 extern uint64 sys_ptrace(void);
@@ -270,6 +275,11 @@ static uint64 (*syscalls[])(void) = {
   [SYS_getsockname] = sys_getsockname,
   [SYS_getpeername] = sys_getpeername,
   [SYS_shutdown]   = sys_shutdown,
+  [SYS_sched_setaffinity] = sys_sched_setaffinity,
+  [SYS_sched_getaffinity] = sys_sched_getaffinity,
+  [SYS_sched_yield] = sys_sched_yield,
+  [SYS_getcpu]    = sys_getcpu,
+  [SYS_sched_group] = sys_sched_group,
   [SYS_setpriority] = sys_setpriority,
   [SYS_getpriority] = sys_getpriority,
   [SYS_ptrace]     = sys_ptrace,

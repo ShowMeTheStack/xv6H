@@ -127,6 +127,31 @@ __stdio_flush_locked(FILE *f)
   return 0;
 }
 
+// throw away what a stream has buffered without writing it. There is
+// no other way to say "that output is not going to happen": a stream
+// whose flush failed still has the bytes in it, and they come out of
+// whatever the descriptor is next pointed at -- a shell built-in
+// whose `> file' was refused would print to the terminal instead.
+//
+// fpurge is the BSD spelling and __fpurge the glibc one; both are
+// here because programs are written against one or the other.
+int
+fpurge(FILE *f)
+{
+  if (f == 0)
+    return EOF;
+  f->pos = f->end = 0;
+  f->ungot = 0;
+  f->flags &= ~(_F_READING | _F_WRITING | _F_EOF);
+  return 0;
+}
+
+void
+__fpurge(FILE *f)
+{
+  fpurge(f);
+}
+
 int
 fflush(FILE *f)
 {

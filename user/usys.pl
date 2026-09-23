@@ -110,6 +110,11 @@ entry("socketpair");
 entry("getsockname");
 entry("getpeername");
 entry("shutdown");
+entry("__sched_setaffinity", "sched_setaffinity");
+entry("__sched_getaffinity", "sched_getaffinity");
+entry("__sched_yield", "sched_yield");
+entry("__getcpu", "getcpu");
+entry("sched_group");
 entry("setpriority");
 # a nice value may be negative, and the stubs read a negative return
 # as -errno; the kernel hands back 20 - nice and the library turns

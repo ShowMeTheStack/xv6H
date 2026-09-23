@@ -276,6 +276,19 @@ check arith_paren 20 "$(( (2 + 3) * 4 ))"
 check arith_in_subst 12 "$(echo $(( 3 * 4 )))"
 rm -f /tmp/shtest.p
 
+# ---- a command ending in a single & is a whole command ----
+# the interactive reader treated a trailing & the way it treats a
+# trailing && and asked for more, so nothing could be put in the
+# background from a terminal.
+: > /tmp/shtest.bg
+(echo one > /tmp/shtest.bg) &
+wait
+check background_amp one "$(cat /tmp/shtest.bg)"
+(echo two > /tmp/shtest.bg) & (echo three >> /tmp/shtest.bg) &
+wait
+check background_two 2 "$(wc -l < /tmp/shtest.bg)"
+rm -f /tmp/shtest.bg
+
 echo "shtest: $passed checks, $failed failures"
 if [ $failed -eq 0 ]; then
 	echo "ALL TESTS PASSED"

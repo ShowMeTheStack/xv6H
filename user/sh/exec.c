@@ -171,9 +171,30 @@ apply_redirs(struct redir *list, struct saved_fd *saves, int *nsaves)
   return 0;
 }
 
+// set when the output a built-in produced could not be written to the
+// file it was redirected to. `echo 1 > /sys/...' that the kernel
+// refused must not report success, and what it buffered must not be
+// flushed to the terminal once the redirection is undone -- which is
+// what happens to anything still in the stream when the descriptor
+// goes back to what it was.
+static int redir_write_failed;
+
 static void
 undo_redirs(struct saved_fd *saves, int nsaves)
 {
+  if (nsaves > 0) {
+    redir_write_failed = 0;
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+      redir_write_failed = 1;
+      fpurge(stdout);
+      clearerr(stdout);
+    }
+    if (fflush(stderr) != 0 || ferror(stderr)) {
+      redir_write_failed = 1;
+      fpurge(stderr);
+      clearerr(stderr);
+    }
+  }
   for (int i = nsaves - 1; i >= 0; i--) {
     if (saves[i].saved >= 0) {
       dup2(saves[i].saved, saves[i].fd);
@@ -392,6 +413,8 @@ run_simple(struct cmd *c, int background)
       }
     }
     undo_redirs(saves, nsaves);
+    if (redir_write_failed && status == 0)
+      status = 1;
     wl_free(&wl);
     return status;
   }

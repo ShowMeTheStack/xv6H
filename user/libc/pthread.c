@@ -1234,19 +1234,22 @@ sem_unlink(const char *name)
 
 // ---- scheduling ----
 
+// the raw system calls; sched.h declares only the POSIX shapes
+int __sched_setaffinity(pid_t pid, size_t n, const unsigned long *mask);
+int __sched_getaffinity(pid_t pid, size_t n, unsigned long *mask);
+int __sched_yield(void);
+int __getcpu(void);
+
 int
 sched_yield(void)
 {
-  // there is no yield system call; a zero-length sleep gives the
-  // scheduler the same chance to run someone else.
-  struct timespec ts = {0, 0};
-  return nanosleep(&ts, 0);
+  return __sched_yield();
 }
 
 int
 sched_getcpu(void)
 {
-  return 0;
+  return __getcpu();
 }
 
 int
@@ -1304,24 +1307,34 @@ sched_rr_get_interval(pid_t pid, struct timespec *ts)
   return 0;
 }
 
+// the kernel speaks one 64-bit word of harts, which is every hart this
+// machine can have; the cpu_set_t a caller passes may be larger.
 int
 sched_setaffinity(pid_t pid, size_t n, const cpu_set_t *set)
 {
-  (void)pid;
-  (void)n;
-  (void)set;
-  return 0;
+  unsigned long mask;
+
+  if (n < sizeof(unsigned long) || set == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  mask = set->bits[0];
+  return __sched_setaffinity(pid, sizeof(mask), &mask);
 }
 
 int
 sched_getaffinity(pid_t pid, size_t n, cpu_set_t *set)
 {
-  (void)pid;
-  (void)n;
+  unsigned long mask = 0;
+
+  if (n < sizeof(unsigned long) || set == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (__sched_getaffinity(pid, sizeof(mask), &mask) < 0)
+    return -1;
   CPU_ZERO(set);
-  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-  for (long i = 0; i < ncpu && i < CPU_SETSIZE; i++)
-    CPU_SET(i, set);
+  set->bits[0] = mask;
   return 0;
 }
 

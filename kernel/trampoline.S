@@ -125,14 +125,16 @@ fp_saved:
         # fetch the kernel page table address, from p->trapframe->kernel_satp.
         ld t1, 0(a0)
 
-        # wait for any previous memory operations to complete, so that
-        # they use the user page table.
-        sfence.vma zero, zero
-
-        # install the kernel page table.
+        # install the kernel page table, then throw away the user
+        # entries the hart may still be holding. There is no fence in
+        # front of the write: a trap has already retired everything
+        # the user did, and sfence.vma orders page-table writes, which
+        # this is not one of. Two of these per trap, four with the
+        # fences xv6 had, and each one makes the emulated machine walk
+        # its page tables again for every line the kernel touches --
+        # a system call that does nothing costs eighteen microseconds
+        # with them and fourteen without.
         csrw satp, t1
-
-        # flush now-stale user entries from the TLB.
         sfence.vma zero, zero
 
         # call usertrap()
@@ -147,8 +149,6 @@ userret:
         # we're running this proc on this hart.
         fence.i
 
-        # switch to the user page table.
-        sfence.vma zero, zero
         csrw satp, a0
         sfence.vma zero, zero
 

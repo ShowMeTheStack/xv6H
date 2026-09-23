@@ -1139,7 +1139,7 @@ blk_flusher(void *arg)
     acquire(&tickslock);
     now = ticks;
     release(&tickslock);
-    if (now - last >= (uint)(blk_flush_secs * TICK_HZ)) {
+    if (now - last >= (uint)(blk_flush_secs * tick_hz)) {
       last = now;
       if (cache.ndirty > 0)
         sync_disk(0);

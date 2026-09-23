@@ -1068,6 +1068,17 @@ vm_create(struct vmconfig *cfg)
   if (vm->mem_limit > mem_bytes)
     vm->mem_limit = 0;   // a limit above the memory it has is no limit
 
+  // its share of the host's processors. All of its vcpus are in one
+  // scheduler group, so `-w 2048' is twice a nice-0 task's share of
+  // the machine whether the guest has one vcpu or eight, and `-w' on
+  // two guests divides the machine between the guests rather than
+  // between their vcpus.
+  vm->sg = sched_group_create(cfg->name[0] ? cfg->name : "vm", cfg->weight);
+  if (vm->sg == 0)
+    goto fail;
+  if (cfg->cpu_max_us > 0)
+    sched_group_set_max(vm->sg, cfg->cpu_max_us, cfg->cpu_period_us);
+
   // the chunk table: one host address per 2 MB of guest RAM, filled in as
   // the guest touches its memory (vm_touch).
   {
@@ -1306,7 +1317,12 @@ vm_pause(struct vm *vm)
   vm->state = VM_PAUSED;
   for (int i = 0; i < vm->nvcpu; i++)
     vcpu_kick(&vm->vcpu[i]);
+  struct sched_group *sg = vm->sg;
   release(&vm->lock);
+  // a paused machine costs nothing: its vcpus sleep on vm->state, and
+  // its group is frozen so that a vcpu on its way to that sleep is
+  // not scheduled in the meantime.
+  sched_group_freeze(sg, 1);
   return 0;
 }
 
@@ -1319,6 +1335,10 @@ vm_resume(struct vm *vm)
     return -1;
   }
   vm->state = VM_RUNNING;
+  struct sched_group *sg = vm->sg;
+  release(&vm->lock);
+  sched_group_freeze(sg, 0);
+  acquire(&vm->lock);
   wakeup((void *)&vm->state);
   release(&vm->lock);
   return 0;
@@ -1343,17 +1363,23 @@ vm_destroy(struct vm *vm)
     vm->disk_ip = 0;
     vm->disk = 0;
     vm->state = VM_FREE;
+    struct sched_group *sg = vm->sg;
+    vm->sg = 0;
     wakeup(&vm->cons_out);
     release(&vm->lock);
+    sched_group_destroy(sg);
     vm_put_disk(ip);
     vm_put_device(d);
     return 0;
   }
   vm->state = VM_HALTING;
+  // a frozen machine cannot notice it has been told to stop
+  struct sched_group *sg = vm->sg;
   wakeup((void *)&vm->state);
   for (int i = 0; i < vm->nvcpu; i++)
     vcpu_kick(&vm->vcpu[i]);
   release(&vm->lock);
+  sched_group_freeze(sg, 0);   // so its vcpus can run to their exit
   return 0;
 }
 
@@ -1535,13 +1561,57 @@ vcpu_enter(struct vcpu *v)
   v->running_hart = -1;
   vic_vcpu_exit(v);
   release(&vm->lock);
+
+  // the exit-rate throttle.
+  //
+  // a guest that traps to the host thousands of times a second --
+  // reading an emulated device register in a loop, say -- makes the
+  // host do all the work while the guest's own processor time looks
+  // small, because most of it is spent in the host. It is charged for
+  // it here: past a rate no ordinary guest reaches, the vcpu gives up
+  // the processor on its way back in, which puts the cost where the
+  // exits are and stops one machine from spending the host on
+  // nothing. Ordinary guests never reach it -- an xv6 guest booting
+  // takes a few thousand exits in all.
+  uint64 now = r_time();
+  uint64 window = plat.timebase ? plat.timebase / 10 : 1000000;  // 100 ms
+  if (now - v->exit_window_start >= window) {
+    v->exit_window_start = now;
+    v->exit_window_count = 0;
+  }
+  if (++v->exit_window_count > EXIT_RATE_LIMIT) {
+    v->exit_throttles++;
+    v->exit_window_count = 0;
+    v->exit_window_start = now;
+    yield();
+  }
 }
 
 // the guest executed wfi: sleep until something is pending for it.
+//
+// before sleeping, a nudge for the siblings. A guest with more than
+// one vcpu spins on its own locks, and a vcpu that spins waiting for
+// a lock held by a sibling the host has not run yet wastes the whole
+// slice. wfi is where a guest says it has nothing to do; giving the
+// rest of the slice to a sibling of the same machine costs nothing
+// here and is worth a whole slice there. The two are in the same
+// scheduler group, so `giving' means no more than going to the back
+// of it -- which is what sleeping does anyway, and the count is what
+// says how often it mattered.
 static void
 vcpu_idle(struct vcpu *v)
 {
   struct vm *vm = v->vm;
+
+  if (vm->nvcpu > 1) {
+    for (int i = 0; i < vm->nvcpu; i++) {
+      struct vcpu *s = &vm->vcpu[i];
+      if (s != v && s->p && !s->idle && s->hsm_state == HSM_STARTED) {
+        v->nudges++;
+        break;
+      }
+    }
+  }
   acquire(&vm->lock);
   while (!(v->vssip || v->ssip_req || vic_seip(v) || r_time() >= v->vstimecmp ||
            vm->state != VM_RUNNING || killed(v->p))) {
@@ -1730,7 +1800,13 @@ vm_run(struct vm *vm, int vcpuid)
   v->p = p;
   vm->vcpus_running++;
   vm->state = VM_RUNNING;
+  struct sched_group *sg = vm->sg;
   release(&vm->lock);
+
+  // from here this process's processor time is the guest's
+  acquire(&p->lock);
+  sched_group_join(p, sg);
+  release(&p->lock);
 
   int rc = 0;
   for (;;) {
@@ -1774,6 +1850,12 @@ vm_run(struct vm *vm, int vcpuid)
   intr_on();
 
   struct inode *ip = 0;
+  // out of the guest's group: whatever this process does next is its
+  // own, not the machine's.
+  acquire(&p->lock);
+  sched_group_join(p, 0);
+  release(&p->lock);
+
   acquire(&vm->lock);
   v->p = 0;
   v->running_hart = -1;
@@ -1804,8 +1886,11 @@ vm_run(struct vm *vm, int vcpuid)
     vm->disk_ip = 0;
     vm->disk = 0;
     vm->state = VM_FREE;
+    sg = vm->sg;
+    vm->sg = 0;
     wakeup(&vm->cons_out); // an attached console reader sees the end
     release(&vm->lock);
+    sched_group_destroy(sg);
   }
   vm_put_disk(ip);
   vm_put_device(dev);

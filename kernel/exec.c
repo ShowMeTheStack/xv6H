@@ -365,7 +365,7 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   aux[na++] = AT_PHENT;   aux[na++] = sizeof(struct proghdr);
   aux[na++] = AT_PHNUM;   aux[na++] = elf.phnum;
   aux[na++] = AT_BASE;    aux[na++] = interp_base;
-  aux[na++] = AT_CLKTCK;  aux[na++] = TICK_HZ;
+  aux[na++] = AT_CLKTCK;  aux[na++] = tick_hz;
   aux[na++] = AT_RANDOM;  aux[na++] = randaddr;
   aux[na++] = AT_SECURE;  aux[na++] = 0;
   aux[na++] = AT_HWCAP;   aux[na++] = plat.misa;

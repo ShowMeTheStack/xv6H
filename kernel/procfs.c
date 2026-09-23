@@ -22,6 +22,7 @@
 #include "fs.h"
 #include "file.h"
 #include "proc.h"
+#include "slab.h"
 #include "defs.h"
 #include "blk.h"
 #include "vfs.h"
@@ -58,6 +59,8 @@
 #define PINO_NET_UDP    17
 #define PINO_NET_SOCKSTAT 18
 #define PINO_NET_UNIX   19
+#define PINO_SCHEDSTAT  20
+#define PINO_SLABINFO   21
 #define PINO_FIRST_PID 1024
 
 // a process's files: the inode number is (pid << 4) + index + base
@@ -107,6 +110,7 @@ static const struct topfile topfiles[] = {
     {"version", PINO_VERSION},       {"filesystems", PINO_FILESYSTEMS},
     {"partitions", PINO_PARTITIONS}, {"diskstats", PINO_DISKSTATS},
     {"self", PINO_SELF},             {"stat", PINO_STAT},
+    {"schedstat", PINO_SCHEDSTAT}, {"slabinfo", PINO_SLABINFO},
     {"net", PINO_NET},
     {0, 0},
 };
@@ -485,6 +489,96 @@ gen_top(struct gen *g, uint inum)
       gen_str(g, "0");
     gen_num(g, hundredths);
     gen_str(g, " 0.00\n");
+    break;
+  }
+
+  case PINO_SCHEDSTAT: {
+    // one line per hart: runnable tasks, their weights summed,
+    // context switches, tasks taken from a busier hart
+    uint64 st[NCPU * SCHED_STAT_FIELDS];
+    memset(st, 0, sizeof(st));
+    sched_stats(st, NCPU * SCHED_STAT_FIELDS);
+    gen_str(g, "cpu nr_running load switches steals tick resched preempts\n");
+    for (int i = 0; i < plat.ncpu; i++) {
+      gen_num(g, i);
+      for (int j = 0; j < SCHED_STAT_FIELDS; j++) {
+        gen_str(g, " ");
+        gen_num(g, st[i * SCHED_STAT_FIELDS + j]);
+      }
+      gen_str(g, "\n");
+    }
+    // and one line per task that is runnable or running: where it is,
+    // what it weighs, and how much virtual time it has. Reading this
+    // while three tasks of different nice are spinning is how the
+    // sharing rule is checked from outside the kernel.
+    // and one line per group: what a VM, a container or a cgroup has
+    // been given and what it has done with it
+    {
+      uint64 gs[NSCHEDGROUP * 9];
+      char names[NSCHEDGROUP][SCHED_GROUP_NAMELEN];
+      int ng = sched_group_list(gs, NSCHEDGROUP, names);
+      if (ng > 0)
+        gen_str(g, "group id name tasks weight quota_us period_us throttles frozen runnable usage_us\n");
+      for (int i = 0; i < ng; i++) {
+        uint64 *o = &gs[i * 9];
+        gen_str(g, "group ");
+        gen_num(g, o[0]);
+        gen_str(g, " ");
+        names[i][SCHED_GROUP_NAMELEN - 1] = 0;
+        gen_str(g, names[i][0] ? names[i] : "-");
+        for (int k = 1; k < 9; k++) {
+          gen_str(g, " ");
+          gen_num(g, o[k]);
+        }
+        gen_str(g, "\n");
+      }
+    }
+    gen_str(g, "task pid cpu state nice weight vruntime exec\n");
+    proc_iter_start();
+    for (struct proc *p = proc_iter_next(0); p; p = proc_iter_next(p)) {
+      if (p->state != RUNNABLE && p->state != RUNNING)
+        continue;
+      gen_str(g, "task ");
+      gen_num(g, p->pid);
+      gen_str(g, " ");
+      gen_num(g, p->cpu < 0 ? 0 : p->cpu);
+      gen_str(g, p->state == RUNNING ? " run " : " rdy ");
+      if (p->nice < 0) {
+        gen_str(g, "-");
+        gen_num(g, (uint64)(-p->nice));
+      } else
+        gen_num(g, p->nice);
+      gen_str(g, " ");
+      gen_num(g, p->se.weight);
+      gen_str(g, " ");
+      gen_num(g, p->se.vruntime);
+      gen_str(g, " ");
+      gen_num(g, p->sum_exec);
+      gen_str(g, "\n");
+    }
+    proc_iter_end();
+    break;
+  }
+
+  case PINO_SLABINFO: {
+    // one line per object cache: what it holds, how big, how many fit
+    // in a slab, how many slabs it owns, how many objects are out, and
+    // the pages that comes to. A cache that has grown keeps a slab
+    // even when it is empty, which is why a run of anything leaves the
+    // kernel holding a few pages more than it started with.
+    uint64 cs[MAXCACHES * 5];
+    char names[MAXCACHES][16];
+    int n = kmem_cache_list(cs, MAXCACHES, names);
+    gen_str(g, "name objsize per_slab slabs objects pages\n");
+    for (int i = 0; i < n; i++) {
+      names[i][15] = 0;
+      gen_str(g, names[i]);
+      for (int k = 0; k < 5; k++) {
+        gen_str(g, " ");
+        gen_num(g, cs[i * 5 + k]);
+      }
+      gen_str(g, "\n");
+    }
     break;
   }
 

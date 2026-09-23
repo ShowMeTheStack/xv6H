@@ -142,4 +142,9 @@
 #define SYS_getsockname 139
 #define SYS_getpeername 140
 #define SYS_shutdown   141
+#define SYS_sched_setaffinity 142
+#define SYS_sched_getaffinity 143
+#define SYS_sched_yield 144
+#define SYS_getcpu     145
+#define SYS_sched_group 146
 #endif

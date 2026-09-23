@@ -153,8 +153,10 @@ plat_time(uint32_t *days, uint32_t *secs)
   uint64 s;
   if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && ts.tv_sec >= (long)TLS_BUILD_SECS)
     s = ts.tv_sec;
-  else
-    s = (uint64)TLS_BUILD_SECS + uptime() / 10; // no RTC: build date, 10 ticks per second
+  else {
+    long hz = sysconf(_SC_CLK_TCK);
+    s = (uint64)TLS_BUILD_SECS + uptime() / (hz > 0 ? hz : 100);
+  }
   *days = (uint32_t)(s / 86400) + 719528;
   *secs = (uint32_t)(s % 86400);
 }

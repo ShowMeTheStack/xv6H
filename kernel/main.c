@@ -37,6 +37,7 @@ main()
     kvminithart();      // turn on paging
     kstackinit();       // the kernel stack region
     procinit_early();   // command-line settings for processes
+    schedinit();        // the run queues, before any task is made
     procinit();         // processes
     trapinit();         // trap vectors
     trapinithart();     // install kernel trap vector
@@ -66,6 +67,7 @@ main()
     // other kernel thread. only a guest has a balloon; on a machine
     // without one the probe finds nothing and that is the whole of it.
     virtio_balloon_init();
+    rbtest();           // the scheduler's tree, before anything uses it
     kthread_selftest(); // two kernel threads take turns, then print
 
     __atomic_store_n(&started, 1, __ATOMIC_RELEASE);

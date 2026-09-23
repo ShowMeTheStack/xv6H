@@ -64,7 +64,7 @@ futex_wait(uint64 uaddr, uint32 val, uint64 tsaddr)
       return -EFAULT;
     if (ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L || ts.tv_sec < 0)
       return -EINVAL;
-    uint64 want = (uint64)ts.tv_sec * TICK_HZ + ((uint64)ts.tv_nsec * TICK_HZ + 999999999UL) / 1000000000UL;
+    uint64 want = (uint64)ts.tv_sec * tick_hz + ((uint64)ts.tv_nsec * tick_hz + 999999999UL) / 1000000000UL;
     acquire(&tickslock);
     until = ticks + (want ? want : 1);
     release(&tickslock);

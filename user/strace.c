@@ -380,9 +380,12 @@ main(int argc, char *argv[])
         if (!summary) {
           print_result(ret);
           line_open = 0;
-          if (show_time)
-            fprintf(out, " <%d.%02d>\n", (uptime() - t0) / 100,
-                    (uptime() - t0) % 100);
+          if (show_time) {
+            // hundredths of a second, from whatever a tick is worth
+            long hz = sysconf(_SC_CLK_TCK);
+            int cs = (int)((uptime() - t0) * 100 / (hz > 0 ? hz : 100));
+            fprintf(out, " <%d.%02d>\n", cs / 100, cs % 100);
+          }
           fflush(out);
         }
       }

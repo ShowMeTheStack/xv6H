@@ -1513,7 +1513,7 @@ jbd2_kjournald(void *arg)
       int used = jbd2_txn_log_blocks(j, j->txn.nblocks, j->txn.nrevokes);
       if (j->commit_request)
         go = 1;
-      else if (now - j->last_commit_tick >= (uint)(JBD2_COMMIT_SECS * TICK_HZ))
+      else if (now - j->last_commit_tick >= (uint)(JBD2_COMMIT_SECS * tick_hz))
         go = 1;
       else if (used * 4 >= loglen)
         go = 1;

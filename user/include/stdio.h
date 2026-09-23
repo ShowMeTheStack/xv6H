@@ -57,6 +57,8 @@ typedef struct __FILE FILE;
 
 extern FILE *stdin, *stdout, *stderr;
 
+int fpurge(FILE *f);
+void __fpurge(FILE *f);
 FILE *fopen(const char *path, const char *mode);
 FILE *fdopen(int fd, const char *mode);
 FILE *freopen(const char *path, const char *mode, FILE *f);

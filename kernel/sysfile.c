@@ -1117,7 +1117,7 @@ sys_poll(void)
   uint64 deadline = 0;
   if (timeout > 0) {
     acquire(&tickslock);
-    deadline = ticks + ((uint64)timeout * TICK_HZ + 999) / 1000;
+    deadline = ticks + ((uint64)timeout * tick_hz + 999) / 1000;
     release(&tickslock);
   }
   for (;;) {
@@ -1177,7 +1177,7 @@ sys_select(void)
   uint64 deadline = 0;
   if (timeout > 0) {
     acquire(&tickslock);
-    deadline = ticks + ((uint64)timeout * TICK_HZ + 999) / 1000;
+    deadline = ticks + ((uint64)timeout * tick_hz + 999) / 1000;
     release(&tickslock);
   }
   for (;;) {

@@ -74,6 +74,9 @@ OBJS = \
   $K/vvnet.o \
   $K/vballoon.o \
   $K/ksm.o \
+  $K/rbtree.o \
+  $K/sched.o \
+  $K/rbtest.o \
   $K/rtc.o \
   $K/slab.o \
   $K/kstack.o \
@@ -424,6 +427,9 @@ UPROGS=\
 	$U/_dd\
 	$U/_blkid\
 	$U/_id\
+	$U/_taskset\
+	$U/_schedbench\
+	$U/_cgrun\
 	$U/_chmod\
 	$U/_login\
 	$U/_sudo\
@@ -604,7 +610,7 @@ build/lib/ld.so: $U/ld.so
 
 # the rescue set: statically linked, under /rescue, so that the system
 # can still be repaired when the loader or the library cannot be read.
-RESCUE = sh init ls cat echo cp rm mkdir kill
+RESCUE = sh init ls cat echo cp rm mkdir kill true
 RESCUEBINS = $(foreach p,$(RESCUE),build/rescue/$(p))
 RESCUEFILES = $(foreach p,$(RESCUE),rescue/$(p):build/rescue/$(p))
 

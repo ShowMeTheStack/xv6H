@@ -256,6 +256,12 @@ struct vimsic {
 
 // register save area layout is shared with hypvec.S: regs[] first,
 // then the host context, then host tp.
+// how many exits to the host a vcpu may take in a tenth of a second
+// before it is made to give the processor up. An xv6 guest booting
+// takes a few thousand exits in all; a guest reading an emulated
+// register in a loop takes this many in every window.
+#define EXIT_RATE_LIMIT 20000
+
 struct vcpu {
   uint64 regs[32];        // 0..255   guest x0..x31 (x0 unused)
   struct context hostctx; // 256..367 host ra, sp, s0..s11 (see proc.h)
@@ -296,12 +302,19 @@ struct vcpu {
 
   // statistics
   uint64 exits, mmio, csr_emul, wfi_sleeps, injected;
+  // the exit-rate throttle: how many exits this vcpu has taken since
+  // the window opened, when it opened, and how often it has been made
+  // to give the processor up for taking too many.
+  uint64 exit_window_start, exit_window_count, exit_throttles;
+  uint64 nudges;          // slices handed to a sibling vcpu
   uint64 last_cause, last_gpa;
 };
 
 // ---- vm ----
 
 struct gendisk;
+
+struct sched_group;
 
 struct vm {
   struct spinlock lock;
@@ -321,6 +334,10 @@ struct vm {
   struct gendisk *disk;   // a whole block device given to the guest instead, or 0
   int nvcpu;
   int vcpus_running;      // vcpus whose host process is inside vm_run
+  // the scheduler group its vcpus belong to, so that the machine's
+  // share of the processor is a property of the machine and not of
+  // how many vcpus somebody gave it (kernel/sched.c)
+  struct sched_group *sg;
   struct vcpu vcpu[NVCPU];
 
   uint64 ram_size;

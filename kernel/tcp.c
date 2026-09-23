@@ -23,6 +23,13 @@
 #include "sock.h"
 #include "tcp.h"
 
+// every timer here is counted in timer ticks, and the tick rate is a
+// setting (param.h, /sys/kernel/tick_hz). These turn the intervals
+// the protocol is written in into whatever a tick is worth today.
+#define MS_TICKS(ms)  (((ms) * tick_hz + 999) / 1000)
+#define SEC_TICKS(s)  ((s) * tick_hz)
+
+
 static struct tcpcb tcbs[NTCP];
 static uint32 iss_next = 0x1000;
 
@@ -108,7 +115,7 @@ tcb_alloc(void)
       t->used = 1;
       t->state = TCPS_CLOSED;
       t->mss = TCP_MSS;
-      t->rto = 10; // 1 s
+      t->rto = SEC_TICKS(1);
       t->cwnd = 4 * TCP_MSS;
       t->ssthresh = 65535;
       if (tring_init(&t->snd, TCP_SNDBUF) < 0 || tring_init(&t->rcv, TCP_RCVBUF) < 0) {
@@ -336,8 +343,8 @@ tcp_timer(void)
         t->ssthresh = 2 * t->mss;
       t->cwnd = t->mss;
       t->rto *= 2;
-      if (t->rto > 600)
-        t->rto = 600;
+      if (t->rto > SEC_TICKS(60))
+        t->rto = SEC_TICKS(60);
       tcp_retransmit(t);
       t->rtx_timer = t->rto;
     }
@@ -361,10 +368,10 @@ rtt_sample(struct tcpcb *t)
     t->srtt = (7 * t->srtt + r) / 8;
   }
   t->rto = t->srtt + 4 * t->rttvar;
-  if (t->rto < 3)
-    t->rto = 3; // 300 ms floor: ticks are coarse
-  if (t->rto > 600)
-    t->rto = 600;
+  if (t->rto < MS_TICKS(300))
+    t->rto = MS_TICKS(300); // a floor, so a fast link does not retransmit on noise
+  if (t->rto > SEC_TICKS(60))
+    t->rto = SEC_TICKS(60);
   t->rtt_seq = 0;
 }
 
@@ -593,7 +600,7 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
   case TCPS_CLOSING:
     if (fin_acked) {
       t->state = TCPS_TIME_WAIT;
-      t->timewait_timer = 30;
+      t->timewait_timer = SEC_TICKS(3);
     }
     break;
   case TCPS_LAST_ACK:
@@ -626,7 +633,7 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
       else
         t->state = TCPS_TIME_WAIT;
       if (t->state == TCPS_TIME_WAIT)
-        t->timewait_timer = 30;
+        t->timewait_timer = SEC_TICKS(3);
       tcb_wakeup(t);
     }
   }

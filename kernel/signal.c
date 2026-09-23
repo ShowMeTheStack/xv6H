@@ -730,8 +730,8 @@ sys_alarm(void)
   release(&tickslock);
   uint64 left = 0;
   if (p->alarm_at > now)
-    left = (p->alarm_at - now + TICK_HZ - 1) / TICK_HZ;
-  p->alarm_at = secs ? now + (uint64)secs * TICK_HZ : 0;
+    left = (p->alarm_at - now + tick_hz - 1) / tick_hz;
+  p->alarm_at = secs ? now + (uint64)secs * tick_hz : 0;
   return left;
 }
 
