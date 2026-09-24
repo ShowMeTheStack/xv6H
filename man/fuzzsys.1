@@ -1,0 +1,14 @@
+NAME
+     fuzzsys - what a container may ask the kernel for
+
+SYNOPSIS
+     fuzzsys check | badpid | fuzz N SEED
+
+DESCRIPTION
+     fuzzsys is three checks of the system-call boundary. `check' makes
+     the twenty calls a container must not have and requires -EPERM
+     from each, including from a child, which is how the filter's
+     inheritance is tested. `badpid' passes impossible process numbers.
+     `fuzz N SEED' makes N random calls with random arguments from that
+     seed, which is how a negative pid that indexed a hash table
+     backwards was found.

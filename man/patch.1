@@ -1,0 +1,20 @@
+NAME
+     patch - apply a diff
+
+SYNOPSIS
+     patch [-p N] [-R] [-i FILE] [-o FILE] [-b]
+
+DESCRIPTION
+     patch reads a unified or context diff and changes the files it
+     names. What it cannot place it writes to a .rej file beside the
+     original and says so.
+
+OPTIONS
+     -p N      strip N leading directories from the names in the diff
+     -R        apply the diff backwards
+     -i FILE   read the diff from FILE rather than standard input
+     -o FILE   write the result to FILE rather than in place
+     -b        keep the original as .orig
+
+SEE ALSO
+     diff(1)

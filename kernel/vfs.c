@@ -18,6 +18,7 @@
 #include "file.h"
 #include "proc.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "blk.h"
 #include "loop.h"
 #include "vfs.h"
@@ -85,6 +86,17 @@ vfs_super_free(struct super *sb)
 struct super *
 vfs_root_super(void)
 {
+  // what "/" is for the caller: its mount namespace's root if it has
+  // pivoted into one, and otherwise the machine's.
+  struct super *sb = mntns_rootsb(mntns_current());
+
+  return sb ? sb : root_super;
+}
+
+// the machine's own root, whatever the caller is in
+struct super *
+vfs_machine_root(void)
+{
   return root_super;
 }
 
@@ -99,11 +111,17 @@ vfs_set_root_super(struct super *sb)
 struct super *
 vfs_mounted_on(struct inode *ip)
 {
+  struct mntns *mns = mntns_current();
+
   if (ip == 0)
     return 0;
   acquire(&vfs_lock);
   for (int i = 0; i < MAXMOUNT; i++) {
     struct super *sb = &supers[i];
+    // a mount the caller's namespace cannot see is not there for it: a
+    // path that would cross it stays in the directory underneath
+    if (!mntns_sees(mns, i))
+      continue;
     if (sb->used && sb->covered && sb->covered->dev == ip->dev && sb->covered->inum == ip->inum) {
       release(&vfs_lock);
       return sb;
@@ -111,6 +129,25 @@ vfs_mounted_on(struct inode *ip)
   }
   release(&vfs_lock);
   return 0;
+}
+
+// which slot a mount is in, for the namespaces (which hold a set of
+// slots rather than pointers).
+int
+vfs_slot_of(struct super *sb)
+{
+  if (sb == 0)
+    return -1;
+  int i = (int)(sb - supers);
+  return (i >= 0 && i < MAXMOUNT) ? i : -1;
+}
+
+struct super *
+vfs_slot(int i)
+{
+  if (i < 0 || i >= MAXMOUNT || !supers[i].used)
+    return 0;
+  return &supers[i];
 }
 
 // the mount whose root this inode is
@@ -255,6 +292,11 @@ mount_point(const char *target, int *err)
 struct super *
 vfs_mount(const char *source, const char *target, const char *type, int flags, const char *opts)
 {
+  // a container that has gone leaves its mounts behind and nothing
+  // can see them any more: their slots come back here, before one is
+  // wanted.
+  vfs_reclaim_unseen();
+
   struct fs_type *t;
   struct gendisk *disk = 0;
   struct inode *cover;
@@ -319,6 +361,7 @@ vfs_mount(const char *source, const char *target, const char *type, int flags, c
     sb->flags = flags;
     sb->readonly = readonly;
     safestrcpy(sb->type, "bind", sizeof(sb->type));
+    mntns_add(mntns_current(), vfs_slot_of(sb));
     safestrcpy(sb->source, source, sizeof(sb->source));
     safestrcpy(sb->path, target, sizeof(sb->path));
     printk("mount: %s on %s type bind\n", sb->source, sb->path);
@@ -398,45 +441,90 @@ vfs_mount(const char *source, const char *target, const char *type, int flags, c
   safestrcpy(sb->path, target, sizeof(sb->path));
   sb->readonly = readonly;
   sb->flags = flags;
+  // the mount belongs to the namespace that made it, and to no other:
+  // what a container mounts is not mounted on the machine.
+  mntns_add(mntns_current(), vfs_slot_of(sb));
   printk("mount: %s on %s type %s%s\n", sb->source, sb->path, sb->type, readonly ? " (ro)" : "");
   return sb;
+}
+
+// the work of taking a mount down, with no lock held: it syncs, it puts
+// inodes and it may detach a loop device, none of which can be done
+// under vfs_lock.
+static void
+super_teardown(struct super *sb)
+{
+  if (sb->bind) {
+    // nothing was mounted: the root is another file system's directory,
+    // and all this holds is a reference to it
+    if (sb->root) {
+      iput(sb->root);
+      sb->root = 0;
+    }
+  } else {
+    if (sb->ops && sb->ops->sync)
+      sb->ops->sync(sb);
+    if (sb->ops && sb->ops->unmount)
+      sb->ops->unmount(sb);
+  }
+  if (sb->covered) {
+    iput(sb->covered);
+    sb->covered = 0;
+  }
+  int loopdev = sb->loopdev;
+  int slot = vfs_slot_of(sb);
+  vfs_super_free(sb);
+  if (slot >= 0)
+    mntns_drop(mntns_root(), slot);
+  // a loop device the mount attached is detached with it
+  if (loopdev >= 0)
+    loop_clr_fd(loopdev);
+}
+
+// a mount no live namespace can see is one a container made and then
+// went away from: take it down, so that its slot comes back. Called
+// where a slot is about to be wanted, which is a place that may sleep.
+void
+vfs_reclaim_unseen(void)
+{
+  for (int i = 0; i < MAXMOUNT; i++) {
+    struct super *sb = 0;
+    acquire(&vfs_lock);
+    if (supers[i].used && supers[i].covered && &supers[i] != root_super)
+      sb = &supers[i];
+    release(&vfs_lock);
+    if (sb && !mntns_anyone_sees(i))
+      super_teardown(sb);
+  }
 }
 
 int
 vfs_umount(const char *target)
 {
+  struct mntns *mns = mntns_current();
+
   acquire(&vfs_lock);
   for (int i = 0; i < MAXMOUNT; i++) {
     struct super *sb = &supers[i];
     if (!sb->used || strncmp(sb->path, target, MOUNTPATH) != 0)
       continue;
-    if (sb == root_super) {
+    // what the caller cannot see it cannot unmount
+    if (!mntns_sees(mns, i))
+      continue;
+    if (sb == root_super || sb == mntns_rootsb(mns)) {
       release(&vfs_lock);
       return -EBUSY;
     }
+    // in a namespace of its own, unmounting means "not here any more";
+    // the mount itself stays until the namespace that made it is the
+    // last to let go of it.
+    if (mns != mntns_root()) {
+      release(&vfs_lock);
+      mntns_drop(mns, i);
+      return 0;
+    }
     release(&vfs_lock);
-    if (sb->bind) {
-      // nothing was mounted: the root is another file system's
-      // directory, and all this holds is a reference to it
-      if (sb->root) {
-        iput(sb->root);
-        sb->root = 0;
-      }
-    } else {
-      if (sb->ops && sb->ops->sync)
-        sb->ops->sync(sb);
-      if (sb->ops && sb->ops->unmount)
-        sb->ops->unmount(sb);
-    }
-    if (sb->covered) {
-      iput(sb->covered);
-      sb->covered = 0;
-    }
-    int loopdev = sb->loopdev;
-    vfs_super_free(sb);
-    // a loop device the mount attached is detached with it
-    if (loopdev >= 0)
-      loop_clr_fd(loopdev);
+    super_teardown(sb);
     return 0;
   }
   release(&vfs_lock);
@@ -493,9 +581,11 @@ vfs_list(void (*emit)(const char *source, const char *path, const char *type, in
                       void *arg),
          void *arg)
 {
+  struct mntns *mns = mntns_current();
+
   for (int i = 0; i < MAXMOUNT; i++) {
     struct super *sb = &supers[i];
-    if (sb->used)
+    if (sb->used && mntns_sees(mns, i))
       emit(sb->source, sb->path, sb->type, sb->readonly, arg);
   }
 }

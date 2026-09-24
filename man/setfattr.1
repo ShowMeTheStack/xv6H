@@ -1,0 +1,19 @@
+NAME
+     setfattr - write extended attributes
+
+SYNOPSIS
+     setfattr -n NAME [-v VALUE | -f FILE] FILE...
+     setfattr -x NAME FILE...
+
+DESCRIPTION
+     setfattr sets an extended attribute on each FILE, from a value on
+     the command line or the contents of a file, or removes one.
+
+OPTIONS
+     -n NAME    the attribute
+     -v VALUE   its value
+     -f FILE    take the value from FILE
+     -x NAME    remove the attribute
+
+SEE ALSO
+     getfattr(1)

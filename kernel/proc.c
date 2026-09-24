@@ -14,6 +14,8 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "nsproxy.h"
+#include "cgroup.h"
 #include "platform.h"
 #include "slab.h"
 #include "page.h"
@@ -23,12 +25,13 @@
 #include "errno.h"
 #include "posix.h"
 #include "fcntl.h"
+#include "sleeplock.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
 struct proc *initproc;
 
-char hostname[64] = "xv6h";
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
@@ -191,10 +194,59 @@ freepid(int pid)
   release(&pid_lock);
 }
 
+// is this number in use in this namespace? (kernel/nsproxy.c asks when
+// it hands one out; the table of processes is here.)
+int
+proc_pid_taken_in_ns(struct pidns *ns, int nr)
+{
+  int taken = 0;
+
+  acquire(&proc_lock);
+  for (struct proc *p = all_procs; p; p = p->all_next) {
+    if (p->state == UNUSED)
+      continue;
+    for (int i = 0; i < p->npids; i++)
+      if (p->pids[i].ns == ns && p->pids[i].nr == nr) {
+        taken = 1;
+        break;
+      }
+    if (taken)
+      break;
+  }
+  release(&proc_lock);
+  return taken;
+}
+
+// the process that answers to this number in this namespace, held, or 0.
+struct proc *
+proc_get_ns(struct pidns *ns, int nr)
+{
+  if (ns == 0 || ns == pidns_root())
+    return proc_get(nr);
+  if (nr <= 0)
+    return 0;
+  acquire(&proc_lock);
+  for (struct proc *p = all_procs; p; p = p->all_next) {
+    if (p->state == UNUSED || p->state == ZOMBIE)
+      continue;
+    if (pid_in_ns(p, ns) == nr)
+      return p;            // proc_lock stays held, as proc_get leaves it
+  }
+  release(&proc_lock);
+  return 0;
+}
+
 // the live process with this pid, or 0 (proc_lock held by the caller).
 static struct proc *
 pid_lookup(int pid)
 {
+  // a number nobody can have. It matters that this is checked and not
+  // assumed: C's remainder keeps the sign of its left operand, so a
+  // negative pid indexed in front of the table, and the pointer read
+  // out of whatever is there was followed. getsid(-1) panicked the
+  // machine, from any process, in or out of a container.
+  if (pid <= 0)
+    return 0;
   for (struct proc *p = pid_hash[pid % PIDHASH]; p; p = p->pid_next)
     if (p->pid == pid)
       return p;
@@ -383,6 +435,27 @@ fdget(struct proc *p, int fd)
   struct file *f = (fd < 0 || fd >= t->n) ? 0 : t->ofile[fd];
   release(&t->lock);
   return f;
+}
+
+// does this process hold a descriptor for this object? The hypervisor
+// asks it of a VM: a descriptor passed over a socket is what lets a
+// process work a machine it does not own (kernel/hyp.c, vm_access).
+int
+proc_has_file(struct proc *p, int type, void *obj)
+{
+  struct fdtable *t = p->fdt;
+  int found = 0;
+
+  acquire(&t->lock);
+  for (int i = 0; i < t->n; i++) {
+    struct file *f = t->ofile[i];
+    if (f && f->type == type && (void *)f->vm == obj) {
+      found = 1;
+      break;
+    }
+  }
+  release(&t->lock);
+  return found;
 }
 
 // take fd out of the table and return what was there.
@@ -646,6 +719,12 @@ allocproc(void)
     goto complain;
   }
 
+  // its numbers. Until something puts it in a namespace of its own it
+  // has exactly one: the machine's.
+  p->pids[0].ns = pidns_root();
+  p->pids[0].nr = p->pid;
+  p->npids = 1;
+
   // on the lists, so kill() and ps see it; state USED until it runs.
   acquire(&proc_lock);
   p->all_next = all_procs;
@@ -754,6 +833,10 @@ freeproc(struct proc *p)
   p->fs = 0;
   sighand_put(p->sighand);
   p->sighand = 0;
+  cg_leave(p);
+  pidns_leave(p);
+  ns_put(p->ns);
+  p->ns = 0;
   if (p->tg) {
     tgroup_put(p->tg);
     p->tg = 0;
@@ -915,6 +998,14 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
 
   if (thread && !(flags & CLONE_VM))
     return -EINVAL; // a thread without the address space makes no sense
+  // a namespace of one's own is the machine's to give -- unless it comes
+  // with a user namespace, which is a world of its own and which anybody
+  // may make: root inside it is nobody outside it.
+  if ((flags & CLONE_NEW_ANY) && (flags & CLONE_NEWUSER) == 0 &&
+      !cap_ok(CAP_SYS_ADMIN))
+    return -EPERM;
+  if (flags & CLONE_NEW_UNSUPPORTED)
+    return -EINVAL;
 
   if ((np = allocproc()) == 0)
     return -EAGAIN;
@@ -983,10 +1074,72 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
   np->tty = p->tty;
   np->umask = p->umask;
   np->cred = p->cred; // a child is whoever its parent was
+  np->netns = p->netns; // and is on the network its parent was on
+  // the namespaces: its parent's, or copies of the ones clone asked
+  // for. A namespace it cannot have is a clone that does not happen.
+  // a child that unshare(CLONE_NEWPID) has been called for goes into a
+  // namespace of its own even though clone did not ask: that is what
+  // unshare means for this one namespace, since the caller's own number
+  // cannot change under everybody who knows it.
+  uint64 nsflags = flags;
+  if (p->newpidns)
+    nsflags |= CLONE_NEWPID;
+  np->ns = ns_copy(p->ns, (int)nsflags);
+  if (np->ns == 0) {
+    freeproc(np);
+    release(&np->lock);
+    proc_put(np);
+    return -ENOSPC;
+  }
+  if (nsflags & CLONE_NEWUSER) {
+    struct cred *cc = &np->cred;
+    cc->cap_effective = CAP_FULL;
+    cc->cap_permitted = CAP_FULL;
+    cc->cap_bounding = CAP_FULL;
+    cc->cap_inheritable = 0;
+  }
+  if (nsflags & CLONE_NEWPID) {
+    // it keeps the machine's number it was given and gains one in the
+    // new namespace, where it is the first process and so its init
+    struct pidns *newns = np->ns->pid;
+    pidns_leave(np);
+    if (pidns_enter(np, newns, np->pid) < 0) {
+      freeproc(np);
+      release(&np->lock);
+      proc_put(np);
+      return -ENOSPC;
+    }
+    newns->initpid = np->pid;
+    p->newpidns = 0;
+  } else if (pidns_of(np) != pidns_root()) {
+    // and a child of a process that is already in a pid namespace needs
+    // a number in it too. Without one it was invisible there: its parent
+    // was told the machine's number, which is not a number it can wait
+    // for, and nothing in the container's /proc could name it.
+    pidns_leave(np);
+    if (pidns_enter(np, pidns_of(np), np->pid) < 0) {
+      freeproc(np);
+      release(&np->lock);
+      proc_put(np);
+      return -EAGAIN;
+    }
+  }
   np->nice = p->nice; // and starts with the same claim on the processor
   np->cpus = p->cpus; // and on the same harts
   np->sg = 0;
   sched_group_join(np, p->sg); // and in the same group, if it is in one
+  // and in its parent's control group, which is where its pages and its
+  // existence are charged. A group that is full is a fork that fails,
+  // which is what pids.max means.
+  np->cg = 0;
+  np->cg_pages = 0;
+  np->filter = p->filter;   // what its parent gave up, it has given up
+  if (p->cg && cg_join(np, p->cg) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    proc_put(np);
+    return -EAGAIN;
+  }
   // a child is not watched because its parent is: ptrace(TRACEME) is
   // something a process does for itself
   np->traced = 0;
@@ -994,7 +1147,14 @@ kclone(uint64 flags, uint64 stack, uint64 ptid, uint64 tls, uint64 ctid)
   np->trace_at_exit = 0;
   safestrcpy(np->name, p->name, sizeof(p->name));
 
-  int tid = np->pid;
+  // what the caller is told is the child's number in the caller's own
+  // namespace. It was the machine's number, which inside a pid namespace
+  // is a number the caller cannot wait for: "vmm run" waited for its
+  // container, was told at once that there was no such child, and
+  // returned while the container was still running.
+  int tid = pid_in_ns(np, pidns_of(p));
+  if (tid == 0)
+    tid = np->pid;   // not visible to the caller: say what the machine calls it
   if (flags & CLONE_CHILD_CLEARTID)
     np->clear_tid = ctid;
   release(&np->lock);
@@ -1090,6 +1250,14 @@ kexit(int status)
 
   // whatever was watching it has nothing left to watch
   ptrace_exit(p);
+
+  // the first process of a pid namespace is that namespace's init, and a
+  // container is its init: when it ends, everything it was running ends
+  // with it rather than being reparented to the machine's init and left
+  // running under a name nobody can use.
+  struct pidns *myns = pidns_of(p);
+  if (myns != pidns_root() && myns->initpid == p->pid)
+    pidns_init_gone(myns);
 
   // the last thread of a process reports its status to the parent; the
   // others simply vanish. a leader leaving takes the group with it.
@@ -1207,7 +1375,7 @@ kwait4(int wpid, uint64 addr, int options, uint64 rusage)
           (n == CLD_CONTINUED && (options & WCONTINUED))) {
         pp->notify = 0;
         int st = (n == CLD_STOPPED) ? ((pp->stopped_sig << 8) | 0x7f) : 0xffff;
-        pid = pp->pid;
+        pid = pid_in_ns(pp, pidns_of(p));
         release(&pp->lock);
         release(&wait_lock);
         if (addr != 0 && copyout(p->mm, addr, (char *)&st, sizeof(st)) < 0)
@@ -1223,7 +1391,7 @@ kwait4(int wpid, uint64 addr, int options, uint64 rusage)
       havekids = 1;
       // make sure the child isn't still in exit() or swtch().
       acquire(&pp->lock);
-      pid = pp->pid;
+      pid = pid_in_ns(pp, pidns_of(p));
       if (addr != 0 &&
           copyout(p->mm, addr, (char *)&pp->xstate, sizeof(pp->xstate)) < 0) {
         release(&pp->lock);
@@ -1274,7 +1442,7 @@ wait_match(struct proc *parent, struct proc *child, int wpid)
   if (wpid == -1)
     return 1;
   if (wpid > 0)
-    return child->pid == wpid;
+    return pid_in_ns(child, pidns_of(parent)) == wpid;
   if (wpid == 0)
     return child->pgid == parent->pgid;
   return child->pgid == -wpid;
@@ -1284,6 +1452,27 @@ int
 kwait(uint64 addr)
 {
   return kwait4(-1, addr, 0, 0);
+}
+
+// the boundary a frozen task stops at: on the way back to user code, and
+// between one entry to a guest and the next. Nothing is held here, which
+// is the whole point -- the task can be left standing for as long as
+// somebody wants without anything else waiting on it. A kill gets
+// through, so a container that is frozen can still be stopped.
+void
+freeze_point(void)
+{
+  struct proc *p = myproc();
+
+  if (p == 0 || p->sg == 0)
+    return;
+  while (sched_group_frozen(p->sg) && !killed(p)) {
+    // prepared, then checked again: an unfreeze between the two would
+    // otherwise be a wakeup nobody was waiting for yet
+    sleep_prepare(p->sg);
+    if (sched_group_frozen(p->sg) && !killed(p))
+      sleep_intr();
+  }
 }
 
 // Per-CPU process scheduler.

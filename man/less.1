@@ -1,0 +1,21 @@
+NAME
+     less - look at a file a screen at a time
+
+SYNOPSIS
+     less [-N] [-S] [-e] [+N] [FILE...]
+     more [FILE...]
+
+DESCRIPTION
+     less shows FILE a screen at a time. Space and f go forward, b back,
+     j and k a line at a time, g and G to the start and the end, /PATTERN
+     searches, n repeats the search, and q leaves. Called as more it
+     behaves as that command does.
+
+OPTIONS
+     -N   number the lines
+     -S   do not wrap long lines
+     -e   leave at the end of the file rather than waiting
+     +N   start at line N
+
+SEE ALSO
+     cat(1), head(1), tail(1)

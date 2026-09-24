@@ -1,0 +1,19 @@
+NAME
+     tr - translate or delete characters
+
+SYNOPSIS
+     tr [-d] [-s] [-c] SET1 [SET2]
+
+DESCRIPTION
+     tr copies standard input to standard output, replacing each
+     character of SET1 with the one in the same position of SET2. The
+     sets may use ranges (a-z), and the escapes \n, \t and \\, and the
+     classes [:alpha:], [:digit:], [:space:], [:upper:] and [:lower:].
+
+OPTIONS
+     -d   delete the characters of SET1 instead of replacing them
+     -s   squeeze runs of the same character into one
+     -c   use the complement of SET1
+
+SEE ALSO
+     sed(1), cut(1)

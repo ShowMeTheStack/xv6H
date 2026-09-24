@@ -44,6 +44,11 @@
 struct vmconfig;
 struct vminfo;
 int vm_create(struct vmconfig *);
+// a descriptor for a machine: by id, or by name with id < 0. It may be
+// inherited, passed over a unix socket, read and written (the guest's
+// console), and closed; closing the last one stops a machine that has
+// no name. See kernel/vmm.h.
+int vm_open(int id, const char *name, int flags);
 int vm_ctl(int, int, unsigned long);
 int vm_run(int, int);
 int vm_destroy(int);
@@ -58,6 +63,20 @@ int hwinfo(struct hwinfo *);
 // this system's own look at the stack.
 struct netinfo;
 int netinfo(struct netinfo *);
+struct rtreq;
+int netroute(int op, struct rtreq *);
+struct gwreq;
+int netgw(int op, struct gwreq *);
+int unshare(int flags);
+int setns(int fd, int nstype);
+int pivot_root(const char *new_root, const char *put_old);
+int sysfilter(int profile, int num);
+int vm_save(int id, const char *path);
+int vm_restore(const char *path, const char *name);
+int vm_snapshot(int id, const char *path);
+int vm_clone(int id, const char *name, const char *disk);
+int vm_migrate(int id, int fd);
+int vm_accept(int fd, const char *name);
 // ptrace: the requests are in kernel/ptrace.h
 long ptrace(int request, int pid, void *addr, void *data);
 

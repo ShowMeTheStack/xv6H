@@ -1,0 +1,26 @@
+NAME
+     sh - the shell
+
+SYNOPSIS
+     sh [-c COMMAND] [-i] [FILE]
+
+DESCRIPTION
+     sh reads commands and runs them. It is a POSIX-shaped shell: pipes,
+     redirection (< > >> 2> 2>&1 <<EOF), && and || and ;, & for the
+     background with job control (jobs, fg, bg, kill %1), command
+     substitution with $(...) and backticks, variables and $((...))
+     arithmetic, globbing, quoting, functions, and the control
+     structures if, while, until, for, case and select.
+
+     Built-ins include cd, export, read, test ([ ]), source (.), exec,
+     eval, shift, set, unset, trap, wait, umask, ulimit, alias, jobs, fg,
+     bg, kill, times, type, getopts, true, false, echo and exit. A login
+     shell reads /etc/profile and then ~/.profile.
+
+OPTIONS
+     -c COMMAND   run COMMAND and exit
+     -i           interactive, whatever the input is
+     FILE         read commands from FILE
+
+SEE ALSO
+     env(1), test in sh(1) itself, crontab(5)

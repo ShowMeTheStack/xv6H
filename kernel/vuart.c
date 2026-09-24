@@ -209,6 +209,24 @@ vm_cons_getc(struct vm *vm)
   return c;
 }
 
+// is there anything to read, or room to write? poll() and select()
+// ask this of a machine's descriptor.
+int
+vm_cons_ready(struct vm *vm, int write)
+{
+  int r;
+
+  acquire(&vm->lock);
+  if (write)
+    r = !cring_full(&vm->cons_in);
+  else if (vm->state == VM_FREE || vm->cons_detach_req)
+    r = -1;                 // a hangup: the machine is gone
+  else
+    r = cring_empty(&vm->cons_out) ? 0 : 1;
+  release(&vm->lock);
+  return r;
+}
+
 // host side: read up to n bytes of guest console output (blocking).
 int
 vm_cons_read(struct vm *vm, int user, uint64 dst, int n)

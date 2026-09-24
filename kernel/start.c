@@ -19,9 +19,15 @@ __attribute__((aligned(16))) char mstack0[MSTACK * NCPU];
 
 // entry.S jumps here in machine mode on stack0,
 // with a0 = hartid and a1 = physical address of the device tree.
-void
+//
+// no canary of its own: it is where the canary is chosen, and a
+// function cannot check on the way out a value that changed while it
+// was inside (kernel/canary.c).
+__attribute__((no_stack_protector)) void
 start(uint64 hartid, uint64 fdt)
 {
+  canary_init(hartid);
+
   // hart 0 learns about the machine from the device tree and configures
   // the machine-level parts of the interrupt controller; the other harts
   // wait for it (they may well get here first).

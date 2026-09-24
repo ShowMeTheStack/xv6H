@@ -40,12 +40,42 @@ main(int argc, char *argv[])
   memset(&to, 0, sizeof(to));
   to.sin_family = AF_INET;
   to.sin_addr.s_addr = htonl(ip);
-  int ok = 0;
+  // a reply that is slow is not a reply that is lost. Each probe is
+  // waited for, but one that has not come by then stays outstanding:
+  // if it arrives while a later probe is in the air, or in the drain
+  // after the last one, it counts. That is what the numbers at the end
+  // mean, and it is what ping has always meant by them.
+  int *sent = malloc((count + 1) * sizeof(int));
+  char *got = malloc(count + 1);
+  if (sent == 0 || got == 0) {
+    fprintf(stderr, "ping: out of memory\n");
+    exit(1);
+  }
+  memset(got, 0, count + 1);
+  int ok = 0, outstanding = 0;
+  struct sockaddr_in from;
+  socklen_t fromlen;
+  char reply[64];
+
+  // count a reply, whichever probe it belongs to.
+  #define TAKE(n)                                                            \
+    do {                                                                     \
+      int q = ntohs(from.sin_port);                                           \
+      if (q >= 1 && q <= count && !got[q]) {                                  \
+        got[q] = 1;                                                           \
+        ok++;                                                                 \
+        outstanding--;                                                        \
+        printf("%d bytes from %s: seq %d time %d ms\n", (n),                  \
+               ip2str(ntohl(from.sin_addr.s_addr), s), q,                     \
+               (int)((uptime() - sent[q]) * 1000 / hz));                      \
+      }                                                                       \
+    } while (0)
+
   for (int seq = 1; seq <= count; seq++) {
     char data[32];
     for (int i = 0; i < sizeof(data); i++)
       data[i] = 'a' + i % 26;
-    int t0 = uptime();
+    sent[seq] = uptime();
     // an echo socket carries the sequence number where the port goes:
     // there is no port in an ICMP message, and the sequence is what
     // an answer has to be matched against
@@ -57,32 +87,36 @@ main(int argc, char *argv[])
       exit(2);
     }
     if (rc < 0) {
-      printf("ping: send failed\n");
+      printf("ping: %s\n", strerror(errno));
       exit(1);
     }
-    struct sockaddr_in from;
-    socklen_t fromlen;
-    char reply[64];
-    int n;
-    // wait for the reply with this sequence number
-    for (;;) {
+    outstanding++;
+    // wait for this one's reply, taking any other that turns up first
+    while (!got[seq]) {
       fromlen = sizeof(from);
-      n = recvfrom(fd, reply, sizeof(reply), 0, (struct sockaddr *)&from,
-                   &fromlen);
-      if (n < 0 || ntohs(from.sin_port) == seq)
-        break;
+      int n = recvfrom(fd, reply, sizeof(reply), 0, (struct sockaddr *)&from,
+                       &fromlen);
+      if (n < 0)
+        break;                      // nothing within the two seconds
+      TAKE(n);
     }
-    if (n < 0) {
-      printf("seq %d: timeout\n", seq);
-    } else {
-      printf("%d bytes from %s: seq %d time %d ms\n", n,
-             ip2str(ntohl(from.sin_addr.s_addr), s), seq,
-             (int)((uptime() - t0) * 1000 / hz));
-      ok++;
-    }
-    if (seq < count)
-      ticksleep((int)hz);   // a second between probes
+    if (seq < count && got[seq])
+      ticksleep((int)hz);           // a second between probes
   }
+
+  // the drain: anything still outstanding has two more seconds to
+  // arrive, which is the receive timeout on the socket.
+  while (outstanding > 0) {
+    fromlen = sizeof(from);
+    int n = recvfrom(fd, reply, sizeof(reply), 0, (struct sockaddr *)&from,
+                     &fromlen);
+    if (n < 0)
+      break;
+    TAKE(n);
+  }
+  for (int seq = 1; seq <= count; seq++)
+    if (!got[seq])
+      printf("seq %d: timeout\n", seq);
   printf("%d packets transmitted, %d received\n", count, ok);
   exit(ok ? 0 : 1);
 }

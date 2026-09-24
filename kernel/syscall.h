@@ -147,4 +147,17 @@
 #define SYS_sched_yield 144
 #define SYS_getcpu     145
 #define SYS_sched_group 146
+#define SYS_vm_open    147
+#define SYS_netroute   148
+#define SYS_netgw      149
+#define SYS_unshare    150
+#define SYS_setns      151
+#define SYS_pivot_root 152
+#define SYS_sysfilter  153
+#define SYS_vm_save    154
+#define SYS_vm_restore 155
+#define SYS_vm_snapshot 156
+#define SYS_vm_clone   157
+#define SYS_vm_migrate 158
+#define SYS_vm_accept  159
 #endif

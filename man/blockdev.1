@@ -1,0 +1,13 @@
+NAME
+     blockdev - ask a block device about itself
+
+SYNOPSIS
+     blockdev --getsize64|--getsz|--getss|--getbsz|--getro|--setro|--setrw|--rereadpt DEVICE
+
+DESCRIPTION
+     blockdev asks the kernel about a block device: its size in bytes or
+     in sectors, its sector size, its block size, whether it is
+     read-only -- and sets those last two.
+
+SEE ALSO
+     blkid(8), losetup(8), sfdisk(8)

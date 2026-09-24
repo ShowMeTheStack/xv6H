@@ -20,17 +20,51 @@ sys.stdout.reconfigure(line_buffering=True)
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODES = ["plic", "aplic", "imsic"]
 
+# every wait in this file is a hang detector, not a stopwatch: the
+# numbers are generous multiples of what a step takes on an idle
+# machine. When several tests share a machine -- tools/qrun.py runs a
+# dozen at once -- the multiple shrinks, and a test starts failing for
+# want of a processor rather than for a reason. The runner says how
+# hard it is pushing and the waits are scaled to match; the hang
+# detection is unchanged, since a hang still never finishes.
+TIMEOUT_SCALE = float(os.environ.get("TEST_TIMEOUT_SCALE", "1"))
+
+
+# The axis this run is on (§11.1): what machine every test gets, unless
+# the test asks for something else on purpose. `--axis mem=16G,sv=39'
+# runs the same tests on a different machine, which is what a campaign
+# is made of. Empty means the defaults below.
+AXIS = {}
+
+
+def axis_default(name, given, default):
+    """what a test asked for, else what the axis says, else the default."""
+    if given is not None:
+        return given
+    return AXIS.get(name, default)
+
 
 class QEMU(object):
-    def __init__(self, intc="plic", cpus=3, mem="1G", aia_guests=2, hyp=1, vec=1, vlen=128, log=None,
-                 extra_env=None, keep_fs=False):
+    def __init__(self, intc=None, cpus=None, mem=None, aia_guests=2, hyp=None, vec=None,
+                 vlen=None, sv=None, log=None,
+                 extra_env=None, keep_fs=False, fsimg=None):
+        intc = axis_default("intc", intc, "plic")
+        cpus = int(axis_default("cpus", cpus, 3))
+        mem = axis_default("mem", mem, "1G")
+        hyp = int(axis_default("hyp", hyp, 1))
+        vec = int(axis_default("vec", vec, 1))
+        vlen = int(axis_default("vlen", vlen, 128))
+        sv = int(axis_default("sv", sv, 48))
         # every run starts from a pristine copy of the host file system
         # (TEST_FSIMG names the copy, so that two runs can go in
         # parallel). keep_fs starts from the copy the last run left,
         # which is what a test of what survives a reboot needs.
-        fsimg = os.environ.get("TEST_FSIMG", "test-fs.img")
+        # one image per machine: a test that starts two of them (E11's
+        # migration) says which, because one image opened twice is one
+        # file system with two kernels writing it.
+        fsimg = fsimg or os.environ.get("TEST_FSIMG", "test-fs.img")
         env = dict(os.environ, INTC=intc, CPUS=str(cpus), MEM=mem, AIA_GUESTS=str(aia_guests),
-                   HYP=str(hyp), VEC=str(vec), VLEN=str(vlen), FSIMG=fsimg)
+                   HYP=str(hyp), VEC=str(vec), VLEN=str(vlen), SV=str(sv), FSIMG=fsimg)
         if extra_env:
             env.update(extra_env)
         if not keep_fs or not os.path.exists(os.path.join(HERE, fsimg)):
@@ -40,10 +74,55 @@ class QEMU(object):
                              encoding="utf8", check=True).stdout.strip().split("\n")[-1]
         self.cmd = cmd
         self.log = log
+        # Three things are true of every machine this harness starts, and
+        # they are checked here rather than believed, because they are the
+        # whole of what keeps the emulated network inside the emulator:
+        #
+        #   - the network is qemu's user-mode NAT and nothing else. No
+        #     hostfwd, no guestfwd, no tap, no bridge, no vde, no socket
+        #     and no -net.
+        #   - so nothing on the emulated network can open a connection to
+        #     this laptop or to anything on its network: outbound through
+        #     the NAT is all there is.
+        #   - and a port a machine publishes exists on the emulated
+        #     network only. Nothing listens on the laptop for it, which
+        #     is checked after the boot (assert_no_listeners).
+        for bad in ("hostfwd", "guestfwd", "-net ", "type=tap", "ifname=",
+                    "type=bridge", "type=vde", "type=socket", "type=dgram"):
+            assert bad not in cmd, "qemu: %s in %s" % (bad, cmd)
+        # one exception, and it is the whole of it: two hosts joined to
+        # each other for a migration (E11) are joined by a *unix* socket
+        # on this laptop's file system -- a path, not a port. Nothing
+        # listens on the network, nothing outside the two emulated
+        # machines can reach either end, and a TCP form of the same
+        # option would be refused here like everything else above.
+        for dev in re.findall(r"-netdev (\S+)", cmd):
+            if dev.startswith("user,"):
+                continue
+            assert dev.startswith("stream,") and "addr.type=unix" in dev, cmd
+            assert "addr.host=" not in dev and "addr.port=" not in dev, cmd
         self.proc = subprocess.Popen(cmd.split(), cwd=HERE, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.buf = b""
         self.consumed = 0
+        self.gone = False   # the machine's console has closed
+
+    # what the emulator has open, from the laptop's point of view: no
+    # listening socket at all. A published port lives on the emulated
+    # network; if one ever appeared here, it would be on the laptop.
+    def assert_no_listeners(self):
+        try:
+            # -a, or lsof takes the selectors as alternatives and reports
+            # every listening socket on the laptop rather than this
+            # process's (which is how this check first "failed")
+            out = subprocess.run(["lsof", "-nP", "-a", "-p", str(self.proc.pid),
+                                  "-iTCP", "-sTCP:LISTEN"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, encoding="utf8",
+                                 timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return          # no lsof: the command line check above still holds
+        listening = [l for l in out.splitlines() if "LISTEN" in l]
+        assert not listening, "qemu is listening on the laptop: %s" % listening
 
     def _pump(self, timeout):
         r, _, _ = select.select([self.proc.stdout], [], [], timeout)
@@ -51,6 +130,7 @@ class QEMU(object):
             return False
         d = os.read(self.proc.stdout.fileno(), 65536)
         if not d:
+            self.gone = True
             return False
         self.buf += d
         if self.log:
@@ -58,15 +138,41 @@ class QEMU(object):
             self.log.flush()
         return True
 
+    # the host and its guests write to one console, so a line the host
+    # prints about a guest ("hyp: vm 0 vcpu 0: store to unmapped gpa
+    # ...") can land in the middle of a line the guest is printing:
+    #
+    #     badguest: helhyp: vm 0 vcpu 0: store to unmapped ...
+    #     lo from a hostile guest
+    #
+    # A pattern that spans the join then never matches. When the plain
+    # search fails, the search is tried again on a copy with the host's
+    # own lines taken out, which puts the guest's line back together.
+    HOSTLINE = re.compile(rb"hyp: [^\n]*\n")
+
     def expect(self, pattern, timeout=60):
         """wait for a regex in output produced since the last expect()."""
         rx = re.compile(pattern.encode() if isinstance(pattern, str) else pattern, re.S)
-        end = time.time() + timeout
+        end = time.time() + timeout * TIMEOUT_SCALE
         while True:
             m = rx.search(self.buf, self.consumed)
             if m:
                 self.consumed = m.end()
                 return m
+            rest = self.buf[self.consumed:]
+            if b"hyp: " in rest:
+                m = rx.search(self.HOSTLINE.sub(b"", rest))
+                if m:
+                    # the match spanned a host line; everything up to
+                    # here has been seen, so start the next wait from
+                    # the end of what has arrived.
+                    self.consumed = len(self.buf)
+                    return m
+            if self.gone:
+                rc = self.proc.poll()
+                tail = self.buf[-3000:].decode(errors="replace")
+                raise TimeoutError("qemu exited (status %s) while waiting for %r;"
+                                   " tail:\n%s" % (rc, pattern, tail))
             if time.time() > end:
                 tail = self.buf[-3000:].decode(errors="replace")
                 raise TimeoutError("timeout waiting for %r; tail:\n%s" % (pattern, tail))
@@ -365,6 +471,539 @@ def t_init(log):
         q.close()
 
 
+def t_namespaces(log):
+    """namespaces: the machine's name is one thing in one namespace and
+    another in another, and what a namespace does stays in it."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out, out
+
+        # a command in a namespace of its own may call the machine
+        # whatever it likes
+        out = run_cmd(q, "unshare -u --hostname inside hostname")
+        assert "inside" in out, out
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out and "inside" not in out, out
+
+        # everything that reports the name reports the namespace's
+        out = run_cmd(q, "unshare -u --hostname inside uname -n")
+        assert "inside" in out, out
+        out = run_cmd(q, "unshare -u --hostname inside cat /sys/kernel/hostname")
+        assert "inside" in out, out
+        out = run_cmd(q, "cat /sys/kernel/hostname")
+        assert "xv6h" in out, out
+
+        # a child is in its parent's namespace, and a change there is a
+        # change for both of them and for nobody else
+        out = run_cmd(q, "unshare -u --hostname inside sh -c 'hostname; "
+                         "hostname deeper; hostname'")
+        assert "inside" in out and "deeper" in out, out
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out, out
+
+        # the namespace goes when the last process in it does, so the
+        # pool does not run out: eight of them, one after another
+        for i in range(8):
+            out = run_cmd(q, "unshare -u --hostname n%d hostname" % i)
+            assert "n%d" % i in out, out
+
+        # and making one is privileged, until user namespaces
+        out = run_cmd(q, "su user -c 'unshare -u --hostname nope hostname'", 30)
+        assert "not permitted" in out.lower(), out
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out, out
+
+        # a namespace has a name of its own under /proc, which is how one
+        # is pointed at: two processes in the same namespace read the same
+        # thing there and two in different ones do not
+        out = run_cmd(q, "ls /proc/self/ns")
+        assert "uts" in out, out
+        root_id = run_cmd(q, "cat /proc/self/ns/uts")
+        assert re.search(r"uts:\[\d+\]", root_id), root_id
+        other = run_cmd(q, "unshare -u --hostname elsewhere cat /proc/self/ns/uts")
+        assert re.search(r"uts:\[\d+\]", other), other
+        assert other.split("uts:")[1] != root_id.split("uts:")[1], (root_id, other)
+
+        # nsenter: a command run in a namespace somebody else is in. The
+        # process to point at is one left running in a namespace of its
+        # own.
+        out = run_cmd(q, "unshare -u --hostname neighbour sleep 20 &", 20)
+        # the shell says what it started; pgrep is asked as well, because
+        # a process that has exec'd something else should still be found
+        # by the name of what it is now
+        m = re.search(r"\[\d+\]\s+(\d+)", out)
+        assert m, out
+        pid = m.group(1)
+        out = run_cmd(q, "ps -ef | grep sleep")
+        assert "sleep" in out, out
+        # and it is called what it is running, not what started it
+        out = run_cmd(q, "head -1 /proc/%s/status" % pid)
+        assert "sleep" in out, out
+        out = run_cmd(q, "pgrep sleep")
+        assert pid in out, out
+        out = run_cmd(q, "cat /proc/%s/ns/uts" % pid)
+        assert re.search(r"uts:\[\d+\]", out), out
+        out = run_cmd(q, "nsenter -t %s -u hostname" % pid, 30)
+        assert "neighbour" in out, out
+        # and the machine outside is still itself
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out, out
+        # a name that nobody is in is not a namespace to enter
+        out = run_cmd(q, "nsenter -t 31337 -u hostname", 30)
+        assert "no such" in out.lower() or "not" in out.lower(), out
+        run_cmd(q, "kill %s" % pid, 20)
+        print("    the machine's name is the namespace's, and namespaces are"
+              " named under /proc")
+    finally:
+        q.close()
+
+
+def t_containers(log):
+    """a container: its own root, its own name, its own numbering, its own
+    identity, and limits around it -- built out of the namespaces and the
+    control group, and none of it the machine's.
+
+    (Commands are kept short and the long ones put in files: every line
+    has to fit in the console's line editor.)"""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # a root for it: a few programs and the C library
+        run_cmd(q, "mkdir -p /ct/bin /ct/lib", 20)
+        for f in ("sh", "ls", "cat", "hostname", "id", "ps", "sleep",
+                  "cgtest", "echo"):
+            run_cmd(q, "cp /bin/%s /ct/bin/%s" % (f, f), 30)
+        run_cmd(q, "cp /lib/libc.so /ct/lib/libc.so", 30)
+        run_cmd(q, "cp /lib/ld.so /ct/lib/ld.so", 30)
+        # cp does not carry the mode across, and a program nobody may
+        # execute is a program the container cannot run -- rightly
+        run_cmd(q, "chmod 755 /ct/bin/*", 30)
+        run_cmd(q, "chmod 755 /ct/lib/*", 30)
+
+        # what it should be able to say about itself
+        run_cmd(q, "echo 'hostname' > /ct/probe")
+        run_cmd(q, "echo 'echo pid=$$' >> /ct/probe")
+        run_cmd(q, "echo 'echo uid=$(id -u)' >> /ct/probe")
+        run_cmd(q, "echo 'ls /' >> /ct/probe")
+        run_cmd(q, "echo 'cat /etc/passwd' >> /ct/probe")
+        run_cmd(q, "echo 'echo in > /tmp/x; cat /tmp/x' >> /ct/probe")
+
+        out = run_cmd(q, "vmm run -n c1 --rootfs /ct -h boxy /bin/sh /probe", 90)
+        assert "boxy" in out, out
+        assert "pid=1" in out, out            # the first process of its own numbering
+        assert "uid=0" in out, out            # root, inside
+        assert "bin" in out and "lib" in out, out
+        assert "proc" in out and "tmp" in out, out   # what it mounted
+        assert "etc" not in out.split(), out         # and not the machine's
+        assert "cannot open" in out or "No such" in out, out  # /etc/passwd
+        assert re.search(r"(?m)^in\s*$", out), out   # its own /tmp works
+
+        # the machine is untouched: its name, and what it has mounted
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out and "boxy" not in out, out
+        out = run_cmd(q, "mount | grep -c /ct")
+        assert re.search(r"(?m)^0\s*$", out), out
+
+        # and the file the container made is an ordinary user's out here
+        out = run_cmd(q, "ls -l /ct/bin/sh | head -1")
+        assert "sh" in out, out
+
+        # its limits are the group's: eight processes and no more
+        out = run_cmd(q, "vmm run -n c2 --rootfs /ct --pids 8 /bin/cgtest fork 40",
+                      90)
+        m = re.search(r"forks (\d+) of 40", out)
+        assert m and int(m.group(1)) < 10, out
+
+        # a container that is left running is listed, and can be stopped
+        run_cmd(q, "echo 'sleep 60' > /ct/idle")
+        out = run_cmd(q, "vmm run -d -n c3 --rootfs /ct /bin/sh /idle", 60)
+        assert "container c3" in out, out
+        out = run_cmd(q, "vmm ps", 30)
+        assert "c3" in out, out
+        out = run_cmd(q, "vmm stop c3", 30)
+        assert "stopped" in out, out
+        out = run_cmd(q, "vmm ps", 30)
+        assert "c3" not in out, out
+
+        # the machine is still itself
+        out = run_cmd(q, "head -1 /etc/passwd")
+        assert "root:x:0:0" in out, out
+        out = run_cmd(q, "id -u")
+        assert re.search(r"(?m)^0\s*$", out), out
+        print("    a container is a process tree with its own everything")
+    finally:
+        q.close()
+
+
+def t_sysfilter(log):
+    """what a container may ask the kernel for.
+
+    The namespaces bound what it can name and the control group bounds
+    what it can take; this is the third fence -- what it can call. The
+    profile is installed by the runtime as its last act before the
+    command, is inherited, and cannot be widened. Checked from inside:
+    every call on the list is refused, ordinary work is not, and then a
+    few thousand calls with arguments nobody meant, to see whether the
+    kernel or the machine minds."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # a root for it
+        run_cmd(q, "mkdir -p /fz/bin /fz/lib", 20)
+        for f in ("sh", "cat", "echo", "fuzzsys", "hostname", "ls"):
+            run_cmd(q, "cp /bin/%s /fz/bin/%s" % (f, f), 30)
+        run_cmd(q, "cp /lib/libc.so /fz/lib/libc.so", 30)
+        run_cmd(q, "cp /lib/ld.so /fz/lib/ld.so", 30)
+        run_cmd(q, "chmod 755 /fz/bin/* /fz/lib/*", 30)
+
+        # every call the profile names is refused, from inside, and a
+        # child of a filtered process is filtered too
+        out = run_cmd(q, "vmm run -n f1 --rootfs /fz /bin/fuzzsys check", 120)
+        assert "calls refused" in out, out
+        assert "a child is filtered too" in out, out
+        assert "check ok" in out, out
+        assert "FAILED" not in out, out
+
+        # the same calls through the programs a container would reach for
+        run_cmd(q, "echo 'hostname other' > /fz/probe")
+        run_cmd(q, "echo 'echo rc=$?' >> /fz/probe")
+        run_cmd(q, "echo 'hostname' >> /fz/probe")
+        out = run_cmd(q, "vmm run -n f2 --rootfs /fz -h boxy /bin/sh /probe", 90)
+        assert "not permitted" in out.lower(), out   # sethostname refused
+        assert "boxy" in out, out                    # and its name is its own
+        assert "other" not in out, out
+
+        # the machine's own business is not readable from inside it: the
+        # audit ring and the list of running machines are privileged over
+        # the machine, and root in a container is the other kind of root
+        run_cmd(q, "echo 'cat /proc/audit' > /fz/peek")
+        run_cmd(q, "echo 'cat /proc/vmm' >> /fz/peek")
+        out = run_cmd(q, "vmm run -n f3 --rootfs /fz /bin/sh /peek", 90)
+        assert "# audit:" in out, out                # the header, and
+        assert "seq=" not in out, out                # not one record
+        assert "id name owner state" in out, out     # the header, and
+        assert not re.search(r"(?m)^\d+ \S+ \d+ (running|paused)", out), out
+
+        # the calls that take a process number, given numbers no process
+        # can have. A negative one indexed in front of the pid table and
+        # the pointer found there was followed: getsid(-1) panicked the
+        # machine from any process at all, container or not.
+        out = run_cmd(q, "fuzzsys badpid", 60)
+        assert "badpid ok" in out, out
+        assert "?" not in out, out
+        out = run_cmd(q, "vmm run -n fb --rootfs /fz /bin/fuzzsys badpid", 90)
+        assert "badpid ok (1)" in out, out    # and it is init in there
+
+        # and now the nonsense: a few thousand calls with arguments drawn
+        # out of a hat, each in a child of its own, inside a container
+        # with eight processes and 64 MB to its name
+        # (in a file: the line editor redraws anything over 74 characters)
+        run_cmd(q, "echo 'fuzzsys fuzz 1200 20260924' > /fz/nonsense")
+        out = run_cmd(q, "vmm run -n f4 --rootfs /fz --pids 8 --mem 16000 "
+                         "/bin/sh /nonsense", 300)
+        m = re.search(r"(\d+) calls, (\d+) refused, (\d+) signalled", out)
+        assert m, out
+        assert int(m.group(1)) > 900, out            # most rounds ran
+        assert int(m.group(2)) > 0, out              # and the filter bit
+        assert "alive" in out, out
+        assert "panic" not in out, out
+
+        # the machine is still itself: its name, its file system, its
+        # shell, and it can still start a container
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out and "boxy" not in out, out
+        out = run_cmd(q, "head -1 /etc/passwd")
+        assert "root:x:0:0" in out, out
+        out = run_cmd(q, "vmm ls", 30)
+        assert "no vms" in out, out
+        out = run_cmd(q, "vmm run -n f5 --rootfs /fz /bin/fuzzsys check", 120)
+        assert "check ok" in out, out
+
+        # the same again on the machine itself, where the profile is one a
+        # program asked for rather than one a runtime imposed: the calls
+        # that could end the machine are already given up before the
+        # guessing starts, and the machine has to survive the rest.
+        out = run_cmd(q, "fuzzsys fuzz 1200 7", 300)
+        assert "alive" in out, out
+        assert "panic" not in out, out
+        out = run_cmd(q, "echo still-here && ls / | grep -c bin")
+        assert "still-here" in out, out
+        print("    a container's calls are bounded, and nonsense is survived")
+    finally:
+        q.close()
+
+
+def t_cgroups(log):
+    """control groups: a name, a place in a tree, and limits with teeth.
+
+    The processor's share is the scheduler suite's business (sched-fair
+    and sched-group-weight); what is checked here is the tree, the two
+    limits that stop a group taking the machine, and freezing."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # the tree: a group is made by name and has a file per control
+        run_cmd(q, "echo g1 > /sys/fs/cgroup/cgroup.create", 20)
+        out = run_cmd(q, "ls /sys/fs/cgroup/g1")
+        for f in ("cpu.weight", "cpu.max", "memory.max", "memory.current",
+                  "pids.max", "pids.current", "freeze", "procs", "stat"):
+            assert f in out, (f, out)
+        run_cmd(q, "echo 5 > /sys/fs/cgroup/g1/pids.max", 20)
+        out = run_cmd(q, "cat /sys/fs/cgroup/g1/pids.max")
+        assert re.search(r"(?m)^5\s*$", out), out
+
+        # how many processes a group may have. Nine children and the
+        # program that made them is ten, and the eleventh is refused
+        # exactly as the machine's own limit would refuse it.
+        out = run_cmd(q, "cgtest fork 40", 60)
+        assert "forks 40 of 40" in out, out
+        out = run_cmd(q, "cgrun -n pl --pids 10 cgtest fork 40", 60)
+        assert "forks 9 of 40" in out, out
+        assert "temporarily unavailable" in out, out
+        out = run_cmd(q, "cat /sys/fs/cgroup/pl/stat")
+        assert re.search(r"pids.refused [1-9]", out), out
+
+        # how much memory. The machine has plenty; the group does not,
+        # and a process in it that asks for more is stopped where it
+        # stands -- which is what an out-of-memory kill is.
+        out = run_cmd(q, "cgtest mem 800", 90)
+        assert "pages 800 of 800" in out, out
+        out = run_cmd(q, "cgrun -n ml --mem 300 cgtest mem 800", 90)
+        assert "pages 800 of 800" not in out, out
+        m = re.findall(r"at (\d+)", out)
+        assert m and 100 <= int(m[-1]) <= 400, out
+        out = run_cmd(q, "cat /sys/fs/cgroup/ml/stat")
+        assert re.search(r"memory.refused [1-9]", out), out
+        out = run_cmd(q, "head -2 /proc/meminfo")
+        m = re.search(r"MemFree:\s+(\d+)", out)
+        assert m and int(m.group(1)) > 500000, out   # the machine is not full
+
+        # freezing: a group that is frozen does nothing, and does it
+        # again when it is let go
+        run_cmd(q, "rm -f /tmp/cnt")
+        q.send("cgrun -n fz --pids 4 cgtest count /tmp/cnt &\n")
+        q.expect(r"\$ ", 20)
+        time.sleep(2)
+        run_cmd(q, "echo 1 > /sys/fs/cgroup/fz/freeze", 20)
+        time.sleep(1)
+        a = run_cmd(q, "wc -c < /tmp/cnt")
+        time.sleep(3)
+        b = run_cmd(q, "wc -c < /tmp/cnt")
+        na = int(re.search(r"(\d+)", a).group(1))
+        nb = int(re.search(r"(\d+)", b).group(1))
+        assert nb == na, (a, b)
+        out = run_cmd(q, "cat /sys/fs/cgroup/fz/freeze")
+        assert re.search(r"(?m)^1\s*$", out), out
+        run_cmd(q, "echo 0 > /sys/fs/cgroup/fz/freeze", 20)
+        # and it starts again. How soon depends on how busy the machine
+        # is, so this waits for it rather than assuming a number of
+        # seconds: what is being tested is that it moves at all.
+        nc = nb
+        for _ in range(20):
+            time.sleep(1)
+            c = run_cmd(q, "wc -c < /tmp/cnt")
+            nc = int(re.search(r"(\d+)", c).group(1))
+            if nc > nb:
+                break
+        assert nc > nb, (b, nc)
+        run_cmd(q, "pkill cgtest", 20)
+
+        # a group with processes in it is not taken away, and an empty
+        # one is
+        out = run_cmd(q, "cgrun --rm fz", 20)
+        assert "busy" in out.lower() or out.strip().endswith("$"), out
+        run_cmd(q, "cgrun --rm g1", 20)
+        out = run_cmd(q, "cgrun --cgls", 20)
+        assert "g1" not in out, out
+
+        # and only the machine's root may make one or set a limit
+        out = run_cmd(q, "su user -c 'echo x > /sys/fs/cgroup/cgroup.create'", 30)
+        assert "permitted" in out.lower() or "denied" in out.lower(), out
+        out = run_cmd(q, "su user -c 'echo 1 > /sys/fs/cgroup/pl/pids.max'", 30)
+        assert "permitted" in out.lower() or "denied" in out.lower(), out
+        print("    a group's limits are what its processes may take")
+    finally:
+        q.close()
+
+
+def t_userns(log):
+    """user namespaces: root inside is an ordinary user outside, and what
+    root inside may do is bounded by its own namespaces."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # the whole of it from inside: the map, becoming root, what that
+        # root may and may not do, and who owns what
+        out = run_cmd(q, "unstest", 60)
+        assert "unstest: all ok" in out, out
+        assert "FAILED" not in out, out
+
+        # an ordinary user may make one -- that is the point of them --
+        # and is root inside it
+        out = run_cmd(q, "su user -c 'unshare -U id -u'", 30)
+        assert "65534" in out, out       # nobody, until a map is written
+        # and the machine is unmoved by any of it
+        out = run_cmd(q, "id -u")
+        assert re.search(r"(?m)^0\s*$", out), out
+        out = run_cmd(q, "head -1 /etc/passwd")
+        assert "root:x:0:0" in out, out
+
+        # a namespace's root may name its own namespace and not the
+        # machine: in a user namespace but the machine's uts namespace,
+        # setting the hostname is refused
+        out = run_cmd(q, "su user -c 'unshare -U hostname nope'", 30)
+        assert "not permitted" in out.lower(), out
+        out = run_cmd(q, "hostname")
+        assert "xv6h" in out and "nope" not in out, out
+        print("    root inside is an ordinary user outside")
+    finally:
+        q.close()
+
+
+def t_mntns(log):
+    """mount namespaces: what a process sees mounted is its own, and a
+    process that has pivoted into a new root cannot reach the machine's
+    file system by any path.
+
+    (The commands are kept short and the multi-step ones put in files:
+    the harness needs every line to fit in the console's line editor.)"""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        run_cmd(q, "mkdir -p /m1 /m2")
+
+        # a mount made in a namespace of its own is not a mount on the
+        # machine
+        run_cmd(q, "echo 'mount -t ramfs none /m1' > /s1")
+        run_cmd(q, "echo 'mount | grep -c /m1' >> /s1")
+        out = run_cmd(q, "unshare -m sh /s1", 30)
+        assert re.search(r"(?m)^1\s*$", out), out
+        out = run_cmd(q, "mount | grep -c /m1")
+        assert re.search(r"(?m)^0\s*$", out), out
+
+        # and the machine's mounts are in a copy made after them
+        run_cmd(q, "mount -t ramfs none /m2", 30)
+        out = run_cmd(q, "unshare -m sh -c 'mount|grep -c /m2'", 30)
+        assert re.search(r"(?m)^1\s*$", out), out
+        # unmounting inside is inside only
+        run_cmd(q, "echo 'umount /m2' > /s2")
+        run_cmd(q, "echo 'mount | grep -c /m2' >> /s2")
+        out = run_cmd(q, "unshare -m sh /s2", 30)
+        assert re.search(r"(?m)^0\s*$", out), out
+        out = run_cmd(q, "mount | grep -c /m2")
+        assert re.search(r"(?m)^1\s*$", out), out
+        run_cmd(q, "umount /m2", 30)
+
+        # the whole of it from inside: a namespace, a mount, a pivot, and
+        # what can be reached afterwards
+        out = run_cmd(q, "nstest", 60)
+        assert "nstest: all ok" in out, out
+        assert "FAILED" not in out, out
+
+        # and the machine is untouched by all of it
+        out = run_cmd(q, "head -1 /etc/passwd")
+        assert "root:x:0:0" in out, out
+        out = run_cmd(q, "mount | grep -c newroot")
+        assert re.search(r"(?m)^0\s*$", out), out
+
+        # a namespace of one's own is privileged
+        out = run_cmd(q, "su user -c 'unshare -m true'", 30)
+        assert "not permitted" in out.lower(), out
+        print("    what is mounted is a namespace's, and a pivot is a wall")
+    finally:
+        q.close()
+
+
+def t_pidns(log):
+    """pid namespaces: a process's number is a fact about a namespace, and
+    inside a container the first process is number 1."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # the first process in a new namespace is its init
+        out = run_cmd(q, "unshare -p sh -c 'echo inside=$$'", 30)
+        assert "inside=1" in out, out
+        # and a child of it is numbered from there, not from the machine.
+        # (A shell given one command execs it rather than forking, so the
+        # child has to be a real one: $! is the number the namespace gave
+        # it.)
+        out = run_cmd(q, "unshare -p sh -c 'sleep 1 & echo child=$!'", 30)
+        m = re.search(r"child=(\d+)", out)
+        assert m and 1 < int(m.group(1)) < 10, out
+        # and the number it was given is the number its parent can wait
+        # for. Only the first process of a namespace was being numbered
+        # in it: fork handed back the machine's number, wait was told
+        # there was no such child, and nothing inside could reap its own.
+        out = run_cmd(q, "unshare -p sh -c 'sleep 1 & wait $!; echo rc=$?'", 30)
+        assert "rc=0" in out, out
+        out = run_cmd(q, "unshare -p sh -c 'sleep 9 & cat /proc/$!/status|head -1'",
+                      30)
+        assert "sleep" in out, out
+
+        # the machine's own numbering is unchanged, and is large by now
+        out = run_cmd(q, "echo outside=$$")
+        m = re.search(r"outside=(\d+)", out)
+        assert m and int(m.group(1)) > 1, out
+
+        # /proc inside the namespace is the namespace's: its own process
+        # is there under its own number, and the machine's init is not
+        out = run_cmd(q, "unshare -p sh -c 'head -1 /proc/1/status'", 30)
+        assert "sh" in out, out
+        out = run_cmd(q, "unshare -p sh -c 'ls /proc | tr \"\\n\" \" \"'", 30)
+        nums = [int(w) for w in out.split() if w.isdigit()]
+        assert nums and max(nums) < 100, out    # its own few, not the machine's
+        out = run_cmd(q, "ls /proc | tr '\\n' ' '")
+        outer = [int(w) for w in out.split() if w.isdigit()]
+        assert max(outer) > max(nums), (nums, outer)
+
+        # what is outside cannot be signalled from inside, even by the
+        # number that would name it outside
+        out = run_cmd(q, "unshare -p sh -c 'kill -TERM 2 2>&1; echo rc=$?'", 30)
+        assert "rc=0" not in out or "No such process" in out, out
+        # and the machine's init is still there
+        out = run_cmd(q, "head -1 /proc/1/status")
+        assert "init" in out, out
+
+        # a namespace goes when its init does, and its numbers come back:
+        # ten in a row, each starting again at 1
+        for _ in range(10):
+            out = run_cmd(q, "unshare -p sh -c 'echo n=$$'", 30)
+            assert "n=1" in out, out
+
+        # the numbers a namespace hands out are its own, so two
+        # namespaces at once both start at 1
+        out = run_cmd(q, "unshare -p sh -c 'echo a=$$' & unshare -p sh -c"
+                         " 'echo b=$$'; wait", 40)
+        assert "a=1" in out and "b=1" in out, out
+
+        # and a process behind a namespace is still the machine's to see
+        out = run_cmd(q, "unshare -p sleep 20 &", 20)
+        m = re.search(r"\[\d+\]\s+(\d+)", out)
+        assert m, out
+        hostpid = int(m.group(1))
+        assert hostpid > 1, out
+        out = run_cmd(q, "ps -ef | grep sleep")
+        assert "sleep" in out, out
+        run_cmd(q, "kill %d" % hostpid, 20)
+        print("    a number is a fact about a namespace")
+    finally:
+        q.close()
+
+
 def t_shutdown(log):
     """poweroff and reboot: the services stopped, what is waiting
     written, and the machine actually stopping."""
@@ -395,6 +1034,79 @@ def t_shutdown(log):
         run_cmd(q, "rm /pmark")
         run_cmd(q, "sync", 30)
         print("    poweroff stops the machine, and what was written is still there")
+    finally:
+        q.close()
+
+    # and the line in /etc/inittab that says what ctrl-alt-del does:
+    #
+    #   ca::ctrlaltdel:/sbin/shutdown -r now
+    #
+    # init takes SIGINT to mean that key, as every init does, so an
+    # interrupt sent to process 1 reboots the machine. It is worth a test
+    # because it surprises people -- a stray ^C aimed at a program, or a
+    # test harness sending one down the console, reboots rather than
+    # interrupting -- and because the surprise is the configuration
+    # working, not failing.
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        out = run_cmd(q, "grep ctrlaltdel /etc/inittab")
+        assert "shutdown -r now" in out, out
+        q.send("kill -INT 1\n")
+        # what a reboot looks like: the services stopped, then a machine
+        # coming up again from the beginning
+        q.expect(r"(?i)(restart|reboot|Stopping)", 30)
+        q.expect(r"xv6 kernel is booting", 60)
+        q.expect(r"init: starting sh", 90)
+        q.expect(r"\$ ", 20)
+        out = run_cmd(q, "uptime")
+        assert "up" in out, out
+        print("    an interrupt to init is ctrl-alt-del, and reboots the machine")
+    finally:
+        q.close()
+
+
+def t_manual(log):
+    """every utility has a manual page, and answers --help from it.
+
+    The check is the list of what is installed against the list of what
+    is documented, made on the machine itself: a program added without a
+    page fails here, which is the only way a manual of two hundred pages
+    stays true."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # what is installed, and what is documented
+        out = run_cmd(q, "ls /bin /sbin | sort -u > /tmp/have", 30)
+        out = run_cmd(q, "man | cut -d' ' -f1 | sort -u > /tmp/doc", 30)
+        out = run_cmd(q, "comm -23 /tmp/have /tmp/doc", 30)
+        undocumented = [l for l in out.splitlines()
+                        if l.strip() and not l.startswith("$") and
+                        "comm -23" not in l and ":" not in l]
+        assert not undocumented, "no manual page for: %s" % undocumented
+
+        # a page is a page, and --help is the same words
+        out = run_cmd(q, "man ls", 20)
+        assert "NAME" in out and "SYNOPSIS" in out and "list directory" in out, out
+        out = run_cmd(q, "ls --help", 20)
+        assert "SYNOPSIS" in out and "DESCRIPTION" not in out, out
+        out = run_cmd(q, "vmm --help", 20)
+        assert "vmm migrate" in out, out
+        out = run_cmd(q, "man -k namespace | wc -l", 20)
+        assert re.search(r"(?m)^[2-9]\d*\s*$", out), out
+        out = run_cmd(q, "man nosuchthing", 20)
+        assert "no manual entry" in out, out
+
+        # and a page the reader can trust: the synopsis names the
+        # program, not another one
+        for name in ("cp", "grep", "mount", "unshare", "tar", "dd"):
+            out = run_cmd(q, "man %s | head -5" % name, 20)
+            assert re.search(r"(?m)^\s+%s - " % name, out), out
+            assert "SYNOPSIS" in out, out
+        print("    every installed utility has a page, and --help reads it")
     finally:
         q.close()
 
@@ -750,6 +1462,48 @@ def t_overlay(log):
         q.close()
 
 
+def t_mount_privilege(log):
+    """mount and umount are the machine's to do, not everybody's.
+
+    Nothing checked before this: any user could mount a file system over
+    any directory they could write -- a ramfs over /etc -- or unmount
+    what somebody else had mounted."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+        run_cmd(q, "mkdir -p /tmp/mp")
+
+        # root may
+        out = run_cmd(q, "mount -t ramfs none /tmp/mp && echo mounted", 30)
+        assert "mounted" in out, out
+        out = run_cmd(q, "mount | grep /tmp/mp")
+        assert "ramfs" in out, out
+
+        # and an ordinary user may not unmount it
+        out = run_cmd(q, "su user -c 'umount /tmp/mp'", 30)
+        assert "not permitted" in out.lower(), out
+        out = run_cmd(q, "mount | grep /tmp/mp")
+        assert "ramfs" in out, out
+        run_cmd(q, "umount /tmp/mp", 30)
+
+        # nor mount anything anywhere
+        out = run_cmd(q, "su user -c 'mount -t ramfs none /tmp/mp'", 30)
+        assert "not permitted" in out.lower(), out
+        out = run_cmd(q, "mount | grep /tmp/mp")
+        assert "ramfs" not in out, out
+        # not even over a directory of their own
+        run_cmd(q, "su user -c 'mkdir -p /tmp/own'", 20)
+        out = run_cmd(q, "su user -c 'mount -t tmpfs none /tmp/own'", 30)
+        assert "not permitted" in out.lower(), out
+        # and the refusal is recorded, like every other privileged thing
+        out = run_cmd(q, "grep -c 'umount' /proc/audit", 20)
+        assert re.search(r"(?m)^[1-9]", out), out
+        print("    mounting is privileged, and refusals are recorded")
+    finally:
+        q.close()
+
+
 def t_mountopts(log):
     """the mount options: read-only and remount, bind, noexec, nodev,
     and -o loop attaching a loop device by itself."""
@@ -879,6 +1633,135 @@ def t_sysfs(log):
         out = run_cmd(q, "cat /tmp/x")
         assert "t" in out, out
         print("    /sys: the kernel, the disks, the mounts and the machine")
+    finally:
+        q.close()
+
+
+def t_aslr(log):
+    """address space layout randomisation: the same program run twice is
+    given different addresses, and with the knob off it is given the
+    same ones. What moves at each level is checked separately, because
+    "some of the numbers changed" would pass even if only the stack
+    were moving."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        def addrs():
+            out = run_cmd(q, "aslrcheck", 30)
+            m = re.search(r"text=0x([0-9a-f]+) libc=0x([0-9a-f]+) "
+                          r"stack=0x([0-9a-f]+) heap=0x([0-9a-f]+) "
+                          r"mmap=0x([0-9a-f]+) brk=0x([0-9a-f]+)", out)
+            assert m, out
+            keys = ("text", "libc", "stack", "heap", "mmap", "brk")
+            return dict(zip(keys, (int(g, 16) for g in m.groups())))
+
+        # the default, 2: everything moves. Ten runs, and every one of
+        # the five addresses has to take at least two different values
+        # -- with a 256-page stack slide a pair could collide by chance,
+        # but not ten runs' worth.
+        out = run_cmd(q, "cat /sys/kernel/randomize_va_space")
+        assert re.search(r"(?m)^2\s*$", out), out
+        runs = [addrs() for _ in range(10)]
+        for k in runs[0]:
+            seen = set(r[k] for r in runs)
+            assert len(seen) > 1, (k, [hex(v) for v in seen])
+        print("    2: text, libc, stack, heap, mmap and brk all move")
+
+        # 0: nothing moves. Every address is identical across runs.
+        run_cmd(q, "echo 0 > /sys/kernel/randomize_va_space")
+        out = run_cmd(q, "cat /sys/kernel/randomize_va_space")
+        assert re.search(r"(?m)^0\s*$", out), out
+        a, b = addrs(), addrs()
+        assert a == b, (a, b)
+        print("    0: two runs report identical addresses")
+
+        # 1: the stack, the mmap area and the shared library move; the
+        # program's own text and its heap, which grows from the end of
+        # that text, do not.
+        run_cmd(q, "echo 1 > /sys/kernel/randomize_va_space")
+        runs = [addrs() for _ in range(8)]
+        # (malloc in this libc maps its arena rather than growing the
+        # heap, so the block it returns moves with the mmap area; the
+        # kernel's heap, which brk reports, is what stays put at 1.)
+        for k in ("stack", "libc", "mmap", "heap"):
+            assert len(set(r[k] for r in runs)) > 1, (k, runs)
+        for k in ("text", "brk"):
+            assert len(set(r[k] for r in runs)) == 1, (k, runs)
+        print("    1: stack, libc and mmap move; text and the heap do not")
+
+        # a bad value is refused and leaves the setting alone
+        run_cmd(q, "echo 3 > /sys/kernel/randomize_va_space")
+        out = run_cmd(q, "cat /sys/kernel/randomize_va_space")
+        assert re.search(r"(?m)^1\s*$", out), out
+
+        run_cmd(q, "echo 2 > /sys/kernel/randomize_va_space")
+        # and the randomised stack is still a working stack: a program
+        # that recurses and a program that maps still run.
+        # three hundred seconds rather than a hundred and eighty: these
+        # three take about a hundred together on a quiet laptop and twice
+        # that on a warm one, and what is being tested is that a
+        # randomised stack works, not how fast.
+        for t in ("bigargtest", "stacktest", "execout"):
+            out = run_cmd(q, "usertests " + t, 300)
+            assert "ALL TESTS PASSED" in out, (t, out)
+        print("    a randomised stack is still a stack: "
+              "bigargtest, stacktest, execout")
+    finally:
+        q.close()
+
+
+def t_audit(log):
+    """the audit log: the privileged things that happen are written down,
+    a program can add a record of its own through /dev/audit, and
+    somebody who is not root can see that there is a log but not what
+    is in it."""
+    q = QEMU(intc="plic", cpus=3, log=log)
+    try:
+        q.expect(r"init: starting sh", 60)
+        q.expect(r"\$ ", 10)
+
+        # booting mounts five file systems, and each one is a record
+        out = run_cmd(q, "cat /proc/audit")
+        m = re.search(r"# audit: (\d+) records, (\d+) dropped", out)
+        assert m and int(m.group(1)) > 0, out
+        assert re.search(r"op=mount what=/dev .* res=ok", out), out
+        assert re.search(r"op=mount what=/proc .* res=ok", out), out
+        before = int(m.group(1))
+
+        # su becomes another user, and that is written down
+        run_cmd(q, "su user -c id", 30)
+        out = run_cmd(q, "cat /proc/audit")
+        assert re.search(r"comm=su op=setuid .* b=1000 res=ok", out), out
+
+        # a mount and an unmount of this run's own
+        run_cmd(q, "mkdir -p /a")
+        run_cmd(q, "mount -t tmpfs none /a", 30)
+        run_cmd(q, "umount /a", 30)
+        out = run_cmd(q, "cat /proc/audit")
+        assert re.search(r"op=mount what=/a .* res=ok", out), out
+        assert re.search(r"op=umount what=/a .* res=ok", out), out
+
+        # a program's own record
+        run_cmd(q, "echo the-suite-was-here > /dev/audit")
+        out = run_cmd(q, "cat /proc/audit")
+        assert "op=user msg=the-suite-was-here" in out, out
+
+        # and it has grown
+        m = re.search(r"# audit: (\d+) records", out)
+        assert m and int(m.group(1)) > before, (before, out)
+
+        # somebody who is not root sees that there is a log and nothing
+        # else, and cannot add to it either
+        out = run_cmd(q, "su user -c 'cat /proc/audit'", 30)
+        assert "# audit:" in out, out
+        assert "op=mount" not in out and "op=setuid" not in out, out
+        out = run_cmd(q, "su user -c 'echo sneaky > /dev/audit'", 30)
+        assert "Permission denied" in out, out
+        out = run_cmd(q, "cat /proc/audit")
+        assert "sneaky" not in out, out
+        print("    mounts, setuid, a program's own record, and not for everybody")
     finally:
         q.close()
 
@@ -1073,15 +1956,50 @@ def main():
     ap.add_argument("-i", "--intc", default=None, help="plic|aplic|imsic (default: all)")
     ap.add_argument("-c", "--cpus", type=int, default=3)
     ap.add_argument("-v", action="store_true", help="tee qemu output to stdout")
-    ap.add_argument("-t", "--test", default=None, help="only tests whose name contains this")
+    ap.add_argument("-t", "--test", default=None, help="only tests whose name matches this (a pattern)")
+    ap.add_argument("--list", action="store_true",
+                    help="print the names of the tests this would run, and stop")
+    ap.add_argument("--tier", default=None, choices=["quick", "full"],
+                    help="quick: thirty-six tests, one of each kind of thing, "
+                         "for every commit (minutes through tools/qrun.py). "
+                         "full: everything, which is what a milestone gets. "
+                         "(the campaign is tools/campaign.py: this, over and "
+                         "over, on different machines)")
+    ap.add_argument("--axis", default=None, metavar="K=V,...",
+                    help="what machine to run them on: intc, cpus, mem, hyp, "
+                         "vec, vlen, sv. `--axis mem=16G,sv=39'")
+    ap.add_argument("--json", default=None, metavar="FILE",
+                    help="write the results there as JSON, with what each took")
+    ap.add_argument("--no-build", action="store_true",
+                    help="the images are already built (a queue runner builds once "
+                         "and then starts many of these at the same time; twelve "
+                         "makes in one tree would race)")
     args = ap.parse_args()
+    if args.axis:
+        for kv in args.axis.split(","):
+            if not kv.strip():
+                continue
+            k, _, v = kv.partition("=")
+            k = k.strip()
+            if k not in ("intc", "cpus", "mem", "hyp", "vec", "vlen", "sv"):
+                ap.error("axis: %s is not one of intc, cpus, mem, hyp, vec, vlen, sv" % k)
+            AXIS[k] = v.strip()
+        if "intc" in AXIS and not args.intc:
+            args.intc = AXIS["intc"]
+        if "cpus" in AXIS:
+            args.cpus = int(AXIS["cpus"])
     modes = [args.intc] if args.intc else MODES
-    log = sys.stdout if args.v else open(os.path.join(HERE, "test-hyp.log"), "w")
+    # TEST_LOG names the console log, so that jobs running side by side
+    # do not write over each other's (TEST_FSIMG does the same for the
+    # disk image).
+    logname = os.environ.get("TEST_LOG", "test-hyp.log")
+    log = sys.stdout if args.v else open(os.path.join(HERE, logname), "w")
 
-    subprocess.run(["make", "-s"], cwd=HERE, check=True)
+    if not (args.no_build or args.list):
+        subprocess.run(["make", "-s"], cwd=HERE, check=True)
     import test_hyp_linux
     have_linux = test_hyp_linux.available(HERE)
-    if have_linux:
+    if have_linux and not (args.no_build or args.list):
         # the host image carries the Linux kernel and its disk as well
         # (make cannot tell that HOSTFILES changed: start from scratch).
         subprocess.run(["rm", "-f", "fs.img"], cwd=HERE)
@@ -1091,7 +2009,7 @@ def main():
         subprocess.run(["make", "-s", "fs.img", "HOSTFS_MB=192",
                         "HOSTFILES=linux/Image linux/linux.img"], cwd=HERE, check=True,
                        stdout=subprocess.DEVNULL)
-    elif args.suite in ("linux", "all"):
+    elif not have_linux and args.suite in ("linux", "all"):
         print("linux/Image not found: run linux/build.sh on a Linux box and linux/fetch.sh; skipping Linux tests")
 
     failures = 0
@@ -1110,16 +2028,35 @@ def main():
             tests.append(("init", lambda: t_init(log)))
             tests.append(("shutdown", lambda: t_shutdown(log)))
             tests.append(("utils", lambda: t_utils(log)))
+            tests.append(("manual", lambda: t_manual(log)))
             tests.append(("logging", lambda: t_logging(log)))
             tests.append(("users", lambda: t_users(log)))
             tests.append(("cowimage", lambda: t_cowimage(log)))
             tests.append(("overlay", lambda: t_overlay(log)))
             tests.append(("mountopts", lambda: t_mountopts(log)))
             tests.append(("sysfs", lambda: t_sysfs(log)))
+            tests.append(("aslr", lambda: t_aslr(log)))
+            tests.append(("audit", lambda: t_audit(log)))
             tests.append(("ramfs", lambda: t_ramfs(log)))
             tests.append(("fsbench", lambda: t_fsbench(log)))
             tests.append(("blockdev", lambda: t_blockdev(log)))
             tests.append(("loopdev", lambda: t_loopdev(log)))
+    if args.suite in ("ns", "all"):
+        # the namespaces, one kind at a time
+        tests.append(("namespaces", lambda: t_namespaces(log)))
+        tests.append(("pidns", lambda: t_pidns(log)))
+        tests.append(("mntns", lambda: t_mntns(log)))
+        tests.append(("userns", lambda: t_userns(log)))
+        tests.append(("mount-privilege", lambda: t_mount_privilege(log)))
+    if args.suite in ("ct", "all"):
+        # and what is built out of them: groups with limits, a root of
+        # its own, a bounded set of system calls, and a network behind a
+        # gateway (test_hyp_ct.py)
+        tests.append(("cgroups", lambda: t_cgroups(log)))
+        tests.append(("containers", lambda: t_containers(log)))
+        tests.append(("sysfilter", lambda: t_sysfilter(log)))
+        import test_hyp_ct
+        tests += test_hyp_ct.tests(modes, args.cpus, log, QEMU, run_cmd)
     if args.suite in ("guest", "all"):
         import test_hyp_guest  # milestone 2+
         tests += test_hyp_guest.tests(modes, args.cpus, log, QEMU, usertests_ok)
@@ -1137,24 +2074,72 @@ def main():
     if args.suite in ("sched", "all"):
         import test_hyp_sched
         tests += test_hyp_sched.tests(modes, args.cpus, log, QEMU)
+    if args.suite in ("snap", "all"):
+        import test_hyp_snap
+        tests += test_hyp_snap.tests(modes, args.cpus, log, QEMU)
 
+    if args.tier == "quick":
+        # the set for every commit: one of each kind of thing, and
+        # §11.3's quarter of an hour is met -- ten minutes on a laptop,
+        # one test after another, and a couple through tools/qrun.py.
+        # What it leaves out is the long ones -- the 16 GB and 512 GB
+        # memory tests, a hundred thousand processes, the Linux guests,
+        # the campaign benchmarks -- not whole areas.
+        quick = ("native-plic|manual|utils|libc|clock|tty|users|sysfs|aslr|"
+                 "audit|ramfs|namespaces|pidns|mntns|userns|mount-privilege|"
+                 "cgroups|containers|sysfilter|ct-net|ct-exec|"
+                 "guest-boot-plic|guest-lifecycle-plic|guest-pages-plic|"
+                 "guest-ksm-plic|net-host-plic|net-routes|net-tools|"
+                 "mm-1g|proc-8000|sched-fair|sched-group-max|"
+                 "snap-save-restore|snap-live|snap-clone|snap-migrate")
+        tests = [t for t in tests if re.fullmatch(quick, t[0])]
     if args.test:
-        tests = [t for t in tests if args.test in t[0]]
+        # a name, part of one, or a pattern: "-t 'pidns|sysfilter'" runs
+        # the two of them and nothing else
+        tests = [t for t in tests if re.search(args.test, t[0])]
+    if args.list:
+        # what a queue runner needs to turn a suite into jobs
+        for name, _ in tests:
+            print(name)
+        return 0
+    results = []
+    started = time.time()
     for name, fn in tests:
         print("== %s" % name)
         t0 = time.time()
         try:
             fn()
             print("== %s: PASS (%.0fs)" % (name, time.time() - t0))
+            results.append({"test": name, "result": "pass",
+                            "seconds": round(time.time() - t0, 1)})
         except Exception as e:
             failures += 1
             import traceback
-            msg = str(e)[-3000:]
+            # keep the head of the message as well as the tail: the
+            # head says what the test was waiting for, and cutting to
+            # the last three thousand characters threw exactly that
+            # away and left a page of console with no question attached.
+            msg = str(e)
+            if len(msg) > 3000:
+                head, _, rest = msg.partition("\n")
+                msg = head + "\n...\n" + rest[-2800:]
             if not msg.strip():
                 msg = traceback.format_exc().strip().splitlines()[-3:]
                 msg = " | ".join(l.strip() for l in msg)
             print("== %s: FAIL (%.0fs): %s" % (name, time.time() - t0, msg))
+            results.append({"test": name, "result": "fail",
+                            "seconds": round(time.time() - t0, 1),
+                            "why": msg.split("\n")[0][:200]})
     print("%d failure(s)" % failures)
+    if args.json:
+        # what ran, on what machine, and how long each of it took: a
+        # campaign is a directory of these.
+        import json
+        with open(args.json, "w") as f:
+            json.dump({"axis": dict(AXIS), "suite": args.suite,
+                       "tier": args.tier, "seconds": round(time.time() - started, 1),
+                       "failures": failures, "tests": results}, f, indent=1)
+            f.write("\n")
     sys.exit(1 if failures else 0)
 
 

@@ -1,0 +1,32 @@
+NAME
+     ip - addresses, links, routes and neighbours
+
+SYNOPSIS
+     ip [-4] [-br] addr [show]
+     ip addr add ADDR/PREFIX [dev NAME] [gw ADDR] [dns ADDR]
+     ip link [show]
+     ip route [show] | ip route get ADDR
+     ip route add PREFIX via ADDR [dev NAME] [metric N]
+     ip route del PREFIX via ADDR
+     ip neigh [show]
+     route [-n]    arp [-n] [-a]
+
+DESCRIPTION
+     ip shows and changes the network configuration. `ip addr add' gives
+     an interface an address by hand -- which is what a wire with no
+     DHCP server on it needs -- and may set the gateway and name server
+     at the same time. `ip route get' asks the kernel the question a
+     packet asks it: which way does this address go? Called as route or
+     arp it prints the same tables in the older format.
+
+OPTIONS
+     -4    IPv4 only (there is no IPv6 here)
+     -br   one line per thing, briefly
+
+EXAMPLES
+     ip addr add 10.7.0.1/24 dev eth0
+     ip route add 10.9.0.0/16 via 10.0.2.2 dev eth0
+     ip route get 8.8.8.8
+
+SEE ALSO
+     ifconfig(1), netstat(1), ping(1), vmm(1)

@@ -16,7 +16,8 @@
  */
 pagetable_t kernel_pagetable;
 
-extern char etext[]; // kernel.ld sets this to end of kernel code.
+extern char etext[];    // kernel.ld: the end of the kernel's code
+extern char erodata[];  // ... and of its constants
 
 extern char trampoline[]; // trampoline.S
 
@@ -108,19 +109,56 @@ kvmmake(void)
   if (plat.rtc_base)
     kvmmap(kpgtbl, plat.rtc_base, plat.rtc_base, PGSIZE, PTE_R | PTE_W);
 
-  // map kernel text executable and read-only.
+  // the kernel's own image, one permission at a time: code that can be
+  // executed and not written, constants that can be neither, and
+  // everything after them -- data, and all of physical RAM -- that can
+  // be written and not executed. Nothing anywhere is both writable and
+  // executable; kvm_check_wx() at the end of this function says so
+  // rather than trusting it.
   kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext - KERNBASE, PTE_R | PTE_X);
+  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, (uint64)erodata - (uint64)etext,
+         PTE_R);
 
-  // map kernel data and all of physical RAM, with 2 MB and 1 GiB pages
-  // wherever the alignment allows (512 GiB take a few hundred entries).
-  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, plat.ram_end - (uint64)etext,
+  // all of physical RAM, with 2 MB and 1 GiB pages wherever the
+  // alignment allows (512 GiB take a few hundred entries).
+  kvmmap(kpgtbl, (uint64)erodata, (uint64)erodata, plat.ram_end - (uint64)erodata,
          PTE_R | PTE_W);
 
   // map the trampoline for trap entry/exit to
   // the highest virtual address in the kernel.
   kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
 
+  kvm_check_wx(kpgtbl);
   return kpgtbl;
+}
+
+// walk a page table and panic if any leaf is both writable and
+// executable. Cheap, done once, and worth doing: W^X that nothing
+// checks is a comment.
+static void
+check_wx(pagetable_t pt, int level, uint64 va)
+{
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pt[i];
+    if ((pte & PTE_V) == 0)
+      continue;
+    uint64 a = va | ((uint64)i << (12 + 9 * level));
+    if (pte & (PTE_R | PTE_W | PTE_X)) {
+      if ((pte & PTE_W) && (pte & PTE_X)) {
+        printk("kvm: 0x%lx is writable and executable\n", a);
+        panic("kvm_check_wx");
+      }
+      continue;
+    }
+    if (level > 0)
+      check_wx((pagetable_t)PTE2PA(pte), level - 1, a);
+  }
+}
+
+void
+kvm_check_wx(pagetable_t pt)
+{
+  check_wx(pt, plat.mmu_levels - 1, 0);
 }
 
 // mappings added to the kernel table while the system runs (kernel

@@ -1,0 +1,20 @@
+NAME
+     stty - the terminal's settings
+
+SYNOPSIS
+     stty [-a] [SETTING...]
+     reset
+     clear
+
+DESCRIPTION
+     stty prints or changes the terminal line settings: echo, icanon,
+     isig, the special characters (intr, erase, kill, eof), rows and
+     columns, and the rest of termios. Called as reset it puts a
+     confused terminal back the way it should be; called as clear it
+     clears the screen.
+
+OPTIONS
+     -a   print everything, not only what differs from the usual
+
+SEE ALSO
+     tty(1), sh(1)

@@ -1,0 +1,17 @@
+NAME
+     syslogd - collect log messages
+
+SYNOPSIS
+     syslogd [-n] [-f FILE]
+
+DESCRIPTION
+     syslogd reads /dev/log and writes what it is told into
+     /var/log/messages, with the time, the host, the tag and the
+     message. The files are rotated by a cron job.
+
+OPTIONS
+     -n         stay in the foreground
+     -f FILE    write there instead
+
+SEE ALSO
+     klogd(8), logger(1), dmesg(1)

@@ -1,0 +1,17 @@
+NAME
+     chown - change a file's owner or group
+
+SYNOPSIS
+     chown [-R] USER[:GROUP] FILE...
+     chgrp [-R] GROUP FILE...
+
+DESCRIPTION
+     chown sets the owner, and with :GROUP the group as well. Giving a
+     file away is root's alone; the owner may change its group to one
+     they are in. Called as chgrp it changes only the group.
+
+OPTIONS
+     -R   descend into directories
+
+SEE ALSO
+     chmod(1), id(1), ls(1)

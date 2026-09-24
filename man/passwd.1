@@ -1,0 +1,19 @@
+NAME
+     passwd - change a password
+
+SYNOPSIS
+     passwd [-l|-u|-d|-S] [USER]
+
+DESCRIPTION
+     passwd changes a user's password, asking for the old one first
+     unless root is asking. The hashes are PBKDF2-SHA256 in
+     /etc/shadow, which only root can read.
+
+OPTIONS
+     -l   lock the account
+     -u   unlock it
+     -d   remove the password entirely
+     -S   say what state the account is in
+
+SEE ALSO
+     login(1), su(1), useradd(8)

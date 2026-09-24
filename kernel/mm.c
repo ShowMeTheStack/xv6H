@@ -15,6 +15,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "cgroup.h"
 #include "platform.h"
 #include "page.h"
 #include "slab.h"
@@ -193,6 +194,26 @@ vma_remove(struct mm *mm, uint64 start, uint64 end)
 
 // ---- the address space ----
 
+// how much to randomise a boundary by, in bytes: a random whole
+// number of pages below `pages'. Zero when randomisation is off.
+//
+// 0 is no randomisation, 1 randomises the stack, the mmap area and
+// the shared libraries, and 2 adds the program's own image and its
+// heap -- the same three values Linux gives this knob, and the same
+// meanings. /sys/kernel/randomize_va_space.
+int randomize_va_space = 2;
+
+uint64
+aslr_slide(uint64 pages)
+{
+  uint64 r;
+
+  if (randomize_va_space == 0 || pages == 0)
+    return 0;
+  random_bytes(&r, sizeof(r));
+  return (r % pages) * PGSIZE;
+}
+
 struct mm *
 mm_create(void)
 {
@@ -207,9 +228,19 @@ mm_create(void)
     kmem_cache_free(mm_cache, mm);
     return 0;
   }
-  mm->stack_top = THREAD_TF_BOT;
+  // address space layout randomisation. The stack and the area mmap
+  // hands out are slid down by a random whole number of pages, so
+  // that the address of a buffer, of a library, or of anything the
+  // loader maps is not the same from one run to the next. An overflow
+  // that has to name an address then has to guess it, and a guess
+  // that is wrong is a fault rather than a foothold.
+  //
+  // whole pages, because a partial page would misalign everything
+  // below; and downward only, because what is above is fixed (the
+  // trapframes, the trampolines).
+  mm->stack_top = THREAD_TF_BOT - aslr_slide(ASLR_STACK_PAGES);
   mm->stack_bottom = mm->stack_top - STACK_MAX;
-  mm->mmap_base = mm->stack_bottom - MMAP_GAP;
+  mm->mmap_base = mm->stack_bottom - MMAP_GAP - aslr_slide(ASLR_MMAP_PAGES);
   return mm;
 }
 
@@ -428,17 +459,26 @@ fault_in(struct mm *mm, struct vma *v, uint64 va)
     perm |= PTE_W;
   if (v->prot & VMA_EXEC)
     perm |= PTE_X;
+  // the group this process is in may be at its limit, in which case this
+  // is a fault it cannot serve -- which is what memory.max means, and is
+  // the same answer as the machine having no pages left.
+  if (cg_charge_page(myproc()) < 0) {
+    kfree(mem);
+    return 0;
+  }
   acquire(&mm->lock);
   pte_t *pte = walk(mm->pagetable, va, 0);
   if (pte && (*pte & PTE_V)) {
     // another thread got there first
     uint64 pa = PTE2PA(*pte);
     release(&mm->lock);
+    cg_uncharge_page(myproc(), 1);
     kfree(mem);
     return pa;
   }
   if (mappages(mm->pagetable, va, PGSIZE, (uint64)mem, perm) != 0) {
     release(&mm->lock);
+    cg_uncharge_page(myproc(), 1);
     kfree(mem);
     return 0;
   }

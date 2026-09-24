@@ -1,0 +1,22 @@
+NAME
+     xargs - build command lines from standard input
+
+SYNOPSIS
+     xargs [-0] [-r] [-t] [-p] [-n MAX] [-L N] [-I STR] [-s SIZE] [COMMAND...]
+
+DESCRIPTION
+     xargs reads words from standard input and runs COMMAND (echo by
+     default) with them appended, as many at a time as will fit.
+
+OPTIONS
+     -0        input is separated by null bytes, not whitespace
+     -r        do not run the command at all if there is no input
+     -t        print each command line before running it
+     -p        ask before each one
+     -n MAX    at most MAX arguments per run
+     -L N      one run per N lines of input
+     -I STR    replace STR in the command with the line
+     -s SIZE   at most SIZE bytes per command line
+
+SEE ALSO
+     find(1), sh(1)

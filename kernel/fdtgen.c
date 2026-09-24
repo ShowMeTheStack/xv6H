@@ -15,6 +15,7 @@
 #include "fdt.h"
 #include "platform.h"
 #include "hyp.h"
+#include "net.h"
 
 struct fdtw {
   char *st;   // structure block
@@ -190,6 +191,18 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     // static address for an xv6 guest: ip, mask, gateway, dns.
     uint32 ipc[4] = {vm->cfg.ip, vm->cfg.mask, vm->cfg.gw, vm->cfg.dns};
     prop_cells(&w, "xv6h,ip", ipc, 4);
+  }
+  if (vm->gw) {
+    // what is on the far side of its gateway: the switch's own subnet,
+    // and the two addresses on it that are not ours -- qemu's router,
+    // which is the laptop, and qemu's name forwarder. A machine cannot
+    // work this out: 10.0.2.15 is the host it may talk to and 10.0.2.2
+    // is the laptop it may not, and they differ by one number. With
+    // this it may reach the switch through its gateway and still refuse
+    // the two, and its own gateway stops looking like the laptop.
+    uint32 outer[4] = {netcfg.ip & netcfg.mask, netcfg.mask, netcfg.gw,
+                       netcfg.dns};
+    prop_cells(&w, "xv6h,outer", outer, 4);
   }
   node_end(&w);
 

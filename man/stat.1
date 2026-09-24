@@ -1,0 +1,23 @@
+NAME
+     stat - what the inode says about a file
+
+SYNOPSIS
+     stat [-L] [-t] [-c FORMAT] FILE...
+
+DESCRIPTION
+     stat prints the inode: type, size in bytes and blocks, mode, owner
+     and group, link count, device and inode number, and the three
+     times. A symbolic link is reported as itself unless -L is given.
+     Called as readlink, it prints what a symbolic link points at
+     instead.
+
+OPTIONS
+     -L   follow symbolic links
+     -t   one line, in the order the fields appear in struct stat
+     -c FORMAT
+          print FORMAT with %n the name, %s the size, %b blocks, %f raw
+          mode, %a mode in octal, %u %U owner, %g %G group, %i inode,
+          %h links, %F the kind of thing it is
+
+SEE ALSO
+     ls(1), file(1), readlink(1)

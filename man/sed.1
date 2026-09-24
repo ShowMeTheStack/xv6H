@@ -1,0 +1,26 @@
+NAME
+     sed - edit a stream of text
+
+SYNOPSIS
+     sed [-n] [-E] [-i] [-e SCRIPT] [-f FILE] [SCRIPT] [FILE...]
+
+DESCRIPTION
+     sed reads each line, applies the script to it and prints the result.
+     The script is the usual language: addresses (a line number, $, a
+     /regexp/, or two of them for a range) in front of commands --
+     s///, p, d, a, i, c, y///, n, N, q, =, b, t, labels, and { } for a
+     group.
+
+OPTIONS
+     -n          print nothing unless the script says to
+     -E          extended regular expressions
+     -i          edit the files in place
+     -e SCRIPT   add SCRIPT to the program
+     -f FILE     read the program from FILE
+
+EXAMPLES
+     sed -n '/error/p' /var/log/messages
+     sed -i 's/tabs/spaces/g' notes.txt
+
+SEE ALSO
+     awk(1), grep(1), tr(1)

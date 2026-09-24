@@ -34,9 +34,16 @@ msimode(struct vm *vm)
   return vm->vic_kind == VIC_IMSIC;
 }
 
+// every one of these takes a source number that may have come
+// straight out of a guest's store instruction -- SETIPNUM and its
+// kind are registers whose *value* is the source -- so the range is
+// checked here rather than trusted. A number outside it names no
+// source, which is what "inactive" means.
 static int
 sm_of(struct vaplic *a, int irq)
 {
+  if (irq <= 0 || irq >= VAPLIC_NSRC)
+    return APLIC_SM_INACTIVE;
   return a->sourcecfg[irq] & 7;
 }
 
@@ -49,14 +56,18 @@ is_level(int sm)
 static int
 is_active(struct vaplic *a, int irq)
 {
+  if (irq <= 0 || irq >= VAPLIC_NSRC)
+    return 0;
   int sm = sm_of(a, irq);
-  return irq > 0 && irq < VAPLIC_NSRC && sm != APLIC_SM_INACTIVE && !(a->sourcecfg[irq] & APLIC_SOURCECFG_D);
+  return sm != APLIC_SM_INACTIVE && !(a->sourcecfg[irq] & APLIC_SOURCECFG_D);
 }
 
 // rectified input: level1/edge1 sources are active-high, level0/edge0 low.
 static int
 rectified(struct vaplic *a, int irq)
 {
+  if (irq <= 0 || irq >= VAPLIC_NSRC)
+    return 0;
   int sm = sm_of(a, irq);
   int in = (a->level >> irq) & 1;
   if (sm == APLIC_SM_LEVEL0 || sm == APLIC_SM_EDGE0)
@@ -68,6 +79,8 @@ rectified(struct vaplic *a, int irq)
 static int
 target_hart(struct vm *vm, int irq)
 {
+  if (irq <= 0 || irq >= VAPLIC_NSRC)
+    return -1;
   int h = vm->aplic.target[irq] >> 18;
   return h < vm->nvcpu ? h : -1;
 }
@@ -75,6 +88,8 @@ target_hart(struct vm *vm, int irq)
 static int
 target_prio(struct vm *vm, int irq)
 {
+  if (irq <= 0 || irq >= VAPLIC_NSRC)
+    return 1;
   int p = vm->aplic.target[irq] & 0xff;
   return p == 0 ? 1 : p;
 }
@@ -382,7 +397,7 @@ vaplic_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
         if ((w & (1u << b)) && is_active(a, 32 * wd + b))
           a->enable |= 1UL << (32 * wd + b);
   } else if (off == APLIC_SETIENUM) {
-    if (is_active(a, w))
+    if (w > 0 && w < VAPLIC_NSRC && is_active(a, w))
       a->enable |= 1UL << w;
   } else if (off >= APLIC_CLRIE && off < APLIC_CLRIE + 4 * 32) {
     int wd = (off - APLIC_CLRIE) / 4;

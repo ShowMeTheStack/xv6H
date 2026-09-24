@@ -1,0 +1,20 @@
+NAME
+     lsof - what files are open
+
+SYNOPSIS
+     lsof [-p PID] [-u USER] [-c NAME] [-t]
+     fuser FILE...
+
+DESCRIPTION
+     lsof prints a line per open file: the process, its user, the
+     descriptor number, the kind of thing it is and its name. Called as
+     fuser it prints the processes that have a given file open.
+
+OPTIONS
+     -p PID    only that process
+     -u USER   only that user's
+     -c NAME   only processes whose command begins with NAME
+     -t        only the process ids, for feeding to kill
+
+SEE ALSO
+     ps(1), netstat(1), /proc in procfs

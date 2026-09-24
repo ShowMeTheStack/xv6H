@@ -774,6 +774,88 @@ exectest(char *s)
 
 // simple fork and pipe read/write
 
+// a pipe that was asked not to block does not block, either way: an
+// empty one says EAGAIN to a reader rather than waiting for a writer,
+// and a full one says it to a writer rather than waiting for a reader.
+// (fcntl(F_SETFL, O_NONBLOCK) on a pipe used to be accepted and do
+// nothing, which is worse than refusing it.)
+void
+pipenonblock(char *s)
+{
+  int fds[2];
+  char buf[512];
+
+  if (pipe2(fds, O_NONBLOCK) < 0) {
+    printf("%s: pipe2 failed\n", s);
+    exit(1);
+  }
+  if (read(fds[0], buf, sizeof(buf)) != -1 || errno != EAGAIN) {
+    printf("%s: a nonblocking read of an empty pipe waited or lied\n", s);
+    exit(1);
+  }
+  // fill it. The pipe is a fixed number of bytes; when it is full the
+  // write says how much it took, and then that there is no room.
+  int total = 0;
+  for (;;) {
+    int n = write(fds[1], buf, sizeof(buf));
+    if (n < 0) {
+      if (errno != EAGAIN) {
+        printf("%s: a full pipe said %d rather than EAGAIN\n", s, errno);
+        exit(1);
+      }
+      break;
+    }
+    total += n;
+    if (total > 1024 * 1024) {
+      printf("%s: a nonblocking pipe took a megabyte\n", s);
+      exit(1);
+    }
+  }
+  if (total == 0) {
+    printf("%s: nothing fitted in an empty pipe\n", s);
+    exit(1);
+  }
+  // take some out and the next write fits again
+  int got = read(fds[0], buf, sizeof(buf));
+  if (got <= 0) {
+    printf("%s: a full pipe read nothing (%d)\n", s, got);
+    exit(1);
+  }
+  if (write(fds[1], buf, got) != got) {
+    printf("%s: the room that was made was not usable\n", s);
+    exit(1);
+  }
+  // and the flag can be taken off again, after which it waits as a pipe
+  // does. Only the emptiness is proved here, since waiting cannot be.
+  if (fcntl(fds[1], F_SETFL, 0) < 0) {
+    printf("%s: F_SETFL failed\n", s);
+    exit(1);
+  }
+  if ((fcntl(fds[1], F_GETFL, 0) & O_NONBLOCK) != 0) {
+    printf("%s: O_NONBLOCK did not come off\n", s);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+
+  // and a pipe made blocking and then made nonblocking with fcntl
+  // behaves the same way, which is what used to be ignored
+  if (pipe(fds) < 0) {
+    printf("%s: pipe failed\n", s);
+    exit(1);
+  }
+  if (fcntl(fds[0], F_SETFL, O_NONBLOCK) < 0) {
+    printf("%s: F_SETFL O_NONBLOCK failed\n", s);
+    exit(1);
+  }
+  if (read(fds[0], buf, sizeof(buf)) != -1 || errno != EAGAIN) {
+    printf("%s: fcntl(O_NONBLOCK) on a pipe was ignored\n", s);
+    exit(1);
+  }
+  close(fds[0]);
+  close(fds[1]);
+}
+
 void
 pipe1(char *s)
 {
@@ -1035,11 +1117,84 @@ forkfork(char *s)
   }
 }
 
+// forkforkfork's storm stops forking when the machine's free memory
+// falls below this: an eighth of the machine's pages, taken from what
+// was free when it started. That is a fork bomb of a couple of
+// thousand processes, which is what the test is about -- the kernel
+// must survive it and give every page back -- without running the
+// machine down to nought free pages, where it spends its time failing
+// allocations and where tearing down ten thousand processes measures
+// the emulator rather than the kernel.
+static long storm_floor, storm_cap;
+
 void
 forkforkfork(char *s)
 {
   long nprocs0 = sysconf(_SC_XV6_NPROCS);
-  unlink("stopforking");
+
+  storm_floor = sysconf(_SC_AVPHYS_PAGES) - sysconf(_SC_PHYS_PAGES) / 8;
+  if (storm_floor < sysconf(_SC_PHYS_PAGES) / 16)
+    storm_floor = sysconf(_SC_PHYS_PAGES) / 16;
+  // and a bound on the number of them, because the one above grows with
+  // the machine and the machine can be large. Six thousand processes at
+  // once is a storm by any measure -- it is most of what this test is
+  // for, and every page of it still has to come back -- and it takes the
+  // same time on a small machine and on a big one. (On an eight-gigabyte
+  // guest the memory floor is some twenty-six thousand processes, and the
+  // rate at which they can be made collapses as the storm grows: the
+  // highest pid was 5555 after ninety seconds, 10413 after two hundred
+  // and ten, and 11028 after four hundred and fifty. A six-gigabyte guest
+  // reaches its floor only because the host runs out of pages to back it
+  // with and fork fails for that reason instead.)
+  storm_cap = nprocs0 + 6000;
+
+  // the storm below takes most of the free pages in the machine, and this
+  // process has to survive it to say stop. A page fault it cannot
+  // serve would kill it, so the stack it is going to use afterwards is
+  // touched now, while there is memory to back it.
+  {
+    volatile char reserve[16384];
+    for (int i = 0; i < (int)sizeof(reserve); i += PGSIZE)
+      reserve[i] = 1;
+  }
+
+  // the stop flag is one byte of a file that exists before the storm
+  // starts, and every process in the storm inherits a descriptor for
+  // it. Saying "stop" is then a pwrite and hearing it is a pread:
+  // neither opens anything, and that matters, because by the time the
+  // storm is over there is no memory left to open a file with. (This
+  // test used to create a file at the two-second mark and have the
+  // children open it; when the storm filled memory first, the create
+  // failed, nothing ever said stop, and the storm ran until the
+  // harness gave up.)
+  // the stop flag lives in tmpfs, where writing it is a memcpy into a
+  // page that already exists: saying "stop" then needs no allocation
+  // and no journal, which matters because by the time it is said the
+  // storm has taken every free page in the machine. (The disk is the
+  // fallback for a system without /tmp.)
+  unlink("/tmp/stopforking");
+  int flag = open("/tmp/stopforking", O_CREATE | O_RDWR, 0666);
+  if (flag < 0) {
+    unlink("stopforking");
+    flag = open("stopforking", O_CREATE | O_RDWR, 0666);
+  }
+  if (flag < 0 || write(flag, "n", 1) != 1) {
+    printf("%s: cannot make the stop flag\n", s);
+    exit(1);
+  }
+  // two pipes, and no polling anywhere. `stop': this process holds the
+  // write end, every process in the storm blocks reading it once it
+  // has run out of memory, and closing the write end wakes all of them
+  // at once. `oom': the storm holds the write end and reports the
+  // first failed fork, so that this process learns the machine is full
+  // by being woken rather than by asking -- asking would mean being
+  // scheduled, and by then it is one of ten thousand runnable
+  // processes and would not be scheduled again for minutes.
+  int stop[2], oom[2];
+  if (pipe(stop) < 0 || pipe(oom) < 0) {
+    printf("%s: cannot make the stop pipes\n", s);
+    exit(1);
+  }
 
   int pid = fork();
   if (pid < 0) {
@@ -1047,25 +1202,43 @@ forkforkfork(char *s)
     exit(1);
   }
   if (pid == 0) {
+    close(stop[1]);   // the storm holds only the read end, and inherits it
+    close(oom[0]);    // and only the write end of the other
     while (1) {
-      int fd = open("stopforking", 0);
-      if (fd >= 0) {
+      char c = 'n';
+      if (pread(flag, &c, 1, 0) == 1 && c == 'y')
         exit(0);
-      }
-      if (fork() < 0) {
-        close(open("stopforking", O_CREATE | O_RDWR, 0666));
-        // out of memory: if not even the file can be opened, stop here
-        // rather than spin (the file table is allocated on demand).
-        if (open("stopforking", 0) < 0)
-          exit(0);
+      if (sysconf(_SC_XV6_NPROCS) >= storm_cap ||
+          sysconf(_SC_AVPHYS_PAGES) < storm_floor || fork() < 0) {
+        // the machine is as full as this test means to make it. Say so,
+        // then wait for the word to stop -- neither needs anything
+        // allocated, and the read returns as soon as the test process
+        // closes its end.
+        char x = 'x';
+        write(oom[1], &x, 1);
+        read(stop[0], &x, 1);
+        exit(0);
       }
     }
 
     exit(0);
   }
+  close(oom[1]);   // so that only the storm holds it
 
-  ticksleep(20); // two seconds
-  close(open("stopforking", O_CREATE | O_RDWR, 0666));
+  // wait to be told that the machine is full, which is what the storm
+  // is for. The wait is a sleep on a pipe, so this process is woken by
+  // the event rather than looking for it; a loop that looked would be
+  // one runnable process among ten thousand and would not run again
+  // for minutes.
+  {
+    char x;
+    read(oom[0], &x, 1);
+  }
+  if (pwrite(flag, "y", 1, 0) != 1)
+    printf("%s: cannot set the stop flag\n", s);
+  close(stop[1]);   // and the ones with no memory to spare hear it here
+  close(stop[0]);
+  close(oom[0]);    // the ones still trying to report stop trying
   wait(0);
   // the storm's orphans are init's to reap; there is no process table to
   // bound them, so wait until they are gone before the free-page check.
@@ -1074,6 +1247,9 @@ forkforkfork(char *s)
       break;
     ticksleep(10);
   }
+  close(flag);
+  unlink("/tmp/stopforking");
+  unlink("stopforking");
 }
 
 // regression test. does reparent() violate the parent-then-child
@@ -2127,9 +2303,13 @@ sbrkmuch(char *s)
 
   oldbrk = sbrk(0);
 
-  // can one grow address space to something big?
+  // can one grow the address space by something big? BIG is an amount,
+  // not an address: with the program's image placed at random (ASLR,
+  // randomize_va_space 2) the heap does not start near zero, and a
+  // test that grew the break *to* the address 100 MB would be asking
+  // for a smaller break than it already had.
   a = sbrk(0);
-  amt = BIG - (uint64)a;
+  amt = BIG;
   p = sbrk(amt);
   if (p != a) {
     printf("%s: sbrk test failed to grow big address space; enough phys mem?\n",
@@ -2137,7 +2317,7 @@ sbrkmuch(char *s)
     exit(1);
   }
 
-  lastaddr = (char *)(BIG - 1);
+  lastaddr = (char *)sbrk(0) - 1;   // the last byte of the heap
   *lastaddr = 99;
 
   // can one de-allocate?
@@ -2254,7 +2434,8 @@ sbrkfail(char *s)
   for (i = 0; i < sizeof(pids) / sizeof(pids[0]); i++) {
     if ((pids[i] = fork()) == 0) {
       // allocate a lot of memory
-      if (sbrk(BIG - (uint64)sbrk(0)) == (char *)SBRK_ERROR)
+      // again an amount rather than an address, for the same reason
+      if (sbrk(BIG) == (char *)SBRK_ERROR)
         write(fds[1], "0", 1);
       else
         write(fds[1], "1", 1);
@@ -2522,6 +2703,137 @@ cowtest(char *s)
     printf("%s: leaked %ld pages (start %ld, sbrk %ld, fork %ld, during %ld, "
            "reaped %ld, end %ld)\n",
            s, free0 - free2, free0, free1, before, during, b2, free2);
+    exit(1);
+  }
+}
+
+volatile char sink;   // so that a write cannot be optimised away
+
+
+// stack canaries: a write past the end of a local array is noticed
+// when the function returns, and the process dies instead of jumping
+// to whatever the overflow put where the return address was.
+//
+// the overflow is deliberate and the compiler must not see through it,
+// which is what the volatile length and the separate function are for.
+__attribute__((noinline)) static void
+overflow(char *p, volatile int n)
+{
+  for (int i = 0; i < n; i++)
+    p[i] = 'A';
+}
+
+__attribute__((noinline)) static void
+smash(void)
+{
+  char buf[32];
+
+  overflow(buf, 256);       // past the end, over the canary
+  sink = buf[0];
+}
+
+void
+canarytest(char *s)
+{
+  int pid = fork();
+  if (pid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (pid == 0) {
+    close(2);               // the message is expected; do not print it
+    smash();
+    exit(0);                // must not get here
+  }
+  int st;
+  wait(&st);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    printf("%s: an overflow past a local array went unnoticed\n", s);
+    exit(1);
+  }
+  if (!WIFSIGNALED(st) && !(WIFEXITED(st) && WEXITSTATUS(st) == 134)) {
+    printf("%s: overflow ended with status %d, not a signal\n", s, st);
+    exit(1);
+  }
+}
+
+// W^X: nothing may be writable and executable at once. A program that
+// generates code writes it and then asks for it to become executable,
+// which works; a process that holds both at once is one that an
+// overflow can turn into whatever it likes.
+void
+wxtest(char *s)
+{
+  char *a = mmap(0, PGSIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (a != MAP_FAILED) {
+    printf("%s: mmap gave out writable executable memory\n", s);
+    exit(1);
+  }
+  a = mmap(0, PGSIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (a == MAP_FAILED) {
+    printf("%s: mmap failed\n", s);
+    exit(1);
+  }
+  a[0] = 0x42;
+  if (mprotect(a, PGSIZE, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+    printf("%s: mprotect made memory writable and executable\n", s);
+    exit(1);
+  }
+  // but write-then-execute is allowed, which is how a just-in-time
+  // compiler is supposed to work
+  if (mprotect(a, PGSIZE, PROT_READ | PROT_EXEC) < 0) {
+    printf("%s: mprotect to read+execute failed\n", s);
+    exit(1);
+  }
+  // and it really is read-only now
+  int pid = fork();
+  if (pid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (pid == 0) {
+    a[0] = 1;            // must fault
+    exit(0);
+  }
+  int st;
+  wait(&st);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    printf("%s: wrote to memory that is only readable and executable\n", s);
+    exit(1);
+  }
+  munmap(a, PGSIZE);
+
+  // the text of this program, and of the library it is linked
+  // against, is not writable either
+  pid = fork();
+  if (pid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (pid == 0) {
+    char *code = (char *)(uint64)(void *)wxtest;
+    code[0] = 0;         // must fault
+    exit(0);
+  }
+  wait(&st);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    printf("%s: the program's own text is writable\n", s);
+    exit(1);
+  }
+  pid = fork();
+  if (pid < 0) {
+    printf("%s: fork failed\n", s);
+    exit(1);
+  }
+  if (pid == 0) {
+    char *code = (char *)(uint64)(void *)strlen;   // in libc.so
+    code[0] = 0;         // must fault
+    exit(0);
+  }
+  wait(&st);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    printf("%s: the library's text is writable\n", s);
     exit(1);
   }
 }
@@ -3954,7 +4266,19 @@ sbrklast(char *s)
 void
 sbrk8000(char *s)
 {
+  // 0x80000004 arrives in the kernel as an int, so it is a large
+  // negative delta: the heap shrinks, and this kernel clamps the shrink
+  // at the start of the heap rather than letting it run below. What is
+  // then checked is that the heap still works -- so a page is asked for
+  // *after* the bogus call, and its last byte is written.
+  //
+  // (writing the byte below the break, which is what this test used to
+  // do, only worked because the heap began inside the last page of the
+  // program's data. With the heap starting a random distance above the
+  // image -- ASLR, randomize_va_space 2 -- there is nothing mapped
+  // below it, and the test was relying on an accident.)
   sbrk(0x80000004);
+  sbrk(PGSIZE);
   volatile char *top = sbrk(0);
   *(top - 1) = *(top - 1) + 1;
 }
@@ -4659,6 +4983,7 @@ static const struct test quicktests[] = {
   {dirtest, "dirtest"},
   {exectest, "exectest"},
   {pipe1, "pipe1"},
+  {pipenonblock, "pipenonblock"},
   {killstatus, "killstatus"},
   {preempt, "preempt"},
   {exitwait, "exitwait"},
@@ -4698,6 +5023,8 @@ static const struct test quicktests[] = {
   {posixtest, "posixtest"},
   {ttytest, "ttytest"},
   {cowtest, "cowtest"},
+  {canarytest, "canarytest"},
+  {wxtest, "wxtest"},
   {mmaptest, "mmaptest"},
   {manyprocs, "manyprocs"},
   {argptest, "argptest"},

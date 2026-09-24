@@ -1,0 +1,16 @@
+NAME
+     klogd - put the kernel's messages into the log
+
+SYNOPSIS
+     klogd [-n]
+
+DESCRIPTION
+     klogd reads the kernel's message ring and hands what it finds to
+     syslogd, so that what printk said is in /var/log/messages as well
+     as in dmesg.
+
+OPTIONS
+     -n   stay in the foreground
+
+SEE ALSO
+     dmesg(1), syslogd(8)

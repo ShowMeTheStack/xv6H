@@ -12,6 +12,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "platform.h"
 #include "page.h"
 #include "slab.h"
@@ -303,7 +304,7 @@ signal_tkill(int tgid, int tid, int sig)
 {
   if (sig < 0 || sig >= NSIG || tid <= 0)
     return -EINVAL;
-  struct proc *p = proc_get(tid);
+  struct proc *p = proc_get_ns(pidns_current(), tid);
   if (p == 0)
     return -ESRCH;
   if (tgid > 0 && (p->tg == 0 || p->tg->tgid != tgid)) {
@@ -324,7 +325,7 @@ signal_kill(int pid, int sig, siginfo_t *info)
     return -EINVAL;
   struct proc *me = myproc();
   if (pid > 0) {
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p == 0)
       return -ESRCH;
     int r = sig ? signal_send(p, sig, info) : 0;
@@ -333,11 +334,16 @@ signal_kill(int pid, int sig, siginfo_t *info)
   }
   int pgid = (pid == 0) ? me->pgid : -pid;
   int found = 0, r = 0;
+  struct pidns *ns = pidns_current();
   proc_iter_start();
   for (struct proc *p = proc_iter_next(0); p; p = proc_iter_next(p)) {
     if (p == me && pid == -1)
       continue;
-    if (p->pid == 1 && pid == -1)
+    // what is not in the caller's namespace is not the caller's to
+    // signal: inside a container, "everybody" is everybody in it
+    if (!pid_visible(p, ns))
+      continue;
+    if (pid_in_ns(p, ns) == 1 && pid == -1)
       continue;
     if (pid != -1 && p->pgid != pgid)
       continue;

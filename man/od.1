@@ -1,0 +1,28 @@
+NAME
+     od - dump a file in octal, hexadecimal or characters
+
+SYNOPSIS
+     od [-bcdosvx] [-A a|d|o|x|n] [-j SKIP] [-N COUNT] [FILE...]
+     hexdump [-C] [FILE...]
+     xxd [FILE...]
+
+DESCRIPTION
+     od prints the bytes of each FILE in the form the options ask for.
+     Called as hexdump or xxd it starts from the conventions of those
+     commands instead: hexdump -C is the usual hexadecimal-and-text
+     dump.
+
+OPTIONS
+     -b   bytes in octal
+     -c   bytes as characters, with escapes
+     -d   two-byte decimal
+     -o   two-byte octal
+     -s   two-byte signed decimal
+     -x   two-byte hexadecimal
+     -A X   how to print the offsets: octal, decimal, hex, or none
+     -j SKIP    start SKIP bytes in
+     -N COUNT   stop after COUNT bytes
+     -v   do not fold repeated lines into a star
+
+SEE ALSO
+     strings(1), file(1), dd(1)

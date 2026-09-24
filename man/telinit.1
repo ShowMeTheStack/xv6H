@@ -1,0 +1,14 @@
+NAME
+     telinit - change runlevel
+
+SYNOPSIS
+     telinit RUNLEVEL
+     telinit q
+
+DESCRIPTION
+     telinit tells init to change to RUNLEVEL (0 to 6), which runs the
+     stop scripts of the old level and the start scripts of the new one.
+     `telinit q' makes init read /etc/inittab again.
+
+SEE ALSO
+     init(8), service(8), shutdown(8)

@@ -153,6 +153,11 @@ usertrap(void)
     }
   }
 
+  // a frozen group's tasks stop here, on their way out of the kernel,
+  // rather than wherever the freeze happened to catch them
+  if (p->sg)
+    freeze_point();
+
   // deliver a pending signal before going back to user space
   if (signal_pending(p))
     do_signals();

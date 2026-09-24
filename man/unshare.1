@@ -1,0 +1,26 @@
+NAME
+     unshare - run a program in new namespaces
+
+SYNOPSIS
+     unshare [-u] [-p] [-m] [-U] [-n] [-f] [COMMAND [ARG...]]
+
+DESCRIPTION
+     unshare runs COMMAND (a shell by default) with namespaces of its
+     own, so that what it does to the hostname, to process numbers, to
+     mounts, to user ids or to the network is its own business and not
+     the machine's.
+
+OPTIONS
+     -u, --uts     a hostname of its own
+     -p, --pid     process numbers of its own; wants -f
+     -m, --mount   a mount table of its own
+     -U, --user    user ids of its own, and it starts as root in them
+     -n, --net     a network of its own: interfaces, routes, sockets
+     -f, --fork    fork before running, which a new pid namespace needs
+
+EXAMPLES
+     unshare -u sh -c 'hostname other; hostname'
+     unshare -pf /bin/ps
+
+SEE ALSO
+     nsenter(1), vmm(1), /proc/PID/ns

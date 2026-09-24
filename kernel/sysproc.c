@@ -1,6 +1,8 @@
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
+#include "nsproxy.h"
+#include "sysfilter.h"
 #include "blk.h"
 #include "platform.h"
 #include "param.h"
@@ -12,7 +14,6 @@
 #include "thread.h"
 #include "vfs.h"
 #include "posix.h"
-extern char hostname[64];
 #include "sleeplock.h"
 #include "fs.h"
 #include "file.h"
@@ -36,14 +37,27 @@ uint64
 sys_getpid(void)
 {
   struct proc *p = myproc();
-  return p->tg ? p->tg->tgid : p->pid; // every thread reports the process
+  // every thread reports the process, and the process reports the number
+  // its own namespace knows it by
+  int pid = p->tg ? p->tg->tgid : p->pid;
+  struct pidns *ns = pidns_current();
+  if (ns != pidns_root()) {
+    struct proc *leader = p->tg ? proc_get(pid) : 0;
+    int nr = pid_in_ns(leader ? leader : p, ns);
+    if (leader)
+      proc_release(leader);
+    return nr;
+  }
+  return pid;
 }
 
 // the identity of this thread, which is what p->pid really holds.
 uint64
 sys_gettid(void)
 {
-  return myproc()->pid;
+  struct proc *p = myproc();
+
+  return pid_in_ns(p, pidns_current());
 }
 
 // clone(flags, stack, ptid, tls, ctid): fork's general form. with
@@ -59,6 +73,79 @@ sys_clone(void)
   argaddr(3, &tls);
   argaddr(4, &ctid);
   return kclone(flags, stack, ptid, tls, ctid);
+}
+
+// sysfilter(profile, num): give up system calls.
+//
+//   sysfilter(SYSFILTER_CONTAINER, 0)  the container profile
+//   sysfilter(SYSFILTER_NONE, n)       give up call number n
+//
+// Nothing here needs privilege: giving something up never does, and
+// there is no way to take anything back.
+uint64
+sys_sysfilter(void)
+{
+  int profile, num;
+  struct proc *p = myproc();
+
+  argint(0, &profile);
+  argint(1, &num);
+  if (num > 0)
+    return sysfilter_deny(&p->filter, num);
+  if (profile == SYSFILTER_NO_NEW_PRIVS) {
+    p->cred.no_new_privs = 1;
+    return 0;
+  }
+  return sysfilter_profile(&p->filter, profile);
+}
+
+// unshare(flags): the calling process leaves the namespaces named and
+// gets copies of them. What it does not name it keeps sharing.
+uint64
+sys_unshare(void)
+{
+  int flags;
+
+  argint(0, &flags);
+  if (flags & ~CLONE_NEW_ANY)
+    return -EINVAL;
+  if (flags & CLONE_NEW_UNSUPPORTED)
+    return -EINVAL;
+  return ns_unshare(flags);
+}
+
+// setns(fd, nstype): join the namespace a descriptor names. The
+// descriptor is on /proc/<pid>/ns/<kind>, so what it names is the
+// namespace of that kind that that process is in -- which is what makes
+// `nsenter -t PID' work and is all a container needs.
+uint64
+sys_setns(void)
+{
+  int fd, nstype, pid, kind;
+  struct file *f;
+
+  argint(0, &fd);
+  argint(1, &nstype);
+  if ((f = fdget(myproc(), fd)) == 0)
+    return -EBADF;
+  if (f->type != FD_INODE || f->ip == 0)
+    return -EINVAL;
+  if (procfs_ns_of(f->ip, &pid, &kind) < 0)
+    return -EINVAL;
+  // nstype 0 means "whatever this is"; anything else has to agree
+  if (nstype != 0) {
+    int want = -1;
+    switch (nstype) {
+    case CLONE_NEWUTS:  want = NSK_UTS;  break;
+    case CLONE_NEWPID:  want = NSK_PID;  break;
+    case CLONE_NEWNS:   want = NSK_MNT;  break;
+    case CLONE_NEWUSER: want = NSK_USER; break;
+    case CLONE_NEWNET:  want = NSK_NET;  break;
+    }
+    if (want != kind)
+      return -EINVAL;
+  }
+  return ns_join(pid, kind);
 }
 
 // futex(uaddr, op, val, timeout, uaddr2, val3)
@@ -181,6 +268,13 @@ sys_mmap(void)
   struct inode *ip = 0;
   if ((prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) || len == 0)
     return -1;
+  // W^X: nothing may be writable and executable at the same time. A
+  // program that wants to generate code writes it and then asks for
+  // it to become executable, which mprotect will do, and a process
+  // that may hold both at once is one that an overflow can turn into
+  // whatever it likes.
+  if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+    return -EACCES;
   if (!(flags & MAP_ANONYMOUS)) {
     struct file *f = fdget(p, fd);
     if (f == 0 || f->type != FD_INODE || (off & (PGSIZE - 1)))
@@ -219,6 +313,8 @@ sys_mprotect(void)
   argint(2, &prot);
   if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
     return -1;
+  if ((prot & PROT_WRITE) && (prot & PROT_EXEC))
+    return -EACCES;   // W^X, as in mmap above
   return mm_mprotect(myproc()->mm, addr, len, prot);
 }
 
@@ -267,7 +363,18 @@ sys_wait4(void)
 uint64
 sys_getppid(void)
 {
-  return proc_ppid(myproc());
+  struct pidns *ns = pidns_current();
+  int ppid = proc_ppid(myproc());
+
+  if (ns == pidns_root() || ppid == 0)
+    return ppid;
+  // a parent outside the namespace is no parent that can be named in
+  // it: the namespace's init reports 0, as Linux's does
+  struct proc *pp = proc_get(ppid);
+  int nr = pp ? pid_in_ns(pp, ns) : 0;
+  if (pp)
+    proc_release(pp);
+  return nr;
 }
 
 // setpgid(pid, pgid): 0 means "this process" and "its own pid".
@@ -280,7 +387,7 @@ sys_setpgid(void)
   struct proc *me = myproc();
   struct proc *p = me;
   if (pid != 0 && pid != me->pid) {
-    p = proc_get(pid);
+    p = proc_get_ns(pidns_current(), pid);
     if (p == 0)
       return -ESRCH;
     if (p->parent != me || p->sid != me->sid) {
@@ -313,7 +420,7 @@ sys_getpgid(void)
   argint(0, &pid);
   if (pid == 0)
     return myproc()->pgid;
-  struct proc *p = proc_get(pid);
+  struct proc *p = proc_get_ns(pidns_current(), pid);
   if (p == 0)
     return -ESRCH;
   int pgid = p->pgid;
@@ -341,7 +448,7 @@ sys_getsid(void)
   argint(0, &pid);
   if (pid == 0)
     return myproc()->sid;
-  struct proc *p = proc_get(pid);
+  struct proc *p = proc_get_ns(pidns_current(), pid);
   if (p == 0)
     return -ESRCH;
   int sid = p->sid;
@@ -506,7 +613,7 @@ sys_uname(void)
   struct utsname u;
   memset(&u, 0, sizeof(u));
   safestrcpy(u.sysname, "xv6H", sizeof(u.sysname));
-  safestrcpy(u.nodename, hostname, sizeof(u.nodename));
+  safestrcpy(u.nodename, uts_hostname(), sizeof(u.nodename));
   safestrcpy(u.release, XV6H_RELEASE, sizeof(u.release));
   safestrcpy(u.version, XV6H_VERSION, sizeof(u.version));
   safestrcpy(u.machine, "riscv64", sizeof(u.machine));
@@ -520,10 +627,7 @@ sys_uname(void)
 int
 sethostname_str(const char *s, int n)
 {
-  if (n < 0 || n >= (int)sizeof(hostname))
-    return -1;
-  safestrcpy(hostname, s, n + 1);
-  return 0;
+  return uts_sethostname(s, n);
 }
 
 uint64
@@ -533,13 +637,17 @@ sys_sethostname(void)
   int n;
   argaddr(0, &addr);
   argint(1, &n);
-  if (n < 0 || n >= (int)sizeof(hostname))
+  if (n < 0 || n >= UTS_LEN)
     return -EINVAL;
   char buf[64];
   if (copyin(myproc()->mm, buf, addr, n) < 0)
     return -EFAULT;
   buf[n] = 0;
   if (!cap_ok(CAP_SYS_ADMIN))
+    return -EPERM;
+  // in a user namespace, the name it may change is its own namespace's:
+  // root inside a container may name the container and not the machine
+  if (!userns_in_root() && uts_is_root())
     return -EPERM;
   sethostname_str(buf, n);
   return 0;
@@ -552,10 +660,11 @@ sys_gethostname(void)
   int n;
   argaddr(0, &addr);
   argint(1, &n);
-  int len = strlen(hostname) + 1;
+  const char *h = uts_hostname();
+  int len = strlen(h) + 1;
   if (n < len)
     return -ENAMETOOLONG;
-  if (copyout(myproc()->mm, addr, hostname, len) < 0)
+  if (copyout(myproc()->mm, addr, (char *)h, len) < 0)
     return -EFAULT;
   return 0;
 }
@@ -603,37 +712,75 @@ sys_getrandom(void)
 // of them to any of the other three, and only a privileged one may set
 // them to something else.
 
+// what root inside a user namespace may be root for. Anything not here
+// is the machine's, whatever the process's capability set says.
+#define CAP_NS_ALLOWED                                                         \
+  (CAP_BIT(CAP_CHOWN) | CAP_BIT(CAP_DAC_OVERRIDE) |                            \
+   CAP_BIT(CAP_DAC_READ_SEARCH) | CAP_BIT(CAP_FOWNER) | CAP_BIT(CAP_FSETID) |  \
+   CAP_BIT(CAP_KILL) | CAP_BIT(CAP_SETGID) | CAP_BIT(CAP_SETUID) |             \
+   CAP_BIT(CAP_SETPCAP) | CAP_BIT(CAP_SYS_CHROOT) | CAP_BIT(CAP_SYS_ADMIN) |   \
+   CAP_BIT(CAP_SYS_NICE) | CAP_BIT(CAP_NET_BIND_SERVICE) |                     \
+   CAP_BIT(CAP_AUDIT_WRITE))
+
 // does this process have a capability?
 int
 cap_ok(int cap)
 {
   struct proc *p = myproc();
 
-  return (p->cred.cap_effective & CAP_BIT(cap)) != 0;
+  if ((p->cred.cap_effective & CAP_BIT(cap)) == 0)
+    return 0;
+  // in a user namespace of its own, a capability reaches its own
+  // namespaces and no further: rebooting the machine, starting a guest,
+  // changing the machine's clock or its network are not a container's to
+  // do however root it is inside.
+  if (!userns_in_root() && (CAP_BIT(cap) & CAP_NS_ALLOWED) == 0)
+    return 0;
+  return 1;
+}
+
+// what a program is told about who it is, in its own namespace's terms.
+// A user the namespace has no name for is nobody: 65534, as everywhere.
+#define NOBODY 65534u
+
+static uint64
+uid_out(unsigned int kuid)
+{
+  int v = uid_to_ns(userns_current(), kuid);
+
+  return v < 0 ? NOBODY : (uint64)v;
+}
+
+static uint64
+gid_out(unsigned int kgid)
+{
+  int v = gid_to_ns(userns_current(), kgid);
+
+  return v < 0 ? NOBODY : (uint64)v;
 }
 
 uint64
 sys_getuid(void)
 {
-  return myproc()->cred.uid;
+  return uid_out(myproc()->cred.uid);
 }
 
 uint64
 sys_geteuid(void)
 {
-  return myproc()->cred.euid;
+  return uid_out(myproc()->cred.euid);
 }
 
 uint64
 sys_getgid(void)
 {
-  return myproc()->cred.gid;
+  return gid_out(myproc()->cred.gid);
 }
 
 uint64
 sys_getegid(void)
 {
-  return myproc()->cred.egid;
+  return gid_out(myproc()->cred.egid);
 }
 
 // every capability goes when the effective user id becomes an ordinary
@@ -642,9 +789,19 @@ sys_getegid(void)
 static void
 cap_follow_euid(struct cred *c, uint old_euid)
 {
-  if (old_euid == 0 && c->euid != 0)
+  // "root" is root in the process's own user namespace. Inside a
+  // container, uid 0 is some ordinary user of the machine, and a process
+  // that becomes it has become root there: dropping its capabilities
+  // because its host number is not zero would leave a container with a
+  // root that can do nothing (which is what it did -- unshare and
+  // sethostname inside a user namespace both failed with EPERM).
+  struct userns *un = userns_current();
+  int was_root = uid_to_ns(un, old_euid) == 0;
+  int is_root = uid_to_ns(un, c->euid) == 0;
+
+  if (was_root && !is_root)
     c->cap_effective = 0;
-  else if (old_euid != 0 && c->euid == 0)
+  else if (!was_root && is_root)
     c->cap_effective = c->cap_permitted;
 }
 
@@ -658,6 +815,12 @@ sys_setuid(void)
   argint(0, &uid);
   if (uid < 0)
     return -EINVAL;
+  // the number is the caller's namespace's; the kernel works in the
+  // machine's, so one that cannot be translated is not a user at all
+  int kuid = uid_from_ns(userns_current(), (unsigned int)uid);
+  if (kuid < 0)
+    return -EINVAL;
+  uid = kuid;
   uint old = c->euid;
   if (cap_ok(CAP_SETUID)) {
     // a privileged process sets all three, and cannot go back
@@ -665,9 +828,11 @@ sys_setuid(void)
   } else if ((uint)uid == c->uid || (uint)uid == c->suid) {
     c->euid = (uint)uid;
   } else {
+    audit("setuid", "euid", old, (uint64)uid, 0);
     return -EPERM;
   }
   cap_follow_euid(c, old);
+  audit("setuid", "euid", old, c->euid, 1);
   return 0;
 }
 
@@ -681,12 +846,20 @@ sys_setgid(void)
   argint(0, &gid);
   if (gid < 0)
     return -EINVAL;
+  int kgid = gid_from_ns(userns_current(), (unsigned int)gid);
+  if (kgid < 0)
+    return -EINVAL;
+  gid = kgid;
+  uint oldg = c->egid;
   if (cap_ok(CAP_SETGID))
     c->gid = c->egid = c->sgid = (uint)gid;
   else if ((uint)gid == c->gid || (uint)gid == c->sgid)
     c->egid = (uint)gid;
-  else
+  else {
+    audit("setgid", "egid", oldg, (uint64)gid, 0);
     return -EPERM;
+  }
+  audit("setgid", "egid", oldg, c->egid, 1);
   return 0;
 }
 
@@ -718,6 +891,7 @@ sys_setresuid(void)
   c->euid = ne;
   c->suid = ns;
   cap_follow_euid(c, old);
+  audit("setresuid", "euid", old, ne, 1);
   return 0;
 }
 
@@ -855,10 +1029,12 @@ sys_capset(void)
     return -EPERM;
   if (!cap_ok(CAP_SETPCAP) && sets[1] != c->cap_permitted)
     return -EPERM;
+  uint64 was = c->cap_effective;
   c->cap_effective = sets[0];
   c->cap_permitted = sets[1];
   c->cap_inheritable = sets[2];
   c->cap_bounding = sets[3];
+  audit("capset", "effective", was, c->cap_effective, 1);
   return 0;
 }
 
@@ -941,7 +1117,7 @@ sys_sched_setaffinity(void)
     return 0;
   }
 
-  struct proc *p = proc_get(pid);
+  struct proc *p = proc_get_ns(pidns_current(), pid);
   if (p == 0)
     return -ESRCH;
   // the same rule as renicing somebody: the owner or a privileged
@@ -976,7 +1152,7 @@ sys_sched_getaffinity(void)
   if (pid == 0 || pid == me->pid) {
     mask = sched_affinity(me);
   } else {
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p == 0)
       return -ESRCH;
     mask = sched_affinity(p);
@@ -1032,6 +1208,13 @@ sys_sched_group(void)
   // everything but joining the root and asking questions is a
   // privileged operation: a group is a claim on the machine.
   if (op != SGC_JOIN && op != SGC_INFO && !cap_ok(CAP_SYS_NICE))
+    return -EPERM;
+  // and the groups themselves are the machine's. They are one set named
+  // by small integers, so a process in a user namespace of its own could
+  // otherwise reach into another container's group -- or leave its own
+  // by joining the root, which is its cpu.max gone. Its share is its
+  // control group's and is set from outside it.
+  if (op != SGC_INFO && !userns_in_root())
     return -EPERM;
 
   struct proc *p = myproc();
@@ -1165,8 +1348,11 @@ sys_reboot(void)
   int how;
 
   argint(0, &how);
-  if (!cap_ok(CAP_SYS_BOOT))
+  if (!cap_ok(CAP_SYS_BOOT)) {
+    audit("reboot", "", (uint64)how, 0, 0);
     return -EPERM;
+  }
+  audit("reboot", "", (uint64)how, 0, 1);
 
   // everything that is waiting to be written goes to the disk first:
   // a power off that loses the last minute of work is a bug, not a

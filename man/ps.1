@@ -1,0 +1,19 @@
+NAME
+     ps - what is running
+
+SYNOPSIS
+     ps [-e] [-f] [-u USER] [-o LIST]
+
+DESCRIPTION
+     ps prints a line per process. With no options it prints the ones on
+     this terminal: pid, terminal, processor time and command.
+
+OPTIONS
+     -e          every process, not only this terminal's
+     -f          full: user, parent, start time and the whole command
+     -u USER     only that user's
+     -o LIST     choose the columns: pid, ppid, pgid, sid, user, uid,
+                 tty, stat, time, etime, pri, nice, rss, vsz, comm, args
+
+SEE ALSO
+     top(1), pgrep(1), /proc in procfs

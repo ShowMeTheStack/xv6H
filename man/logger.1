@@ -1,0 +1,17 @@
+NAME
+     logger - write a line to the log
+
+SYNOPSIS
+     logger [-p FACILITY.LEVEL] [-t TAG] [-s] [MESSAGE...]
+
+DESCRIPTION
+     logger sends a message to syslogd. With no MESSAGE it sends what it
+     reads from standard input, a line at a time.
+
+OPTIONS
+     -p FACILITY.LEVEL   which facility and how serious
+     -t TAG              the tag to put in front of it
+     -s                  also write it to standard error
+
+SEE ALSO
+     syslogd(8), dmesg(1)

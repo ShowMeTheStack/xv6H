@@ -1,0 +1,18 @@
+NAME
+     mkimage - make a file system image from a directory
+
+SYNOPSIS
+     mkimage [-b BLOCKS] [-j BLOCKS] [-L LABEL] IMAGE DIR
+
+DESCRIPTION
+     mkimage writes an ext4 image holding what is under DIR, which is how
+     a guest's or a container's root file system is made without a loop
+     device or a mount.
+
+OPTIONS
+     -b BLOCKS   how big, in blocks of 4096 bytes
+     -j BLOCKS   the journal's size
+     -L LABEL    the volume label
+
+SEE ALSO
+     mkfs_ext4(8), losetup(8), vmm(1)

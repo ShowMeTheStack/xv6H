@@ -1,0 +1,18 @@
+NAME
+     httpd - a web server
+
+SYNOPSIS
+     httpd [-p PORT] [-d DIRECTORY] [-n]
+
+DESCRIPTION
+     httpd serves files under a directory over HTTP. It is started at
+     boot by /etc/init.d/httpd and reads its settings from
+     /etc/default/httpd.
+
+OPTIONS
+     -p PORT       listen there (80 by default)
+     -d DIRECTORY  serve this directory (/srv/www by default)
+     -n            stay in the foreground
+
+SEE ALSO
+     curl(1), service(8), netstat(1)

@@ -241,9 +241,19 @@ def t_sched_group_max(QEMU, intc, cpus, log):
         print("    capped group used %.1f%% of one processor (ceiling 25%%)" % pct)
         assert 15 < pct < 35, pct
 
-        # freezing stops it, and letting it go starts it again
+        # freezing stops it, and letting it go starts it again. Freezing is
+        # asked for, not done on the spot: a task that was on a processor
+        # runs to its freeze point first, and on a busy build box that is
+        # tens of microseconds later than the command returning. What is
+        # being tested is that a group which has stopped accrues nothing,
+        # so the first sample waits until it has stopped.
         run(q, "cgrun -f %d on" % gid, 30)
-        c = groups(q)
+        for _ in range(20):
+            c = groups(q)
+            if c[gid]["runnable"] == 0:
+                break
+            time.sleep(0.5)
+        assert c[gid]["runnable"] == 0, c
         time.sleep(3)
         d = groups(q)
         assert d[gid]["frozen"] == 1, d

@@ -89,6 +89,12 @@ dl_mmap(void *addr, uint64_t len, int prot, int flags, int fd, uint64_t off)
   return (void *)SYSCALL6(SYS_mmap, addr, len, prot, flags, fd, off);
 }
 
+static long
+dl_mprotect(void *addr, uint64_t len, int prot)
+{
+  return SYSCALL3(SYS_mprotect, addr, len, prot);
+}
+
 static void __attribute__((noreturn))
 dl_exit(int code)
 {
@@ -180,6 +186,8 @@ die(const char *what, const char *detail)
 
 // ---- the objects we have loaded ----
 
+#define MAXSEG 8
+
 struct dso {
   uint64_t base;            // where its vaddrs were placed
   const char *name;
@@ -199,6 +207,17 @@ struct dso {
   uint64_t tls_vaddr, tls_filesz, tls_memsz, tls_align, tls_offset;
   int has_tls;
   int relocated;
+  // the segments as they were loaded, so that their real permissions
+  // can be put back once the relocations are in. Everything is mapped
+  // writable and not executable while the loader works on it, and
+  // becomes executable and not writable afterwards: at no instant is
+  // any page both, which is what the kernel now insists on.
+  struct {
+    uint64_t start, len;
+    int prot;
+  } seg[MAXSEG];
+  int nseg;
+  int protected;
   char path[MAXPATHLEN];
 };
 
@@ -436,6 +455,12 @@ load_object(const char *name)
   if (lo > hi)
     die("no loadable segments", path);
 
+  struct {
+    uint64_t start, len;
+    int prot;
+  } segs[MAXSEG];
+  int nseg = 0;
+
   char *span = dl_mmap(0, hi - lo, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (span == MAP_FAILED)
     die("out of memory mapping", path);
@@ -455,9 +480,12 @@ load_object(const char *name)
     if (ph[i].p_flags & PF_X)
       prot |= PROT_EXEC;
     // relocations are applied into the text as well as the data, so
-    // everything is mapped writable until the loader is done.
+    // everything is mapped writable -- and therefore not executable --
+    // until the loader is done with it. protect_segments() puts the
+    // real permissions back.
+    int load_prot = (prot | PROT_WRITE) & ~PROT_EXEC;
     if (filelen &&
-        dl_mmap((void *)start, filelen, prot | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, off) ==
+        dl_mmap((void *)start, filelen, load_prot, MAP_PRIVATE | MAP_FIXED, fd, off) ==
             MAP_FAILED)
       die("cannot map segment of", path);
     // the part of the segment with no file behind it is already zero,
@@ -471,9 +499,15 @@ load_object(const char *name)
         tail = memend;
       dl_memset((void *)fileend, 0, tail - fileend);
       if (memend > tail)
-        if (dl_mmap((void *)tail, memend - tail, prot | PROT_WRITE,
+        if (dl_mmap((void *)tail, memend - tail, load_prot,
                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
           die("cannot map bss of", path);
+    }
+    if (nseg < MAXSEG) {
+      segs[nseg].start = start;
+      segs[nseg].len = PAGEUP(base + ph[i].p_vaddr + ph[i].p_memsz) - start;
+      segs[nseg].prot = prot;
+      nseg++;
     }
   }
   dl_close(fd);
@@ -481,6 +515,12 @@ load_object(const char *name)
   o = &objects[nobjects++];
   dl_memset(o, 0, sizeof(*o));
   o->base = base;
+  o->nseg = nseg;
+  for (int k = 0; k < nseg; k++) {
+    o->seg[k].start = segs[k].start;
+    o->seg[k].len = segs[k].len;
+    o->seg[k].prot = segs[k].prot;
+  }
   int i = 0;
   for (; path[i] && i < MAXPATHLEN - 1; i++)
     o->path[i] = path[i];
@@ -602,6 +642,21 @@ relocate(struct dso *o)
     apply(o, o->jmprel, o->pltrelsz / sizeof(Elf64_Rela));
 }
 
+// the relocations are in: give each segment the permissions its
+// program header asked for. Until now the text has been writable so
+// that relocations could be applied to it; from now on it is
+// executable instead, and nothing is both.
+static void
+protect_segments(struct dso *o)
+{
+  if (o->protected)
+    return;
+  o->protected = 1;
+  for (int k = 0; k < o->nseg; k++)
+    if (o->seg[k].len)
+      dl_mprotect((void *)o->seg[k].start, o->seg[k].len, o->seg[k].prot);
+}
+
 // ---- what the library calls through ----
 
 static void
@@ -633,6 +688,8 @@ dl_dlopen(const char *path, int flags)
     load_needed(&objects[i]);
   for (int i = nobjects - 1; i >= before; i--)
     relocate(&objects[i]);
+  for (int i = nobjects - 1; i >= before; i--)
+    protect_segments(&objects[i]);
   for (int i = nobjects - 1; i >= before; i--)
     run_init(&objects[i]);
   return o;
@@ -762,9 +819,48 @@ publish(void)
   v->iterate = dl_iterate;
 }
 
+// ---- the loader's own stack guard ----
+//
+// the loader is built like the programs it loads, canaries and all,
+// but it cannot borrow the library's guard: the library is what it is
+// in the middle of mapping. So it has its own, seeded from the sixteen
+// random bytes the kernel left in the auxiliary vector (AT_RANDOM),
+// and its own handler for a canary that did not survive.
+//
+// the low byte is zeroed for the same reason the C library zeroes it:
+// a string function that runs off the end of a buffer stops at the
+// NUL, so an overflow written with one cannot reproduce the guard.
+uint64_t __stack_chk_guard = 0x2f0a1c4ba9e63d00ULL;
+
+__attribute__((noreturn)) void
+__stack_chk_fail(void)
+{
+  static const char msg[] = "ld.so: stack smashing detected\n";
+  dl_write(2, msg, sizeof(msg) - 1);
+  SYSCALL1(SYS_exit, 134);  // as a SIGABRT would
+  for (;;)
+    ;
+}
+
+// no canary in the function that installs one: its prologue would read
+// the old value and its epilogue the new one, and every call would
+// look like an attack.
+__attribute__((no_stack_protector)) static void
+guard_init(uint64_t *auxv)
+{
+  for (uint64_t *a = auxv; a[0]; a += 2) {
+    if (a[0] == 25 && a[1]) { // AT_RANDOM
+      uint64_t v;
+      dl_memcpy(&v, (void *)a[1], sizeof(v));
+      __stack_chk_guard = v & ~0xffULL;
+      return;
+    }
+  }
+}
+
 // ---- the second step: load the program's world ----
 
-__attribute__((used)) uint64_t
+__attribute__((no_stack_protector, used)) uint64_t
 __dls2(int argc, char **argv, char **envp, uint64_t ldbase)
 {
   Elf64_Phdr *phdr = 0;
@@ -779,6 +875,7 @@ __dls2(int argc, char **argv, char **envp, uint64_t ldbase)
   while (*auxv)
     auxv++;
   auxv++;
+  guard_init(auxv);
   for (uint64_t *a = auxv; a[0]; a += 2) {
     if (a[0] == 3) // AT_PHDR
       phdr = (Elf64_Phdr *)a[1];
@@ -841,6 +938,8 @@ __dls2(int argc, char **argv, char **envp, uint64_t ldbase)
   // place before its copy relocation runs.
   for (int i = nobjects - 1; i >= 0; i--)
     relocate(&objects[i]);
+  for (int i = nobjects - 1; i >= 0; i--)
+    protect_segments(&objects[i]);
 
   publish(); // so that dlopen and its relatives work
 

@@ -170,6 +170,18 @@ drain_quarantine(void)
     slots[i] = ks.q[i];
   ks.nq = 0;
   draining = 1;
+  // from here to the end of the drain this hart keeps interrupts off,
+  // so that nothing can take it off the processor while `draining' is
+  // set. A drain that is preempted half way is a deadlock waiting to
+  // happen: every hart that later finds the queue full waits for it to
+  // finish, and the harts that wait are their own schedulers -- so the
+  // process holding the half-finished drain can never be run again.
+  // (Found by the fork storm: three harts spinning here, the lock
+  // free, the queue full and `draining' set with nobody draining.)
+  //
+  // the lock is still released across the work, because the other
+  // harts have to be able to take the flush IPI below.
+  push_off();
   release(&ks.lock);
   // the mappings are torn down first, then every hart forgets them,
   // then the frames may be reused.
@@ -202,6 +214,8 @@ drain_quarantine(void)
     ks.nused--;
   }
   draining = 0;
+  pop_off();   // balances the push_off above; the caller's release()
+               // puts this hart's interrupts back as they were
 }
 
 // release a stack. the caller must not be running on it.

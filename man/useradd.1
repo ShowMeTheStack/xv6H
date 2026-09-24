@@ -1,0 +1,29 @@
+NAME
+     useradd - add and change users and groups
+
+SYNOPSIS
+     useradd [-u UID] [-g GROUP] [-G GROUPS] [-d DIR] [-s SHELL] [-m] NAME
+     userdel [-r] NAME
+     usermod [-u UID] [-g GROUP] [-G GROUPS] [-d DIR] [-s SHELL] [-L|-U] NAME
+     groupadd [-g GID] NAME
+     groupdel NAME
+     groupmod [-g GID] [-n NEWNAME] NAME
+
+DESCRIPTION
+     One program under six names, which together edit /etc/passwd,
+     /etc/group and /etc/shadow. Each writes to a temporary file and
+     renames it, so an interrupted change leaves the old file.
+
+OPTIONS
+     -u UID      the user id
+     -g GROUP    the primary group
+     -G GROUPS   the supplementary groups
+     -d DIR      the home directory
+     -s SHELL    the login shell
+     -m          make the home directory
+     -r          userdel: remove the home directory too
+     -L, -U      usermod: lock or unlock the account
+     -n NEWNAME  groupmod: rename
+
+SEE ALSO
+     passwd(1), login(1), id(1)

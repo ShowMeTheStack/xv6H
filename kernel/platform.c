@@ -190,6 +190,12 @@ parse(const void *fdt)
           plat.net_gw = fdt32((const char *)item.data + 8);
           plat.net_dns = fdt32((const char *)item.data + 12);
         }
+        if (streq(item.prop, "xv6h,outer") && item.len >= 16) {
+          plat.outer_net = fdt32(item.data);
+          plat.outer_mask = fdt32((const char *)item.data + 4);
+          plat.outer_gw = fdt32((const char *)item.data + 8);
+          plat.outer_dns = fdt32((const char *)item.data + 12);
+        }
         continue;
       }
       if (!acc.pending)

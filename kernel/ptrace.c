@@ -32,6 +32,7 @@
 #include "fs.h"
 #include "file.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "errno.h"
 #include "signal.h"
 #include "ptrace.h"
@@ -208,7 +209,7 @@ sys_ptrace(void)
     return -EPERM;
   }
 
-  t = proc_get(pid);
+  t = proc_get_ns(pidns_current(), pid);
   if (t == 0)
     return -ESRCH;
   if (!may_trace(t) || !t->traced) {

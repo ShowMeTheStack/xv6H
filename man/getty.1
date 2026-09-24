@@ -1,0 +1,18 @@
+NAME
+     getty - open a terminal and ask who is there
+
+SYNOPSIS
+     getty [-n] [-i] [-l PROGRAM] TTY
+
+DESCRIPTION
+     getty opens TTY, sets it up as a terminal, prints the issue and
+     runs login on it. init starts one for each line in /etc/inittab and
+     starts it again when it ends.
+
+OPTIONS
+     -n            do not ask for a name: run the program straight away
+     -i            no issue
+     -l PROGRAM    run this instead of login
+
+SEE ALSO
+     login(1), init(8), inittab(5)

@@ -1,0 +1,25 @@
+NAME
+     awk - a pattern-and-action language for text
+
+SYNOPSIS
+     awk [-F SEP] [-v NAME=VALUE] 'PROGRAM' [FILE...]
+
+DESCRIPTION
+     awk runs PROGRAM against each line of its input. A program is a list
+     of pattern { action } rules; a line is split into $1, $2 and so on,
+     with $0 the whole of it and NF the number of fields. BEGIN and END
+     rules run before and after everything else. The usual built-ins are
+     here: NR, FNR, FS, OFS, NF, FILENAME, length, substr, index, split,
+     sub, gsub, match, sprintf, printf, getline, and arithmetic with
+     arrays and functions.
+
+OPTIONS
+     -F SEP           the field separator
+     -v NAME=VALUE    set a variable before the program runs
+
+EXAMPLES
+     awk '{ s += $2 } END { print s }' sizes
+     awk -F: '$3 >= 1000 { print $1 }' /etc/passwd
+
+SEE ALSO
+     sed(1), grep(1), bc(1)

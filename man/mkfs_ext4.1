@@ -1,0 +1,18 @@
+NAME
+     mkfs_ext4 - make an ext4 file system
+
+SYNOPSIS
+     mkfs.ext4 [-b BLOCKS] [-j BLOCKS] [-L LABEL] DEVICE
+
+DESCRIPTION
+     mkfs.ext4 writes an empty ext4 file system: the superblock, the
+     group descriptors, the bitmaps, the inode table, the root directory
+     and a journal.
+
+OPTIONS
+     -b BLOCKS   how many blocks of 4096 bytes
+     -j BLOCKS   the journal's size in blocks
+     -L LABEL    the volume label
+
+SEE ALSO
+     mount(1), e2tools(8), mkimage(1), blkid(8)

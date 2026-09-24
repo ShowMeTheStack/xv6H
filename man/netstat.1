@@ -1,0 +1,21 @@
+NAME
+     netstat - sockets, and what they are doing
+
+SYNOPSIS
+     netstat [-a] [-n] [-t] [-u] [-l] [-p]
+     ss [-a] [-n] [-t] [-u] [-l] [-p]
+
+DESCRIPTION
+     netstat prints the sockets: protocol, how much is queued each way,
+     the two addresses, the state, and with -p the process.
+
+OPTIONS
+     -a   all sockets, not only the connected ones
+     -n   numbers rather than names
+     -t   TCP only
+     -u   UDP only
+     -l   only the ones listening
+     -p   the process that has it
+
+SEE ALSO
+     lsof(1), ip(8), tcpdump(1), /proc/net/tcp

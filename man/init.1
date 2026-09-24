@@ -1,0 +1,19 @@
+NAME
+     init - the first process
+
+SYNOPSIS
+     init
+
+DESCRIPTION
+     init is process 1. It mounts what /etc/fstab says, runs the scripts
+     in /etc/init.d through /etc/rc.d/rc for the runlevel, starts what
+     /etc/inittab asks for -- a getty on the console, the daemons -- and
+     restarts anything marked respawn when it dies. It reaps orphans,
+     and on shutdown it sends TERM, waits, sends KILL, unmounts and
+     stops the machine.
+
+     Without an /etc/inittab it starts a shell on the console, which is
+     what a guest with a bare root does.
+
+SEE ALSO
+     telinit(8), service(8), shutdown(8), inittab(5)

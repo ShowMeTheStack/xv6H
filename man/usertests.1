@@ -1,0 +1,15 @@
+NAME
+     usertests - the kernel's own tests
+
+SYNOPSIS
+     usertests [-q] [NAME...]
+
+DESCRIPTION
+     usertests runs the system-call tests against a running kernel:
+     the file system, permissions, the clock, copy-on-write, lazy
+     allocation, mmap, signals, threads and the terminal. It prints a
+     line per test and ALL TESTS PASSED at the end.
+
+OPTIONS
+     -q       the quicker set
+     NAME...  only these tests

@@ -1,0 +1,10 @@
+NAME
+     schedbench - what the scheduler costs, and how it shares
+
+SYNOPSIS
+     schedbench [-t SECONDS] [-c N] spin|yield|pipe|wake
+
+DESCRIPTION
+     schedbench runs a workload and prints the numbers: context
+     switches a second, the latency of a wakeup, and how the processor
+     was divided between the participants.

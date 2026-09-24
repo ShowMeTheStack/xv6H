@@ -61,6 +61,30 @@ decode(uint32 inst, struct memop *m)
     case 6: m->is_load = 0; m->size = 4; m->reg = 8 + ((inst >> 2) & 7); return 0; // c.sw
     case 7: m->is_load = 0; m->size = 8; m->reg = 8 + ((inst >> 2) & 7); return 0; // c.sd
     }
+    // Zcb (this machine advertises it, so a guest may use it): the
+    // byte and halfword forms of the compressed loads and stores, in
+    // quadrant 0 with funct3 = 4. The three bits above rs1' say which,
+    // and for the halfword forms bit 6 separates signed from unsigned
+    // and load from store. A guest compiled for Zcb reaches a device
+    // with these, and before they were decoded such an access was
+    // reported as an instruction that could not be emulated.
+    if (funct3 == 4) {
+      int sel = (inst >> 10) & 7;
+      int reg = 8 + ((inst >> 2) & 7);
+      switch (sel) {
+      case 0: // c.lbu
+        m->is_load = 1; m->size = 1; m->sign = 0; m->reg = reg; return 0;
+      case 1: // c.lhu (bit 6 clear) and c.lh (bit 6 set)
+        m->is_load = 1; m->size = 2; m->sign = (inst >> 6) & 1; m->reg = reg;
+        return 0;
+      case 2: // c.sb
+        m->is_load = 0; m->size = 1; m->sign = 0; m->reg = reg; return 0;
+      case 3: // c.sh
+        if ((inst >> 6) & 1)
+          return -1;
+        m->is_load = 0; m->size = 2; m->sign = 0; m->reg = reg; return 0;
+      }
+    }
   } else if (q == 2) {
     switch (funct3) {
     case 2: m->is_load = 1; m->size = 4; m->reg = (inst >> 7) & 31; return 0; // c.lwsp
@@ -105,18 +129,18 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
   struct memop m;
 
   if (decode(inst, &m) < 0 || (m.is_load == is_store)) {
-    printk("hyp: vm %d vcpu %d: cannot emulate inst 0x%x at pc 0x%lx gpa 0x%lx\n",
-           vm->id, v->id, inst, v->pc, gpa);
+    if (vm_gripe(&vm->g_mmio))
+      printk("hyp: vm %d vcpu %d: cannot emulate inst 0x%x at pc 0x%lx gpa 0x%lx "
+             "(%ld times)\n", vm->id, v->id, inst, v->pc, gpa, vm->g_mmio);
     vcpu_inject(v, is_store ? EXC_STORE_ACCESS : EXC_LOAD_ACCESS, gpa);
     return 0;
   }
 
   struct vdev *d = find_dev(vm, gpa);
   if (d == 0) {
-    static int reported;
-    if (reported++ < 10)
-      printk("hyp: vm %d vcpu %d: %s to unmapped gpa 0x%lx at pc 0x%lx\n", vm->id, v->id,
-             is_store ? "store" : "load", gpa, v->pc);
+    if (vm_gripe(&vm->g_fault))
+      printk("hyp: vm %d vcpu %d: %s to unmapped gpa 0x%lx at pc 0x%lx (%ld times)\n",
+             vm->id, v->id, is_store ? "store" : "load", gpa, v->pc, vm->g_fault);
     vcpu_inject(v, is_store ? EXC_STORE_ACCESS : EXC_LOAD_ACCESS, gpa);
     return 0;
   }

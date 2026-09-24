@@ -26,6 +26,8 @@
 #include "file.h"
 #include "proc.h"
 #include "defs.h"
+#include "nsproxy.h"
+#include "cgroup.h"
 #include "blk.h"
 #include "vfs.h"
 #include "platform.h"
@@ -73,6 +75,20 @@ enum {
   S_W_CACHE_PCT,
   S_W_FLUSH_SECS,
   S_W_TICK_HZ,
+  S_W_ASLR,
+  // the control groups. `arg' is the group's slot, so a read or a write
+  // knows which group it is about without looking it up by name.
+  S_CG_CPU_WEIGHT,
+  S_CG_CPU_MAX,
+  S_CG_MEM_MAX,
+  S_CG_MEM_CUR,
+  S_CG_PIDS_MAX,
+  S_CG_PIDS_CUR,
+  S_CG_FREEZE,
+  S_CG_PROCS,
+  S_CG_STAT,
+  S_W_CG_CREATE,
+  S_W_CG_DESTROY,
 };
 
 struct sysent {
@@ -231,8 +247,43 @@ rebuild(void)
   add("kernel/mm/free_pages", S_MEM_FREE, 0, 0, 0);
   add_rw("mm/cache_pct", S_W_CACHE_PCT, 0, 0, 0, 1);
   add("fs", S_DIR, 1, 0, 0);
+  // the control groups, as they are now
+  add("fs/cgroup", S_DIR, 1, 0, 0);
+  add_rw("fs/cgroup/cgroup.create", S_W_CG_CREATE, 0, 0, 0, 1);
+  add_rw("fs/cgroup/cgroup.destroy", S_W_CG_DESTROY, 0, 0, 0, 1);
+  for (int i = 0; i < NCGROUP; i++) {
+    struct cgroup *cg = cg_at(i);
+    if (cg == 0)
+      continue;
+    char dir[SYSFS_PATHMAX], f[SYSFS_PATHMAX];
+    safestrcpy(dir, "fs/cgroup/", sizeof(dir));
+    safestrcpy(dir + 10, cg->name, sizeof(dir) - 10);
+    add(dir, S_DIR, 1, 0, 0);
+    static const struct {
+      const char *name;
+      int kind;
+      int writable;
+    } cgfiles[] = {
+        {"cpu.weight", S_CG_CPU_WEIGHT, 1}, {"cpu.max", S_CG_CPU_MAX, 1},
+        {"memory.max", S_CG_MEM_MAX, 1},    {"memory.current", S_CG_MEM_CUR, 0},
+        {"pids.max", S_CG_PIDS_MAX, 1},     {"pids.current", S_CG_PIDS_CUR, 0},
+        {"freeze", S_CG_FREEZE, 1},         {"procs", S_CG_PROCS, 1},
+        {"stat", S_CG_STAT, 0},             {0, 0, 0},
+    };
+    for (int k = 0; cgfiles[k].name; k++) {
+      int n = strlen(dir);
+      safestrcpy(f, dir, sizeof(f));
+      if (n < (int)sizeof(f) - 2) {
+        f[n++] = '/';
+        f[n] = 0;
+        safestrcpy(f + n, cgfiles[k].name, sizeof(f) - n);
+      }
+      add_rw(f, cgfiles[k].kind, 0, i, 0, cgfiles[k].writable);
+    }
+  }
   add_rw("fs/writeback_secs", S_W_FLUSH_SECS, 0, 0, 0, 1);
   add_rw("kernel/tick_hz", S_W_TICK_HZ, 0, 0, 0, 1);
+  add_rw("kernel/randomize_va_space", S_W_ASLR, 0, 0, 0, 1);
 
   // what the machine has
   add("hypervisor", S_DIR, 1, 0, 0);
@@ -316,7 +367,17 @@ gn(struct gen *g, uint64 v)
     g->buf[g->len++] = tmp[--n];
 }
 
-extern char hostname[];
+// one line per process in a group, for its `procs' file
+static void
+cg_emit_pid(int pid, void *arg)
+{
+  struct gen *g = arg;
+
+  gn(g, (uint64)pid);
+  gs(g, "\n");
+}
+
+
 
 static void
 generate(struct gen *g, struct sysent *e)
@@ -342,7 +403,7 @@ generate(struct gen *g, struct sysent *e)
     break;
   case S_HOSTNAME:
   case S_W_HOSTNAME:
-    gs(g, hostname);
+    gs(g, uts_hostname());
     gs(g, "\n");
     break;
   case S_W_CACHE_PCT:
@@ -357,6 +418,10 @@ generate(struct gen *g, struct sysent *e)
     gn(g, tick_hz);
     gs(g, "\n");
     break;
+  case S_W_ASLR:
+    gn(g, randomize_va_space);
+    gs(g, "\n");
+    break;
   case S_PAGESIZE:
     gn(g, PGSIZE);
     gs(g, "\n");
@@ -368,6 +433,52 @@ generate(struct gen *g, struct sysent *e)
   case S_UPTIME:
     gn(g, clock_monotonic_ns() / 1000000000UL);
     gs(g, "\n");
+    break;
+
+  // ---- the control groups ----
+  case S_CG_CPU_WEIGHT:
+  case S_CG_CPU_MAX:
+  case S_CG_MEM_MAX:
+  case S_CG_MEM_CUR:
+  case S_CG_PIDS_MAX:
+  case S_CG_PIDS_CUR:
+  case S_CG_FREEZE: {
+    struct cgroup *cg = cg_at(e->arg);
+    static const int which[] = {CG_CPU_WEIGHT, CG_CPU_MAX, CG_MEMORY_MAX,
+                                CG_MEMORY_CURRENT, CG_PIDS_MAX,
+                                CG_PIDS_CURRENT, CG_FREEZE};
+    if (cg == 0)
+      break;
+    gn(g, cg_get(cg, which[e->kind - S_CG_CPU_WEIGHT]));
+    gs(g, "\n");
+    break;
+  }
+  case S_CG_PROCS: {
+    struct cgroup *cg = cg_at(e->arg);
+    if (cg)
+      cg_walk_procs(cg, cg_emit_pid, g);
+    break;
+  }
+  case S_CG_STAT: {
+    struct cgroup *cg = cg_at(e->arg);
+    if (cg == 0)
+      break;
+    gs(g, "memory.current ");
+    gn(g, cg_get(cg, CG_MEMORY_CURRENT));
+    gs(g, "\nmemory.refused ");
+    gn(g, cg_get(cg, CG_MEM_REFUSED));
+    gs(g, "\npids.current ");
+    gn(g, cg_get(cg, CG_PIDS_CURRENT));
+    gs(g, "\npids.refused ");
+    gn(g, cg_get(cg, CG_PID_REFUSED));
+    gs(g, "\ncpu.throttles ");
+    gn(g, cg_get(cg, CG_CPU_THROTTLES));
+    gs(g, "\n");
+    break;
+  }
+  case S_W_CG_CREATE:
+  case S_W_CG_DESTROY:
+    gs(g, "(write a name here)\n");
     break;
   case S_MEM_TOTAL:
   case S_MEM_FREE: {
@@ -588,10 +699,137 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
   acquiresleep(&sysfs_lock);
   rebuild();
   if ((e = find_inum(ip->inum)) != 0 && e->writable) {
+    // the machine's own settings are the machine's, whoever asks. The
+    // file's mode says root, and root inside a container holds
+    // CAP_DAC_OVERRIDE, which goes through a mode: without this a
+    // container could change the tick rate, the share of memory the
+    // block cache may hold, how often the machine writes back, or how
+    // every process after it is laid out in memory.
+    if ((e->kind == S_W_CACHE_PCT || e->kind == S_W_FLUSH_SECS ||
+         e->kind == S_W_TICK_HZ || e->kind == S_W_ASLR) &&
+        (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root())) {
+      releasesleep(&sysfs_lock);
+      return -EPERM;
+    }
     switch (e->kind) {
     case S_W_HOSTNAME:
+      // the same door as sethostname(2), and the same rule: privileged,
+      // and in a user namespace the name it may change is its own
+      if (!cap_ok(CAP_SYS_ADMIN) || (!userns_in_root() && uts_is_root())) {
+        r = -EPERM;
+        break;
+      }
       r = sethostname_str(buf, n) < 0 ? -EINVAL : (int)whole;
       break;
+
+    case S_W_CG_CREATE: {
+      // the tree is the machine's: a container is inside one of these
+      // groups and does not get to edit it. Root there is root for the
+      // container, and this is the other kind of root.
+      if (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root()) {
+        r = -EPERM;
+        break;
+      }
+      int e2 = cg_create(buf, cg_current(), 0);
+      r = e2 < 0 ? e2 : (int)whole;
+      break;
+    }
+    case S_W_CG_DESTROY: {
+      // the tree is the machine's: a container is inside one of these
+      // groups and does not get to edit it. Root there is root for the
+      // container, and this is the other kind of root.
+      if (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root()) {
+        r = -EPERM;
+        break;
+      }
+      struct cgroup *cg = cg_find(buf);
+      if (cg == 0 || cg == cg_root()) {
+        r = -ENOENT;
+        break;
+      }
+      int e2 = cg_destroy(cg);
+      r = e2 < 0 ? e2 : (int)whole;
+      break;
+    }
+    case S_CG_PROCS: {
+      // a process joins a group by being written into it: "echo $$ >
+      // /sys/fs/cgroup/g/procs", which is how this has always been done.
+      // the tree is the machine's: a container is inside one of these
+      // groups and does not get to edit it. Root there is root for the
+      // container, and this is the other kind of root.
+      if (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root()) {
+        r = -EPERM;
+        break;
+      }
+      struct cgroup *cg = cg_at(e->arg);
+      if (cg == 0) {
+        r = -ENOENT;
+        break;
+      }
+      int pid = 0, ok = n > 0;
+      for (int i = 0; i < (int)n; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+          ok = 0;
+          break;
+        }
+        pid = pid * 10 + (buf[i] - '0');
+      }
+      if (!ok) {
+        r = -EINVAL;
+        break;
+      }
+      struct proc *t = proc_get_ns(pidns_current(), pid);
+      if (t == 0) {
+        r = -ESRCH;
+        break;
+      }
+      int e2 = cg_join(t, cg);
+      proc_release(t);
+      r = e2 < 0 ? e2 : (int)whole;
+      break;
+    }
+    case S_CG_CPU_WEIGHT:
+    case S_CG_CPU_MAX:
+    case S_CG_MEM_MAX:
+    case S_CG_PIDS_MAX:
+    case S_CG_FREEZE: {
+      // the tree is the machine's: a container is inside one of these
+      // groups and does not get to edit it. Root there is root for the
+      // container, and this is the other kind of root.
+      if (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root()) {
+        r = -EPERM;
+        break;
+      }
+      struct cgroup *cg = cg_at(e->arg);
+      if (cg == 0) {
+        r = -ENOENT;
+        break;
+      }
+      uint64 v = 0;
+      int ok = n > 0;
+      for (int i = 0; i < (int)n; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+          ok = 0;
+          break;
+        }
+        v = v * 10 + (uint64)(buf[i] - '0');
+      }
+      if (!ok) {
+        r = -EINVAL;
+        break;
+      }
+      static const int which[] = {CG_CPU_WEIGHT, CG_CPU_MAX, CG_MEMORY_MAX,
+                                  CG_PIDS_MAX, CG_FREEZE};
+      static const int kinds[] = {S_CG_CPU_WEIGHT, S_CG_CPU_MAX, S_CG_MEM_MAX,
+                                  S_CG_PIDS_MAX, S_CG_FREEZE};
+      int w = -1;
+      for (int i = 0; i < 5; i++)
+        if (kinds[i] == e->kind)
+          w = which[i];
+      int e2 = w < 0 ? -EINVAL : cg_set_limit(cg, w, v);
+      r = e2 < 0 ? e2 : (int)whole;
+      break;
+    }
     case S_W_CACHE_PCT: {
       int v = 0;
       for (int i = 0; i < (int)n; i++) {
@@ -629,6 +867,23 @@ sysfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
       // changes is what the ones from here on are worth. It is a knob
       // for measuring, not something to turn under a running load.
       r = (v < 1 || tick_set_hz(v) < 0) ? -EINVAL : (int)whole;
+      break;
+    }
+    case S_W_ASLR: {
+      int v = 0;
+      for (int i = 0; i < (int)n; i++) {
+        if (buf[i] < '0' || buf[i] > '9') {
+          v = -1;
+          break;
+        }
+        v = v * 10 + (buf[i] - '0');
+      }
+      // 0 lays every address out the same way every time, which is what
+      // a debugger wants; 1 moves the stack and the mmap area; 2 moves
+      // the text of a position-independent executable as well. Only
+      // processes started after the write are affected -- the ones
+      // already running keep the layout they were given.
+      r = (v < 0 || v > 2) ? -EINVAL : (randomize_va_space = v, (int)whole);
       break;
     }
     default:
@@ -779,7 +1034,8 @@ sysfs_mount(struct gendisk *disk, const char *source, int readonly, const char *
     return 0;
   sb->ops = &sysfs_sops;
   sb->iops = &sysfs_iops;
-  sys_sb = sb;
+  if (sys_sb == 0)
+    sys_sb = sb;        // the first mount owns the inodes
   sb->root = sysfs_iget(SINO_ROOT);
   if (sb->root == 0) {
     vfs_super_free(sb);

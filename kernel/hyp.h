@@ -175,6 +175,12 @@ struct vvirtio {
   int wake;                 // the guest rang the doorbell
   int stop;                 // the VM is going: leave
   int running;              // the thread exists and has not left yet
+  volatile int busy;        // a request is being carried out right now
+  // what the guest has got wrong, counted rather than printed (see
+  // vm_gripe): a guest can post a broken request a million times a
+  // second, and a host that printed each one would drown its console.
+  uint64 malformed;         // requests that made no sense
+  uint64 desync;            // available indexes the ring cannot hold
 };
 
 struct vq_state {
@@ -199,6 +205,7 @@ struct vvnet {
 // ignores it keeps its memory.
 struct vballoon {
   int present;
+  uint64 desync;            // as vvirtio.desync
   uint32 device_features_sel, driver_features_sel;
   uint64 driver_features;
   uint32 queue_sel;
@@ -262,6 +269,37 @@ struct vimsic {
 // register in a loop takes this many in every window.
 #define EXIT_RATE_LIMIT 20000
 
+// the kinds of exit a histogram counts. They are the causes worth
+// telling apart rather than every cause the hardware has: what is being
+// asked is "which of these is this guest paying for?".
+#define XK_MMIO_LOAD  0
+#define XK_MMIO_STORE 1
+#define XK_INST_FAULT 2
+#define XK_CSR        3
+#define XK_ECALL      4
+#define XK_ILLEGAL    5
+#define XK_TIMER      6
+#define XK_EXTERNAL   7
+#define XK_OTHER      8
+#define XK_KINDS      9
+
+struct vmsnap {
+  volatile int active;
+  struct inode *ip;
+  uint off;                // where the next page record goes in the file
+  uint64 written;          // bytes of the MEM section written so far
+  uint32 *done;            // one bit per guest page (0 while pre-copying)
+  // pages written since this round began: by the guest, which faults, or
+  // by the host on the guest's behalf -- a disk read or a received frame
+  // lands in guest memory without any fault at all, which is why
+  // vm_copyout marks them here.
+  uint32 *dirty;
+  volatile int precopy;    // a migration's rounds: mark, do not write out
+  int npages;              // how many bits that is
+  struct sleeplock lock;
+  uint64 faulted;          // pages the guest's own writes wrote out
+};
+
 struct vcpu {
   uint64 regs[32];        // 0..255   guest x0..x31 (x0 unused)
   struct context hostctx; // 256..367 host ra, sp, s0..s11 (see proc.h)
@@ -302,6 +340,7 @@ struct vcpu {
 
   // statistics
   uint64 exits, mmio, csr_emul, wfi_sleeps, injected;
+  uint64 exit_hist[XK_KINDS];   // and what they were (XK_*)
   // the exit-rate throttle: how many exits this vcpu has taken since
   // the window opened, when it opened, and how often it has been made
   // to give the processor up for taking too many.
@@ -316,6 +355,8 @@ struct gendisk;
 
 struct sched_group;
 
+struct cgw;
+
 struct vm {
   struct spinlock lock;
   // guest memory -- the chunk table and the G-stage page tables -- has
@@ -328,6 +369,27 @@ struct vm {
   struct spinlock memlock;
   int id;
   volatile int state;
+  // who it belongs to, and how many descriptors name it. A machine is
+  // its creator's: another user may not run it, control it, read its
+  // console or destroy it without CAP_SYS_ADMIN. `fdref' counts open
+  // FD_VM files; an unnamed machine is destroyed when the last one is
+  // closed, and a named one outlives its descriptors (vm_fdput).
+  uint owner;
+  int fdref;
+  // complaints this machine has caused, counted rather than printed
+  // every time (vm_gripe): a guest can fault or ask for something
+  // impossible as fast as it can run.
+  uint64 g_mmio, g_fault, g_sbi, g_filter;
+  // the ports of this machine the world may reach, and how many frames
+  // its switch port has turned away for not being asked for
+  struct pport ports[NPPORT];
+  int nports;
+  struct spinlock portlock;
+  // the gateway this machine is behind, if any. A machine behind one is
+  // not on the switch's own segment: what it says reaches its gateway
+  // and its neighbours behind the same gateway, and nothing else.
+  struct cgw *gw;
+  uint64 net_filtered;
   struct vmconfig cfg;    // how it was created
   uint64 entry;           // guest entry point
   struct inode *disk_ip;  // the disk image file, or 0
@@ -377,6 +439,21 @@ struct vm {
 
   uint64 dtb_gpa;
 
+  // a snapshot in progress (kernel/vmstate.c). While one is, every page
+  // the guest has not yet had written out is mapped read-only, and a
+  // store to one is a page written to the file before the guest is let
+  // on. `done' is one bit per guest page: set means the file has it (or
+  // never needed it), clear means the guest's own write has to wait for
+  // it. The lock covers the bitmap and the file's offset together,
+  // because the two are one fact.
+  struct vmsnap snap;
+
+  // what this machine's guests add to the host's counter. Zero for a
+  // machine that has always run here; on a restore it is the difference
+  // between the counter the machine was saved at and the one it wakes up
+  // to, so that the guest's clock goes on from where it stopped rather
+  // than jumping forward by however long the file sat on a disk.
+  uint64 htimedelta;
 };
 
 extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used
@@ -389,8 +466,26 @@ int vballoon_request(struct vm *vm, uint64 bytes); // the same, asked for by a p
 // hyp.c
 void hypinithart(void);
 struct vm *vm_lookup(int id);
+struct vm *vm_by_name(const char *name); // one the caller may reach, or 0
+int vm_access(struct vm *vm);            // may this process touch it?
+struct vm *vm_fdget(struct vm *vm);      // a descriptor takes a reference
+void vm_fdput(struct vm *vm);            // and gives it back
 int vm_count(void);
 int vm_create(struct vmconfig *cfg);
+// the same, without loading a kernel or writing a device tree: what a
+// restore makes, because the machine's memory is about to be written
+// from a file and an image loaded underneath it would show through
+// wherever the guest had zeroes.
+int vm_create_blank(struct vmconfig *cfg);
+void vmstate_restored(struct vm *vm);
+// a store to a page a snapshot has not written yet: the page goes to the
+// file first, and the guest goes on afterwards. Called from the fault
+// path, in the vcpu's own process, where sleeping is allowed.
+void vmsnap_before_write(struct vm *vm, uint64 gpa);
+int vm_snapshot(struct vm *vm, char *path);
+int vm_clone_page(struct vm *dst, struct vm *src, uint64 gpa);
+void vm_snap_protect(struct vm *vm, uint32 *done, uint32 *dirty, int npages);
+void vm_snap_unprotect(struct vm *vm);
 int vm_run(struct vm *vm, int vcpuid);
 int vm_destroy(struct vm *vm);
 int vm_pause(struct vm *vm);
@@ -415,6 +510,7 @@ void vcpu_inject(struct vcpu *v, uint64 cause, uint64 tval);
 void vm_halt(struct vm *vm);
 int vm_seip(struct vcpu *v);
 void hyp_stats(uint64 *out, int n);
+int vm_gripe(uint64 *count);  // should this complaint about a guest be printed?
 
 // hypcsr.c
 int hyp_illegal(struct vcpu *v, uint32 inst);
@@ -445,13 +541,18 @@ void vic_msi(struct vm *vm, int vcpuid, int eiid);     // caller holds vm->lock
 void vuart_init(struct vm *vm);
 int vuart_irq_level(struct vm *vm);
 int vm_cons_read(struct vm *vm, int user, uint64 dst, int n);
+int vm_cons_ready(struct vm *vm, int write);
 int vm_cons_write(struct vm *vm, int user, uint64 src, int n);
 void vm_cons_putc(struct vm *vm, int c);
 int vm_cons_getc(struct vm *vm);
 
 // vvirtio.c
 void vvirtio_init(struct vm *vm);
-void vvirtio_stop(struct vm *vm);   // wait for the queue thread to leave
+void vvirtio_stop(struct vm *vm);
+// wait until the disk thread has nothing in hand: what it has in hand is
+// a write into guest memory, and a save that does not wait for it writes
+// down a page the device is about to change.
+int vvirtio_quiesce(struct vm *vm);
 
 // vrtc.c
 void vrtc_init(struct vm *vm);
@@ -460,6 +561,9 @@ void vrtc_init(struct vm *vm);
 struct mbuf;
 void vvnet_init(struct vm *vm);
 void vvnet_rx(struct vm *vm, struct mbuf *m);
+int vm_port_add(struct vm *vm, uint8 proto, uint16 hport, uint16 gport);
+int vm_port_rm(struct vm *vm, uint8 proto, uint16 hport);
+int vm_port_lookup(struct vm *vm, uint8 proto, uint16 hport, uint16 *gport);
 void bridgeinit(void);
 void bridge_rx_uplink(struct mbuf *m);
 int bridge_tx_host(struct mbuf *m);

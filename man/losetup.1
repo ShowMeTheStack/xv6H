@@ -1,0 +1,27 @@
+NAME
+     losetup - make a file look like a block device
+
+SYNOPSIS
+     losetup [-f] [-r] [-o OFFSET] [--sizelimit N] [--show] DEVICE FILE
+     losetup -d DEVICE
+     losetup -b BASE DEVICE DELTA
+     losetup [-a]
+
+DESCRIPTION
+     losetup attaches FILE to a loop device, so that a file holding a
+     file system can be mounted. With -b it attaches DELTA as a
+     copy-on-write layer over BASE, which is what gives a cloned machine
+     a disk of its own without copying the original.
+
+OPTIONS
+     -f             find a free device and use it
+     -r             read-only
+     -o OFFSET      start OFFSET bytes into the file
+     --sizelimit N  use only N bytes of it
+     --show         print the device chosen
+     -d DEVICE      detach
+     -a             list what is attached
+     -b BASE        this device is a delta over BASE
+
+SEE ALSO
+     mount(1), mkimage(1), vmm(1)

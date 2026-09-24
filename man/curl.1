@@ -1,0 +1,25 @@
+NAME
+     curl - fetch a URL
+
+SYNOPSIS
+     curl [-s] [-i] [-I] [-L] [-f] [-o FILE] [-O] [-X METHOD]
+          [-H HEADER] [-d DATA] URL
+
+DESCRIPTION
+     curl fetches a URL over HTTP and writes the body to standard
+     output.
+
+OPTIONS
+     -s          silent: no progress
+     -i          print the headers too
+     -I          the headers only (a HEAD request)
+     -L          follow redirects
+     -f          fail quietly on an error status
+     -o FILE     write the body there
+     -O          write it to the file the URL names
+     -X METHOD   use this method
+     -H HEADER   add a header
+     -d DATA     send DATA as the body (and POST by default)
+
+SEE ALSO
+     wget(1), https(1), nc(1)

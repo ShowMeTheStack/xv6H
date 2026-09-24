@@ -9,6 +9,14 @@
 //   vm_ctl(id, op, arg)               VMCTL_PAUSE / VMCTL_RESUME / ...
 //   vm_cons(id, op, buf, n)           VMCONS_READ / VMCONS_WRITE / VMCONS_DETACH
 //   vm_info(id, struct vminfo *)      0 if the slot exists (state VM_FREE if empty)
+//   vm_open(id, name, flags)          -> a descriptor for a machine
+//
+// A machine belongs to the user who created it: everything above
+// refuses (-EPERM) for anybody else without CAP_SYS_ADMIN. A
+// descriptor is the other way in -- whoever holds one may work the
+// machine it names -- and it is what fork and SCM_RIGHTS pass around.
+// An unnamed machine is destroyed when its last descriptor is closed;
+// a named one outlives them, because its name is how it is found.
 //   consraw(on)                       host console raw mode
 //
 
@@ -20,6 +28,22 @@
 #define VMF_RAW       2 // kernel is a raw binary loaded at load_addr (also the entry)
 #define VMF_HSM       4 // secondary vcpus start stopped, to be started via SBI HSM (Linux)
 #define VMF_NOHUGE    8 // back guest RAM 4 KB at a time, never with megapages
+
+// A machine's switch port is closed: what arrives from outside is
+// delivered only when it belongs to a conversation the machine itself
+// started, or when it is for a port the machine has published. A
+// published port is named by the port outside and the port inside,
+// which at E7 are on the same address and so are usually the same
+// number; a gateway is what makes them differ.
+#define NPPORT 8
+
+#define NCTVOL 4          // volumes a container may be given
+#define NCTENV 8          // and variables
+
+struct pport {
+  uint16 hport, gport;
+  uint8 proto;             // IPPROTO_TCP (6) or IPPROTO_UDP (17)
+};
 
 struct vmconfig {
   char name[VM_NAMELEN];   // optional
@@ -39,9 +63,22 @@ struct vmconfig {
   // is a ceiling on top of that (0: none).
   int weight;
   int cpu_max_us, cpu_period_us;
+  struct pport ports[NPPORT];
+  int nports;
+  char gwname[16];         // the gateway this machine is behind, by name
 };
 
 enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
+
+// one line of /proc/vmm: the registry of machines on this host. Unlike
+// vm_info, which answers for the machines the caller may reach, this
+// is the whole table, and only a privileged reader gets it.
+struct vmentry {
+  int id, state, kind, nvcpu, fdref;
+  unsigned int owner;      // the uid that created it
+  unsigned long mem_mb, resident_mb;
+  char name[VM_NAMELEN];
+};
 
 #define VMCTL_PAUSE  0
 #define VMCTL_RESUME 1
@@ -59,6 +96,13 @@ enum vmstate { VM_FREE = 0, VM_NEW, VM_RUNNING, VM_HALTING, VM_PAUSED };
 // vm_ctl(id, VMCTL_CPUMAX, pct): a ceiling, in hundredths of one
 // processor, over a period of a tenth of a second. 0 removes it.
 #define VMCTL_CPUMAX 6
+// vm_ctl(id, VMCTL_PORT_ADD | VMCTL_PORT_RM, VMCTL_PORT(proto, hport,
+// gport)): publish a port of this machine, or stop publishing it. Only
+// the host port and the protocol name a port to remove.
+#define VMCTL_PORT_ADD 7
+#define VMCTL_PORT_RM  8
+#define VMCTL_PORT(proto, hport, gport) \
+  (((unsigned long)(proto) << 32) | ((unsigned)(hport) << 16) | (unsigned)(gport))
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -81,6 +125,10 @@ struct vminfo {
   uint64 disk_sectors;
   uint64 exits, mmio, csr, wfi, injected;
   uint64 exit_throttles, nudges;  // the exit-rate throttle, and the sibling nudge
+  // its switch port: what it publishes, and what was turned away
+  struct pport ports[NPPORT];
+  int nports;
+  uint64 net_filtered;
   // vcpu 0, for debugging
   uint64 pc, last_cause, last_gpa;
   int running_hart, idle, mmode;
@@ -88,6 +136,10 @@ struct vminfo {
   uint64 scounteren, senvcfg, hcounteren;
   // vcpu 1 (if any): pc, last cause, idle, hsm state, exits, injected VSEIP state
   uint64 pc1, cause1, exits1;
+  // what vcpu 0's exits were: one count per kind (XK_* in kernel/hyp.h,
+  // and the names in user/vmm.c). A histogram says which exit is worth
+  // making cheaper; a total says only how busy the guest is.
+  uint64 exit_hist[9];
   int idle1, hsm1, hart1;
   uint64 eie0_0, eip0_0, eie0_1, eip0_1;
   int deliv0, deliv1, thr0, thr1;

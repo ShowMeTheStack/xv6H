@@ -112,16 +112,27 @@ find_tls(uint64 *auxv)
 }
 
 // the ELF entry point calls this with the stack exec built.
-void
+//
+// no canary of its own: this is where the canary is chosen, and a
+// function checks on the way out the value as the global stands then
+// (user/libc/canary.c).
+__attribute__((no_stack_protector)) void
 start(int argc, char **argv, char **envp)
 {
   extern int main(int argc, char **argv, char **envp);
+  extern void __libc_canary_init(const void *);
   uint64 *auxv;
 
   // the auxiliary vector sits above the environment
   for (auxv = (uint64 *)envp; *auxv; auxv++)
     ;
-  find_tls(auxv + 1);
+  auxv++;
+  for (uint64 *a = auxv; a[0]; a += 2)
+    if (a[0] == AT_RANDOM) {
+      __libc_canary_init((const void *)a[1]);
+      break;
+    }
+  find_tls(auxv);
 
   void *block = main_block;
   if (__tls_size() > sizeof(main_block)) {
@@ -140,6 +151,16 @@ start(int argc, char **argv, char **envp)
     program_invocation_name = argv[0];
     char *slash = strrchr(argv[0], '/');
     program_invocation_short_name = slash ? slash + 1 : argv[0];
+  }
+
+  // `--help' is answered from the manual, here, so that every program
+  // answers it the same way and a program written tomorrow answers it
+  // without being told to. A program with no manual page keeps whatever
+  // it did before: __libc_help says whether it printed anything.
+  if (argc == 2 && argv[1] && strcmp(argv[1], "--help") == 0) {
+    extern int __libc_help(const char *name);
+    if (__libc_help(program_invocation_short_name))
+      exit(0);
   }
 
   // main() may be declared with two arguments or three; the extra one

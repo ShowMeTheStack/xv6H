@@ -1,0 +1,22 @@
+NAME
+     nl - number lines
+
+SYNOPSIS
+     nl [-ba|-bt] [-w N] [-s STR] [FILE...]
+     rev [FILE...]
+     expand [-t N] [FILE...]
+
+DESCRIPTION
+     nl copies its input with a line number in front of each line.
+     Called as rev it reverses each line; called as expand it turns tabs
+     into spaces.
+
+OPTIONS
+     -ba     number every line
+     -bt     number only the lines with something on them (the default)
+     -w N    the number is N columns wide
+     -s STR  put STR between the number and the line
+     -t N    expand: a tab stop every N columns
+
+SEE ALSO
+     cat(1), fmt is not provided

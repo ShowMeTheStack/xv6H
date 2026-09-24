@@ -1,0 +1,22 @@
+NAME
+     shutdown - stop the machine
+
+SYNOPSIS
+     shutdown [-h|-r|-H] [-f] [now|+MINUTES|hh:mm] [MESSAGE]
+     halt     reboot     poweroff
+
+DESCRIPTION
+     shutdown warns everyone logged in, waits, and then stops the
+     machine: init runs the stop scripts, processes are asked and then
+     told to go, file systems are written out and unmounted, and the
+     machine halts, reboots or powers off. halt, reboot and poweroff are
+     the same program with the answer already chosen.
+
+OPTIONS
+     -h   halt
+     -r   reboot
+     -H   halt without powering off
+     -f   skip the file system check on the way up
+
+SEE ALSO
+     init(8), telinit(8), sync(1)

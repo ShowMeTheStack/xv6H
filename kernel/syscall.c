@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "sysfilter.h"
 #include "syscall.h"
 #include "defs.h"
 #include "errno.h"
@@ -104,6 +105,19 @@ extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
 extern uint64 sys_vm_create(void);
+extern uint64 sys_vm_open(void);
+extern uint64 sys_netroute(void);
+extern uint64 sys_netgw(void);
+extern uint64 sys_unshare(void);
+extern uint64 sys_setns(void);
+extern uint64 sys_pivot_root(void);
+extern uint64 sys_sysfilter(void);
+extern uint64 sys_vm_save(void);
+extern uint64 sys_vm_restore(void);
+extern uint64 sys_vm_snapshot(void);
+extern uint64 sys_vm_clone(void);
+extern uint64 sys_vm_migrate(void);
+extern uint64 sys_vm_accept(void);
 extern uint64 sys_vm_ctl(void);
 extern uint64 sys_vm_stats(void);
 extern uint64 sys_hwinfo(void);
@@ -256,6 +270,19 @@ static uint64 (*syscalls[])(void) = {
   [SYS_mkdir]   = sys_mkdir,
   [SYS_close]   = sys_close,
   [SYS_vm_create]  = sys_vm_create,
+  [SYS_vm_open]    = sys_vm_open,
+  [SYS_netroute]   = sys_netroute,
+  [SYS_netgw]      = sys_netgw,
+  [SYS_unshare]    = sys_unshare,
+  [SYS_setns]      = sys_setns,
+  [SYS_pivot_root] = sys_pivot_root,
+  [SYS_sysfilter]  = sys_sysfilter,
+  [SYS_vm_save]    = sys_vm_save,
+  [SYS_vm_restore] = sys_vm_restore,
+  [SYS_vm_snapshot] = sys_vm_snapshot,
+  [SYS_vm_clone]   = sys_vm_clone,
+  [SYS_vm_migrate] = sys_vm_migrate,
+  [SYS_vm_accept]  = sys_vm_accept,
   [SYS_vm_ctl]     = sys_vm_ctl,
   [SYS_vm_stats]   = sys_vm_stats,
   [SYS_hwinfo]     = sys_hwinfo,
@@ -398,6 +425,16 @@ syscall(void)
   // number and the arguments before anything happens
   if (p->traced)
     ptrace_syscall_entry(p);
+  // what this process has given up it does not get back, and what it
+  // never had it cannot ask for: a container's profile is checked here,
+  // before the call runs, and answers the way a kernel without the call
+  // would.
+  if (sysfilter_denies(&p->filter, num)) {
+    p->trapframe->a0 = (uint64)-EPERM;
+    if (p->traced)
+      ptrace_syscall_exit(p);
+    return;
+  }
   if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
     // Use num to lookup the system call function for num, call it,
     // and store its return value in p->trapframe->a0
@@ -405,8 +442,28 @@ syscall(void)
     if ((long)p->trapframe->a0 == -EINTR && !p->norestart)
       p->restartable = 1;
   } else {
-    printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
-    p->trapframe->a0 = -1;
+    // a number this kernel has no call for. ENOSYS is the answer a
+    // program probing for a call expects, and the message is a
+    // diagnostic for one built against a different kernel -- so it is
+    // rate-limited. Without a limit any process, in a container or not,
+    // can fill the operator's console with it a few thousand lines at a
+    // time, which is what a fuzzer did.
+    static uint last;      // the tick of the last one printed
+    static uint quiet;     // and how many were not
+    extern uint ticks;
+    uint now = ticks;
+    if (now - last >= 100 || last == 0) {
+      if (quiet)
+        printk("%d %s: unknown sys call %d (%d more not reported)\n", p->pid,
+               p->name, num, quiet);
+      else
+        printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
+      last = now ? now : 1;
+      quiet = 0;
+    } else {
+      quiet++;
+    }
+    p->trapframe->a0 = (uint64)-ENOSYS;
   }
   // and on the way out, where the answer is
   if (p->traced)

@@ -1,0 +1,19 @@
+NAME
+     timecmd - how long a command takes, and other ways to run one
+
+SYNOPSIS
+     time [-p] COMMAND [ARG...]
+     timeout SECONDS COMMAND [ARG...]
+     nohup COMMAND [ARG...]
+
+DESCRIPTION
+     Called as time it runs COMMAND and prints how long it took -- real,
+     user and system. Called as timeout it kills the command if it is
+     still running after SECONDS. Called as nohup it runs the command
+     with hangups ignored, so that it survives the terminal going away.
+
+OPTIONS
+     -p   the POSIX form of the timing report
+
+SEE ALSO
+     sleep(1), ps(1)

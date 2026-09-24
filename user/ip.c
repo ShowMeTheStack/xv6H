@@ -2,13 +2,17 @@
 // on the wire.
 //
 //   ip [-4] [-br] addr|link|route|neigh [show]
-//   route [-n]                 the routing table
+//   ip route add|del|get       where packets go
+//   route [-n] | route add|del the same, spelled the older way
 //   arp  [-n] [-a]             the address cache
 //
 // the state comes from /proc/net and from the interface itself; this
 // program formats it, and setting an address is ifconfig's job.
 #include "user/user.h"
 #include "kernel/net.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <errno.h>
 
 static int numeric = 1, brief;
 
@@ -120,14 +124,14 @@ show_link(int with_addr)
 
 // ---- routes ----
 
-struct route {
+struct rtline {
   char iface[16];
   uint32 dest, gw, mask;
   int flags;
 };
 
 static int
-read_routes(struct route *out, int max)
+read_routes(struct rtline *out, int max)
 {
   FILE *f = fopen("/proc/net/route", "r");
   char line[512];
@@ -141,7 +145,7 @@ read_routes(struct route *out, int max)
       first = 0;
       continue;
     }
-    struct route *r = &out[n];
+    struct rtline *r = &out[n];
     const char *p = line;
     int k = 0;
     while (*p && *p != '\t' && *p != ' ' && k < 15)
@@ -176,7 +180,7 @@ read_routes(struct route *out, int max)
 static void
 show_route_ip(void)
 {
-  struct route r[16];
+  struct rtline r[16];
   int n = read_routes(r, 16);
   char d[24], g[24];
 
@@ -195,14 +199,22 @@ show_route_ip(void)
     if (r[i].mask == 0)
       continue;
     dotted(r[i].dest, d, sizeof(d));
-    printf("%s/%d dev %s scope link\n", d, prefix_len(r[i].mask), r[i].iface);
+    printf("%s/%d", d, prefix_len(r[i].mask));
+    // a route through a gateway is not on this link, and ip says so by
+    // naming the gateway instead of the scope
+    if (r[i].gw) {
+      dotted(r[i].gw, g, sizeof(g));
+      printf(" via %s dev %s\n", g, r[i].iface);
+    } else {
+      printf(" dev %s scope link\n", r[i].iface);
+    }
   }
 }
 
 static void
 show_route_classic(void)
 {
-  struct route r[16];
+  struct rtline r[16];
   int n = read_routes(r, 16);
 
   if (n < 0) {
@@ -285,15 +297,118 @@ show_arp(int ip_form)
     ; // an empty cache prints only its title, as arp does
 }
 
+// ---- changing the table ----
+
+// "10.1.0.0/16", "default", "10.1.2.3" (which is /32)
+static int
+parse_prefix(const char *a, uint32 *dst, uint32 *mask)
+{
+  if (strcmp(a, "default") == 0 || strcmp(a, "0/0") == 0) {
+    *dst = *mask = 0;
+    return 0;
+  }
+  char buf[32];
+  int n = strlen(a);
+  if (n >= (int)sizeof(buf))
+    return -1;
+  strcpy(buf, a);
+  char *slash = strchr(buf, '/');
+  int bits = 32;
+  if (slash) {
+    *slash = 0;
+    bits = atoi(slash + 1);
+    if (bits < 0 || bits > 32)
+      return -1;
+  }
+  struct in_addr in;
+  if (inet_aton(buf, &in) == 0)
+    return -1;
+  *dst = ntohl(in.s_addr);
+  *mask = bits == 0 ? 0 : ~((uint32)0) << (32 - bits);
+  *dst &= *mask;
+  return 0;
+}
+
+// ip route add PREFIX [via GW] [dev DEV] [metric N]
+// ip route del PREFIX [via GW]
+// ip route get ADDRESS
+static int
+route_change(const char *me, int op, int argc, char *argv[], int i)
+{
+  struct rtreq r;
+  memset(&r, 0, sizeof(r));
+  strcpy(r.dev, "eth0");
+
+  if (i >= argc) {
+    fprintf(stderr, "%s: which route?\n", me);
+    return 1;
+  }
+  if (parse_prefix(argv[i++], &r.dst, &r.mask) < 0) {
+    fprintf(stderr, "%s: %s is not an address\n", me, argv[i - 1]);
+    return 1;
+  }
+  if (op == RT_GET)
+    r.mask = 0xffffffff;
+  for (; i < argc; i++) {
+    if ((strcmp(argv[i], "via") == 0 || strcmp(argv[i], "gw") == 0) && i + 1 < argc) {
+      struct in_addr in;
+      if (inet_aton(argv[++i], &in) == 0) {
+        fprintf(stderr, "%s: %s is not an address\n", me, argv[i]);
+        return 1;
+      }
+      r.gw = ntohl(in.s_addr);
+    } else if (strcmp(argv[i], "dev") == 0 && i + 1 < argc) {
+      strncpy(r.dev, argv[++i], sizeof(r.dev) - 1);
+    } else if (strcmp(argv[i], "metric") == 0 && i + 1 < argc) {
+      r.metric = atoi(argv[++i]);
+    } else if (strcmp(argv[i], "netmask") == 0 && i + 1 < argc) {
+      struct in_addr in;             // route(8) spells the mask this way
+      if (inet_aton(argv[++i], &in) == 0) {
+        fprintf(stderr, "%s: %s is not a mask\n", me, argv[i]);
+        return 1;
+      }
+      r.mask = ntohl(in.s_addr);
+      r.dst &= r.mask;
+    } else {
+      fprintf(stderr, "%s: %s?\n", me, argv[i]);
+      return 1;
+    }
+  }
+  uint32 asked = r.dst;
+  if (netroute(op, &r) < 0) {
+    fprintf(stderr, "%s: %s\n", me, strerror(errno));
+    return 1;
+  }
+  if (op == RT_GET) {
+    // the answer is about one address, so it is printed as one: the
+    // address asked about, the next hop if there is one, and the
+    // interface it leaves by
+    struct in_addr in;
+    in.s_addr = htonl(asked);
+    printf("%s", inet_ntoa(in));
+    if (r.gw) {
+      in.s_addr = htonl(r.gw);
+      printf(" via %s", inet_ntoa(in));
+    }
+    printf(" dev %s\n", r.dev);
+  }
+  return 0;
+}
+
 static void
 usage(const char *me)
 {
   if (strcmp(me, "route") == 0)
-    fprintf(stderr, "usage: route [-n]\n");
+    fprintf(stderr, "usage: route [-n]\n"
+                      "       route add PREFIX [gw GW] [dev DEV] [metric N]\n"
+                      "       route del PREFIX [gw GW]\n");
   else if (strcmp(me, "arp") == 0)
     fprintf(stderr, "usage: arp [-n] [-a]\n");
   else
-    fprintf(stderr, "usage: ip [-4] [-br] addr|link|route|neigh [show]\n");
+    fprintf(stderr, "usage: ip [-4] [-br] addr|link|route|neigh [show]\n"
+                      "       ip route add PREFIX [via GW] [dev DEV] [metric N]\n"
+                      "       ip route del PREFIX [via GW]\n"
+                      "       ip route get ADDRESS\n");
   exit(1);
 }
 
@@ -328,9 +443,12 @@ main(int argc, char *argv[])
 
   if (strcmp(me, "route") == 0) {
     if (i < argc) {
-      fprintf(stderr, "route: adding and deleting routes is not supported;"
-                      " use ifconfig to set the gateway\n");
-      exit(1);
+      const char *verb = argv[i++];
+      if (strcmp(verb, "add") == 0)
+        exit(route_change(me, RT_ADD, argc, argv, i));
+      if (strcmp(verb, "del") == 0 || strcmp(verb, "delete") == 0)
+        exit(route_change(me, RT_DEL, argc, argv, i));
+      usage(me);
     }
     show_route_classic();
     exit(0);
@@ -346,10 +464,59 @@ main(int argc, char *argv[])
   const char *object = argv[i++];
   const char *verb = i < argc ? argv[i++] : "show";
 
+  // ip addr add A.B.C.D/PREFIX [dev NAME] [gw G] [dns D]
+  if (strncmp(object, "a", 1) == 0 && strcmp(verb, "add") == 0) {
+    struct rtreq r;
+    memset(&r, 0, sizeof(r));
+    if (i >= argc)
+      usage(me);
+    char spec[40], *slash;
+    strncpy(spec, argv[i++], sizeof(spec) - 1);
+    spec[sizeof(spec) - 1] = 0;
+    int prefix = 24;
+    if ((slash = strchr(spec, '/')) != 0) {
+      *slash = 0;
+      prefix = atoi(slash + 1);
+    }
+    if (parse_ip(spec, &r.dst) < 0 || prefix < 1 || prefix > 32) {
+      fprintf(stderr, "%s: %s is not an address\n", me, spec);
+      exit(1);
+    }
+    r.mask = prefix == 32 ? 0xffffffffu : ~0u << (32 - prefix);
+    for (; i < argc; i++) {
+      if (strcmp(argv[i], "dev") == 0 && i + 1 < argc)
+        strncpy(r.dev, argv[++i], sizeof(r.dev) - 1);
+      else if ((strcmp(argv[i], "gw") == 0 || strcmp(argv[i], "via") == 0) &&
+               i + 1 < argc) {
+        if (parse_ip(argv[++i], &r.gw) < 0)
+          usage(me);
+      } else if (strcmp(argv[i], "dns") == 0 && i + 1 < argc) {
+        uint32 d = 0;
+        if (parse_ip(argv[++i], &d) < 0)
+          usage(me);
+        r.metric = (int)d;      // the resolver, carried in the spare field
+      } else
+        usage(me);
+    }
+    if (netroute(RT_ADDR, &r) < 0) {
+      fprintf(stderr, "%s: addr add: %s\n", me, strerror(errno));
+      exit(1);
+    }
+    exit(0);
+  }
+
+  if (strncmp(object, "r", 1) == 0) {
+    if (strcmp(verb, "add") == 0)
+      exit(route_change(me, RT_ADD, argc, argv, i));
+    if (strcmp(verb, "del") == 0 || strcmp(verb, "delete") == 0)
+      exit(route_change(me, RT_DEL, argc, argv, i));
+    if (strcmp(verb, "get") == 0)
+      exit(route_change(me, RT_GET, argc, argv, i));
+  }
   if (strcmp(verb, "show") != 0 && strcmp(verb, "list") != 0 &&
       strcmp(verb, "s") != 0 && strcmp(verb, "l") != 0) {
-    fprintf(stderr, "ip: only `show' is supported; use ifconfig to change"
-                    " the interface\n");
+    fprintf(stderr, "ip: of the objects only `show', with `addr add' and"
+                    " for routes add, del and get\n");
     exit(1);
   }
 

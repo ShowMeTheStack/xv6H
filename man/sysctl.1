@@ -1,0 +1,19 @@
+NAME
+     sysctl - read and write kernel settings
+
+SYNOPSIS
+     sysctl [-a] [-n] [-w] NAME[=VALUE]...
+     sysctl -p [FILE]
+
+DESCRIPTION
+     sysctl reads and writes the knobs under /proc/sys: the hostname,
+     the maximum number of processes, what a fault prints, and the rest.
+
+OPTIONS
+     -a          print everything there is
+     -n          print the value without the name
+     -w          write, rather than read
+     -p [FILE]   apply the settings in FILE (/etc/sysctl.conf by default)
+
+SEE ALSO
+     /proc/sys, /etc/sysctl.conf

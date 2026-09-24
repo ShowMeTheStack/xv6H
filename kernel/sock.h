@@ -14,6 +14,10 @@ struct sock {
   struct spinlock lock;
   int type;
   int id;
+  // the network it is on: the namespace of the process that made it.
+  // Two containers may both have a socket on port 80, and a packet is
+  // delivered to the one whose namespace it arrived in.
+  struct netns *ns;
   uint32 lip, rip;
   uint16 lport, rport;
   struct mbuf *rxq;   // received datagrams (UDP/ICMP)
@@ -24,6 +28,7 @@ struct sock {
   int want_errors;    // deliver ICMP errors here as well as replies
   uint deadline;      // a waiting receive gives up at this tick; 0 for none
   int rcvtimeo;       // SO_RCVTIMEO, in ticks; 0 to wait as long as it takes
+  int sndtimeo;       // SO_SNDTIMEO, in ticks; what bounds connect(2)
   int shut_rd, shut_wr; // shutdown(2) has closed this direction
 };
 

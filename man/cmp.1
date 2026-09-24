@@ -1,0 +1,17 @@
+NAME
+     cmp - compare two files byte by byte
+
+SYNOPSIS
+     cmp [-s] [-l] FILE1 [FILE2]
+
+DESCRIPTION
+     cmp says where two files first differ, and nothing at all when they
+     are the same. FILE2 may be left out, or either name may be -, to
+     mean standard input.
+
+OPTIONS
+     -s   say nothing; the exit status is the answer
+     -l   list every differing byte, with both values in octal
+
+SEE ALSO
+     diff(1), md5 is not provided

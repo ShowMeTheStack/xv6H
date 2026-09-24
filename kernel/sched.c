@@ -446,12 +446,14 @@ reweight(struct rq *rq, struct proc *p, uint32 w)
   ent_reweight(q ? &q->load : &rq->load, &p->se, w, nice_inv[nice + 20]);
 }
 
-// a group is on a hart's tree when it has something to run there and
-// is neither frozen nor out of its bandwidth. rq->lock held.
+// a group is on a hart's tree when it has something to run there and is
+// not out of its bandwidth. A frozen group stays on it: its tasks have to
+// be able to *reach* the place where they stop (freeze_point below), and
+// a task that cannot run cannot get there.
 static void
 group_activate(struct rq *rq, struct gq *q)
 {
-  if (q->nr_running == 0 || q->sg->frozen || q->throttled)
+  if (q->nr_running == 0 || q->throttled)
     return;
   if (!q->se.counted) {
     // it has been away: it comes back at the hart's minimum, with the
@@ -895,8 +897,6 @@ take_farthest(struct rq *src, int to)
       p = c;
     } else {
       struct gq *q = (struct gq *)n;
-      if (q->sg->frozen)
-        continue;
       for (struct rb_node *m = rb_last(&q->tree); m; m = rb_prev(m)) {
         struct proc *c = rb_owner(m);
         if (c == src->curr || !sched_may_run(c, to) || task_hot(c, now))
@@ -1437,6 +1437,7 @@ sched_group_set_weight(struct sched_group *g, uint32 weight)
       ent_reweight(&rq->load, &q->se, g->weight, g->inv_weight);
     release(&rq->lock);
   }
+  audit("sched_group", g->name, (uint64)g->id, weight, 1);
   return 0;
 }
 
@@ -1467,6 +1468,7 @@ sched_group_set_max(struct sched_group *g, uint64 quota_us, uint64 period_us)
   release(&g->lock);
   if (quota_us == 0)
     group_unthrottle(g);   // no limit: nothing stays throttled
+  audit("cpu_max", g->name, quota_us, period_us, 1);
   return 0;
 }
 
@@ -1503,7 +1505,8 @@ sched_group_freeze(struct sched_group *g, int on)
     int kick = 0;
     acquire(&rq->lock);
     if (on) {
-      group_deactivate(rq, q);
+      // it keeps its place on every hart's tree: its tasks run on, as
+      // far as the next boundary, and stop there.
       if (rq->curr_gq == q && i == cpuid())
         sched_need_resched();
     } else {
@@ -1516,6 +1519,8 @@ sched_group_freeze(struct sched_group *g, int on)
     if (kick && i != cpuid())
       sched_kick(i);
   }
+  if (!on)
+    wakeup(g);      // and the ones that had stopped at a boundary go on
   return 0;
 }
 

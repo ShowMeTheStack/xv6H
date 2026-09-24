@@ -1,0 +1,25 @@
+NAME
+     mount - attach a file system
+
+SYNOPSIS
+     mount [-t TYPE] [-o OPTIONS] [-r|-w] [--bind] SOURCE TARGET
+     mount
+
+DESCRIPTION
+     mount attaches SOURCE at TARGET. With no arguments it prints what
+     is mounted. The types are ext4, tmpfs, ramfs, procfs, devfs, sysfs
+     and overlay; --bind attaches a directory somewhere else as well.
+
+     In a mount namespace this changes only that namespace's table, and
+     a container may mount only the harmless types, always nodev and
+     nosuid.
+
+OPTIONS
+     -t TYPE      the file system type
+     -o OPTIONS   ro, rw, nodev, nosuid, noexec, sync, data=ordered,
+                  data=journal, size=N, lowerdir=, upperdir=, workdir=
+     -r, -w       read-only or read-write
+     --bind       attach a directory at a second place
+
+SEE ALSO
+     umount(1), df(1), losetup(8), fstab(5)

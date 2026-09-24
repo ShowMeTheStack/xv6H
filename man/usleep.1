@@ -1,0 +1,13 @@
+NAME
+     usleep - wait a while, in microseconds
+
+SYNOPSIS
+     usleep MICROSECONDS
+
+DESCRIPTION
+     usleep waits for that many microseconds. The wait is at least that
+     long: what it really costs is a timer interrupt and a scheduling
+     decision, which is what vmbench measures.
+
+SEE ALSO
+     sleep(1)

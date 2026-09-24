@@ -27,6 +27,10 @@
 #include "imsic.h"
 #include "page.h"
 #include "hyp.h"
+#include "vmstate.h"
+#include "net.h"
+#include "cgw.h"
+#include "errno.h"
 
 struct vm *vmtab[NVM];
 
@@ -534,6 +538,19 @@ vm_protect_page(struct vm *vm, uint64 gpa)
 
 // let the page be written again, and drop the reference
 // vm_protect_page took.
+//
+// Not while a snapshot or a migration is running, though. Same-page
+// merging write-protects a page to compare it and lets it be written
+// again when the comparison fails -- and a snapshot has write-protected
+// every page for its own reasons, so this would hand the guest a page it
+// can change without anybody hearing about it. The page stays read-only;
+// the guest's next write faults, the snapshot is told, and the fault
+// makes it writable again (vm_unshare). vm_snap_unprotect puts back what
+// is left at the end.
+//
+// (Seven pages of a migrated guest's kernel arrived holding what they
+// held a round earlier because of this, and the guest panicked in its
+// own lock code a moment after it started running.)
 void
 vm_unprotect_page(struct vm *vm, uint64 gpa, uint64 frame)
 {
@@ -542,7 +559,7 @@ vm_unprotect_page(struct vm *vm, uint64 gpa, uint64 frame)
 
   acquire(&vm->memlock);
   uint64 c = vm->chunk[k];
-  if (c && gc_split(c) && gc_pages(c)[i] == frame) {
+  if (c && gc_split(c) && gc_pages(c)[i] == frame && !vm->snap.active) {
     uint64 *pte = gstage_pte(vm, G_RAM_BASE + off, 0, 0);
     if (pte && (*pte & PTE_V) && !(PA2PAGE(frame)->flags & PG_KSM))
       *pte |= PTE_W;
@@ -585,6 +602,179 @@ vm_share_page(struct vm *vm, uint64 gpa, uint64 frame)
   else
     kfree((void *)old);
   return 0;
+}
+
+// ---- cloning: one machine's pages in two machines (§9) ----
+//
+// A clone has the memory its original had, and neither of them has a copy
+// of it: every page is mapped into both, read-only, and the first write
+// by either of them faults and gets a copy of its own (vm_unshare, which
+// is the same path same-page merging uses -- a clone is that, arranged
+// deliberately rather than discovered).
+//
+// The two locks are never held together. The original's page is
+// write-protected and a reference taken under its lock; the clone's page
+// is installed under the clone's. In between the frame is held by that
+// reference and cannot go anywhere.
+int
+vm_clone_page(struct vm *dst, struct vm *src, uint64 gpa)
+{
+  uint64 off = (gpa - G_RAM_BASE) & ~(uint64)(PGSIZE - 1);
+  int k = off / HCHUNK, i = (off % HCHUNK) / PGSIZE;
+  uint64 frame = 0;
+
+  if (vm_split(src, G_RAM_BASE + off) < 0)
+    return -1;
+  acquire(&src->memlock);
+  uint64 c = src->chunk ? src->chunk[k] : 0;
+  if (c && gc_split(c) && (frame = gc_pages(c)[i]) != 0) {
+    uint64 *pte = gstage_pte(src, G_RAM_BASE + off, 0, 0);
+    if (pte && (*pte & PTE_V)) {
+      *pte &= ~(uint64)PTE_W;
+      PA2PAGE(frame)->flags |= PG_KSM;
+      page_get(PA2PAGE(frame));
+    } else {
+      frame = 0;
+    }
+  }
+  release(&src->memlock);
+  if (frame == 0)
+    return 0;                 // nothing there: the clone has nothing either
+  vm_fence_sync(src);
+
+  // and into the clone, which has nothing at this address yet. Its chunk
+  // has to be the page-at-a-time kind before one page can be put in it:
+  // an empty one of those is a page of zeroes and costs nothing until
+  // something is mapped through it.
+  uint64 *spare = (uint64 *)kalloc();
+  if (spare == 0) {
+    page_put(PA2PAGE(frame));
+    return -1;
+  }
+  memset(spare, 0, PGSIZE);
+  int r = -1;
+  acquire(&dst->memlock);
+  if (dst->chunk == 0) {
+    release(&dst->memlock);
+    kfree(spare);
+    page_put(PA2PAGE(frame));
+    return -1;
+  }
+  if (dst->chunk[k] == 0) {
+    dst->chunk[k] = (uint64)spare | GC_SPLIT;
+    dst->nsplit++;
+    spare = 0;
+  } else if (!gc_split(dst->chunk[k])) {
+    // it was backed by a 2 MB block (the clone's own faults got there
+    // first): split it, which is what gstage_split is for
+    if (gstage_split(dst, k, spare) == 0)
+      spare = 0;
+  }
+  uint64 dc = dst->chunk[k];
+  if (dc && gc_split(dc) && gc_pages(dc)[i] == 0) {
+    // gstage_pte(vm, gpa, level, alloc): a page is level 0, and the
+    // tables above it have to be made, because the clone has nothing
+    // here yet. (Level 1 with no allocation -- which this asked for at
+    // first -- is a 2 MB entry that is not there, so every page failed.)
+    uint64 *pte = gstage_pte(dst, G_RAM_BASE + off, 0, 1);
+    if (pte) {
+      gc_pages(dc)[i] = frame;
+      *pte = PA2PTE(frame) | (GPTE_LEAF & ~(uint64)PTE_W);
+      dst->resident += PGSIZE;
+      r = 0;
+    }
+  } else if (dc && gc_split(dc) && gc_pages(dc)[i] == frame) {
+    r = 0;                   // already there: nothing to do
+  }
+  release(&dst->memlock);
+  if (spare)
+    kfree(spare);
+  if (r < 0)
+    page_put(PA2PAGE(frame));
+  return r;
+}
+
+// ---- a snapshot's write protection (kernel/vmstate.c has the rest) ----
+//
+// every backed page read-only, and every unbacked one marked as owed to
+// nobody: a page the guest had not touched when the snapshot began is not
+// part of the machine that was snapshotted, whatever it does with it
+// afterwards. memlock is taken a chunk at a time rather than for the
+// whole walk, so a fault on another hart waits for one chunk at worst.
+void
+vm_snap_protect(struct vm *vm, uint32 *done, uint32 *dirty, int npages)
+{
+  for (int k = 0; k < vm->nchunks; k++) {
+    uint64 gpa0 = G_RAM_BASE + (uint64)k * HCHUNK;
+    acquire(&vm->memlock);
+    int backed = vm->chunk && vm->chunk[k] != 0;
+    release(&vm->memlock);
+    if (!backed) {
+      // nothing to protect, and nothing anybody is owed. A pre-copy has
+      // no `done' bitmap: it sends what is dirty and asks the memory
+      // itself what is backed, round by round.
+      if (done)
+        for (int i = 0; i < HCHUNK_PAGES; i++)
+          if (k * HCHUNK_PAGES + i < npages)
+            vmsnap_set(done, k * HCHUNK_PAGES + i);
+      continue;
+    }
+    int split_ok = 1;
+    // a chunk still backed by one 2 MB block has to become pages before
+    // any one of them can be made read-only on its own
+    vm_split(vm, gpa0);
+    acquire(&vm->memlock);
+    uint64 c = vm->chunk ? vm->chunk[k] : 0;
+    for (int i = 0; i < HCHUNK_PAGES; i++) {
+      int idx = k * HCHUNK_PAGES + i;
+      if (idx >= npages)
+        break;
+      uint64 frame = (c && gc_split(c)) ? gc_pages(c)[i] : 0;
+      uint64 *pte = frame ? gstage_pte(vm, gpa0 + (uint64)i * PGSIZE, 0, 0) : 0;
+      if (pte && (*pte & PTE_V))
+        *pte &= ~(uint64)PTE_W;
+      else if (done)
+        vmsnap_set(done, idx);
+      else if (dirty && frame == 0 && c) {
+        // a chunk that is still one 2 MB block -- vm_split had no memory
+        // for the page table -- stays writable, and a write to it faults
+        // on nothing. A pre-copy carries all of it again rather than
+        // sending a page the guest may have changed underneath it.
+        vmsnap_mark(dirty, idx);
+        split_ok = 0;
+      }
+    }
+    release(&vm->memlock);
+    if (!split_ok)
+      printk("hyp: vm %d: chunk %d would not split; its pages go again\n",
+             vm->id, k);
+  }
+  vm_fence_sync(vm);
+}
+
+// and afterwards: a page the guest never wrote to while the snapshot ran
+// is still read-only and has to be writable again. One that is shared
+// with another machine stays read-only, which is what PG_KSM means.
+void
+vm_snap_unprotect(struct vm *vm)
+{
+  for (int k = 0; k < vm->nchunks; k++) {
+    uint64 gpa0 = G_RAM_BASE + (uint64)k * HCHUNK;
+    acquire(&vm->memlock);
+    uint64 c = vm->chunk ? vm->chunk[k] : 0;
+    if (c && gc_split(c)) {
+      for (int i = 0; i < HCHUNK_PAGES; i++) {
+        uint64 frame = gc_pages(c)[i];
+        if (frame == 0)
+          continue;
+        uint64 *pte = gstage_pte(vm, gpa0 + (uint64)i * PGSIZE, 0, 0);
+        if (pte && (*pte & PTE_V) && !(PA2PAGE(frame)->flags & PG_KSM))
+          *pte |= PTE_W;
+      }
+    }
+    release(&vm->memlock);
+  }
+  vm_fence_sync(vm);
 }
 
 // a store to a page this VM maps read-only. if it is shared, the VM is
@@ -653,6 +843,8 @@ vm_unshare(struct vm *vm, uint64 gpa)
 static int
 gpa2hpa_locked(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
 {
+  if (vm->chunk == 0)
+    return -1;        // its memory has been freed: nothing is backed
   if (gpa < G_RAM_BASE || gpa >= G_RAM_BASE + vm->ram_size)
     return -1;
   uint64 off = gpa - G_RAM_BASE;
@@ -738,6 +930,25 @@ vm_copyin(struct vm *vm, void *dst, uint64 gpa, uint64 n)
 int
 vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n)
 {
+  // Every host write into guest memory comes through here: a block the
+  // disk read, a frame that arrived, the console's echo. None of them
+  // faults, so a snapshot or a pre-copy in progress would never hear
+  // about them and would carry the page as it was before -- a guest that
+  // read a file while it was being migrated would arrive with the old
+  // contents of the buffer it read into. Marking the pages dirty is all
+  // that is needed and is safe from any context: this is called with
+  // netlock held, where writing a page to a file would not be.
+  if (vm->snap.active && vm->snap.dirty && n > 0 &&
+      gpa >= G_RAM_BASE && gpa < G_RAM_BASE + vm->ram_size) {
+    uint64 last = gpa + n - 1;
+    if (last >= G_RAM_BASE + vm->ram_size)
+      last = G_RAM_BASE + vm->ram_size - 1;
+    for (uint64 p = gpa & ~(uint64)(PGSIZE - 1); p <= last; p += PGSIZE) {
+      int idx = (int)((p - G_RAM_BASE) / PGSIZE);
+      if (idx < vm->snap.npages)
+        vmsnap_mark(vm->snap.dirty, idx);
+    }
+  }
   while (n > 0) {
     uint64 hpa, len;
     if (copy_step(vm, gpa, &hpa, &len) < 0)
@@ -761,6 +972,246 @@ vm_lookup(int id)
   if (id < 0 || id >= NVM)
     return 0;
   return vmtab[id]; // 0 for a slot never used
+}
+
+// who may touch a machine: whoever created it, and anybody with
+// ---- machines behind a gateway ----
+
+int
+cgw_members(struct cgw *g)
+{
+  int n = 0;
+
+  for (int i = 0; i < NVM; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm && vm->state != VM_FREE && vm->gw == g)
+      n++;
+  }
+  return n;
+}
+
+struct vm *
+cgw_member_by_ip(struct cgw *g, uint32 ip)
+{
+  for (int i = 0; i < NVM; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm && vm->state == VM_RUNNING && vm->gw == g && vm->cfg.ip == ip)
+      return vm;
+  }
+  return 0;
+}
+
+// the machine behind this gateway that published this port, and the port
+// it means inside. 1 if there is one.
+int
+cgw_published(struct cgw *g, uint8 proto, uint16 hport, struct vm **out,
+              uint16 *gport)
+{
+  for (int i = 0; i < NVM; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state != VM_RUNNING || vm->gw != g || vm->cfg.ip == 0)
+      continue;
+    if (vm_port_lookup(vm, proto, hport, gport)) {
+      if (out)
+        *out = vm;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// ---- published ports ----
+//
+// A machine's ports are a small list rather than a table: eight is more
+// than a guest with one address has any use for, and a linear walk of
+// eight costs less than anything cleverer would.
+
+int
+vm_port_add(struct vm *vm, uint8 proto, uint16 hport, uint16 gport)
+{
+  if (hport == 0 || (proto != IPPROTO_TCP && proto != IPPROTO_UDP))
+    return -EINVAL;
+  if (gport == 0)
+    gport = hport;
+  acquire(&vm->portlock);
+  for (int i = 0; i < vm->nports; i++) {
+    if (vm->ports[i].proto == proto && vm->ports[i].hport == hport) {
+      vm->ports[i].gport = gport;      // the same port, aimed elsewhere
+      release(&vm->portlock);
+      return 0;
+    }
+  }
+  if (vm->nports >= NPPORT) {
+    release(&vm->portlock);
+    return -ENOSPC;
+  }
+  vm->ports[vm->nports].proto = proto;
+  vm->ports[vm->nports].hport = hport;
+  vm->ports[vm->nports].gport = gport;
+  vm->nports++;
+  release(&vm->portlock);
+  return 0;
+}
+
+int
+vm_port_rm(struct vm *vm, uint8 proto, uint16 hport)
+{
+  int found = -ESRCH;
+
+  acquire(&vm->portlock);
+  for (int i = 0; i < vm->nports; i++) {
+    if (vm->ports[i].proto != proto || vm->ports[i].hport != hport)
+      continue;
+    vm->ports[i] = vm->ports[vm->nports - 1];
+    vm->nports--;
+    found = 0;
+    break;
+  }
+  release(&vm->portlock);
+  return found;
+}
+
+// is this port published, and what port inside does it mean? Called on
+// every frame the switch would deliver to the machine, so it takes the
+// lock and nothing else.
+int
+vm_port_lookup(struct vm *vm, uint8 proto, uint16 hport, uint16 *gport)
+{
+  int found = 0;
+
+  acquire(&vm->portlock);
+  for (int i = 0; i < vm->nports; i++) {
+    if (vm->ports[i].proto == proto && vm->ports[i].hport == hport) {
+      if (gport)
+        *gport = vm->ports[i].gport;
+      found = 1;
+      break;
+    }
+  }
+  release(&vm->portlock);
+  return found;
+}
+
+// CAP_SYS_ADMIN. Every hypervisor call goes through here, so a user
+// who guesses another user's VM id learns only that it is not theirs.
+int
+vm_access(struct vm *vm)
+{
+  struct proc *p = myproc();
+
+  if (vm == 0)
+    return 0;
+  if (vm->owner == p->cred.euid)
+    return 1;
+  // a descriptor is a capability: whoever holds one -- because it was
+  // passed to them over a socket, or inherited -- may work the machine
+  // it names, whoever they are.
+  if (proc_has_file(p, FD_VM, vm))
+    return 1;
+  return cap_ok(CAP_SYS_ADMIN);
+}
+
+// a machine by name. Names are unique among one user's machines, so
+// two people may each have a `web' and neither can reach the other's;
+// a search by somebody privileged finds their own first and then the
+// rest, which is the only case where the answer depends on the order
+// of the table.
+struct vm *
+vm_by_name(const char *name)
+{
+  struct vm *any = 0;
+
+  if (name == 0 || name[0] == 0)
+    return 0;
+  acquire(&vmslock);
+  for (int i = 0; i < NVM; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state == VM_FREE)
+      continue;
+    if (strncmp(vm->cfg.name, name, VM_NAMELEN) != 0)
+      continue;
+    if (vm->owner == myproc()->cred.euid) {
+      release(&vmslock);
+      return vm;
+    }
+    if (any == 0 && cap_ok(CAP_SYS_ADMIN))
+      any = vm;
+  }
+  release(&vmslock);
+  return any;
+}
+
+// a descriptor names a machine: while one is open the machine is not
+// reused, and closing the last one stops an unnamed machine. A named
+// machine is a thing in its own right -- `vmm ls' shows it, anyone who
+// may reach it can open it again -- so it stays.
+struct vm *
+vm_fdget(struct vm *vm)
+{
+  acquire(&vm->lock);
+  vm->fdref++;
+  release(&vm->lock);
+  return vm;
+}
+
+// the whole table, for /proc/vmm: every machine, whoever it belongs to.
+// procfs checks the reader.
+int
+vm_list(struct vmentry *out, int max)
+{
+  int n = 0;
+
+  acquire(&vmslock);
+  for (int i = 0; i < NVM && n < max; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state == VM_FREE)
+      continue;
+    struct vmentry *e = &out[n++];
+    e->id = vm->id;
+    e->state = vm->state;
+    e->kind = vm->vic_kind;
+    e->nvcpu = vm->nvcpu;
+    e->fdref = vm->fdref;
+    e->owner = vm->owner;
+    e->mem_mb = vm->ram_size / (1024 * 1024);
+    e->resident_mb = vm->resident / (1024 * 1024);
+    safestrcpy(e->name, vm->cfg.name, VM_NAMELEN);
+  }
+  release(&vmslock);
+  return n;
+}
+
+// a guest can do the same wrong thing as fast as it can run, and a
+// host that printed every one would fill its console and spend its
+// time formatting. The first few are printed, then one in every
+// 4096, and the count is what the message carries.
+int
+vm_gripe(uint64 *count)
+{
+  uint64 n = ++(*count);
+
+  return n <= 8 || (n & 4095) == 0;
+}
+
+// which machine a descriptor names, for fstat and for /proc
+int
+vm_fdid(struct vm *vm)
+{
+  return vm->id;
+}
+
+void
+vm_fdput(struct vm *vm)
+{
+  acquire(&vm->lock);
+  int last = (--vm->fdref == 0);
+  int named = vm->cfg.name[0] != 0;
+  int gone = vm->state == VM_FREE;
+  if (vm->fdref < 0)
+    panic("vm_fdput");
+  release(&vm->lock);
+  if (last && !named && !gone)
+    vm_destroy(vm);
 }
 
 static void
@@ -798,6 +1249,11 @@ vm_free_resources(struct vm *vm)
       }
       vm->chunk[i] = 0;
     }
+    // the count first: a reader checks it before indexing the table
+    // (ksm_scan_chunk does, twice), so the table must not go while a
+    // count that admits an index is still there to be read.
+    vm->nchunks = 0;
+    __sync_synchronize();
     kfree((void *)vm->chunk);
     vm->chunk = 0;
   }
@@ -1007,8 +1463,16 @@ static int vm_load(struct vm *vm);
 
 // create a VM from cfg: memory, devices, the disk image file, and the
 // kernel loaded into guest RAM. returns the id, or -1.
-int
-vm_create(struct vmconfig *cfg)
+// a slot being filled in: claimed, but not yet VM_NEW, because
+// vm_create zeroes the whole structure -- state included -- after it
+// has taken the slot. Without this a second vm_create could take the
+// same slot during that window.
+static char vmclaim[NVM];
+
+static int vm_create_flags(struct vmconfig *cfg, int noload);
+
+static int
+vm_create_flags(struct vmconfig *cfg, int noload)
 {
   if (!plat.has_h)
     return -1;
@@ -1018,13 +1482,27 @@ vm_create(struct vmconfig *cfg)
     return -1;
   if (mem_bytes < 8 * HCHUNK || (mem_bytes % HCHUNK) != 0 || mem_bytes > VM_MAXMEM)
     return -1;
-  if (cfg->kernel[0] == 0)
+  if (cfg->kernel[0] == 0 && !noload)
     return -1;
 
   // a slot: a VM object is allocated the first time its slot is used and
   // kept for reuse (struct vm is large: vcpus, interrupt controller
   // state, console rings).
+  uint uid = myproc()->cred.euid;
+
   acquire(&vmslock);
+  // a name is how a machine is found again (vm_open), so one user may
+  // not have two of the same name at once.
+  if (cfg->name[0]) {
+    for (int i = 0; i < NVM; i++) {
+      struct vm *o = vmtab[i];
+      if (o && o->state != VM_FREE && o->owner == uid &&
+          strncmp(o->cfg.name, cfg->name, VM_NAMELEN) == 0) {
+        release(&vmslock);
+        return -1;
+      }
+    }
+  }
   struct vm *vm = 0;
   for (int i = 0; i < NVM; i++) {
     if (vmtab[i] == 0) {
@@ -1037,12 +1515,18 @@ vm_create(struct vmconfig *cfg)
       memset(nv, 0, sizeof(*nv));
       initlock(&nv->lock, "vm");
       initlock(&nv->memlock, "vmmem");
+      initsleeplock(&nv->snap.lock, "vmsnap");
       nv->id = i;
       nv->state = VM_FREE;
       vmtab[i] = nv;
     }
-    if (vmtab[i]->state == VM_FREE) {
+    // a free slot is reusable only once no descriptor names it: a
+    // machine that has exited still answers through a descriptor
+    // somebody holds, and must not turn into a different machine
+    // underneath them.
+    if (vmtab[i]->state == VM_FREE && vmtab[i]->fdref == 0 && !vmclaim[i]) {
       vm = vmtab[i];
+      vmclaim[i] = 1;
       vm->state = VM_NEW;
       break;
     }
@@ -1058,7 +1542,30 @@ vm_create(struct vmconfig *cfg)
   vm->memlock = mlk;
   vm->id = id;
   vm->state = VM_NEW;
+  vm->owner = uid;
   vm->cfg = *cfg;
+  initlock(&vm->portlock, "vmports");
+  // a machine whose gateway is a gateway object is behind it, on that
+  // object's private subnet rather than on the switch's own segment.
+  // That is the whole of how a machine gets there: the address it was
+  // given says where it is.
+  vm->gw = 0;
+  if (cfg->net == 2 && cfg->ip) {
+    struct cgw *g = cfg->gwname[0] ? cgw_find(cfg->gwname)
+                                   : (cfg->gw ? cgw_by_addr(cfg->gw) : 0);
+    // the address it was given has to be on that gateway's subnet, and
+    // the gateway has to be its default route: a machine behind a
+    // gateway reaches everything else through it.
+    if (g && cfg->gw == g->addr && (cfg->ip & g->mask) == (g->addr & g->mask))
+      vm->gw = g;
+
+  }
+  vm->nports = cfg->nports > NPPORT ? NPPORT : cfg->nports;
+  for (int i = 0; i < vm->nports; i++)
+    vm->ports[i] = cfg->ports[i];
+  acquire(&vmslock);
+  vmclaim[id] = 0;   // the slot says what it is again
+  release(&vmslock);
   vm->nvcpu = nvcpu;
   vm->ram_size = mem_bytes;
   vm->nchunks = mem_bytes / HCHUNK;
@@ -1156,7 +1663,7 @@ vm_create(struct vmconfig *cfg)
   if (vm->blk.bounce == 0)
     goto fail;
 
-  if (vm_load(vm) < 0)
+  if (!noload && vm_load(vm) < 0)
     goto fail;
 
   for (int i = 0; i < nvcpu; i++) {
@@ -1165,6 +1672,7 @@ vm_create(struct vmconfig *cfg)
     vcpu_reset(&vm->vcpu[i], vm, i);
   }
 
+  audit("vm_create", cfg->name, (uint64)id, (uint64)cfg->mem_mb, 1);
   return id;
 
 fail:
@@ -1355,6 +1863,7 @@ vm_destroy(struct vm *vm)
     release(&vm->lock);
     return -1;
   }
+  audit("vm_destroy", vm->cfg.name, (uint64)vm->id, vm->ram_size / (1024 * 1024), 1);
   if (vm->vcpus_running == 0) {
     // nobody is inside vm_run: free right here.
     vm_free_resources(vm);
@@ -1381,6 +1890,37 @@ vm_destroy(struct vm *vm)
   release(&vm->lock);
   sched_group_freeze(sg, 0);   // so its vcpus can run to their exit
   return 0;
+}
+
+int
+vm_create(struct vmconfig *cfg)
+{
+  return vm_create_flags(cfg, 0);
+}
+
+int
+vm_create_blank(struct vmconfig *cfg)
+{
+  return vm_create_flags(cfg, 1);
+}
+
+// the last thing a restore does. Every vcpu is about to enter on a hart
+// it has never run on, with a G-stage that was built page by page
+// underneath it while it did not exist, so the first entry flushes
+// everything; and no host process is inside vm_run yet.
+void
+vmstate_restored(struct vm *vm)
+{
+  acquire(&vm->lock);
+  for (int i = 0; i < vm->nvcpu; i++) {
+    struct vcpu *v = &vm->vcpu[i];
+    v->last_hart = -1;
+    v->running_hart = -1;
+    v->p = 0;
+    v->idle = 0;
+    v->fence_req |= FENCE_I | FENCE_VMA | FENCE_GVMA;
+  }
+  release(&vm->lock);
 }
 
 // make a vcpu notice a change: wake it if it is idle in wfi, or make
@@ -1433,6 +1973,14 @@ vcpu_inject(struct vcpu *v, uint64 cause, uint64 tval)
 // ---- guest entry / exit ----
 
 static uint64 hart_hgatp[NCPU];
+// write a VS CSR only if what the hardware has is not already it
+#define VS_LOAD(csr, field)                                                    \
+  do {                                                                         \
+    if (!same || v->hw_##field != v->field) {                                   \
+      csr_write(csr, v->field);                                                 \
+      v->hw_##field = v->field;                                                 \
+    }                                                                          \
+  } while (0)
 
 static void
 vcpu_enter(struct vcpu *v)
@@ -1451,6 +1999,22 @@ vcpu_enter(struct vcpu *v)
   hvip |= vic_vcpu_enter(v);
   release(&vm->lock);
 
+  int hart = cpuid();
+  // Writing the thirteen VS CSRs on every entry and reading them back on
+  // every exit is a measurable part of what an exit costs on an emulated
+  // machine: vmbench says 15.5 us for an emulated load, and skipping the
+  // writes that were not needed took about 700 ns off it -- five per cent.
+  //
+  // It is not done, and the reason is worth writing down. The obvious way
+  // is a shadow of what was last put in the hardware, written only when
+  // software has changed the value since the exit read it. Built that way,
+  // an xv6 guest died at its first page fault, and a check after the
+  // conditional writes said why: the hardware held an *older* vstimecmp,
+  // vsstatus, vsepc and vscause than the shadow claimed, with the shadow
+  // and the structure agreeing -- so something changes these registers
+  // between an exit and the next entry without going through either. Until
+  // that something is found, the entry writes all of them: five per cent
+  // is not worth a guest that dies for a reason nobody has explained.
   csr_write(CSR_VSSTATUS, v->vsstatus);
   csr_write(CSR_VSIE, v->vsie);
   csr_write(CSR_VSTVEC, v->vstvec);
@@ -1464,7 +2028,6 @@ vcpu_enter(struct vcpu *v)
     csr_write(CSR_VSISELECT, v->vsiselect);
   csr_write(CSR_HVIP, hvip);
 
-  int hart = cpuid();
   if (hart_hgatp[hart] != vm->hgatp) {
     csr_write(CSR_HGATP, vm->hgatp);
     asm volatile("hfence.gvma zero, zero" ::: "memory");
@@ -1619,6 +2182,13 @@ vcpu_idle(struct vcpu *v)
     v->wfi_sleeps++;
     sleep_prepare(v);
     release(&vm->lock);
+    // and the host's timer is set for this guest's own deadline before
+    // the sleep, not at the next tick. timer_rearm() takes the first of
+    // the tick, the slice and every idle guest's virtual timer
+    // (hyp_next_deadline) -- but nothing called it when a vcpu went to
+    // sleep, so a guest asking to be woken in 100 microseconds waited
+    // for the next host tick instead: 3.2 milliseconds, measured.
+    timer_rearm();
     sleep();
     acquire(&vm->lock);
     v->idle = 0;
@@ -1673,6 +2243,30 @@ hyp_sgei(void)
   vimsic_sgei();
 }
 
+// which bucket an exit falls in. The interrupt bit is the top one; the
+// rest are exception causes.
+static int
+exit_kind(uint64 scause)
+{
+  if ((long)scause < 0) {
+    uint64 code = scause & 0xff;
+    if (code == 5)
+      return XK_TIMER;          // supervisor timer
+    if (code == 9 || code == 10)
+      return XK_EXTERNAL;       // supervisor or guest external
+    return XK_OTHER;
+  }
+  switch (scause) {
+  case EXC_LOAD_GPF:  return XK_MMIO_LOAD;
+  case EXC_STORE_GPF: return XK_MMIO_STORE;
+  case EXC_INST_GPF:  return XK_INST_FAULT;
+  case EXC_VIRT_INST: return XK_CSR;
+  case EXC_ILLEGAL:   return XK_ILLEGAL;
+  case EXC_ECALL_VS:  return XK_ECALL;
+  default:            return XK_OTHER;
+  }
+}
+
 static int
 handle_exit(struct vcpu *v)
 {
@@ -1680,6 +2274,7 @@ handle_exit(struct vcpu *v)
   uint64 stval = r_stval();
   uint64 htval = csr_read(CSR_HTVAL);
   v->last_cause = scause;
+  v->exit_hist[exit_kind(scause)]++;
   v->last_gpa = (htval << 2) | (stval & 3);
 
   if (scause >> 63) {
@@ -1728,12 +2323,25 @@ handle_exit(struct vcpu *v)
       vm_halt(v->vm);
       return -1;
     }
+    if (t > 0 && v->vm->snap.active && v->vm->snap.precopy) {
+      // a page backed while a pre-copy is running is a page the round
+      // that is sweeping may already have passed, and it is mapped
+      // writable from the start, so nothing will fault on it again:
+      // this is the only chance to say it has to go over.
+      int idx = (int)((gpa - G_RAM_BASE) / PGSIZE);
+      if (gpa >= G_RAM_BASE && idx < v->vm->snap.npages && v->vm->snap.dirty)
+        vmsnap_mark(v->vm->snap.dirty, idx);
+    }
     if (t == 0) {
       // the page is there. a store that still faulted is a store to a
-      // page mapped read-only because it is shared, and the writer
-      // gets a copy of its own (see vm_unshare).
-      if (scause == EXC_STORE_GPF)
+      // page mapped read-only because it is shared, or because a
+      // snapshot has not written it out yet: the snapshot gets it as it
+      // was, and then the writer gets a copy of its own (vm_unshare).
+      if (scause == EXC_STORE_GPF) {
+        if (v->vm->snap.active)
+          vmsnap_before_write(v->vm, gpa);
         vm_unshare(v->vm, gpa);
+      }
       return 0;
     }
     if (t < 0) {
@@ -1771,8 +2379,10 @@ handle_exit(struct vcpu *v)
     return hyp_mmio(v, gpa, scause == EXC_STORE_GPF, inst);
   }
   case EXC_INST_GPF:
-    printk("hyp: vm %d vcpu %d: instruction fetch from unmapped gpa 0x%lx (pc 0x%lx)\n",
-           v->vm->id, v->id, (htval << 2) | (stval & 3), v->pc);
+    if (vm_gripe(&v->vm->g_fault))
+      printk("hyp: vm %d vcpu %d: instruction fetch from unmapped gpa 0x%lx "
+             "(pc 0x%lx, %ld times)\n", v->vm->id, v->id,
+             (htval << 2) | (stval & 3), v->pc, v->vm->g_fault);
     vcpu_inject(v, EXC_INST_ACCESS, stval);
     return 0;
   default:

@@ -130,6 +130,8 @@ tcb_alloc(void)
   return 0;
 }
 
+static void ooo_free(struct tcpcb *t);
+
 static void
 tcb_free(struct tcpcb *t)
 {
@@ -140,11 +142,13 @@ tcb_free(struct tcpcb *t)
       c->state = TCPS_CLOSED;
       tring_free(&c->snd);
       tring_free(&c->rcv);
+      ooo_free(c);
       c->used = 0;
     }
   }
   tring_free(&t->snd);
   tring_free(&t->rcv);
+  ooo_free(t);
   if (t->sock)
     t->sock->tcp = 0;
   t->used = 0;
@@ -152,12 +156,12 @@ tcb_free(struct tcpcb *t)
 }
 
 static struct tcpcb *
-tcb_find(uint32 lip, uint16 lport, uint32 rip, uint16 rport)
+tcb_find(struct netns *ns, uint32 lip, uint16 lport, uint32 rip, uint16 rport)
 {
   struct tcpcb *listener = 0;
   for (int i = 0; i < NTCP; i++) {
     struct tcpcb *t = &tcbs[i];
-    if (!t->used || t->lport != lport)
+    if (!t->used || t->ns != ns || t->lport != lport)
       continue;
     if (t->state == TCPS_LISTEN) {
       listener = t;
@@ -211,7 +215,7 @@ tcp_send_segment(struct tcpcb *t, uint32 seq, uint32 ack, uint8 flags, uint32 da
     o[3] = TCP_MSS & 0xff;
   }
   h->sum = l4_checksum(t->lip, t->rip, IPPROTO_TCP, h, m->len);
-  net_tx_ip(m, t->rip, IPPROTO_TCP);
+  net_tx_ip_ns(t->ns, m, t->rip, IPPROTO_TCP);
 }
 
 static void
@@ -222,7 +226,8 @@ tcp_send_ack(struct tcpcb *t)
 
 // send a reset in reply to a segment that has no connection.
 static void
-tcp_send_rst(uint32 lip, uint16 lport, uint32 rip, uint16 rport, uint32 seq, uint32 ack, int with_ack)
+tcp_send_rst(struct netns *ns, uint32 lip, uint16 lport, uint32 rip,
+             uint16 rport, uint32 seq, uint32 ack, int with_ack)
 {
   struct mbuf *m = mbufalloc(MBUF_HEADROOM);
   if (m == 0)
@@ -236,7 +241,7 @@ tcp_send_rst(uint32 lip, uint16 lport, uint32 rip, uint16 rport, uint32 seq, uin
   h->off = (sizeof(*h) / 4) << 4;
   h->flags = TCP_RST | (with_ack ? TCP_ACK : 0);
   h->sum = l4_checksum(lip, rip, IPPROTO_TCP, h, m->len);
-  net_tx_ip(m, rip, IPPROTO_TCP);
+  net_tx_ip_ns(ns, m, rip, IPPROTO_TCP);
 }
 
 static void
@@ -254,6 +259,25 @@ tcp_output(struct tcpcb *t)
   if (t->state != TCPS_ESTABLISHED && t->state != TCPS_CLOSE_WAIT && t->state != TCPS_FIN_WAIT_1 &&
       t->state != TCPS_CLOSING && t->state != TCPS_LAST_ACK)
     return;
+  // A segment to one of this machine's own addresses is delivered by the
+  // send: tcp_send_segment goes to the loopback, which hands the packet
+  // to ip_rx before it returns, and the answer to it comes back into
+  // this connection -- all of it inside the call below. Two things
+  // follow. The sequence state is moved on *before* the segment goes,
+  // because an acknowledgement that arrives during the send is measured
+  // against snd_nxt and is thrown away as "acking something we never
+  // sent" if it still holds yesterday's value. And a tcp_output that
+  // the answer calls returns at once rather than sending the same bytes
+  // a second time: nothing can be added to the ring meanwhile, because
+  // the writer would need netlock, which this call holds.
+  //
+  // (Before this, every loopback segment was acknowledged into a stale
+  // snd_nxt, the acknowledgement was dropped, and the conversation went
+  // at the speed of the retransmission timer -- which is why a local
+  // fetch took a second and a migration ran at 45 KB/s.)
+  if (t->sending)
+    return;
+  t->sending = 1;
   uint32 unsent_end = t->snd_una + tring_len(&t->snd); // first byte not in the ring
   uint32 wnd = MIN(t->snd_wnd, t->cwnd);
   int sent = 0;
@@ -271,18 +295,21 @@ tcp_output(struct tcpcb *t)
       t->rtt_seq = t->snd_nxt + len;
       t->rtt_start = ticks;
     }
-    tcp_send_segment(t, t->snd_nxt, t->rcv_nxt, flags, len, 0);
+    uint32 seq = t->snd_nxt;
     t->snd_nxt += len;
+    tcp_send_segment(t, seq, t->rcv_nxt, flags, len, 0);
     sent = 1;
   }
   if (t->fin_queued && !t->fin_sent && t->snd_nxt == unsent_end) {
-    tcp_send_segment(t, t->snd_nxt, t->rcv_nxt, TCP_FIN | TCP_ACK, 0, 0);
+    uint32 seq = t->snd_nxt;
     t->snd_nxt += 1;
     t->fin_sent = 1;
+    tcp_send_segment(t, seq, t->rcv_nxt, TCP_FIN | TCP_ACK, 0, 0);
     sent = 1;
   }
   if (sent)
     rtx_start(t);
+  t->sending = 0;
 }
 
 // retransmit the oldest unacknowledged segment. caller holds netlock.
@@ -328,8 +355,15 @@ tcp_timer(void)
         tcb_free(t);
       continue;
     }
+    if (t->conn_deadline && (int)(ticks - t->conn_deadline) >= 0) {
+      t->conn_deadline = 0;
+      tcb_wakeup(t);        // the waiting connect gives up on its own
+    }
     if (t->rtx_timer && --t->rtx_timer == 0) {
-      if (++t->retries > 10) {
+      // a connection that has not been answered is given up on sooner
+      // than one that has: five SYNs is half a minute of asking, and
+      // ten retransmissions is for a conversation that exists.
+      if (++t->retries > (t->state == TCPS_SYN_SENT ? 5 : 10)) {
         // give up: reset the connection.
         t->rcv_rst = 1;
         t->state = TCPS_CLOSED;
@@ -343,10 +377,39 @@ tcp_timer(void)
         t->ssthresh = 2 * t->mss;
       t->cwnd = t->mss;
       t->rto *= 2;
-      if (t->rto > SEC_TICKS(60))
-        t->rto = SEC_TICKS(60);
+      // A minute between attempts is for a path that may come back in a
+      // minute. Everything this kernel talks to is on the same machine or
+      // one hop away, and a connection that has not been answered in
+      // eight seconds is not going to be answered by waiting longer --
+      // meanwhile a transfer that lost one segment is stopped for the
+      // whole of it.
+      if (t->rto > SEC_TICKS(8))
+        t->rto = SEC_TICKS(8);
       tcp_retransmit(t);
       t->rtx_timer = t->rto;
+    }
+    // zero-window probe. With the peer's window shut there is nothing to
+    // retransmit and nothing that may be sent, so neither timer above is
+    // running: if the update that opens the window is lost, both ends
+    // wait for ever. One byte the peer is not obliged to take makes it
+    // answer with the window it has now.
+    if ((t->state == TCPS_ESTABLISHED || t->state == TCPS_CLOSE_WAIT) &&
+        t->snd_wnd == 0 && tring_len(&t->snd) > 0 && t->rtx_timer == 0) {
+      if (t->persist == 0 || --t->persist == 0) {
+        // one byte of the data that is waiting, sent as data and counted
+        // as data: a probe that does not advance snd_nxt is a byte the
+        // peer may take and acknowledge, leaving this end with an
+        // acknowledgement for something it does not believe it sent --
+        // which tcp_ack drops, and the connection stops for good. With it
+        // counted, the retransmission timer takes over the asking.
+        uint32 seq = t->snd_nxt;
+        t->snd_nxt += 1;
+        rtx_start(t);
+        tcp_send_segment(t, seq, t->rcv_nxt, TCP_ACK, 1, 0);
+        t->persist = SEC_TICKS(1);
+      }
+    } else {
+      t->persist = 0;
     }
   }
 }
@@ -380,13 +443,29 @@ static int
 tcp_ack(struct tcpcb *t, uint32 ack)
 {
   if (SEQ_LEQ(ack, t->snd_una)) {
-    if (ack == t->snd_una && tring_len(&t->snd) > 0 && ++t->dupacks == 3) {
-      // fast retransmit
-      t->ssthresh = MIN(t->cwnd, t->snd_nxt - t->snd_una) / 2;
-      if (t->ssthresh < 2 * t->mss)
-        t->ssthresh = 2 * t->mss;
-      t->cwnd = t->ssthresh + 3 * t->mss;
-      tcp_retransmit(t);
+    if (ack == t->snd_una && tring_len(&t->snd) > 0) {
+      t->dupacks++;
+      // Fast retransmit, with the threshold the window can actually
+      // reach. Three duplicate acknowledgements need four segments in
+      // flight, and this stack's send ring is eight kilobytes: a window
+      // of two segments never gets there, so every lost segment used to
+      // cost a whole retransmission timeout -- and the timeout doubles.
+      // A migration on a link that drops one frame of a back-to-back
+      // pair went from 45 KB/s to a dead stop that way, one segment per
+      // sixty seconds. With fewer than four segments outstanding the
+      // threshold is one less than what is outstanding (RFC 5827's early
+      // retransmit), which recovers in a round trip instead.
+      uint32 out = (t->snd_nxt - t->snd_una + t->mss - 1) / t->mss;
+      int thresh = 3;
+      if (out > 1 && out < 4)
+        thresh = (int)out - 1;
+      if (t->dupacks == thresh) {
+        t->ssthresh = MIN(t->cwnd, t->snd_nxt - t->snd_una) / 2;
+        if (t->ssthresh < 2 * t->mss)
+          t->ssthresh = 2 * t->mss;
+        t->cwnd = t->ssthresh + 3 * t->mss;
+        tcp_retransmit(t);
+      }
     }
     return 0;
   }
@@ -409,7 +488,9 @@ tcp_ack(struct tcpcb *t, uint32 ack)
   return 1;
 }
 
-static void
+// hand data to the application's ring, as much of it as there is room
+// for, and say how much that was.
+static uint32
 tcp_deliver(struct tcpcb *t, char *data, uint32 len)
 {
   uint32 room = tring_space(&t->rcv);
@@ -417,6 +498,75 @@ tcp_deliver(struct tcpcb *t, char *data, uint32 len)
     len = room; // the window said so; excess is dropped and retransmitted
   tring_write(&t->rcv, data, len);
   t->rcv_nxt += len;
+  return len;
+}
+
+// ---- what arrived out of order ----
+//
+// A segment that starts beyond rcv_nxt is not something to throw away:
+// the piece in front of it will be retransmitted, and this one is then
+// the next piece. What is kept here is the mbuf itself, which is why
+// there are only four of them.
+
+static void
+ooo_free(struct tcpcb *t)
+{
+  for (int i = 0; i < t->nooo; i++)
+    if (t->ooo[i].m)
+      mbuffree(t->ooo[i].m);
+  t->nooo = 0;
+}
+
+// keep this segment. returns 1 when it has taken the mbuf.
+static int
+ooo_keep(struct tcpcb *t, struct mbuf *m, char *data, uint32 seq, uint32 len)
+{
+  if (len == 0 || t->nooo >= TCP_OOO)
+    return 0;
+  for (int i = 0; i < t->nooo; i++)
+    if (t->ooo[i].seq == seq)
+      return 0;                      // already have this one
+  t->ooo[t->nooo].m = m;
+  t->ooo[t->nooo].data = data;
+  t->ooo[t->nooo].seq = seq;
+  t->ooo[t->nooo].len = len;
+  t->nooo++;
+  return 1;
+}
+
+// deliver whatever the hole in front of it was waiting for. returns the
+// number of bytes that went in.
+static uint32
+ooo_drain(struct tcpcb *t)
+{
+  uint32 total = 0;
+
+  for (int again = 1; again && t->nooo > 0;) {
+    again = 0;
+    for (int i = 0; i < t->nooo; i++) {
+      uint32 seq = t->ooo[i].seq, len = t->ooo[i].len;
+      int done = 0;
+      if (SEQ_LEQ(seq + len, t->rcv_nxt)) {
+        done = 1;                    // all of it is old
+      } else if (SEQ_LEQ(seq, t->rcv_nxt)) {
+        uint32 skip = t->rcv_nxt - seq;
+        uint32 took = tcp_deliver(t, t->ooo[i].data + skip, len - skip);
+        total += took;
+        if (took == len - skip) {
+          done = 1;
+          again = 1;
+        } else {
+          return total;              // no room: it waits where it is
+        }
+      }
+      if (done) {
+        mbuffree(t->ooo[i].m);
+        t->ooo[i] = t->ooo[--t->nooo];
+        i--;
+      }
+    }
+  }
+  return total;
 }
 
 static void
@@ -427,6 +577,7 @@ listen_accept_syn(struct tcpcb *l, uint32 lip, uint32 rip, uint16 rport, uint32 
   struct tcpcb *t = tcb_alloc();
   if (t == 0)
     return;
+  t->ns = l->ns;
   t->lip = lip;
   t->lport = l->lport;
   t->rip = rip;
@@ -446,7 +597,7 @@ listen_accept_syn(struct tcpcb *l, uint32 lip, uint32 rip, uint16 rport, uint32 
 }
 
 void
-tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
+tcp_rx(struct netns *ns, struct mbuf *m, uint32 src, uint32 dst)
 {
   struct tcp *h = (struct tcp *)m->head;
   if (m->len < sizeof(*h))
@@ -480,10 +631,10 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
   char *data = m->head + hl;
   uint32 datalen = m->len - hl;
 
-  struct tcpcb *t = tcb_find(dst, dport, src, sport);
+  struct tcpcb *t = tcb_find(ns, dst, dport, src, sport);
   if (t == 0) {
     if (!(flags & TCP_RST))
-      tcp_send_rst(dst, dport, src, sport, (flags & TCP_ACK) ? ack : 0, seq + datalen + ((flags & TCP_SYN) ? 1 : 0), !(flags & TCP_ACK));
+      tcp_send_rst(ns, dst, dport, src, sport, (flags & TCP_ACK) ? ack : 0, seq + datalen + ((flags & TCP_SYN) ? 1 : 0), !(flags & TCP_ACK));
     goto drop;
   }
 
@@ -552,8 +703,12 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
     datalen -= skip;
     seq = t->rcv_nxt;
   } else if (SEQ_GT(seq, t->rcv_nxt)) {
-    // a hole: duplicate ACK asks for the missing piece
+    // a hole: the duplicate acknowledgement asks for the missing piece,
+    // and this segment waits for it rather than being thrown away.
+    int kept = ooo_keep(t, m, data, seq, datalen);
     tcp_send_ack(t);
+    if (kept)
+      return;                 // the mbuf belongs to the queue now
     goto drop;
   }
 
@@ -573,7 +728,7 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
         tcb_wakeup(l);
       } else {
         t->state = TCPS_CLOSED;
-        tcp_send_rst(t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
+        tcp_send_rst(t->ns, t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
         tcb_free(t);
         goto drop;
       }
@@ -584,6 +739,7 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
 
   int newack = tcp_ack(t, ack);
   // window update
+  uint32 oldwnd = t->snd_wnd;
   if (SEQ_LT(t->snd_wl1, seq) || (t->snd_wl1 == seq && SEQ_LEQ(t->snd_wl2, ack))) {
     t->snd_wnd = win;
     t->snd_wl1 = seq;
@@ -617,6 +773,9 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
   int must_ack = 0;
   if (datalen > 0 && (t->state == TCPS_ESTABLISHED || t->state == TCPS_FIN_WAIT_1 || t->state == TCPS_FIN_WAIT_2)) {
     tcp_deliver(t, data, datalen);
+    // and whatever was waiting behind this piece
+    if (t->nooo > 0)
+      ooo_drain(t);
     must_ack = 1;
     tcb_wakeup(t);
   }
@@ -639,8 +798,25 @@ tcp_rx(struct mbuf *m, uint32 src, uint32 dst)
   }
   if (must_ack)
     tcp_send_ack(t);
-  if (newack)
+  if (newack || t->snd_wnd > oldwnd) {
+    // an acknowledgement is room in the send ring, and somebody may be
+    // asleep waiting for exactly that. Without this wakeup a sender
+    // stalls for ever the moment its ring fills: everything smaller than
+    // the ring went through, which is why nothing noticed until a
+    // machine was migrated down a socket (and a plain `nc' of 256 KB
+    // stalls the same way, loopback included).
+    //
+    // A window that has just opened counts as well, and for the same
+    // reason. A receiver whose buffer filled advertises nothing; the
+    // segment that says it has room again acknowledges no new data, so
+    // without the second test here nothing would send into the room it
+    // announced -- and both ends would wait for the other. That is the
+    // second half of the same defect: a migration stopped after five
+    // pages of guest memory with data in the sender's ring, an open
+    // window, and neither side about to speak again.
+    tcb_wakeup(t);
     tcp_output(t);
+  }
 drop:
   mbuffree(m);
 }
@@ -665,7 +841,8 @@ tcp_connect(struct sock *s)
   s->tcp = t;
   // talking to ourselves: the local address is the loopback one too,
   // because that is what the answer will be addressed to
-  t->lip = (s->rip >> 24) == 127 ? s->rip : netcfg.ip;
+  t->ns = s->ns;
+  t->lip = (s->rip >> 24) == 127 ? s->rip : net_src_for(s->ns, s->rip);
   t->lport = s->lport;
   t->rip = s->rip;
   t->rport = s->rport;
@@ -678,22 +855,41 @@ tcp_connect(struct sock *s)
   t->rtt_start = ticks;
   tcp_send_segment(t, t->iss, 0, TCP_SYN, 0, 1);
   t->rtx_timer = t->rto;
+  uint t0 = ticks;
+  int timedout = 0;
+  t->conn_deadline = s->sndtimeo ? t0 + (uint)s->sndtimeo : 0;
   while (t->state == TCPS_SYN_SENT) {
     if (killed(myproc()))
       break;
+    // SO_SNDTIMEO bounds the wait: a program that says how long it will
+    // wait for a connection is told when that is up
+    if (s->sndtimeo && (int)(ticks - t0) >= s->sndtimeo) {
+      timedout = 1;
+      break;
+    }
     sleep_prepare(t);
     release(&netlock);
     sleep_intr();
     acquire(&netlock);
   }
+  t->conn_deadline = 0;
   int ok = (t->state == TCPS_ESTABLISHED);
+  int t_rcv_rst = t->rcv_rst;
   if (!ok) {
     s->tcp = 0;
     t->sock = 0;
     tcb_free(t);
   }
+  int reset = t_rcv_rst;
   release(&netlock);
-  return ok ? 0 : -1;
+  if (ok)
+    return 0;
+  // why it failed is what the program has to know: a reset means
+  // nothing is listening there, a timeout means nothing answered at
+  // all, and those are different things to a program and to a person.
+  if (reset)
+    return -ECONNREFUSED;
+  return timedout ? -ETIMEDOUT : -EINTR;
 }
 
 int
@@ -707,7 +903,8 @@ tcp_listen(struct sock *s, int backlog)
   }
   t->sock = s;
   s->tcp = t;
-  t->lip = netcfg.ip;
+  t->ns = s->ns;
+  t->lip = 0;              // it answers on whatever address it arrives at
   t->lport = s->lport;
   t->maxbacklog = (backlog < 1) ? 1 : MIN(backlog, TCP_BACKLOG);
   t->state = TCPS_LISTEN;
@@ -764,7 +961,7 @@ tcp_accept(struct sock *s)
   acquire(&netlock);
   if (ns == 0) {
     t->state = TCPS_CLOSED;
-    tcp_send_rst(t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
+    tcp_send_rst(t->ns, t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
     tcb_free(t);
     release(&netlock);
     return 0;
@@ -825,6 +1022,10 @@ tcp_read(struct sock *s, int user, uint64 addr, int n)
     if (s->tcp != t)
       break;
   }
+  // room in the ring may be room for something the out-of-order queue is
+  // still holding
+  if (s->tcp == t && t->nooo > 0 && ooo_drain(t) > 0)
+    tcp_send_ack(t);
   // window update if the receive buffer went from cramped to roomy
   if (s->tcp == t && before < TCP_RCVBUF / 2 && tring_space(&t->rcv) >= TCP_RCVBUF / 2)
     tcp_send_ack(t);
@@ -919,7 +1120,7 @@ tcp_close(struct sock *s)
     break;
   case TCPS_SYN_RCVD:
   case TCPS_SYN_SENT:
-    tcp_send_rst(t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
+    tcp_send_rst(t->ns, t->lip, t->lport, t->rip, t->rport, t->snd_nxt, 0, 0);
     tcb_free(t);
     break;
   case TCPS_LISTEN:

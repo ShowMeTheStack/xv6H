@@ -1,0 +1,30 @@
+NAME
+     man - the manual
+
+SYNOPSIS
+     man [NAME...]
+     man -k WORD...
+
+DESCRIPTION
+     man prints the manual page for each NAME. With no arguments it
+     prints the index: every page, with the one line that says what it
+     is. With -k it prints the lines of that index which mention any of
+     the given words, which is how to find a page whose name you do not
+     know.
+
+     The pages live in one file, /usr/share/man/man.db, written at build
+     time from man/NAME.1 in the source tree. Every utility in this
+     system has a page, and the C library answers `NAME --help' from the
+     same file (the NAME, SYNOPSIS and OPTIONS sections of it), so the
+     two cannot disagree.
+
+OPTIONS
+     -k   search the index instead of printing a page
+
+EXAMPLES
+     man vmm            what the hypervisor's front end does
+     man -k namespace   every page that mentions namespaces
+     man                everything there is
+
+SEE ALSO
+     which(1)

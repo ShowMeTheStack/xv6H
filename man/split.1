@@ -1,0 +1,19 @@
+NAME
+     split - split a file into pieces
+
+SYNOPSIS
+     split [-l N] [-b SIZE] [-a N] [-d] [FILE [PREFIX]]
+
+DESCRIPTION
+     split writes FILE (or standard input) out in pieces called PREFIX
+     followed by a suffix -- aa, ab, ac by default. Without options the
+     pieces are a thousand lines each.
+
+OPTIONS
+     -l N     N lines per piece
+     -b SIZE  SIZE bytes per piece; SIZE may end in K, M or G
+     -a N     N letters of suffix
+     -d       number the suffixes instead of lettering them
+
+SEE ALSO
+     cat(1), head(1), tail(1)

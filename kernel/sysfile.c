@@ -7,6 +7,7 @@
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "param.h"
 #include "stat.h"
 #include "spinlock.h"
@@ -1249,8 +1250,102 @@ sys_mount(void)
   if (optaddr && copyinstr(myproc()->mm, opts, optaddr, sizeof(opts)) < 0)
     opts[0] = 0;
 
+  if (!cap_ok(CAP_SYS_ADMIN) ||
+      (!userns_in_root() && mntns_current() == mntns_root())) {
+    // privileged, and -- in a user namespace -- mounting into a mount
+    // namespace of its own rather than into the machine's
+    audit("mount", target, (uint64)flags, 0, 0);
+    return -EPERM;
+  }
+  if (!userns_in_root()) {
+    // and in a user namespace of its own -- a container -- only the file
+    // systems that are made out of nothing, plus a second name for a
+    // directory it can already reach. A block device is the machine's
+    // to mount: root inside a container is not root over the disks, and
+    // an ext4 image it could mount is an ext4 image it could corrupt the
+    // kernel with. What it does mount carries nodev and nosuid, so a
+    // device node or a set-user-id program it puts there is worth
+    // nothing.
+    static const char *const allowed[] = {"tmpfs", "ramfs", "procfs",
+                                          "devfs", "none"};
+    int ok = (flags & MS_BIND) != 0;
+    for (int i = 0; !ok && i < (int)(sizeof(allowed) / sizeof(allowed[0])); i++)
+      if (strncmp(type, allowed[i], sizeof(type)) == 0)
+        ok = 1;
+    if (!ok) {
+      audit("mount", target, (uint64)flags, 0, 0);
+      return -EPERM;
+    }
+    // nodev and nosuid on what it makes for itself: a device node or a
+    // set-user-id program a container puts in its own tmpfs is worth
+    // nothing. (devfs and procfs are one instance each, and the flags of
+    // a shared super are the machine's mount's -- so they are not set
+    // here, where they would be a promise this kernel cannot keep.)
+    if (strncmp(type, "tmpfs", sizeof(type)) == 0 ||
+        strncmp(type, "ramfs", sizeof(type)) == 0 || (flags & MS_BIND))
+      flags |= MS_NODEV | MS_NOSUID;
+  }
   struct super *sb = vfs_mount(source, target, type, flags, opts);
+  audit("mount", target, (uint64)flags, 0, sb != 0);
   return sb ? 0 : -EINVAL;
+}
+
+// pivot_root(new_root, put_old)
+uint64
+sys_pivot_root(void)
+{
+  char newroot[MAXPATH], putold[MAXPATH];
+  struct proc *p = myproc();
+
+  if (argstr(0, newroot, sizeof(newroot)) < 0 ||
+      argstr(1, putold, sizeof(putold)) < 0)
+    return -EFAULT;
+  if (!cap_ok(CAP_SYS_ADMIN))
+    return -EPERM;
+  struct mntns *mns = mntns_current();
+  if (mns == mntns_root())
+    return -EINVAL;      // the machine's own root is not pivoted away
+
+  // new_root has to be a mount point: what is pivoted into is a file
+  // system, not a directory of the one being left.
+  struct inode *ip = namei(newroot);
+  if (ip == 0)
+    return -ENOENT;
+  struct super *sb = 0;
+  for (int i = 0; i < MAXMOUNT; i++) {
+    struct super *c = vfs_slot(i);
+    if (c && c->root && c->root->dev == ip->dev && c->root->inum == ip->inum) {
+      sb = c;
+      break;
+    }
+  }
+  if (sb == 0) {
+    iput(ip);
+    return -EINVAL;
+  }
+  int slot = vfs_slot_of(sb);
+  // what goes is everything outside the new root; what is mounted inside
+  // it stays, which is what makes a volume bound in before the pivot
+  // still be there after it.
+  int rlen = strlen(newroot);
+  while (rlen > 1 && newroot[rlen - 1] == '/')
+    rlen--;
+  unsigned int keep = 1u << slot;
+  for (int i = 0; i < MAXMOUNT; i++) {
+    struct super *c = vfs_slot(i);
+    if (c == 0 || i == slot || !mntns_sees(mns, i))
+      continue;
+    if (strncmp(c->path, newroot, rlen) == 0 && c->path[rlen] == '/')
+      keep |= 1u << i;
+  }
+  mntns_set_root(mns, sb);
+  mntns_keep(mns, keep);
+  // and this process is in it: its root and its working directory are
+  // the new root, so a path cannot walk out of what it has pivoted into
+  proc_set_root(p, ip);
+  proc_set_cwd(p, idup(ip));
+  audit("pivot_root", newroot, 0, 0, 1);
+  return 0;
 }
 
 uint64
@@ -1260,7 +1355,14 @@ sys_umount(void)
 
   if (argstr(0, target, sizeof(target)) < 0)
     return -EFAULT;
-  return vfs_umount(target);
+  if (!cap_ok(CAP_SYS_ADMIN) ||
+      (!userns_in_root() && mntns_current() == mntns_root())) {
+    audit("umount", target, 0, 0, 0);
+    return -EPERM;
+  }
+  int r = vfs_umount(target);
+  audit("umount", target, 0, 0, r == 0);
+  return r;
 }
 
 // getdents(fd, buf, len): directory entries in the POSIX shape, so
@@ -2066,6 +2168,20 @@ do_chown(struct inode *ip, int uid, int gid)
 
   if (ip->sb && ip->sb->readonly)
     return -EROFS;
+  // the numbers came from a program, so they are its namespace's: a
+  // name the namespace does not have is not an owner it may name
+  if (uid >= 0) {
+    int k = uid_from_ns(userns_current(), (unsigned int)uid);
+    if (k < 0)
+      return -EINVAL;
+    uid = k;
+  }
+  if (gid >= 0) {
+    int k = gid_from_ns(userns_current(), (unsigned int)gid);
+    if (k < 0)
+      return -EINVAL;
+    gid = k;
+  }
   if (uid >= 0 && (uint)uid != ip->uid && !cap_ok(CAP_CHOWN))
     return -EPERM;
   if (gid >= 0 && (uint)gid != ip->gid && !cap_ok(CAP_CHOWN)) {
@@ -2215,8 +2331,10 @@ sys_chroot(void)
 
   if (argstr(0, path, MAXPATH) < 0)
     return -EFAULT;
-  if (!cap_ok(CAP_SYS_CHROOT))
+  if (!cap_ok(CAP_SYS_CHROOT)) {
+    audit("chroot", path, 0, 0, 0);
     return -EPERM;
+  }
   if ((ip = namei(path)) == 0)
     return -ENOENT;
   ilock(ip);
@@ -2230,5 +2348,6 @@ sys_chroot(void)
   }
   iunlock(ip);
   proc_set_root(myproc(), ip); // it takes the reference
+  audit("chroot", path, 0, 0, 1);
   return 0;
 }

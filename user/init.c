@@ -257,6 +257,20 @@ run_and_wait(struct entry *e)
 
 // ---- signals ----
 
+// a handler that interrupts what init is waiting in, rather than one the
+// kernel restarts the call for.
+static void
+catch_signal(int sig, void (*fn)(int))
+{
+  struct sigaction act;
+
+  memset(&act, 0, sizeof(act));
+  act.sa_handler = fn;
+  act.sa_flags = 0;              // not SA_RESTART
+  sigemptyset(&act.sa_mask);
+  sigaction(sig, &act, 0);
+}
+
 static void
 on_hup(int sig)
 {
@@ -301,10 +315,17 @@ main(void)
   umask(022);
   mount_basics();
 
-  signal(SIGHUP, on_hup);
-  signal(SIGTERM, on_term);
-  signal(SIGINT, on_term);
-  signal(SIGUSR1, on_usr1);
+  // sigaction, and without SA_RESTART, which is the whole point:
+  // init does its work when wait() comes back interrupted. signal()
+  // asks for SA_RESTART -- that is what signal() has meant since BSD --
+  // so the kernel rewound the call and waited again, the handler having
+  // set a flag nothing would look at until a child happened to exit.
+  // `telinit 3', `kill -HUP 1' and ctrl-alt-del all did nothing at all
+  // because of it.
+  catch_signal(SIGHUP, on_hup);
+  catch_signal(SIGTERM, on_term);
+  catch_signal(SIGINT, on_term);
+  catch_signal(SIGUSR1, on_usr1);
 
   if (read_inittab() < 0)
     fallback();
@@ -389,22 +410,30 @@ main(void)
             }
           }
           printf("init: re-reading %s\n", INITTAB);
-          // the entries that are running keep running: only the table
-          // of what should be is replaced
+          // the entries that are running keep running, and an entry
+          // that has had its turn has had it: only the table of what
+          // should be is replaced. (Forgetting the second of those made
+          // a re-read run the runlevel's scripts again, so `telinit'
+          // and every SIGHUP started a second syslogd, a second httpd
+          // and configured the interface over again.)
           pid_t keep[MAXENTRY];
           char keepid[MAXENTRY][8];
+          int keepstarted[MAXENTRY];
           int nkeep = 0;
           for (int i = 0; i < nentries; i++)
-            if (entries[i].pid > 0) {
+            if (entries[i].pid > 0 || entries[i].started) {
               keep[nkeep] = entries[i].pid;
+              keepstarted[nkeep] = entries[i].started;
               snprintf(keepid[nkeep], sizeof(keepid[nkeep]), "%s", entries[i].id);
               nkeep++;
             }
           if (read_inittab() == 0)
             for (int k = 0; k < nkeep; k++)
               for (int i = 0; i < nentries; i++)
-                if (strcmp(entries[i].id, keepid[k]) == 0)
+                if (strcmp(entries[i].id, keepid[k]) == 0) {
                   entries[i].pid = keep[k];
+                  entries[i].started = keepstarted[k];
+                }
         }
         if (shutdown_wanted) {
           int sig = shutdown_wanted;

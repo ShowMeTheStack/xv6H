@@ -1121,7 +1121,7 @@ sys_setsockopt(void)
   if ((f = sockfile(fd, 0, &err)) == 0)
     return err;
 
-  if (level == SOL_SOCKET && opt == SO_RCVTIMEO) {
+  if (level == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO)) {
     struct timeval_k tv;
     if (len < (int)sizeof(tv) || copyin(p->mm, (char *)&tv, uval, sizeof(tv)) < 0)
       return -EINVAL;
@@ -1134,7 +1134,10 @@ sys_setsockopt(void)
       ticks10 = 1;
     if (f->type == FD_UNIX)
       return 0;   // a local socket has no timeout to set
-    return ipsock_setopt(f->sock, SO_RCVTIMEO_TICKS, (int)ticks10);
+    return ipsock_setopt(f->sock,
+                         opt == SO_RCVTIMEO ? SO_RCVTIMEO_TICKS
+                                            : SO_SNDTIMEO_TICKS,
+                         (int)ticks10);
   }
 
   int value = 0;

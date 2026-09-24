@@ -6,6 +6,7 @@
 #include "sleeplock.h"
 #include "proc.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "platform.h"
 #include "stat.h"
 #include "fs.h"
@@ -99,6 +100,12 @@ load_elf(struct mm *mm, struct inode *ip, struct elfhdr *elf, uint64 base, uint6
     if (ph.type != ELF_PROG_LOAD)
       continue;
     if (ph.memsz < ph.filesz)
+      return 0;
+    // W^X: a segment that is both writable and executable is refused
+    // rather than mapped. Nothing this system builds has one; a file
+    // that does was either built by something else or is not what it
+    // says it is.
+    if ((ph.flags & 0x1) && (ph.flags & 0x2))
       return 0;
     if (ph.vaddr + ph.memsz < ph.vaddr)
       return 0;
@@ -249,9 +256,12 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   }
 
   // a position-independent executable is loaded away from address
-  // zero, so that a null dereference has no page to land on.
+  // zero, so that a null dereference has no page to land on -- and,
+  // when randomisation is on for the image too, at a different place
+  // every time it is run.
   if (elf.type == ET_DYN)
-    base = ELF_PIE_BASE;
+    base = ELF_PIE_BASE +
+           (randomize_va_space >= 2 ? aslr_slide(ASLR_PIE_PAGES) : 0);
   else if (elf.type != ET_EXEC)
     goto bad;
 
@@ -301,14 +311,37 @@ exec_depth(char *path, char **argv, char **envp, int depth)
   }
 
   p = myproc();
-  mm->heap_start = sz;
-  mm->brk = sz;
+  // the heap starts a random distance above the end of the image, so
+  // that the first malloc()ed block is not at a fixed address even in
+  // a program whose text is not position-independent. The gap is
+  // unmapped, and mm_brk() grows from heap_start, so nothing below it
+  // is reachable through brk().
+  uint64 brkgap = randomize_va_space >= 2 ? aslr_slide(ASLR_BRK_PAGES) : 0;
+  // with a gap the heap starts on a page boundary, and it has to: the
+  // heap area mm_brk() creates begins at PGROUNDUP(brk), so a break
+  // that starts part way into a page leaves the rest of that page
+  // unmapped -- and that is the page sbrk() hands out first. Without a
+  // gap the break starts at the end of the image, inside the last page
+  // of its data, which is mapped; that is the old behaviour and it is
+  // kept exactly.
+  mm->heap_start = brkgap ? PGROUNDUP(sz) + brkgap : sz;
+  mm->brk = mm->heap_start;
 
   // the stack: an area below the trapframe, grown by faults, with the
   // page under it unmapped as a guard.
   if (mm_setup_stack(mm) < 0)
     goto bad;
   sp = mm->stack_top;
+  // and the stack pointer itself starts a random number of 16-byte
+  // steps below the top of its page. The page-granular slide above
+  // moves the whole stack; this moves what is on it relative to the
+  // page boundary, so a buffer's low bits are not the same twice
+  // either. 16, because the ABI requires sp to stay 16-byte aligned.
+  if (randomize_va_space != 0) {
+    uint64 r;
+    random_bytes(&r, sizeof(r));
+    sp -= (r % (PGSIZE / 16)) * 16;
+  }
   uint64 stackbase = mm->stack_bottom;
 
   // the strings: the arguments, then the environment, bounded together
@@ -412,7 +445,7 @@ exec_depth(char *path, char **argv, char **envp, int depth)
     c->egid = new_egid;
     c->suid = c->euid;
     c->sgid = c->egid;
-    if (c->euid == 0)
+    if (uid_to_ns(userns_current(), c->euid) == 0)
       c->cap_effective = c->cap_permitted = c->cap_bounding;
     else if (setid)
       c->cap_effective = c->cap_permitted = 0;

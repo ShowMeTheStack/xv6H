@@ -17,12 +17,333 @@
 #include "defs.h"
 #include "platform.h"
 #include "net.h"
+#include "cgw.h"
+#include "errno.h"
 
-struct netcfg netcfg;
+// the root namespace: the physical NIC, the switch the guests are on,
+// and the addresses this machine answers to. A container's namespace
+// is another one of these (kernel/net.h).
+struct netns rootns = { .ip_id = 1 };
+
+static int lo_tx(struct netif *dev, struct mbuf *m);
+
+// the namespaces, and the one a call belongs to. The root is not in the
+// table: it is never freed, and a null pointer anywhere means it.
+static struct netns netnstab[NNETNS];
+static struct spinlock netnslock;
+
+struct netns *
+netns_cur(void)
+{
+  struct proc *p = myproc();
+
+  if (p == 0 || p->ns == 0 || p->ns->net == 0)
+    return &rootns;
+  return p->ns->net;
+}
+
+int
+netns_id(struct netns *ns)
+{
+  return ns == 0 || ns == &rootns ? 0 : ns->id;
+}
+
+void
+netns_hold(struct netns *ns)
+{
+  if (ns == 0 || ns == &rootns)
+    return;
+  acquire(&netnslock);
+  ns->ref++;
+  release(&netnslock);
+}
+
+struct netns *
+netns_new(void)
+{
+  struct netns *ns = 0;
+
+  acquire(&netnslock);
+  for (int i = 0; i < NNETNS; i++) {
+    if (netnstab[i].ref == 0) {
+      ns = &netnstab[i];
+      memset(ns, 0, sizeof(*ns));
+      ns->ref = 1;
+      ns->id = i + 1;
+      ns->ip_id = 1;
+      break;
+    }
+  }
+  release(&netnslock);
+  if (ns == 0)
+    return 0;
+  // a network of one's own begins as a machine with no cable: the
+  // loopback, its route, and nothing that reaches anybody else.
+  struct netif *lo = netif_add(ns, "lo", NETIF_LOOPBACK, lo_tx, 0);
+  if (lo == 0) {
+    netns_put(ns);
+    return 0;
+  }
+  route_add(ns, 0x7f000000, 0xff000000, 0, lo, 0);
+  ns->cfg.up = 1;             // it can always talk to itself
+  return ns;
+}
+
+void
+netns_put(struct netns *ns)
+{
+  if (ns == 0 || ns == &rootns)
+    return;
+  acquire(&netnslock);
+  int last = (--ns->ref <= 0);
+  if (last)
+    ns->ref = 0;
+  release(&netnslock);
+  if (!last)
+    return;
+  // the last process in it is gone. What it had goes with it: the port
+  // on its gateway, its interfaces, its routes, and anything still
+  // parked waiting for a hardware address.
+  cgw_detach_ns(ns);
+  acquire(&netlock);
+  for (int i = 0; i < ARP_ENTRIES; i++)
+    for (int j = 0; j < ARP_PENDING; j++)
+      if (ns->arp[i].pending[j]) {
+        mbuffree(ns->arp[i].pending[j]);
+        ns->arp[i].pending[j] = 0;
+      }
+  while (ns->lo_head) {
+    struct mbuf *m = ns->lo_head;
+    ns->lo_head = m->next;
+    mbuffree(m);
+  }
+  ns->lo_tail = 0;
+  release(&netlock);
+  route_flush(ns);
+  while (ns->ifs)
+    netif_del(ns->ifs);
+  ns->lo = 0;
+  memset(&ns->cfg, 0, sizeof(ns->cfg));
+}
+
+// ---- interfaces ----
+//
+// they come from a small fixed table rather than the allocator: an
+// interface outlives the call that made it, there are never many, and a
+// namespace that cannot make one has to fail rather than sleep. Eight
+// per machine is the root's two plus a container's wires.
+#define MAXNETIF 32        // the root's two, and two for every container
+static struct netif netiftab[MAXNETIF];
+static struct spinlock netiflock;
+
+struct netif *
+netif_add(struct netns *ns, const char *name, int flags,
+          int (*tx)(struct netif *, struct mbuf *), void *priv)
+{
+  acquire(&netiflock);
+  for (int i = 0; i < MAXNETIF; i++) {
+    struct netif *d = &netiftab[i];
+    if (d->ns != 0)
+      continue;
+    memset(d, 0, sizeof(*d));
+    safestrcpy(d->name, name, NETIF_NAMELEN);
+    d->flags = flags;
+    d->tx = tx;
+    d->priv = priv;
+    d->ns = ns;
+    d->up = 1;
+    if (flags & NETIF_LOOPBACK) {
+      d->ip = 0x7f000001;
+      d->mask = 0xff000000;
+      ns->lo = d;
+    }
+    // the list keeps the loopback first, which is the order `ip link'
+    // and /proc/net/dev print
+    if (ns->ifs == 0 || (flags & NETIF_LOOPBACK)) {
+      d->next = ns->ifs;
+      ns->ifs = d;
+    } else {
+      struct netif **t = &ns->ifs->next;
+      while (*t)
+        t = &(*t)->next;
+      *t = d;
+    }
+    release(&netiflock);
+    return d;
+  }
+  release(&netiflock);
+  return 0;
+}
+
+// an interface goes away with the namespace that had it.
+void
+netif_del(struct netif *dev)
+{
+  if (dev == 0)
+    return;
+  acquire(&netiflock);
+  struct netns *ns = dev->ns;
+  if (ns) {
+    struct netif **pp = &ns->ifs;
+    while (*pp && *pp != dev)
+      pp = &(*pp)->next;
+    if (*pp)
+      *pp = dev->next;
+    if (ns->lo == dev)
+      ns->lo = 0;
+  }
+  memset(dev, 0, sizeof(*dev));   // ns == 0 is what marks the slot free
+  release(&netiflock);
+}
+
+struct netif *
+netif_find(struct netns *ns, const char *name)
+{
+  for (struct netif *d = ns->ifs; d; d = d->next)
+    if (strncmp(d->name, name, NETIF_NAMELEN) == 0)
+      return d;
+  return 0;
+}
+
+void
+netif_set_addr(struct netif *dev, uint32 ip, uint32 mask)
+{
+  dev->ip = ip;
+  dev->mask = mask;
+}
+
+// ---- routes ----
+//
+// also a fixed table: a namespace has a handful (its own subnets and a
+// default), and a route is consulted on every packet, so walking a
+// short array beats chasing an allocator.
+#define MAXROUTE 32
+static struct route routetab[MAXROUTE];
+static struct spinlock routelock;
+
+// every route a namespace has, which is what taking one apart needs.
+void
+route_flush(struct netns *ns)
+{
+  acquire(&routelock);
+  struct route *r = ns->routes;
+  while (r) {
+    struct route *next = r->next;
+    memset(r, 0, sizeof(*r));      // dev == 0 marks the slot free
+    r = next;
+  }
+  ns->routes = 0;
+  release(&routelock);
+}
+
+// remove a route. The gateway is part of what names it, so two routes
+// to the same prefix through different gateways are two routes.
+int
+route_del(struct netns *ns, uint32 dst, uint32 mask, uint32 gw)
+{
+  int found = 0;
+
+  acquire(&routelock);
+  struct route **pp = &ns->routes;
+  while (*pp) {
+    struct route *r = *pp;
+    if (r->dst == dst && r->mask == mask && r->gw == gw) {
+      *pp = r->next;
+      r->dev = 0;      // which is what marks the slot free
+      found = 1;
+      continue;
+    }
+    pp = &r->next;
+  }
+  release(&routelock);
+  return found ? 0 : -1;
+}
+
+void
+netif_walk(struct netns *ns, void (*fn)(const struct netif *, void *), void *arg)
+{
+  acquire(&netiflock);
+  for (struct netif *d = ns->ifs; d; d = d->next)
+    fn(d, arg);
+  release(&netiflock);
+}
+
+int
+route_add(struct netns *ns, uint32 dst, uint32 mask, uint32 gw,
+          struct netif *dev, int metric)
+{
+  acquire(&routelock);
+  for (int i = 0; i < MAXROUTE; i++) {
+    struct route *r = &routetab[i];
+    if (r->dev != 0)
+      continue;
+    r->dst = dst & mask;
+    r->mask = mask;
+    r->gw = gw;
+    r->dev = dev;
+    r->metric = metric;
+    r->next = ns->routes;
+    ns->routes = r;
+    release(&routelock);
+    return 0;
+  }
+  release(&routelock);
+  return -1;
+}
+
+void
+route_flush_dev(struct netns *ns, struct netif *dev)
+{
+  acquire(&routelock);
+  struct route **t = &ns->routes;
+  while (*t) {
+    struct route *r = *t;
+    if (r->dev == dev) {
+      *t = r->next;
+      memset(r, 0, sizeof(*r));
+    } else {
+      t = &r->next;
+    }
+  }
+  release(&routelock);
+}
+
+// the longest prefix that matches, and where to send it: the
+// destination itself when the route is on-link, the gateway when it is
+// not. A tie on prefix length goes to the smaller metric.
+struct netif *
+route_lookup(struct netns *ns, uint32 dst, uint32 *nexthop)
+{
+  struct route *best = 0;
+  int bestlen = -1;
+
+  acquire(&routelock);
+  for (struct route *r = ns->routes; r; r = r->next) {
+    if ((dst & r->mask) != r->dst)
+      continue;
+    int len = 0;
+    for (uint32 m = r->mask; m & 0x80000000; m <<= 1)
+      len++;
+    if (len > bestlen || (len == bestlen && best && r->metric < best->metric)) {
+      best = r;
+      bestlen = len;
+    }
+  }
+  struct netif *dev = best ? best->dev : 0;
+  if (best && nexthop)
+    *nexthop = best->gw ? best->gw : dst;
+  release(&routelock);
+  return dev;
+}
+
+void
+route_walk(struct netns *ns, void (*fn)(const struct route *r, void *arg),
+           void *arg)
+{
+  for (struct route *r = ns->routes; r; r = r->next)
+    fn(r, arg);
+}
 struct spinlock netlock;
-uint64 net_rx_packets, net_tx_packets, net_rx_dropped, net_tx_dropped, net_policy_dropped;
-
-static uint16 ip_id = 1;
 
 // ---- packet buffers ----
 
@@ -136,6 +457,11 @@ l4_checksum(uint32 src, uint32 dst, uint8 proto, void *data, int len)
 // for its own gateway/dns addresses, so nothing else on the subnet can
 // be reached through the uplink), and it is allowed.
 
+// is this machine's gateway a router inside the host rather than the
+// door to the laptop? The hypervisor says so in the device tree
+// (xv6h,outer), because a machine cannot tell from an address.
+static int gw_local;
+
 int
 net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
 {
@@ -147,6 +473,17 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
   if ((dst >> 24) == 127)
     return 1;
 
+  // a container behind a gateway: its own subnet is its own network --
+  // the gateway's address, and anything else behind the same gateway.
+  // What it sends beyond that goes through the gateway, and the
+  // translated packet meets this same policy on the way out of the
+  // switch, so nothing here opens a door the machine does not have.
+  struct netns *cur = netns_cur();
+  if (cur != &rootns && cur->cfg.mask &&
+      (dst & cur->cfg.mask) == (cur->cfg.ip & cur->cfg.mask) &&
+      dst != (cur->cfg.ip | ~cur->cfg.mask))
+    return 1;
+
   // DHCP: broadcast discover/request, and renewals to the server.
   if (proto == IPPROTO_UDP && dport == 67 && (dst == 0xffffffff || dst == netcfg.gw))
     return 1;
@@ -154,11 +491,22 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
   if (proto == IPPROTO_UDP && dport == 53 && dst == netcfg.dns)
     return 1;
   uint8 a = dst >> 24, b = (dst >> 16) & 0xff;
-  if (dst == netcfg.gw || dst == netcfg.dns)
+  if ((dst == netcfg.gw && !gw_local) || dst == netcfg.dns)
     return 0; // the laptop, and qemu's forwarder
   if (netcfg.up && netcfg.mask && (dst & netcfg.mask) == (netcfg.ip & netcfg.mask) &&
       dst != (netcfg.ip | ~netcfg.mask))
     return 1; // a guest or the host: never leaves the switch
+  // a machine behind a gateway: the switch is on the far side of it, and
+  // the host and the other machines on it are reachable through the
+  // gateway. The two addresses that are qemu's -- its router, which is
+  // the laptop, and its name forwarder -- are not.
+  if (plat.outer_mask && (dst & plat.outer_mask) == plat.outer_net) {
+    if (dst == plat.outer_gw || dst == plat.outer_dns)
+      return 0;
+    if (dst == (plat.outer_net | ~plat.outer_mask))
+      return 0;   // the broadcast address of a network that is not ours
+    return 1;
+  }
   if (a == 10 || a == 0)
     return 0; // 127 is handled above: it is ours and goes nowhere
   if (a == 172 && b >= 16 && b < 32)
@@ -178,63 +526,78 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
 
 static const uint8 broadcast_mac[ETHADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
-static int
-net_tx_eth(struct mbuf *m, const uint8 *dhost, uint16 type)
+int
+netif_tx(struct netif *dev, struct mbuf *m, const uint8 *dhost, uint16 type)
 {
   struct eth *e = (struct eth *)mbufpush(m, sizeof(*e));
   memmove(e->dhost, dhost, ETHADDR_LEN);
-  memmove(e->shost, netcfg.mac, ETHADDR_LEN);
+  memmove(e->shost, dev->mac, ETHADDR_LEN);
   e->type = htons(type);
-  if (pktcap_active())
-    pktcap_frame(m->head, m->len);
-  return bridge_tx_host(m);
+  if (dev->tx == 0 || !dev->up) {
+    dev->tx_dropped++;
+    dev->ns->tx_dropped++;
+    mbuffree(m);
+    return -1;
+  }
+  dev->tx_packets++;
+  return dev->tx(dev, m);
+}
+
+// the old spelling: out of whichever interface reaches the world.
+int
+net_tx_eth(struct mbuf *m, const uint8 *dhost, uint16 type)
+{
+  struct netif *dev = netif_find(&rootns, "eth0");
+
+  if (dev == 0) {
+    mbuffree(m);
+    return -1;
+  }
+  return netif_tx(dev, m, dhost, type);
 }
 
 // ---- arp ----
 
-#define ARP_ENTRIES 16
-#define ARP_PENDING 4
-
-static struct arpent {
-  uint32 ip;
-  uint8 mac[ETHADDR_LEN];
-  int valid;
-  uint requested;              // tick of the last request
-  struct mbuf *pending[ARP_PENDING]; // packets waiting for the answer
-} arptab[ARP_ENTRIES];
-
+// the cache is a field of the namespace, and a question leaves by the
+// interface whose address is the answer's: a container asks its own
+// gateway on its own wire, with its own hardware address on the front.
 static void
-arp_send(uint16 op, const uint8 *dmac, uint32 tip, const uint8 *tmac)
+arp_send(struct netif *dev, uint16 op, const uint8 *dmac, uint32 tip,
+         const uint8 *tmac)
 {
   struct mbuf *m = mbufalloc(MBUF_HEADROOM);
-  if (m == 0)
+  if (m == 0 || dev == 0) {
+    if (m)
+      mbuffree(m);
     return;
+  }
   struct arp *a = (struct arp *)mbufput(m, sizeof(*a));
   a->hrd = htons(ARP_HRD_ETHER);
   a->pro = htons(ETHTYPE_IP);
   a->hln = ETHADDR_LEN;
   a->pln = 4;
   a->op = htons(op);
-  memmove(a->sha, netcfg.mac, ETHADDR_LEN);
-  a->sip = htonl(netcfg.ip);
+  memmove(a->sha, dev->mac, ETHADDR_LEN);
+  a->sip = htonl(dev->ip);
   memmove(a->tha, tmac, ETHADDR_LEN);
   a->tip = htonl(tip);
-  net_tx_eth(m, dmac, ETHTYPE_ARP);
+  netif_tx(dev, m, dmac, ETHTYPE_ARP);
 }
 
 static struct arpent *
-arp_find(uint32 ip)
+arp_find(struct netns *ns, uint32 ip)
 {
   for (int i = 0; i < ARP_ENTRIES; i++)
-    if (arptab[i].ip == ip)
-      return &arptab[i];
+    if (ns->arp[i].ip == ip)
+      return &ns->arp[i];
   return 0;
 }
 
 static struct arpent *
-arp_entry(uint32 ip)
+arp_entry(struct netns *ns, uint32 ip)
 {
-  struct arpent *e = arp_find(ip);
+  struct arpent *e = arp_find(ns, ip);
+  struct arpent *arptab = ns->arp;
   if (e)
     return e;
   // reuse: an empty slot, else an invalid one, else the oldest.
@@ -257,30 +620,33 @@ arp_entry(uint32 ip)
 }
 
 static void
-arp_rx(struct mbuf *m)
+arp_rx(struct netif *dev, struct mbuf *m)
 {
   struct arp *a = (struct arp *)m->head;
+  struct netns *ns = dev ? dev->ns : &rootns;
+  uint32 mine = dev ? dev->ip : rootns.cfg.ip;
+
   if (m->len < sizeof(*a) || ntohs(a->hrd) != ARP_HRD_ETHER || ntohs(a->pro) != ETHTYPE_IP)
     goto out;
   uint32 sip = ntohl(a->sip), tip = ntohl(a->tip);
 
   // learn the sender (also from requests, as everyone does).
-  struct arpent *e = arp_find(sip);
-  if (e || tip == netcfg.ip) {
+  struct arpent *e = arp_find(ns, sip);
+  if (e || tip == mine) {
     if (!e)
-      e = arp_entry(sip);
+      e = arp_entry(ns, sip);
     memmove(e->mac, a->sha, ETHADDR_LEN);
     e->valid = 1;
     for (int j = 0; j < ARP_PENDING; j++) {
       if (e->pending[j]) {
         struct mbuf *p = e->pending[j];
         e->pending[j] = 0;
-        net_tx_eth(p, e->mac, ETHTYPE_IP);
+        netif_tx(dev, p, e->mac, ETHTYPE_IP);
       }
     }
   }
-  if (ntohs(a->op) == ARP_OP_REQUEST && netcfg.up && tip == netcfg.ip)
-    arp_send(ARP_OP_REPLY, a->sha, sip, a->sha);
+  if (ntohs(a->op) == ARP_OP_REQUEST && dev && dev->up && mine && tip == mine)
+    arp_send(dev, ARP_OP_REPLY, a->sha, sip, a->sha);
 out:
   mbuffree(m);
 }
@@ -290,26 +656,53 @@ out:
 void
 arp_walk(void (*fn)(uint32 ip, const uint8 *mac, int valid, void *arg), void *arg)
 {
+  struct netns *ns = netns_cur();
+
   for (int i = 0; i < ARP_ENTRIES; i++)
-    if (arptab[i].ip)
-      fn(arptab[i].ip, arptab[i].mac, arptab[i].valid, arg);
+    if (ns->arp[i].ip)
+      fn(ns->arp[i].ip, ns->arp[i].mac, ns->arp[i].valid, arg);
 }
 
 // ---- ipv4 ----
 
 // loopback: a packet to one of our own addresses goes back into the
 // stack rather than to the wire (see below).
-static int loopback_send(struct mbuf *m);
-static int is_local(uint32 dst);
+static int loopback_send(struct netns *ns, struct mbuf *m);
+static int is_local(struct netns *ns, uint32 dst);
+
+// the address this namespace speaks from, for a packet going to dst:
+// the address of the interface the route chooses. A namespace has one
+// address per interface and the route says which one is being used,
+// which is the only answer that is right in a namespace with two.
+static uint32
+src_for(struct netns *ns, uint32 dst)
+{
+  uint32 nh = dst;
+
+  if ((dst >> 24) == 127)
+    return dst;                  // to 127.x from 127.x, always
+  struct netif *dev = route_lookup(ns, dst, &nh);
+  if (dev && dev->ip)
+    return dev->ip;
+  return ns->cfg.ip;
+}
+
+// the same question from outside this file: what address does this
+// namespace speak from, to reach dst?
+uint32
+net_src_for(struct netns *ns, uint32 dst)
+{
+  return src_for(ns, dst);
+}
 
 // send m as an IP packet to dst. takes ownership. caller holds netlock.
 // `ttl` of zero means the usual 64; a smaller one makes the packet
 // expire on the way, which is how traceroute finds the routers.
 static int
-ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
+ip_send_ns(struct netns *ns, struct mbuf *m, uint32 dst, uint8 proto, int ttl)
 {
   // the interface has to be up to reach anything but ourselves
-  if (!netcfg.up && !(proto == IPPROTO_UDP) && (dst >> 24) != 127) {
+  if (!ns->cfg.up && !(proto == IPPROTO_UDP) && (dst >> 24) != 127) {
     mbuffree(m);
     return -1;
   }
@@ -317,29 +710,46 @@ ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
   h->vhl = 0x45;
   h->tos = 0;
   h->len = htons(m->len);
-  h->id = htons(ip_id++);
+  h->id = htons(ns->ip_id++);
   h->off = 0;
   h->ttl = ttl > 0 && ttl < 256 ? (uint8)ttl : 64;
   h->pro = proto;
   h->sum = 0;
   // a packet to 127.x comes from 127.x, whatever this machine's own
   // address is -- and may be sent before there is one
-  h->src = htonl((dst >> 24) == 127 ? dst : netcfg.ip);
+  h->src = htonl(src_for(ns, dst));
   h->dst = htonl(dst);
   h->sum = ip_checksum(h, sizeof(*h), 0);
 
-  if (is_local(dst))
-    return loopback_send(m);
-
-  if (dst == 0xffffffff)
-    return net_tx_eth(m, broadcast_mac, ETHTYPE_IP);
+  if (is_local(ns, dst))
+    return loopback_send(ns, m);
 
   uint32 nexthop = dst;
-  if (netcfg.mask && (dst & netcfg.mask) != (netcfg.ip & netcfg.mask))
-    nexthop = netcfg.gw;
-  struct arpent *e = arp_entry(nexthop);
+  struct netif *dev = route_lookup(ns, dst, &nexthop);
+  if (dst == 0xffffffff) {
+    // a broadcast goes out of the interface that has a route for it,
+    // and out of the namespace's only one when nothing does
+    if (dev == 0)
+      dev = ns->ifs && ns->ifs->next ? ns->ifs->next : ns->ifs;
+    if (dev == 0 || (dev->flags & NETIF_LOOPBACK)) {
+      mbuffree(m);
+      return -ENETUNREACH;
+    }
+    return netif_tx(dev, m, broadcast_mac, ETHTYPE_IP);
+  }
+  if (dev == 0) {
+    // nothing in the table matches, so there is nowhere to send it.
+    // (A broadcast, and anything to the machine itself, was answered
+    // above and never gets here.)
+    mbuffree(m);
+    ns->tx_dropped++;
+    return -ENETUNREACH;
+  }
+  if (dev->flags & NETIF_LOOPBACK)
+    return loopback_send(ns, m);
+  struct arpent *e = arp_entry(ns, nexthop);
   if (e->valid)
-    return net_tx_eth(m, e->mac, ETHTYPE_IP);
+    return netif_tx(dev, m, e->mac, ETHTYPE_IP);
 
   // not resolved: park the packet and ask.
   int parked = 0;
@@ -352,15 +762,25 @@ ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
   }
   if (!parked) {
     mbuffree(m);
-    net_tx_dropped++;
+    ns->tx_dropped++;
   }
   // one request in flight per tenth of a second, whatever a tick is
   if (ticks - e->requested >= (uint)(tick_hz / 10 ? tick_hz / 10 : 1) ||
       e->requested == 0) {
     e->requested = ticks ? ticks : 1;
-    arp_send(ARP_OP_REQUEST, broadcast_mac, nexthop, broadcast_mac);
+    arp_send(dev, ARP_OP_REQUEST, broadcast_mac, nexthop, broadcast_mac);
   }
   return 0;
+}
+
+// the same, in the namespace the caller belongs to. Every path that has
+// a process behind it ends up here; the ones that do not -- a TCP
+// retransmission from the timer, a gateway forwarding a packet -- say
+// which namespace they mean, because by then there is no process to ask.
+static int
+ip_send_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
+{
+  return ip_send_ns(netns_cur(), m, dst, proto, ttl);
 }
 
 // the usual time to live
@@ -377,6 +797,12 @@ net_tx_ip(struct mbuf *m, uint32 dst, uint8 proto)
 }
 
 int
+net_tx_ip_ns(struct netns *ns, struct mbuf *m, uint32 dst, uint8 proto)
+{
+  return ip_send_ns(ns, m, dst, proto, 0);
+}
+
+int
 net_tx_ip_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
 {
   return ip_send_ttl(m, dst, proto, ttl);
@@ -385,7 +811,7 @@ net_tx_ip_ttl(struct mbuf *m, uint32 dst, uint8 proto, int ttl)
 // ---- icmp ----
 
 static void
-icmp_rx(struct mbuf *m, struct ip *iph)
+icmp_rx(struct netns *ns, struct mbuf *m, struct ip *iph)
 {
   struct icmp *ic = (struct icmp *)m->head;
   if (m->len < sizeof(*ic))
@@ -396,14 +822,16 @@ icmp_rx(struct mbuf *m, struct ip *iph)
     ic->type = ICMP_ECHOREPLY;
     ic->sum = 0;
     ic->sum = ip_checksum(ic, m->len, 0);
-    if (net_policy_ok(src, IPPROTO_ICMP, 0, 0) || (netcfg.mask && (src & netcfg.mask) == (netcfg.ip & netcfg.mask)))
-      ip_send(m, src, IPPROTO_ICMP);
+    if (ns != &rootns ||
+        net_policy_ok(src, IPPROTO_ICMP, 0, 0) ||
+        (netcfg.mask && (src & netcfg.mask) == (netcfg.ip & netcfg.mask)))
+      ip_send_ns(ns, m, src, IPPROTO_ICMP, 0);
     else
       mbuffree(m);
     return;
   }
   if (ic->type == ICMP_ECHOREPLY) {
-    if (sock_icmp_rx(m, src, ntohs(ic->id)) == 0)
+    if (sock_icmp_rx(ns, m, src, ntohs(ic->id)) == 0)
       return; // consumed
     goto drop;
   }
@@ -423,10 +851,10 @@ icmp_rx(struct mbuf *m, struct ip *iph)
     if (inner->pro == IPPROTO_ICMP) {
       uint16 id = (l4[4] << 8) | l4[5];
       uint16 seq = (l4[6] << 8) | l4[7];
-      sock_icmp_error(src, ic->type, ic->code, id, seq);
+      sock_icmp_error(ns, src, ic->type, ic->code, id, seq);
     } else if (inner->pro == IPPROTO_UDP) {
       uint16 sport = (l4[0] << 8) | l4[1];
-      sock_udp_error(src, ic->type, ic->code, sport);
+      sock_udp_error(ns, src, ic->type, ic->code, sport);
     }
     goto drop;
   }
@@ -435,7 +863,8 @@ drop:
 }
 
 int
-net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n, int ttl)
+net_tx_icmp_echo_ns(struct netns *ns, uint32 dst, uint16 id, uint16 seq,
+                    char *data, int n, int ttl)
 {
   if (n > 1400)
     n = 1400;
@@ -451,7 +880,7 @@ net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n, int ttl)
   memmove(ic + 1, data, n);
   ic->sum = ip_checksum(ic, sizeof(*ic) + n, 0);
   acquire(&netlock);
-  int r = ip_send_ttl(m, dst, IPPROTO_ICMP, ttl);
+  int r = ip_send_ns(ns, m, dst, IPPROTO_ICMP, ttl);
   release(&netlock);
   return r;
 }
@@ -460,24 +889,26 @@ net_tx_icmp_echo(uint32 dst, uint16 id, uint16 seq, char *data, int n, int ttl)
 
 // takes ownership of m (payload already in place). caller holds netlock.
 static int
-udp_send(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport, int ttl)
+udp_send(struct netns *ns, struct mbuf *m, uint32 dst, uint16 sport,
+         uint16 dport, int ttl)
 {
   struct udp *u = (struct udp *)mbufpush(m, sizeof(*u));
   u->sport = htons(sport);
   u->dport = htons(dport);
   u->ulen = htons(m->len);
   u->sum = 0;
-  u->sum = l4_checksum(netcfg.ip, dst, IPPROTO_UDP, u, m->len);
+  u->sum = l4_checksum(src_for(ns, dst), dst, IPPROTO_UDP, u, m->len);
   if (u->sum == 0)
     u->sum = 0xffff;
-  return ip_send_ttl(m, dst, IPPROTO_UDP, ttl);
+  return ip_send_ns(ns, m, dst, IPPROTO_UDP, ttl);
 }
 
 int
-net_tx_udp(struct mbuf *m, uint32 dst, uint16 sport, uint16 dport, int ttl)
+net_tx_udp_ns(struct netns *ns, struct mbuf *m, uint32 dst, uint16 sport,
+              uint16 dport, int ttl)
 {
   acquire(&netlock);
-  int r = udp_send(m, dst, sport, dport, ttl);
+  int r = udp_send(ns, m, dst, sport, dport, ttl);
   release(&netlock);
   return r;
 }
@@ -489,8 +920,8 @@ static void dhcp_rx(struct mbuf *m, uint32 src);
 // first eight bytes after it -- which is how the sender tells which
 // of its packets the complaint is about. caller holds netlock.
 static void
-icmp_send_error(uint32 dst, int type, int code, const struct ip *iph,
-                const void *l4, int l4len)
+icmp_send_error(struct netns *ns, uint32 dst, int type, int code,
+                const struct ip *iph, const void *l4, int l4len)
 {
   if (dst == 0 || dst == 0xffffffff || (dst >> 28) == 0xe)
     return; // never to a broadcast or to a group
@@ -515,11 +946,11 @@ icmp_send_error(uint32 dst, int type, int code, const struct ip *iph,
   memmove((char *)ic + sizeof(*ic), iph, ihl);
   memmove((char *)ic + sizeof(*ic) + ihl, l4, l4len);
   ic->sum = ip_checksum(ic, n, 0);
-  ip_send(m, dst, IPPROTO_ICMP);
+  ip_send_ns(ns, m, dst, IPPROTO_ICMP, 0);
 }
 
 static void
-udp_rx(struct mbuf *m, struct ip *iph)
+udp_rx(struct netns *ns, struct mbuf *m, struct ip *iph)
 {
   struct udp *u = (struct udp *)m->head;
   if (m->len < sizeof(*u) || ntohs(u->ulen) < sizeof(*u) || ntohs(u->ulen) > m->len) {
@@ -530,17 +961,17 @@ udp_rx(struct mbuf *m, struct ip *iph)
   uint16 sport = ntohs(u->sport), dport = ntohs(u->dport);
   uint32 src = ntohl(iph->src);
   mbufpull(m, sizeof(*u));
-  if (dport == 68) {
+  if (dport == 68 && ns == &rootns) {
     dhcp_rx(m, src);
     return;
   }
-  if (sock_udp_rx(m, src, sport, dport) < 0) {
-    net_rx_dropped++;
+  if (sock_udp_rx(ns, m, src, sport, dport) < 0) {
+    ns->rx_dropped++;
     // nobody has that port. saying so is what every other stack does,
     // and it is what makes a UDP connection fail at once rather than
     // wait for a timeout. `u` still points at the header the pull
     // above stepped over.
-    icmp_send_error(src, ICMP_UNREACH, 3, iph, u, sizeof(*u));
+    icmp_send_error(ns, src, ICMP_UNREACH, 3, iph, u, sizeof(*u));
     mbuffree(m);
   }
 }
@@ -558,45 +989,50 @@ udp_rx(struct mbuf *m, struct ip *iph)
 // answering inside the delivery of the packet that caused it would
 // nest one call frame per exchange. the outermost sender drains the
 // queue instead, so the depth is two whatever the conversation.
-static struct mbuf *lo_head, *lo_tail;
-static int lo_delivering;
-
-static void ip_rx(struct mbuf *m);
+// the queue is the namespace's: a container talking to itself does not
+// queue behind the machine, and the machine does not deliver into it.
+static void ip_rx(struct netns *ns, struct netif *dev, struct mbuf *m);
 
 static int
-loopback_send(struct mbuf *m)
+loopback_send(struct netns *ns, struct mbuf *m)
 {
   m->next = 0;
-  if (lo_tail)
-    lo_tail->next = m;
+  if (ns->lo_tail)
+    ns->lo_tail->next = m;
   else
-    lo_head = m;
-  lo_tail = m;
-  if (lo_delivering)
+    ns->lo_head = m;
+  ns->lo_tail = m;
+  if (ns->lo_delivering)
     return 0;
 
-  lo_delivering = 1;
-  while (lo_head) {
-    struct mbuf *p = lo_head;
-    lo_head = p->next;
-    if (lo_head == 0)
-      lo_tail = 0;
+  ns->lo_delivering = 1;
+  while (ns->lo_head) {
+    struct mbuf *p = ns->lo_head;
+    ns->lo_head = p->next;
+    if (ns->lo_head == 0)
+      ns->lo_tail = 0;
     p->next = 0;
-    ip_rx(p);
+    ip_rx(ns, ns->lo, p);
   }
-  lo_delivering = 0;
+  ns->lo_delivering = 0;
   return 0;
 }
 
-// is this address one of ours?
+// is this address one of ours? 127 anything, and any address one of the
+// namespace's own interfaces answers to.
 static int
-is_local(uint32 dst)
+is_local(struct netns *ns, uint32 dst)
 {
-  return (dst >> 24) == 127 || (netcfg.up && dst == netcfg.ip);
+  if ((dst >> 24) == 127)
+    return 1;
+  for (struct netif *d = ns->ifs; d; d = d->next)
+    if (d->up && d->ip && d->ip == dst)
+      return 1;
+  return 0;
 }
 
 static void
-ip_rx(struct mbuf *m)
+ip_rx(struct netns *ns, struct netif *dev, struct mbuf *m)
 {
   struct ip *h = (struct ip *)m->head;
   if (m->len < sizeof(*h) || (h->vhl >> 4) != 4)
@@ -608,34 +1044,52 @@ ip_rx(struct mbuf *m)
   if (ntohs(h->off) & 0x3fff)
     goto drop; // fragments are not supported
   uint32 dst = ntohl(h->dst);
-  if (netcfg.up && dst != netcfg.ip && dst != 0xffffffff && !is_local(dst))
+  // addressed to this namespace: one of its own addresses, a broadcast,
+  // or 127. A namespace with no address yet takes what arrives, which is
+  // what makes DHCP possible.
+  if (dst != 0xffffffff && !is_local(ns, dst) &&
+      ((dev && dev->ip) || ns->cfg.up))
     goto drop;
   m->len = len;
   mbufpull(m, hl);
   switch (h->pro) {
   case IPPROTO_ICMP:
-    icmp_rx(m, h);
+    icmp_rx(ns, m, h);
     return;
   case IPPROTO_UDP:
-    udp_rx(m, h);
+    udp_rx(ns, m, h);
     return;
   case IPPROTO_TCP:
-    tcp_rx(m, ntohl(h->src), dst);
+    tcp_rx(ns, m, ntohl(h->src), dst);
     return;
   }
 drop:
-  net_rx_dropped++;
+  ns->rx_dropped++;
   mbuffree(m);
 }
 
-// a frame from the NIC (or from the bridge). takes ownership.
+static void rx_drain(void);
+
+// a frame arriving on an interface. takes ownership. dev may be null
+// while the machine is still finding its network device.
 void
-net_rx(struct mbuf *m)
+netif_rx(struct netif *dev, struct mbuf *m)
 {
   struct eth *e = (struct eth *)m->head;
   if (m->len < sizeof(*e)) {
+    if (dev) {
+      dev->rx_dropped++;
+      dev->ns->rx_dropped++;
+    }
     mbuffree(m);
     return;
+  }
+  if (dev) {
+    dev->rx_packets++;
+    // a frame addressed to somebody else is the switch's mistake, not
+    // ours, but it is worth counting
+    if ((e->dhost[0] & 1) == 0 && memcmp(e->dhost, dev->mac, ETHADDR_LEN) != 0)
+      dev->rx_dropped++;
   }
   // captured before anything is taken off the front, so what a reader
   // sees is the frame as it arrived
@@ -643,14 +1097,83 @@ net_rx(struct mbuf *m)
     pktcap_frame(m->head, m->len);
   uint16 type = ntohs(e->type);
   mbufpull(m, sizeof(*e));
+  struct netns *ns = dev ? dev->ns : &rootns;
   acquire(&netlock);
   if (type == ETHTYPE_ARP)
-    arp_rx(m);
+    arp_rx(dev, m);
   else if (type == ETHTYPE_IP)
-    ip_rx(m);
+    ip_rx(ns, dev, m);
   else
     mbuffree(m);
   release(&netlock);
+  rx_drain();
+}
+
+// Frames that arrived while this hart was already inside the stack, and
+// the drain that takes them afterwards.
+//
+// The switch can answer a question the stack is in the middle of asking.
+// A packet leaving through a gateway makes the stack ask for a hardware
+// address; the gateway is a port on the same switch and answers at once,
+// in the same call chain, and the answer arrives at a stack that is
+// holding the lock it would need. (The panic was `acquire: net is
+// already held by this cpu' from netif_rx under ip_rx under arp_send.)
+// Such a frame waits here and is taken as soon as the lock is free,
+// which is what the loopback queue does for the same reason.
+static struct mbuf *rxq_head, *rxq_tail;   // netlock
+static int rx_draining;
+
+static void
+rx_drain(void)
+{
+  for (;;) {
+    acquire(&netlock);
+    if (rx_draining || rxq_head == 0) {
+      release(&netlock);
+      return;
+    }
+    struct mbuf *m = rxq_head;
+    rxq_head = m->next;
+    if (rxq_head == 0)
+      rxq_tail = 0;
+    rx_draining = 1;
+    release(&netlock);
+    m->next = 0;
+    struct netif *dev = m->rxdev ? m->rxdev : netif_find(&rootns, "eth0");
+    m->rxdev = 0;
+    netif_rx(dev, m);
+    acquire(&netlock);
+    rx_draining = 0;
+    release(&netlock);
+  }
+}
+
+// a frame from the NIC (or from the bridge). takes ownership.
+void
+net_rx(struct mbuf *m)
+{
+  net_rx_dev(netif_find(&rootns, "eth0"), m);
+}
+
+// the same for a frame arriving somewhere else: the container end of a
+// gateway's wire, which is reached from inside the stack's own send --
+// a container asks for a hardware address, the gateway answers at once,
+// and the answer must not be delivered under the lock the question is
+// holding.
+void
+net_rx_dev(struct netif *dev, struct mbuf *m)
+{
+  if (holding(&netlock)) {
+    m->next = 0;
+    m->rxdev = dev;
+    if (rxq_tail)
+      rxq_tail->next = m;
+    else
+      rxq_head = m;
+    rxq_tail = m;
+    return;
+  }
+  netif_rx(dev, m);
 }
 
 // ---- dhcp client ----
@@ -673,13 +1196,6 @@ struct dhcp {
   uint8 options[312];
 } __attribute__((packed));
 
-static struct {
-  int state;        // 0 idle, 1 discovering, 2 requesting, 3 bound
-  uint32 xid;
-  uint32 offered, server;
-  uint last_tx;
-  int attempts;
-} dhcp;
 
 static void
 dhcp_send(int type)
@@ -692,7 +1208,7 @@ dhcp_send(int type)
   d->op = 1;
   d->htype = 1;
   d->hlen = 6;
-  d->xid = htonl(dhcp.xid);
+  d->xid = htonl(rootns.dhcp.xid);
   d->flags = htons(0x8000); // please broadcast the reply
   memmove(d->chaddr, netcfg.mac, ETHADDR_LEN);
   d->magic = htonl(0x63825363);
@@ -700,25 +1216,33 @@ dhcp_send(int type)
   *o++ = 53; *o++ = 1; *o++ = type;
   if (type == DHCP_REQUEST) {
     *o++ = 50; *o++ = 4;
-    uint32 r = htonl(dhcp.offered); memmove(o, &r, 4); o += 4;
+    uint32 r = htonl(rootns.dhcp.offered); memmove(o, &r, 4); o += 4;
     *o++ = 54; *o++ = 4;
-    uint32 s = htonl(dhcp.server); memmove(o, &s, 4); o += 4;
+    uint32 s = htonl(rootns.dhcp.server); memmove(o, &s, 4); o += 4;
   }
   *o++ = 55; *o++ = 3; *o++ = 1; *o++ = 3; *o++ = 6; // subnet, router, dns
   *o++ = 255;
   m->len = (char *)o - (char *)d; // trim unused option space
-  uint32 saved_ip = netcfg.ip;
-  netcfg.ip = 0; // source 0.0.0.0 while unconfigured
-  udp_send(m, 0xffffffff, 68, 67, 0);
+  // 0.0.0.0 while unconfigured, which is where every lease begins. The
+  // source address comes from the interface now, so it is the interface
+  // that has to be unconfigured for the length of the send.
+  struct netif *eth0 = netif_find(&rootns, "eth0");
+  uint32 saved_ip = netcfg.ip, saved_dev = eth0 ? eth0->ip : 0;
+  netcfg.ip = 0;
+  if (eth0)
+    eth0->ip = 0;
+  udp_send(&rootns, m, 0xffffffff, 68, 67, 0);
   netcfg.ip = saved_ip;
-  dhcp.last_tx = ticks;
+  if (eth0)
+    eth0->ip = saved_dev;
+  rootns.dhcp.last_tx = ticks;
 }
 
 static void
 dhcp_rx(struct mbuf *m, uint32 src)
 {
   struct dhcp *d = (struct dhcp *)m->head;
-  if (m->len < sizeof(*d) - sizeof(d->options) + 4 || ntohl(d->xid) != dhcp.xid ||
+  if (m->len < sizeof(*d) - sizeof(d->options) + 4 || ntohl(d->xid) != rootns.dhcp.xid ||
       ntohl(d->magic) != 0x63825363 || memcmp(d->chaddr, netcfg.mac, ETHADDR_LEN) != 0)
     goto out;
   int type = 0;
@@ -747,27 +1271,28 @@ dhcp_rx(struct mbuf *m, uint32 src)
     }
     o = v + len;
   }
-  if (type == DHCP_OFFER && dhcp.state == 1) {
-    dhcp.offered = ntohl(d->yiaddr);
-    dhcp.server = server ? server : src;
-    dhcp.state = 2;
+  if (type == DHCP_OFFER && rootns.dhcp.state == 1) {
+    rootns.dhcp.offered = ntohl(d->yiaddr);
+    rootns.dhcp.server = server ? server : src;
+    rootns.dhcp.state = 2;
     dhcp_send(DHCP_REQUEST);
-  } else if (type == DHCP_ACK && dhcp.state == 2) {
+  } else if (type == DHCP_ACK && rootns.dhcp.state == 2) {
     netcfg.ip = ntohl(d->yiaddr);
     netcfg.mask = mask ? mask : 0xffffff00;
     netcfg.gw = gw;
     netcfg.dns = dns ? dns : gw;
     netcfg.up = 1;
     netcfg.dhcp = 1;
-    dhcp.state = 3;
+    rootns.dhcp.state = 3;
+    netns_configure(&rootns, "eth0", netcfg.ip, netcfg.mask, netcfg.gw);
     printk("net: dhcp: ip %d.%d.%d.%d gateway %d.%d.%d.%d dns %d.%d.%d.%d\n", netcfg.ip >> 24,
            (netcfg.ip >> 16) & 0xff, (netcfg.ip >> 8) & 0xff, netcfg.ip & 0xff, netcfg.gw >> 24,
            (netcfg.gw >> 16) & 0xff, (netcfg.gw >> 8) & 0xff, netcfg.gw & 0xff, netcfg.dns >> 24,
            (netcfg.dns >> 16) & 0xff, (netcfg.dns >> 8) & 0xff, netcfg.dns & 0xff);
     wakeup(&netcfg);
   } else if (type == DHCP_NAK) {
-    dhcp.state = 1;
-    dhcp.xid++;
+    rootns.dhcp.state = 1;
+    rootns.dhcp.xid++;
     dhcp_send(DHCP_DISCOVER);
   }
 out:
@@ -778,19 +1303,22 @@ out:
 void
 net_timer(void)
 {
+  ct_timer();
+  cgw_timer();
   if (!virtio_net_present())
     return;
   acquire(&netlock);
-  if ((dhcp.state == 1 || dhcp.state == 2) &&
-      ticks - dhcp.last_tx >= (uint)(2 * tick_hz)) {
+  if ((rootns.dhcp.state == 1 || rootns.dhcp.state == 2) &&
+      ticks - rootns.dhcp.last_tx >= (uint)(2 * tick_hz)) {
     // no answer in 2 seconds: try again (from the start after a while).
-    if (++dhcp.attempts % 4 == 0)
-      dhcp.state = 1;
-    dhcp_send(dhcp.state == 1 ? DHCP_DISCOVER : DHCP_REQUEST);
+    if (++rootns.dhcp.attempts % 4 == 0)
+      rootns.dhcp.state = 1;
+    dhcp_send(rootns.dhcp.state == 1 ? DHCP_DISCOVER : DHCP_REQUEST);
   }
   tcp_timer();
   release(&netlock);
   sock_timer();
+  rx_drain();
 }
 
 // static configuration (from the hypervisor's device tree or a request).
@@ -804,28 +1332,68 @@ net_set_static(uint32 ip, uint32 mask, uint32 gw, uint32 dns)
   netcfg.dns = dns;
   netcfg.up = 1;
   netcfg.dhcp = 0;
-  dhcp.state = 0;
+  rootns.dhcp.state = 0;
   release(&netlock);
+  netns_configure(&rootns, "eth0", ip, mask, gw);
   wakeup(&netcfg);
+}
+
+// an address on an interface, and the two routes that go with it: the
+// subnet it is on, and (if there is a gateway) everything else. This is
+// what `ifconfig eth0 addr' does, and what DHCP does when it is
+// answered.
+void
+netns_configure(struct netns *ns, const char *ifname, uint32 ip, uint32 mask,
+                uint32 gw)
+{
+  struct netif *dev = netif_find(ns, ifname);
+
+  if (dev == 0)
+    return;
+  route_flush_dev(ns, dev);
+  netif_set_addr(dev, ip, mask);
+  if (mask)
+    route_add(ns, ip & mask, mask, 0, dev, 0);
+  if (gw)
+    route_add(ns, 0, 0, gw, dev, 0);   // the default route
 }
 
 void
 net_stats(struct netinfo *ni)
 {
+  struct netns *ns = netns_cur();
+
   acquire(&netlock);
-  ni->ip = netcfg.ip;
-  ni->mask = netcfg.mask;
-  ni->gw = netcfg.gw;
-  ni->dns = netcfg.dns;
-  memmove(ni->mac, netcfg.mac, 6);
-  ni->up = netcfg.up;
-  ni->dhcp = netcfg.dhcp;
-  ni->rx_packets = net_rx_packets;
-  ni->tx_packets = net_tx_packets;
-  ni->rx_dropped = net_rx_dropped;
-  ni->tx_dropped = net_tx_dropped;
-  ni->policy_dropped = net_policy_dropped;
+  ni->ip = ns->cfg.ip;
+  ni->mask = ns->cfg.mask;
+  ni->gw = ns->cfg.gw;
+  ni->dns = ns->cfg.dns;
+  memmove(ni->mac, ns->cfg.mac, 6);
+  ni->up = ns->cfg.up;
+  ni->dhcp = ns->cfg.dhcp;
+  ni->rx_packets = ns->rx_packets;
+  ni->tx_packets = ns->tx_packets;
+  ni->rx_dropped = ns->rx_dropped;
+  ni->tx_dropped = ns->tx_dropped;
+  ni->policy_dropped = ns->policy_dropped;
   release(&netlock);
+}
+
+// the root namespace's two interfaces. `lo' delivers to itself; `eth0'
+// hands the frame to the switch, which decides whether it goes to the
+// uplink, to a guest, or nowhere (kernel/bridge.c).
+static int
+eth0_tx(struct netif *dev, struct mbuf *m)
+{
+  if (pktcap_active())
+    pktcap_frame(m->head, m->len);
+  return bridge_tx_host(m);
+}
+
+static int
+lo_tx(struct netif *dev, struct mbuf *m)
+{
+  return loopback_send(dev->ns, m);
 }
 
 void
@@ -834,11 +1402,23 @@ netinit(void)
   pktcap_init();
   pktcap_register();
   initlock(&netlock, "net");
+  initlock(&netiflock, "netif");
+  initlock(&netnslock, "netns");
+  gw_local = plat.outer_mask != 0;
+  ctinit();
+  cgwinit();
+  initlock(&routelock, "route");
+  netif_add(&rootns, "lo", NETIF_LOOPBACK, lo_tx, 0);
+  route_add(&rootns, 0x7f000000, 0xff000000, 0, rootns.lo, 0);
   sockinit();
   if (virtio_net_init() < 0) {
     printk("net: no network device\n");
     return;
   }
+  struct netif *eth0 = netif_add(&rootns, "eth0", 0, eth0_tx, 0);
+  if (eth0 == 0)
+    panic("netinit: no room for eth0");
+  memmove(eth0->mac, netcfg.mac, ETHADDR_LEN);
   if (plat.net_ip) {
     net_set_static(plat.net_ip, plat.net_mask, plat.net_gw, plat.net_dns);
     printk("net: static ip %d.%d.%d.%d\n", netcfg.ip >> 24, (netcfg.ip >> 16) & 0xff,
@@ -846,8 +1426,8 @@ netinit(void)
     return;
   }
   acquire(&netlock);
-  dhcp.xid = 0x78763648 ^ (netcfg.mac[5] << 8) ^ netcfg.mac[4];
-  dhcp.state = 1;
+  rootns.dhcp.xid = 0x78763648 ^ (netcfg.mac[5] << 8) ^ netcfg.mac[4];
+  rootns.dhcp.state = 1;
   dhcp_send(DHCP_DISCOVER);
   release(&netlock);
 }

@@ -1,0 +1,20 @@
+NAME
+     sudo - run a command as another user, by policy
+
+SYNOPSIS
+     sudo [-u USER] [-i|-s] [COMMAND [ARG...]]
+     sudo -l
+
+DESCRIPTION
+     sudo runs COMMAND as root, or as the user given by -u, if
+     /etc/sudoers allows it. It asks for the *caller's* password, not
+     the target's, and remembers the answer for a few minutes.
+
+OPTIONS
+     -u USER   run as USER rather than root
+     -i        a login shell as that user
+     -s        a shell as that user, keeping the environment
+     -l        list what the caller may do
+
+SEE ALSO
+     su(1), /etc/sudoers, login(1)

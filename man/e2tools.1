@@ -1,0 +1,18 @@
+NAME
+     e2tools - look at and check an ext4 file system
+
+SYNOPSIS
+     dumpe2fs [-h] DEVICE
+     tune2fs [-l] [-L LABEL] [-c N] [-i N] DEVICE
+     fsck.ext4 [-f] [-n] [-y] DEVICE
+     e2fsck ...
+     resize2fs DEVICE [BLOCKS]
+
+DESCRIPTION
+     One program under five names. dumpe2fs prints the superblock and
+     the group descriptors; tune2fs changes what can be changed after
+     the fact; fsck.ext4 checks the file system and can repair it; and
+     resize2fs grows or shrinks one.
+
+SEE ALSO
+     mkfs_ext4(8), mount(1), blkid(8)

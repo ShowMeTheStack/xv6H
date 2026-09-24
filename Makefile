@@ -4,6 +4,7 @@ U=user
 OBJS = \
   $K/entry.o \
   $K/start.o \
+  $K/canary.o \
   $K/console.o \
   $K/devnull.o \
   $K/blk.o \
@@ -11,6 +12,13 @@ OBJS = \
   $K/procfs.o \
   $K/devfs.o \
   $K/logdev.o \
+  $K/audit.o \
+  $K/conntrack.o \
+  $K/cgw.o \
+  $K/nsproxy.o \
+  $K/cgroup.o \
+  $K/sysfilter.o \
+  $K/vmstate.o \
   $K/ramfs.o \
   $K/sysfs.o \
   $K/overlayfs.o \
@@ -143,7 +151,17 @@ CFLAGS += -fno-builtin-memcpy -Wno-main
 CFLAGS += -fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf
 CFLAGS += -I.
 CFLAGS += -I$U/include
-CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+# stack canaries. Every function with an array or a taken address on
+# its stack writes a word before its saved return address on the way
+# in and checks it on the way out; a write past the end of a local
+# buffer changes it and the function does not return. The guard comes
+# from the random generator at boot (kernel) and from the auxiliary
+# vector (user); __stack_chk_fail panics in the kernel and raises
+# SIGABRT in a process.
+#
+# the guest images below keep -fno-stack-protector: they are raw
+# binaries with no libc and nothing to fail into.
+CFLAGS += $(shell $(CC) -fstack-protector-strong -E -x c /dev/null >/dev/null 2>&1 && echo -fstack-protector-strong)
 
 # Disable PIE when possible (for Ubuntu 16.10 toolchain)
 ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
@@ -377,6 +395,7 @@ mkfs/mkext4: mkfs/mkext4.c mkfs/ext4_ondisk.h
 
 UPROGS=\
 	$U/_cat\
+	$U/_man\
 	$U/_echo\
 	$U/_forktest\
 	$U/_grep\
@@ -430,6 +449,10 @@ UPROGS=\
 	$U/_taskset\
 	$U/_schedbench\
 	$U/_cgrun\
+	$U/_cgtest\
+	$U/_fuzzsys\
+	$U/_aslrcheck\
+	$U/_vmowntest\
 	$U/_chmod\
 	$U/_login\
 	$U/_sudo\
@@ -442,6 +465,10 @@ UPROGS=\
 	$U/_sysctl\
 	$U/_uname\
 	$U/_hostname\
+	$U/_unshare\
+	$U/_nsenter\
+	$U/_nstest\
+	$U/_unstest\
 	$U/_sleep\
 	$U/_usleep\
 	$U/_head\
@@ -552,16 +579,8 @@ HOSTFILES ?=
 guest/kernel: $K/kernel
 	$(OBJCOPY) -S $K/kernel guest/kernel
 
-GUESTFILES = README $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest
-GUESTDEPS = mkfs/mkext4 README user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS)
-
-guest/disk.img: $(GUESTDEPS)
-	mkfs/mkext4 -b $(GUESTFS_EXT4_BLOCKS) -j 1024 guest/disk.img $(GUESTFILES)
-
 GUESTDISKIDX = $(shell i=0; while [ $$i -lt $(GUESTDISKS) ]; do echo $$i; i=$$((i+1)); done)
 GUESTDISKIMGS = $(foreach k,$(GUESTDISKIDX),guest/disk$(k).img)
-guest/disk%.img: guest/disk.img
-	cp guest/disk.img $@
 
 # a guest that is not xv6: linked at 0x80400000, also as a raw binary.
 guest/hello: guest/hello.c guest/hello.S guest/hello.ld
@@ -581,13 +600,24 @@ guest/vguest: guest/vguest.c guest/hello.S guest/hello.ld
 	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/hello.ld -o guest/vguest \
 	  guest/hello.S guest/vguest.c
 
+# what an exit costs, measured from inside a guest (guest/vmbench.c).
+guest/vmbench: guest/vmbench.c guest/hello.S guest/hello.ld
+	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
+	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/hello.ld -o guest/vmbench \
+	  guest/hello.S guest/vmbench.c
+
 # a hostile test guest (see guest/badguest.c), used by test-hyp.py.
+guest/fuzzguest: guest/fuzzguest.c guest/fuzzentry.S guest/badguest.ld
+	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
+	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/badguest.ld -o guest/fuzzguest \
+	  guest/fuzzentry.S guest/fuzzguest.c
+
 guest/badguest: guest/badguest.c guest/badentry.S guest/badguest.ld
 	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
 	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/badguest.ld -o guest/badguest \
 	  guest/badentry.S guest/badguest.c
 
-GUESTBINS = guest/kernel guest/badguest guest/hello guest/hello.bin guest/fdguest guest/vguest
+GUESTBINS = guest/kernel guest/badguest guest/fuzzguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench
 
 # the loader and the shared library belong in every file system image
 # everything an image carries is stripped: the debug information is for
@@ -743,16 +773,40 @@ $(ARCHREFDEPS): tools/mkarchref.py
 	@mkdir -p build/archtest
 	python3 tools/mkarchref.py build/archtest
 
-FSFILES = README $(GUESTBINS) $(GUESTDISKIMGS) \
+# the manual: one page per utility in man/, concatenated into one file
+# (tools/mkman.py says why) and read by man(1) and by the C library's
+# answer to --help.
+MANPAGES = $(wildcard man/*.1)
+build/man.db: tools/mkman.py $(MANPAGES)
+	@mkdir -p build
+	python3 tools/mkman.py $@ $(MANPAGES)
+
+FSFILES = README usr/share/man/man.db:build/man.db $(GUESTBINS) $(GUESTDISKIMGS) \
 	  $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest user/texttest user/archtest user/filetest user/calctest \
 	  user/systest \
 	  $(HOSTFILES) \
 	  $(ARCHREFS) $(ETCSPEC) $(SETUIDFILES) $(INITSCRIPTS)
-FSDEPS = README user/shtest user/texttest user/archtest user/filetest user/calctest user/systest $(ARCHREFDEPS) $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) \
+FSDEPS = README build/man.db user/shtest user/texttest user/archtest user/filetest user/calctest user/systest $(ARCHREFDEPS) $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) \
 	 $(HOSTFILES) $(ETCFILES) build/etc/shadow build/bin/_nologin \
 	 etc/init.d/rcS etc/init.d/syslogd etc/init.d/klogd etc/init.d/crond etc/rc.d/rc \
 	 etc/cron.d/rotate-logs etc/init.d/networking etc/network/interfaces lib/init/functions \
 	 etc/init.d/httpd etc/default/httpd srv/www/index.html srv/www/hello.txt
+
+# the guest's file system image. This rule has to come after STRIPPED,
+# DYNDEPS and RESCUEBINS are defined: make expands a rule's
+# prerequisites when it reads the rule, so with the rule above those
+# definitions the list was `mkfs/mkext4 README user/shtest' and the
+# guest image was never rebuilt when a program in it changed. That is
+# how a guest came to run a loader from an hour earlier while the host
+# ran the new one.
+GUESTFILES = README usr/share/man/man.db:build/man.db $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest
+GUESTDEPS = mkfs/mkext4 README build/man.db user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS)
+
+guest/disk.img: $(GUESTDEPS)
+	mkfs/mkext4 -b $(GUESTFS_EXT4_BLOCKS) -j 1024 guest/disk.img $(GUESTFILES)
+
+guest/disk%.img: guest/disk.img
+	cp guest/disk.img $@
 
 fs.img: mkfs/mkext4 $(FSDEPS)
 	mkfs/mkext4 -b $$(( $(HOSTFS_MB) * 256 )) -j 1024 fs.img $(FSFILES)
@@ -772,8 +826,24 @@ OBJDIRS = kernel user user/sh user/ldso user/libc user/libc/math user/libc/pic \
 # survived a change to struct vm that way, and the guest read a pointer
 # out of the middle of another field. any such object is removed here,
 # before anything is built, so it is compiled again.
-STALEOBJS := $(foreach o,$(wildcard $(foreach d,$(OBJDIRS),$(d)/*.o)),\
+STALECAND := $(foreach o,$(wildcard $(foreach d,$(OBJDIRS),$(d)/*.o)),\
                $(if $(wildcard $(o:.o=.d)),,$(o)))
+# ...except that an object written a moment ago may be one this build has
+# just compiled, with its dependency file still on the way -- make writes
+# the two in that order, and re-reads this file after updating any of the
+# .d files it includes. Removing one of those turns a parallel build into
+# a failed link, which it did, twice. Only the settled ones are removed.
+#
+# -maxdepth 0 is not decoration. Without it, a find that ends up with no
+# path argument (an empty list, a name that has just gone) walks the
+# current directory instead and prints every file in the tree older than
+# a minute -- and the rm below then deleted the whole source tree on the
+# build box. It never happened on the laptop, because BSD find refuses a
+# missing path where GNU find helpfully assumes one. With -maxdepth 0 the
+# worst that can be named is the directory itself, which rm -f will not
+# remove.
+STALEOBJS := $(if $(STALECAND),\
+               $(shell find $(STALECAND) -maxdepth 0 -mmin +1 2>/dev/null))
 ifneq ($(STALEOBJS),)
 $(info removing $(words $(STALEOBJS)) object files with no dependency file)
 $(shell rm -f $(STALEOBJS))
@@ -782,10 +852,10 @@ endif
 -include $(foreach d,$(OBJDIRS),$(d)/*.d)
 
 clean: 
-	rm -rf tls/obj
+	rm -rf tls/obj build
 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
 	*/*.o */*.d */*.asm */*.sym \
-	$K/kernel fs.img test-fs.img guest/kernel guest/badguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/disk*.img \
+	$K/kernel fs.img test-fs.img guest/kernel guest/badguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench guest/disk*.img \
 	mkfs/mkext4 .gdbinit \
         $U/usys.S $U/tls_date.h tls/libbearssl.a \
 	$(UPROGS)
@@ -870,9 +940,23 @@ endif
 # outbound connections, and the kernel's egress policy limits those to
 # public addresses (plus DHCP and the DNS forwarder). NET=0 removes it.
 NET ?= 1
-ifneq ($(NET),0)
+ifneq ($(strip $(LINK)),)
+# two hosts, joined to each other and to nothing else (E11: migration).
+# The link is a *unix* socket on the laptop's file system, not a port: no
+# TCP socket is opened anywhere, so there is nothing for the laptop or its
+# network to reach, and the only thing at the other end of the wire is the
+# other emulated machine. LINKSRV=on is the end that makes the socket.
+LINKSRV ?= off
+QEMUOPTS += -netdev stream,id=n0,server=$(LINKSRV),addr.type=unix,addr.path=$(LINK)
+QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
+else ifneq ($(NET),0)
 QEMUOPTS += -netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 endif
+
+# an escape hatch for debugging: QEMUEXTRA is appended to the command
+# line, so that a run can be given -gdb, -d or anything else without
+# editing this file. Empty in every ordinary build.
+QEMUOPTS += $(QEMUEXTRA)
 
 qemu: check-qemu-version $K/kernel fs.img
 	$(QEMU) $(QEMUOPTS)

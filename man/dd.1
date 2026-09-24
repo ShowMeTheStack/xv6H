@@ -1,0 +1,26 @@
+NAME
+     dd - copy blocks
+
+SYNOPSIS
+     dd [if=FILE] [of=FILE] [bs=N] [count=N] [skip=N] [seek=N] [conv=...]
+
+DESCRIPTION
+     dd copies blocks from one file to another, and says how many it
+     moved. It is how to write an image to a device, make a file of
+     zeroes, or read a few blocks from the middle of something.
+
+OPTIONS
+     if=FILE    read from FILE (standard input by default)
+     of=FILE    write to FILE (standard output by default)
+     bs=N       the block size; N may end in k, M or G
+     count=N    copy N blocks
+     skip=N     skip N blocks of the input
+     seek=N     skip N blocks of the output
+     conv=...   notrunc, sync, fsync
+
+EXAMPLES
+     dd if=/dev/zero of=/tmp/z bs=4096 count=256
+     dd if=/dev/vda of=/tmp/first.img bs=512 count=2048
+
+SEE ALSO
+     cp(1), truncate(1), mkimage(1)

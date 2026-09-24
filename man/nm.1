@@ -1,0 +1,22 @@
+NAME
+     nm - the symbols in an object file
+
+SYNOPSIS
+     nm [-a] [-D] [-g] [-n] [-p] [-r] [-u] [-S] FILE...
+
+DESCRIPTION
+     nm prints the symbol table: the value, the kind (T for text, D for
+     data, B for bss, U for undefined, and so on) and the name.
+
+OPTIONS
+     -a   all symbols, including the debugging ones
+     -D   the dynamic symbols
+     -g   only the global ones
+     -n   sort by value
+     -p   do not sort
+     -r   reverse the order
+     -u   only the undefined ones
+     -S   print sizes as well
+
+SEE ALSO
+     readelf(1), ldd(1), strings(1)

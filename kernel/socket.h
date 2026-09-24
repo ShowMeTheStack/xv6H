@@ -70,6 +70,7 @@
 #define SO_TTL            1 // the time to live IP packets go out with
 #define SO_ICMP_ERRORS    2 // deliver ICMP errors here as well as replies
 #define SO_RCVTIMEO_TICKS 3 // a receive gives up after this many ticks
+#define SO_SNDTIMEO_TICKS 4 // a connect gives up after this many ticks
 
 // what an ICMP socket's recvfrom puts in its `port`: the sequence
 // number of the probe, and above it the ICMP type when the message is

@@ -1,0 +1,22 @@
+NAME
+     nsenter - run a program in another process's namespaces
+
+SYNOPSIS
+     nsenter -t PID [-a] [-u] [-p] [-m] [-U] [-n] [COMMAND [ARG...]]
+
+DESCRIPTION
+     nsenter joins the namespaces of the process named by -t and runs
+     COMMAND there -- which is how to look inside a container from
+     outside it.
+
+OPTIONS
+     -t PID   whose namespaces to join
+     -a       all of them
+     -u       the hostname namespace
+     -p       the process-number namespace
+     -m       the mount namespace
+     -U       the user namespace
+     -n       the network namespace
+
+SEE ALSO
+     unshare(1), vmm(1)

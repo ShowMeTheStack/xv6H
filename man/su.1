@@ -1,0 +1,17 @@
+NAME
+     su - become another user
+
+SYNOPSIS
+     su [-] [-c COMMAND] [USER]
+
+DESCRIPTION
+     su starts a shell as USER (root by default), asking for that user's
+     password unless the caller is already root.
+
+OPTIONS
+     -           a login shell: the environment and directory are that
+                 user's, as though they had logged in
+     -c COMMAND  run COMMAND instead of an interactive shell
+
+SEE ALSO
+     sudo(1), login(1), id(1)

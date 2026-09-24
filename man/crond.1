@@ -1,0 +1,16 @@
+NAME
+     crond - run commands on a schedule
+
+SYNOPSIS
+     crond [-n]
+
+DESCRIPTION
+     crond wakes every minute and runs whatever /etc/crontab, the files
+     in /etc/cron.d and the users' crontabs say to run then. Output goes
+     to the log.
+
+OPTIONS
+     -n   stay in the foreground
+
+SEE ALSO
+     crontab(1), service(8), syslogd(8)

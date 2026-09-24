@@ -60,6 +60,7 @@ static const struct chardev chardevs[] = {
     {"log", DEV_LOG, 0, 0666, 0},
     {"kmsg", DEV_KMSG, 0, 0640, 0},
     {"pktcap", DEV_PKTCAP, 0, 0600, 0}, // every frame: root alone
+    {"audit", DEV_AUDIT, 0, 0600, 0},   // and the audit log: root alone
 };
 #define NCHARDEV ((int)(sizeof(chardevs) / sizeof(chardevs[0])))
 
@@ -245,7 +246,8 @@ devfs_mount(struct gendisk *disk, const char *source, int readonly, const char *
     return 0;
   sb->ops = &devfs_sops;
   sb->iops = &devfs_iops;
-  dev_sb = sb;
+  if (dev_sb == 0)
+    dev_sb = sb;        // the first mount owns the inodes (see above)
   sb->root = devfs_iget(DINO_ROOT);
   if (sb->root == 0) {
     vfs_super_free(sb);

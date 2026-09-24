@@ -8,7 +8,8 @@
 //   -l  listen instead of connecting
 //   -k  keep listening after the first connection ends
 //   -p  the port to listen on, for people who type it that way
-//   -w  give up after this many seconds with nothing happening
+//   -w  give up after this many seconds with nothing happening -- and
+//       after the same wait on a connection that is not answered
 //   -z  say whether the port answers and then stop
 //   -v  say what is happening on standard error
 //   -n  do not look up names
@@ -23,6 +24,17 @@
 
 static int use_udp, do_listen, keep_open, quiet_scan, verbose, no_names;
 static int timeout_secs = 0;
+
+// -w, on the socket: how long a connection that is not answered is
+// waited for. Without it, the stack's own five SYNs decide.
+static void
+set_timeout(int fd)
+{
+  if (timeout_secs <= 0)
+    return;
+  struct timeval tv = {timeout_secs, 0};
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
 
 static void
 say(const char *fmt, const char *a, int n)
@@ -154,6 +166,7 @@ scan(const char *host, int from_port, int to_port)
     }
     struct sockaddr_in to;
     mkaddr(&to, ip, p);
+    set_timeout(fd);
     int ok = connect(fd, (struct sockaddr *)&to, sizeof(to)) >= 0;
     if (ok) {
       any = 1;
@@ -239,6 +252,7 @@ do_client(const char *host, int port)
   if (!use_udp) {
     struct sockaddr_in to;
     mkaddr(&to, ip, port);
+    set_timeout(fd);
     if (connect(fd, (struct sockaddr *)&to, sizeof(to)) < 0) {
       char a[20];
       fprintf(stderr, "nc: connect to %s port %d failed: %s\n",

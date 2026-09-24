@@ -1,0 +1,21 @@
+NAME
+     nice - run a program at another priority
+
+SYNOPSIS
+     nice [-n INCREMENT] COMMAND [ARG...]
+     renice [-n] VALUE [-p PID | -g PGID | -u USER]...
+
+DESCRIPTION
+     nice runs COMMAND with its niceness raised by INCREMENT (10 by
+     default): a higher number is a smaller share of the processor.
+     Lowering it below zero is root's alone. Called as renice it changes
+     a process that is already running.
+
+OPTIONS
+     -n N     the increment, or for renice the value
+     -p PID   renice: a process
+     -g PGID  renice: a process group
+     -u USER  renice: a user's processes
+
+SEE ALSO
+     taskset(1), cgrun(1), schedbench(1)

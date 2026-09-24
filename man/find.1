@@ -1,0 +1,36 @@
+NAME
+     find - walk a directory tree, testing and acting on what is there
+
+SYNOPSIS
+     find [PATH...] [EXPRESSION]
+
+DESCRIPTION
+     find walks each PATH and evaluates EXPRESSION for everything it
+     meets. With no expression it prints every name.
+
+OPTIONS
+     -name PAT, -iname PAT    the name matches (case-insensitively)
+     -path PAT                the whole path matches
+     -type f|d|l|b|c|p|s      the kind of thing it is
+     -size N[ckMG]            its size
+     -empty                   an empty file or directory
+     -user NAME, -group NAME  its owner
+     -perm MODE               its mode
+     -links N                 its link count
+     -inum N                  its inode number
+     -mtime N, -mmin N        when it was last changed
+     -newer FILE              changed more recently than FILE
+     -maxdepth N, -mindepth N how deep to go
+     -print, -print0, -ls     what to print
+     -delete                  remove it
+     -exec CMD {} ;           run CMD; -ok asks first
+     -a, -o, -not, ( )        and, or, not, grouping
+     -prune                   do not descend into this one
+
+EXAMPLES
+     find / -name '*.conf'
+     find /tmp -type f -mtime +7 -delete
+     find . -type f -print0 | xargs -0 wc -l
+
+SEE ALSO
+     xargs(1), ls(1), grep(1)

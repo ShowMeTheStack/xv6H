@@ -1,0 +1,14 @@
+NAME
+     service - start and stop services
+
+SYNOPSIS
+     service NAME start|stop|restart|reload|status
+     update-rc.d NAME defaults|remove|enable|disable
+
+DESCRIPTION
+     service runs /etc/init.d/NAME with the action given. Called as
+     update-rc.d it makes or removes the links under /etc/rc.d that
+     decide what starts at boot.
+
+SEE ALSO
+     init(8), telinit(8), start-stop-daemon(8)

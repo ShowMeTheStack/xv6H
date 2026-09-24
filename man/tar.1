@@ -1,0 +1,24 @@
+NAME
+     tar - read and write archives
+
+SYNOPSIS
+     tar {c|x|t}[v][z]f ARCHIVE [-C DIR] [FILE...]
+
+DESCRIPTION
+     tar makes an archive of files, lists one, or unpacks one. It reads
+     the ustar and pax formats and writes ustar; with z it uses gzip on
+     the way. Unpacking refuses absolute paths and paths with .. in
+     them, so an archive cannot write outside the directory it is
+     unpacked into.
+
+OPTIONS
+     c    create
+     x    extract
+     t    list
+     v    say what it is doing
+     z    compressed
+     f ARCHIVE   the archive file; - is standard input or output
+     -C DIR      change to DIR first
+
+SEE ALSO
+     gzip(1), cp(1)

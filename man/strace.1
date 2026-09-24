@@ -1,0 +1,23 @@
+NAME
+     strace - what system calls a program makes
+
+SYNOPSIS
+     strace [-f] [-c] [-T] [-s N] [-e NAME,...] COMMAND [ARG...]
+     strace -p PID
+
+DESCRIPTION
+     strace runs COMMAND and prints every system call it makes with its
+     arguments and its result, or attaches to a process that is already
+     running. It is the ptrace interface underneath, so a process can
+     only be traced by whoever may signal it.
+
+OPTIONS
+     -f              follow children
+     -c              count them instead of printing each one
+     -T              print how long each call took
+     -s N            print at most N bytes of each string
+     -e NAME,...     only these calls
+     -p PID          attach to a running process
+
+SEE ALSO
+     ps(1), dmesg(1)

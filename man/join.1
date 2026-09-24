@@ -1,0 +1,19 @@
+NAME
+     join - join two files on a common field
+
+SYNOPSIS
+     join [-a N] [-v N] [-t C] [-1 N] [-2 N] FILE1 FILE2
+
+DESCRIPTION
+     join reads two sorted files and, for each pair of lines whose join
+     field matches, writes the field followed by the rest of both lines.
+
+OPTIONS
+     -1 N   the join field in FILE1
+     -2 N   the join field in FILE2
+     -t C   fields are separated by C
+     -a N   also print the unpaired lines of file N
+     -v N   print only the unpaired lines of file N
+
+SEE ALSO
+     sort(1), comm(1), awk(1)

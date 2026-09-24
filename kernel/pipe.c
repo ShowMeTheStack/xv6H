@@ -90,7 +90,7 @@ piperready(struct pipe *pi, int write)
 }
 
 int
-pipewrite(struct pipe *pi, uint64 addr, int n)
+pipewrite(struct pipe *pi, uint64 addr, int n, int nonblock)
 {
   int i = 0;
   struct proc *pr = myproc();
@@ -121,6 +121,13 @@ pipewrite(struct pipe *pi, uint64 addr, int n)
         return i + done > 0 ? i + done : -EINTR;
       }
       if (pi->nwrite == pi->nread + PIPESIZE) { //DOC: pipewrite-full
+        // as much as fits, and no waiting for the rest. A write that
+        // fits nothing at all is the one that says so.
+        if (nonblock) {
+          wakeup(&pi->nread);
+          release(&pi->lock);
+          return i + done > 0 ? i + done : -EAGAIN;
+        }
         wakeup(&pi->nread);
         sleep_prepare(&pi->nwrite);
         release(&pi->lock);
@@ -138,7 +145,7 @@ pipewrite(struct pipe *pi, uint64 addr, int n)
 }
 
 int
-piperead(struct pipe *pi, uint64 addr, int n)
+piperead(struct pipe *pi, uint64 addr, int n, int nonblock)
 {
   int i;
   struct proc *pr = myproc();
@@ -146,6 +153,12 @@ piperead(struct pipe *pi, uint64 addr, int n)
 
   acquire(&pi->lock);
   while (pi->nread == pi->nwrite && pi->writeopen) { //DOC: pipe-empty
+    // a reader that said it would not wait is told there is nothing
+    // rather than made to wait for it
+    if (nonblock) {
+      release(&pi->lock);
+      return -EAGAIN;
+    }
     if (killed(pr)) {
       release(&pi->lock);
       return -EINTR;

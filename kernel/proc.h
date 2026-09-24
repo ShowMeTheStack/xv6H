@@ -1,6 +1,8 @@
 #include "rbtree.h"
 #include "cred.h"
 #include "signal.h"
+#include "nsproxy.h"
+#include "sysfilter.h"
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -214,6 +216,21 @@ struct proc {
   uint64 minflt, majflt; // page faults served without and with I/O
   int umask;
   struct cred cred;      // who this process is (cred.h)
+  struct netns *netns;   // the network stack it sees; 0 is the root one
+  // the six views of the machine (kernel/nsproxy.h). 0 is the root set,
+  // which is what every process is in until something unshares.
+  struct nsproxy *ns;
+  // its numbers: one in its own pid namespace and one in each namespace
+  // above it, innermost last. pids[0] is the machine's own namespace and
+  // pids[0].nr is `pid' above. npids is 0 for a process created before
+  // the namespaces existed at all (the idle harts).
+  struct pidmap pids[PIDNS_DEPTH];
+  int npids;
+  // unshare(CLONE_NEWPID) does not move the caller -- it cannot, its
+  // number is known to everybody -- it puts the next child in a new
+  // namespace, which is what Linux does and what `unshare --fork' is
+  // for.
+  int newpidns;
   // the nice value, -20 (most of the processor) to 19 (least), as
   // setpriority(2) sets it and nice(1) asks for. it is inherited by
   // fork and kept across exec. The scheduler turns it into a weight
@@ -239,6 +256,15 @@ struct proc {
   int cpu;                // the hart whose queue it is on, or last ran on
   uint64 cpus;            // the harts it may run on, a bit each (affinity)
   struct sched_group *sg; // the group it belongs to, or 0 for the root
+  // the control group it is in (kernel/cgroup.h), or 0 for the machine's
+  // own, and how many pages are charged to it there. The count is per
+  // process so that what it held is given back when it ends without
+  // walking its address space.
+  struct cgroup *cg;
+  uint64 cg_pages;
+  // what it may ask the kernel for (kernel/sysfilter.h). Inherited by
+  // its children, never widened.
+  struct sysfilter filter;
 
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack

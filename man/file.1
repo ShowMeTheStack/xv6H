@@ -1,0 +1,19 @@
+NAME
+     file - what kind of file this is
+
+SYNOPSIS
+     file [-b] [-i] [-L] FILE...
+
+DESCRIPTION
+     file looks at the first bytes of each FILE and says what it appears
+     to be: an ELF binary and for what machine, an archive, a
+     compressed stream, a script with the interpreter it names, an image
+     of a file system, text, or data.
+
+OPTIONS
+     -b   the answer alone, without the name in front of it
+     -i   a MIME type instead of a sentence
+     -L   follow symbolic links
+
+SEE ALSO
+     stat(1), strings(1), od(1)

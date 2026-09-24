@@ -1,0 +1,20 @@
+NAME
+     crontab - a user's schedule
+
+SYNOPSIS
+     crontab [-u USER] [-l|-r|-e|FILE]
+
+DESCRIPTION
+     crontab installs, prints or removes the table of commands crond
+     runs for a user. A line is five fields -- minute, hour, day of
+     month, month, day of week -- and then the command.
+
+OPTIONS
+     -u USER   whose table (root only)
+     -l        print it
+     -r        remove it
+     -e        edit it
+     FILE      install this file as the table
+
+SEE ALSO
+     crond(8), sh(1)

@@ -1,0 +1,28 @@
+NAME
+     diff - compare two files line by line
+
+SYNOPSIS
+     diff [-u] [-c] [-q] [-s] [-i] [-w] [-b] [-B] [-N] [-r] [-U N] A B
+
+DESCRIPTION
+     diff prints the lines that would have to change to turn A into B.
+     Either name may be a directory, with -r to compare what is in them,
+     or - for standard input. The exit status is 0 when they are the
+     same, 1 when they differ and 2 on an error, which is what makes it
+     useful in a script.
+
+OPTIONS
+     -u      unified output (the usual form, with @@ hunk headers)
+     -U N    unified, with N lines of context
+     -c      context output
+     -q      say only whether they differ
+     -s      say so when they are identical
+     -i      ignore case
+     -w      ignore all whitespace
+     -b      ignore changes in the amount of whitespace
+     -B      ignore lines that are entirely blank
+     -N      treat a missing file as empty
+     -r      compare directories, and what is under them
+
+SEE ALSO
+     patch(1), cmp(1), comm(1)

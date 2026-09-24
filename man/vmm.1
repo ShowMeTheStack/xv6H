@@ -1,0 +1,79 @@
+NAME
+     vmm - machines, containers and the hypervisor
+
+SYNOPSIS
+     vmm start [-n NAME] [-k KERNEL] [-f DISK|none] [-c NCPU] [-m MB]
+               [-a BOOTARGS] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-w WEIGHT]
+               [--cpu-max PCT] [-p HPORT[:GPORT][/udp]] [-M MB] [-H] [-s]
+               [-4] [-d] [-r ADDR]
+     vmm ls | ps [VM] | info VM | stats
+     vmm attach VM | pause VM | resume VM | restart VM | kill VM|--all
+     vmm balloon VM MB | ksm on|off | weight VM N | cpumax VM PCT
+     vmm port VM [ls] | vmm port VM add|rm SPEC...
+     vmm gw [ls] | vmm gw add NAME ADDR/PREFIX [pub IP] | vmm gw rm NAME
+     vmm save VM FILE | vmm snapshot VM FILE | vmm restore FILE [-n NAME] [-d]
+     vmm clone BASE NEW [-f DISK] [-d]
+     vmm migrate VM HOST:PORT | vmm accept PORT [-n NAME] [-d]
+     vmm run [-n NAME] --rootfs DIR [OPTIONS] [CMD ARG...]
+     vmm stop NAME | vmm exec NAME CMD...
+
+DESCRIPTION
+     vmm is the front end to the hypervisor and to containers. A machine
+     is a guest with its own memory, vcpus and emulated devices, run by
+     this kernel's own G-stage hypervisor; a container is a group of
+     processes of this kernel in namespaces of their own.
+
+     `vmm start' makes a machine and attaches to its console; Ctrl-] goes
+     back to the shell without stopping it. `vmm ls' says what there is,
+     `vmm info' says what one of them is doing -- memory, exits by cause,
+     its share of the processors -- and `vmm kill' ends it.
+
+     A machine's memory can be given back to the host while it runs
+     (`vmm balloon'), shared with other machines page by page when the
+     pages are identical (`vmm ksm on'), and written down: `vmm save'
+     with the machine stopped, `vmm snapshot' with it running, and `vmm
+     restore' to bring it back. `vmm clone' makes a second machine that
+     shares the first's pages until one of them writes. `vmm migrate'
+     hands a machine to another host over a connection, memory first
+     while it runs and the rest with it stopped, and `vmm accept' takes
+     it at the other end.
+
+     `vmm run' starts a container instead: a root of its own, its own
+     process numbers, its own network, its own hostname, with limits on
+     memory and processes, volumes from the host, and ports published to
+     the machine's network. `vmm exec' enters one, `vmm stop' ends it.
+
+OPTIONS
+     -n NAME        what to call it
+     -k KERNEL      the kernel to boot (default /kernel)
+     -f DISK|none   the disk image, or no disk at all
+     -c NCPU        how many vcpus
+     -m MB          how much memory
+     -M MB          the most it may have (the balloon's ceiling)
+     -a BOOTARGS    the command line the guest is given
+     -i SPEC        its address: dhcp, or IP/PREFIX[,GW[,DNS]]
+     -p SPEC        publish a port: HPORT[:GPORT][/udp]
+     -w WEIGHT      its share of the processors against everything else
+     --cpu-max PCT  a ceiling on that share
+     -H             no hypervisor extension inside (nested guests off)
+     -s             single-step for debugging
+     -4             Sv39 rather than Sv48 inside
+     -d             detached: do not attach to the console
+     -r ADDR        load the kernel at ADDR
+     --rootfs DIR   vmm run: the container's root
+     --mem PAGES    vmm run: how much memory it may have
+     --pids N       vmm run: how many processes
+     -v SPEC        vmm run: a volume, HOST:PATH[:ro]
+     -e VAR=VALUE   vmm run: a variable in its environment
+     --net host|none, --if NAME, --gw NAME, -i IP/PREFIX
+                    vmm run: what network it is on
+
+EXAMPLES
+     vmm start -n web -m 128 -c 2 -i dhcp -p 8080:80
+     vmm info web
+     vmm snapshot web /snap.vst
+     vmm migrate web 10.7.0.2:9000
+     vmm run -n build --rootfs /containers/build --pids 64 /bin/sh
+
+SEE ALSO
+     cgrun(1), unshare(1), nsenter(1), ip(8), README-hyp.md

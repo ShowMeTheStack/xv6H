@@ -1,0 +1,20 @@
+NAME
+     gzip - compress and uncompress
+
+SYNOPSIS
+     gzip [-d] [-c] [-1..-9] [FILE...]
+     gunzip [-c] [FILE...]
+     zcat [FILE...]
+
+DESCRIPTION
+     gzip compresses each FILE to FILE.gz and removes the original;
+     gunzip does the reverse. Called as zcat it writes the uncompressed
+     bytes to standard output and leaves the file alone.
+
+OPTIONS
+     -d        uncompress
+     -c        to standard output, keeping the original
+     -1..-9    how hard to try
+
+SEE ALSO
+     tar(1), cat(1)

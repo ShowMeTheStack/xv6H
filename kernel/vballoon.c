@@ -122,7 +122,10 @@ process_queue(struct vm *vm, int qi)
   struct vq_state *q = &b->q[qi];
   int any = 0, cfg = 0;
 
-  for (;;) {
+  // bounded, for the reason process_queue in vvirtio.c is bounded: a
+  // guest that keeps the available index moving must not be able to
+  // keep this loop running.
+  for (int done = 0; done < MAXQ; done++) {
     uint16 avail_idx, head, used_idx;
     acquire(&vm->lock);
     uint32 num = q->num;
@@ -139,6 +142,16 @@ process_queue(struct vm *vm, int qi)
     avail_idx = ai;
     if (avail_idx == last)
       break;
+    if ((uint16)(avail_idx - last) > (uint16)num) {
+      if (vm_gripe(&b->desync))
+        printk("hyp: vm %d: balloon available index %d is ahead of a "
+               "%d-entry ring (%ld times)\n", vm->id, avail_idx, num,
+               b->desync);
+      acquire(&vm->lock);
+      q->last_avail = avail_idx;
+      release(&vm->lock);
+      break;
+    }
     if (vm_copyin(vm, &head, avail + 4 + 2 * (last % num), 2) < 0)
       break;
 
@@ -354,7 +367,9 @@ vballoon_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
     return -1;
 
   acquire(&vm->lock);
-  int sel = b->queue_sel;
+  // unsigned: the guest chooses this value, and a signed one below 3
+  // includes every negative number there is (see vvnet_read).
+  uint32 sel = b->queue_sel;
   switch (off) {
   case VIRTIO_MMIO_DEVICE_FEATURES_SEL: b->device_features_sel = val; break;
   case VIRTIO_MMIO_DRIVER_FEATURES_SEL: b->driver_features_sel = val; break;

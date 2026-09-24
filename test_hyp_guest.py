@@ -780,6 +780,116 @@ def t_malicious(QEMU, intc, cpus, log):
         q.close()
 
 
+def t_fuzz(QEMU, intc, cpus, log, rounds=10000):
+    """a guest that does everything wrong, at random, for as long as it is
+    asked to: random writes and reads over every device the machine
+    has, random CSR numbers, illegal instructions, guest-physical
+    addresses that are not there, nonsense virtqueues and unknown SBI
+    calls. What is under test is the host: it must stay up, keep its
+    console, take the machine's memory back, and still be able to run
+    the next guest. The seed is printed, so a run that finds something
+    can be run again with the same one."""
+    import random
+    seed = random.randrange(1, 2 ** 31)
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        free0, _ = host_stats(q)
+        print("    seed %d, %d rounds" % (seed, rounds))
+        # two vcpus: a device model that is right for one and wrong for
+        # two is a hypervisor bug of exactly the kind this is looking
+        # for. The second vcpu fuzzes the devices while the first one
+        # counts the rounds.
+        q.send('vmm start -k /fuzzguest -f none -m 32 -c 2 -a "seed=%d rounds=%d"\n'
+               % (seed, rounds))
+        # short patterns, and the guest prints each of its two markers
+        # twice: the host writes to the same console, and a message it
+        # prints about this guest (a fault, a nonsense queue) can land
+        # in the middle of a line the guest is printing.
+        mark = q.mark()
+        q.expect(r"fuzzguest: seed", 60)
+        q.expect(r"fuzzguest: done", 600)
+        q.expect(r"traps", 30)   # the rest of that line, which is the numbers
+        out = q.output_since(mark)
+        m = re.search(r"seed (\d+) rounds (\d+)", out)
+        assert m and int(m.group(1)) == seed, out[:400]
+        m = re.search(r"done, \d+ rounds, (\d+) traps", out)
+        # it is only a test of the paths it reached: a run that took no
+        # traps at all would mean the payload never got going.
+        assert m, out[-400:]
+        traps = int(m.group(1))
+        assert traps > rounds // 20, traps
+        print("    the guest took %d traps and the host is still here" % traps)
+        q.expect(r"\[vm \d+ has exited\]", ATONCE)
+        q.expect(r"\$ ", ATONCE)
+        assert "no vms" in vm_ls(q)
+
+        # the host still has its console, its memory and its guests
+        m = q.mark()
+        q.send("echo host-still-here\n")
+        q.expect(r"\nhost-still-here", ATONCE)
+        q.expect(r"\$ ", ATONCE)
+        free1 = wait_pages(q, free0)
+        assert free1 >= free0 - 1, (free0, free1)
+        vmid = start_guest(q, "-n after -c 1 -f /disk0.img")
+        q.send("echo guest-after-fuzz\n")
+        q.expect(r"\nguest-after-fuzz", ATONCE)
+        detach(q)
+        kill_vm(q, vmid)
+    finally:
+        q.close()
+
+
+def wait_pages(q, free0, timeout=20):
+    """free memory in megabytes, once the machine that has gone has
+    given it back."""
+    end = time.time() + timeout
+    while True:
+        free1, _ = host_stats(q)
+        if free1 >= free0 - 1 or time.time() > end:
+            return free1
+        time.sleep(0.5)
+
+
+def t_ownership(QEMU, intc, cpus, log):
+    """a machine belongs to the user who created it, and a descriptor for
+    it is a capability: vmowntest does the work (user/vmowntest.c), and
+    /proc/vmm is checked from the shell."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        m = q.mark()
+        q.send("vmowntest\n")
+        q.expect(r"vmowntest: (ok|\d+ failure)", 120)
+        out = q.output_since(m)
+        assert "vmowntest: ok" in out, out
+        q.expect(r"\$ ", ATONCE)
+
+        # the registry: a running machine is in it, with its owner
+        vmid = start_guest(q, "-n owned -c 1 -f /disk0.img")
+        detach(q)
+        m = q.mark()
+        q.send("cat /proc/vmm\n")
+        q.expect(r"\$ ", ATONCE)
+        out = q.output_since(m)
+        assert re.search(r"(?m)^%d owned 0 (running|new) " % vmid, out), out
+        # and an unprivileged reader sees none of it
+        m = q.mark()
+        q.send("su user -c 'cat /proc/vmm'\n")
+        q.expect(r"\$ ", ATONCE)
+        out = q.output_since(m)
+        assert "owned" not in out, out
+        # nor can they kill it
+        m = q.mark()
+        q.send("su user -c 'vmm kill %d'\n" % vmid)
+        q.expect(r"\$ ", ATONCE)
+        out = q.output_since(m)
+        assert "killed" not in out, out
+        assert "owned" in vm_ls(q)
+        kill_vm(q, vmid)
+        assert "no vms" in vm_ls(q)
+    finally:
+        q.close()
+
+
 def costs_nothing(q, run, rounds=2):
     """running and killing a guest must cost the host nothing.
 
@@ -896,6 +1006,9 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
         t.append(("guest-malicious-%s" % m, lambda m=m: t_malicious(QEMU, m, cpus, log)))
         t.append(("guest-fd-vector-%s" % m, lambda m=m: t_fdv_guests(QEMU, m, cpus, log)))
     t.append(("guest-fd-vector-novec-plic", lambda: t_fdv_guests(QEMU, "plic", cpus, log, vec=0)))
+    t.append(("guest-ownership-plic", lambda: t_ownership(QEMU, "plic", cpus, log)))
+    for m in modes:
+        t.append(("guest-fuzz-%s" % m, lambda m=m: t_fuzz(QEMU, m, cpus, log)))
     # host configurations: a single hart, and more harts than the default.
     t.append(("guest-smp-on-1-hart-plic", lambda: t_guest_usertests(QEMU, "plic", 1, log, 2)))
     t.append(("guest-parallel-on-4-harts-imsic", lambda: t_parallel(QEMU, "imsic", 4, log, 3, 2)))

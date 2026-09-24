@@ -1,0 +1,13 @@
+NAME
+     fsbench - what the file system costs
+
+SYNOPSIS
+     fsbench [-d DIR] [PHASE...]
+
+DESCRIPTION
+     fsbench writes, reads, syncs and unlinks in the ways that separate
+     one file system from another -- sequential and random, small files
+     and big ones, metadata, a big directory, and a mixture -- and
+     prints megabytes a second and operations a second for each. It is
+     plain POSIX, so the same source runs on Linux for comparison
+     (bench/run.py).

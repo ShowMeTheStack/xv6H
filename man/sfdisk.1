@@ -1,0 +1,18 @@
+NAME
+     sfdisk - partition a disk
+
+SYNOPSIS
+     sfdisk [-l] [--label dos|gpt] DEVICE
+     fdisk -l DEVICE
+
+DESCRIPTION
+     sfdisk prints a partition table with -l, and writes one from the
+     lines it reads on standard input otherwise: start, size and type
+     per partition. Both the DOS and the GPT layouts are understood.
+
+OPTIONS
+     -l              print the table
+     --label TYPE    which kind of table to write
+
+SEE ALSO
+     blockdev(8), losetup(8), mkfs_ext4(8)

@@ -1,0 +1,19 @@
+NAME
+     pgrep - find, or signal, processes by name
+
+SYNOPSIS
+     pgrep [-l] [-u USER] PATTERN
+     pkill [-SIGNAL] [-u USER] PATTERN
+     killall [-SIGNAL] NAME
+
+DESCRIPTION
+     pgrep prints the process ids whose command matches PATTERN. Called
+     as pkill or killall it signals them instead -- TERM by default.
+
+OPTIONS
+     -l          print the name beside the id
+     -u USER     only that user's processes
+     -SIGNAL     pkill, killall: the signal to send
+
+SEE ALSO
+     ps(1), kill(1), top(1)

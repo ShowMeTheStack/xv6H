@@ -1,0 +1,17 @@
+NAME
+     chattr - change a file's attributes
+
+SYNOPSIS
+     chattr [-R] [+-=ATCDSacdeijstu] FILE...
+     lsattr [-R] [FILE...]
+
+DESCRIPTION
+     chattr sets the ext4 inode flags: i makes a file immutable, a
+     append-only, and so on. Called as lsattr it prints them.
+
+OPTIONS
+     -R   descend into directories
+     +X   add the attribute, -X remove it, =X set exactly these
+
+SEE ALSO
+     ls(1), stat(1)

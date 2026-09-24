@@ -16,6 +16,14 @@
 #define STACK_MAX   (8UL << 20)   // 8 MB stack region, guard page below it
 #define MMAP_GAP    (1UL << 30)   // between the stack region and the first mmap
 
+// how far the stack and the mmap area may be slid down, in pages: a
+// megabyte and a gigabyte respectively. See aslr_slide() in mm.c and
+// /sys/kernel/randomize_va_space.
+#define ASLR_STACK_PAGES  256
+#define ASLR_MMAP_PAGES   262144
+#define ASLR_PIE_PAGES    65536
+#define ASLR_BRK_PAGES    2048
+
 // vma.prot (mman.h's PROT_* have the same values)
 #define VMA_READ  1
 #define VMA_WRITE 2

@@ -1,10 +1,11 @@
 #ifndef XV6_FILE_H
 #define XV6_FILE_H
 struct gendisk;
+struct vm;
 
 struct file {
   enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_BLOCK, FD_SOCK,
-         FD_UNIX } type;
+         FD_UNIX, FD_VM } type;
   int ref; // reference count
   char readable;
   char writable;
@@ -20,6 +21,7 @@ struct file {
   union {
     struct sock *sock;   // FD_SOCK
     struct unsock *un;   // FD_UNIX
+    struct vm *vm;       // FD_VM: a virtual machine this descriptor holds
   };
 };
 
@@ -98,4 +100,5 @@ extern struct devsw devsw[];
 #define DEV_LOG     8   // /dev/log: what syslog(3) writes and syslogd reads
 #define DEV_KMSG    9   // /dev/kmsg: the kernel's own messages
 #define DEV_PKTCAP 10   // /dev/pktcap: every frame, as pcap records
+#define DEV_AUDIT  11   // /dev/audit: a program's own record in the audit log
 #endif

@@ -45,6 +45,10 @@ struct platform {
   int virtio_irq[PLAT_MAXVIRTIO];
 
   uint32 net_ip, net_mask, net_gw, net_dns; // static network config (0: use DHCP)
+  // a machine behind a gateway object: the network on the far side of
+  // it, and the two addresses on that network it may not talk to.
+  // outer_mask is 0 on a machine that is not behind one.
+  uint32 outer_net, outer_mask, outer_gw, outer_dns;
   uint64 misa;          // read in machine mode at boot
   int has_h;            // misa reports the hypervisor extension
   int has_v;            // misa reports the vector extension

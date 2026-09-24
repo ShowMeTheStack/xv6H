@@ -5,6 +5,7 @@
 # while the laptop keeps working:
 #
 #   tools/remote.sh run NAME SUITE [test-hyp.py args...]   # sync, build, start in tmux
+#   tools/remote.sh queue NAME [tools/qrun.py args...]      # sync, build, the whole matrix as a queue
 #   tools/remote.sh status [NAME]                           # progress of a run, or of all runs
 #   tools/remote.sh wait NAME                               # block until NAME is done, print the summary
 #   tools/remote.sh log NAME                                # the full results file
@@ -40,7 +41,8 @@ sync_tree() { # NAME
   # those. that cost a whole matrix run once.
   rsync -a --delete --delete-excluded \
     --include '*.d/' --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
-    --exclude 'fs.img' --exclude 'test-*.img' --exclude 'user/_*' --exclude 'user/usys.S' \
+    --exclude 'fs.img' --exclude '*-fs.img' --exclude 'test-*.img' --exclude 'mig*.img' --exclude 'mig*.sock' --exclude 'user/_*' --exclude 'user/usys.S' \
+    --exclude 'qlogs' --exclude 'qresults.txt' \
     --exclude 'ext4check.img' --exclude 'ext4check.mnt' --exclude '*.cow' --exclude '*.log' \
     --exclude 'guest[0-9]*.img' --exclude 'build' --exclude '__pycache__' \
     --exclude 'kernel/kernel' --exclude 'mkfs/mkfs' --exclude 'mkfs/mkext4' --exclude 'mkfs/mkpasswd' --exclude 'tls/obj' --exclude 'tls/libbearssl.a' \
@@ -71,6 +73,17 @@ script)
     tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=192 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
   echo "started $name: $script $* on $HOST"
   ;;
+queue)
+  name=$1; shift || true
+  [ -n "$name" ] || { echo "usage: remote.sh queue NAME [qrun args...]"; exit 1; }
+  sync_tree "$name"
+  # qrun builds once itself and then runs every test as its own job, so
+  # the build here is only the file system image the jobs copy.
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
+    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (python3 tools/qrun.py $* > results.out 2>&1; echo \\\$? > done)\""
+  echo "started $name: tools/qrun.py $* on $HOST (tools/remote.sh status $name)"
+  ;;
+
 status)
   name=$1
   if [ -n "$name" ]; then

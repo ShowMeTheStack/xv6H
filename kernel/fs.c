@@ -17,6 +17,7 @@
 #include "types.h"
 #include "riscv.h"
 #include "defs.h"
+#include "nsproxy.h"
 #include "param.h"
 #include "stat.h"
 #include "spinlock.h"
@@ -271,8 +272,14 @@ stati(struct inode *ip, struct stat *st)
   st->nlink = ip->nlink;
   st->size = ip->size;
   st->mode = ip->mode;
-  st->uid = ip->uid;
-  st->gid = ip->gid;
+  // in the caller's namespace's terms: a file whose owner has no name
+  // inside is owned by nobody there (65534), which is what Linux shows
+  {
+    int u = uid_to_ns(userns_current(), ip->uid);
+    int g = gid_to_ns(userns_current(), ip->gid);
+    st->uid = u < 0 ? 65534u : (uint)u;
+    st->gid = g < 0 ? 65534u : (uint)g;
+  }
   st->atime = ip->atime;
   st->mtime = ip->mtime;
   st->ctime = ip->ctime;

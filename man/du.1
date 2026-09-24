@@ -1,0 +1,18 @@
+NAME
+     du - how much disk a tree uses
+
+SYNOPSIS
+     du [-s] [-a] [-h] [PATH...]
+
+DESCRIPTION
+     du adds up the blocks of everything under each PATH and prints a
+     line per directory. The numbers are blocks the files actually
+     occupy, so a sparse file counts what it costs and not what it says.
+
+OPTIONS
+     -s   one total per PATH and nothing else
+     -a   a line for every file, not only directories
+     -h   kilobytes and megabytes rather than blocks
+
+SEE ALSO
+     df(1), ls(1), find(1)

@@ -225,7 +225,11 @@ vvnet_read(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 *val)
   if (size != 4)
     return -1;
   acquire(&vm->lock);
-  int qs = n->queue_sel;
+  // unsigned, and deliberately: queue_sel is whatever the guest last
+  // wrote to it, and `int qs = ...; if (qs < 2)' let a guest choose
+  // 0x80000000, pass the test with a negative number and have the
+  // host index q[] with it.
+  uint32 qs = n->queue_sel;
   switch (off) {
   case VIRTIO_MMIO_MAGIC_VALUE: v = 0x74726976; break;
   case VIRTIO_MMIO_VERSION: v = 2; break;
@@ -258,7 +262,7 @@ vvnet_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
   if (size != 4)
     return -1;
   acquire(&vm->lock);
-  int qs = n->queue_sel;
+  uint32 qs = n->queue_sel;   // unsigned: see vvnet_read
   struct vq_state *q = (qs < 2) ? &n->q[qs] : 0;
   switch (off) {
   case VIRTIO_MMIO_DEVICE_FEATURES_SEL: n->device_features_sel = val; break;

@@ -91,8 +91,8 @@ void            kinit(void);
 // pipe.c
 int             pipealloc(struct file**, struct file**);
 void            pipeclose(struct pipe*, int);
-int             piperead(struct pipe*, uint64, int);
-int             pipewrite(struct pipe*, uint64, int);
+int             piperead(struct pipe*, uint64, int, int);
+int             pipewrite(struct pipe*, uint64, int, int);
 
 // printk.c
 int             printk(char*, ...) __attribute__ ((format (printf, 1, 2)));
@@ -115,6 +115,7 @@ void            proc_mapstacks(pagetable_t);
 int             kkill(int);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
+void            freeze_point(void);   // where a frozen task stops
 struct cpu*     mycpu(void);
 struct proc*    myproc();
 void            procinit(void);
@@ -167,6 +168,9 @@ int             fetchstr(uint64, char*, int);
 int             fetchaddr(uint64, uint64*);
 void            syscall();
 
+// canary.c
+void            canary_init(uint64 hartid);
+
 // trap.c
 extern uint     ticks;
 extern int      tick_hz;        // timer interrupts a second
@@ -189,6 +193,7 @@ void            uartputs_sync(const char *, int);
 
 // vm.c
 void            kvminit(void);
+void            kvm_check_wx(pagetable_t);
 void            kvminithart(void);
 void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
 int             mappages(pagetable_t, uint64, uint64, uint64, int);
@@ -294,17 +299,32 @@ struct inode *  proc_set_cwd(struct proc *, struct inode *);
 struct file *   fdtake(struct proc *, int);
 struct file *   fdput(struct proc *, int, struct file *, int);
 int             fdalloc(struct file *);
+int             proc_has_file(struct proc *, int type, void *obj);
 int             fdalloc_from(struct file *, int);
 int             fdtable_grow_to(struct proc *, int);
 int             fileready(struct file *, int);
 int             piperready(struct pipe *, int);
 int             sockready(struct sock *, int);
+int             sockread(struct sock *, int user, uint64 addr, int n);
+int             sockwrite(struct sock *, int user, uint64 addr, int n);
 int             consoleready(int);
 int             consoleioctl(uint64, uint64);
 int             fdflags_get(struct proc *, int);
 int             fdflags_set(struct proc *, int, int);
 void            fdtable_cloexec(struct proc *);
 struct file *   fdget(struct proc *, int);
+struct pidns;
+int             proc_pid_taken_in_ns(struct pidns *, int nr);
+struct proc *   proc_get_ns(struct pidns *, int nr);
+struct super;
+int             vfs_slot_of(struct super *);
+struct super *  vfs_slot(int);
+struct super *  vfs_machine_root(void);
+void            vfs_reclaim_unseen(void);
+
+// procfs (kernel/procfs.c): what a descriptor on /proc/<pid>/ns/<kind>
+// names, which is what setns(2) needs
+int             procfs_ns_of(struct inode *, int *pid, int *kind);
 uint64          proc_count(void);
 void            procinit_early(void);
 
@@ -386,6 +406,10 @@ void            randominit(void);
 void            random_bytes(void *, int);
 void            random_add(const void *, int);
 
+// mm.c: address space layout randomisation
+extern int      randomize_va_space;
+uint64          aslr_slide(uint64 pages);
+
 // net.c / virtio_net.c
 void            netinit(void);
 void            net_timer(void);
@@ -402,6 +426,26 @@ void            fp_save(uint64 *);
 void            fp_restore(uint64 *);
 void            vec_save(char *, uint64 *);
 void            vec_restore(char *, uint64 *);
+
+// hyp.c, vuart.c: what a VM descriptor (FD_VM, file.c) needs. The rest
+// of the hypervisor's interface is in hyp.h, which only its own files
+// include.
+struct vm;
+void            vm_fdput(struct vm *);
+int             vm_fdid(struct vm *);
+struct vmentry;
+int             vm_list(struct vmentry *out, int max); // /proc/vmm
+int             vm_cons_read(struct vm *, int user, uint64 dst, int n);
+int             vm_cons_write(struct vm *, int user, uint64 src, int n);
+int             vm_cons_ready(struct vm *, int write);
+
+// audit.c
+void            auditinit(void);
+void            auditdevinit(void);
+void            audit(const char *op, const char *detail, uint64 a, uint64 b, int ok);
+int             audit_write(int user, uint64 src, int n);
+int             audit_snapshot(char *dst, int max);
+void            audit_stats(uint64 *seq, uint64 *lost);
 
 // hyp.c
 void            hypinit(void);

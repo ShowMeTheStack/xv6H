@@ -191,11 +191,18 @@ ksm_scan_chunk(struct vm *vm, uint32 k)
   static char scratch[PGSIZE] __attribute__((aligned(PGSIZE)));
   int looked = 0;
 
-  if (k >= (uint32)vm->nchunks || vm->chunk[k] == 0)
+  // the table can go while this is walking it: a machine may be
+  // destroyed at any moment, and vm_free_resources frees the chunks and
+  // then the table itself. What is read here is re-read through
+  // vm_copyin under the lock that protects it, which answers "not
+  // backed" for a machine whose memory has gone; the two reads below are
+  // hints, and are ordered so that a null table is never indexed.
+  if (vm->chunk == 0 || k >= (uint32)vm->nchunks || vm->chunk[k] == 0)
     return 0;
   for (int i = 0; i < HCHUNK_PAGES; i++) {
     uint64 gpa = gpa_of(k, i);
-    uint64 c = vm->chunk[k];
+    uint64 *tab = vm->chunk;
+    uint64 c = tab ? tab[k] : 0;
 
     if (c == 0)
       break;

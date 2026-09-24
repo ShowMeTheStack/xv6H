@@ -1,0 +1,13 @@
+NAME
+     taskset - run a program on chosen processors
+
+SYNOPSIS
+     taskset MASK COMMAND [ARG...]
+
+DESCRIPTION
+     taskset runs COMMAND with its affinity set to MASK, a hexadecimal
+     bitmap of harts: 1 is hart 0, 3 is harts 0 and 1, and so on. A
+     thread only runs where its mask allows.
+
+SEE ALSO
+     nproc(1), nice(1), ps(1)

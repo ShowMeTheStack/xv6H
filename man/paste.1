@@ -1,0 +1,20 @@
+NAME
+     paste - join lines side by side
+
+SYNOPSIS
+     paste [-s] [-d LIST] [FILE...]
+     fold [-s] [-w WIDTH] [FILE...]
+
+DESCRIPTION
+     paste writes the first line of every FILE as one line separated by
+     tabs, then the second, and so on. Called as fold it breaks long
+     lines instead.
+
+OPTIONS
+     -s        one file at a time: all of its lines on one line
+     -d LIST   use these separators instead of tabs
+     -w WIDTH  fold: break at WIDTH columns
+     -s        fold: break at a space rather than mid-word
+
+SEE ALSO
+     cut(1), column layout in pr(1) is not provided

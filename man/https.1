@@ -1,0 +1,17 @@
+NAME
+     https - fetch an https URL
+
+SYNOPSIS
+     https [-v] URL [FILE]
+
+DESCRIPTION
+     https fetches an https:// URL. The TLS is BearSSL, with the
+     certificate checked against the roots built into the image; -v says
+     which version was negotiated, what certificate was offered and
+     whether it verified.
+
+OPTIONS
+     -v   say what the handshake did
+
+SEE ALSO
+     curl(1), wget(1)

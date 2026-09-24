@@ -1,0 +1,22 @@
+NAME
+     ls - list directory contents
+
+SYNOPSIS
+     ls [-a] [-l] [-h] [-R] [-i] [-d] [FILE...]
+
+DESCRIPTION
+     For each FILE, ls writes its name; for a directory, the names of
+     the things inside it. With no FILE it lists the working directory.
+     Names beginning with a dot are left out unless -a is given.
+
+OPTIONS
+     -a   include names beginning with a dot
+     -l   one line per name: type and mode, links, owner, group, size,
+          time of last change, and the name
+     -h   with -l, sizes in kilobytes and megabytes rather than bytes
+     -R   descend into directories
+     -i   print each name's inode number
+     -d   list a directory itself rather than what is in it
+
+SEE ALSO
+     stat(1), find(1), du(1)

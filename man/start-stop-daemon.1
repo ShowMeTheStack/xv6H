@@ -1,0 +1,27 @@
+NAME
+     start-stop-daemon - start and stop daemons from a script
+
+SYNOPSIS
+     start-stop-daemon --start [--pidfile FILE] [--exec PATH] [--background]
+                       [--make-pidfile] [--chuid USER] [--] [ARG...]
+     start-stop-daemon --stop [--pidfile FILE] [--exec PATH]
+                       [--signal SIG] [--retry N]
+
+DESCRIPTION
+     start-stop-daemon is what an init script uses to start a daemon
+     once and to stop it again: it looks for a process matching the
+     pidfile or the executable, and starts or signals accordingly. Its
+     exit status says whether anything was done.
+
+OPTIONS
+     --start, --stop     which way round
+     --pidfile FILE      where the process id is kept
+     --exec PATH         match on this executable
+     --background        put it in the background
+     --make-pidfile      write the pidfile after starting
+     --chuid USER        run as that user
+     --signal SIG        the signal to send when stopping
+     --retry N           wait N seconds, then use KILL
+
+SEE ALSO
+     service(8), init(8)

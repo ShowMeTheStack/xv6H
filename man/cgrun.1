@@ -1,0 +1,25 @@
+NAME
+     cgrun - run a program in a control group
+
+SYNOPSIS
+     cgrun [-n NAME] [-w WEIGHT] [-m PCT] [-M BYTES] [-P N] COMMAND [ARG...]
+     cgrun -f GROUP on|off
+     cgrun -l
+
+DESCRIPTION
+     cgrun puts a program in a group of its own and runs it there. A
+     group has a weight (its share of the processors against its
+     siblings), a ceiling (at most this much of one processor), a memory
+     limit and a process limit, and it can be frozen and thawed.
+
+OPTIONS
+     -n NAME    what to call the group
+     -w WEIGHT  its share, 1 to 10000 (1024 is the default)
+     -m PCT     at most this percentage of one processor
+     -M BYTES   the memory limit
+     -P N       the process limit
+     -f G on|off   freeze or thaw group G
+     -l         list the groups and what they are using
+
+SEE ALSO
+     nice(1), taskset(1), vmm(1), /sys/fs/cgroup

@@ -179,17 +179,36 @@ process_queue(struct vm *vm, struct vvirtio *b)
   }
   uint32 num = b->queue_num;
   int any = 0;
-  for (;;) {
+  // one ring's worth of requests per call, and no more: a doorbell is
+  // a notification that the ring has something in it, not a licence
+  // to hold this thread while the guest keeps writing. Whatever is
+  // still there when this returns is taken on the next round of the
+  // worker, which can see that the VM is going away.
+  for (uint32 done = 0; done < num; done++) {
     uint16 avail_idx, head, used_idx;
     if (rd16(vm, b->avail + 2, &avail_idx) < 0)
       break;
     if (avail_idx == b->last_avail)
       break;
+    // the ring holds `num' descriptors, so at most num can be
+    // outstanding. Anything more is not a queue state that could have
+    // arisen: the guest has written nonsense into the index (or into
+    // the whole ring). Catch up to it rather than walk it.
+    if ((uint16)(avail_idx - b->last_avail) > num) {
+      if (vm_gripe(&b->desync))
+        printk("hyp: vm %d: virtio available index %d is %d ahead of a "
+               "%d-entry ring (%ld times)\n", vm->id, avail_idx,
+               (uint16)(avail_idx - b->last_avail), num, b->desync);
+      b->last_avail = avail_idx;
+      break;
+    }
     if (rd16(vm, b->avail + 4 + 2 * (b->last_avail % num), &head) < 0)
       break;
     int len = do_request(vm, b, head);
     if (len < 0) {
-      printk("hyp: vm %d: malformed virtio request (head %d)\n", vm->id, head);
+      if (vm_gripe(&b->malformed))
+        printk("hyp: vm %d: malformed virtio request (head %d, %ld so far)\n",
+               vm->id, head, b->malformed);
       len = 0;
     }
     // used ring entry: {id, len}
@@ -244,9 +263,40 @@ blk_worker(void *arg)
       return;
     }
     b->wake = 0;
+    b->busy = 1;
     release(&vm->lock);
     process_queue(vm, b);
+    acquire(&vm->lock);
+    b->busy = 0;
+    release(&vm->lock);
+    wakeup((void *)&b->busy);
   }
+}
+
+// The vcpus being stopped is not the machine being still: this thread
+// reads blocks into guest memory and writes them out of it, and it does
+// that whether or not anybody is inside the guest. A save waits here
+// first, or it writes down pages the disk is in the middle of filling --
+// which is what a migrated guest's "panic: kerneltrap" was, ten pages of
+// its block cache holding what they held before the read landed.
+int
+vvirtio_quiesce(struct vm *vm)
+{
+  struct vvirtio *b = &vm->blk;
+
+  acquire(&vm->lock);
+  for (int tries = 0; tries < 500; tries++) {
+    if (!b->running || (!b->busy && !b->wake)) {
+      release(&vm->lock);
+      return 0;
+    }
+    sleep_prepare((void *)&b->busy);
+    release(&vm->lock);
+    sleep();
+    acquire(&vm->lock);
+  }
+  release(&vm->lock);
+  return -1;
 }
 
 // the VM is going. the thread is told to leave and waited for, because

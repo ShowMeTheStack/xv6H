@@ -1,0 +1,18 @@
+NAME
+     traceroute - the path to a host
+
+SYNOPSIS
+     traceroute [-n] [-q TRIES] [-m MAXHOPS] HOST
+
+DESCRIPTION
+     traceroute sends packets with a small time-to-live and prints who
+     sends back the "time exceeded" for each hop, which is the route to
+     HOST as the network sees it.
+
+OPTIONS
+     -n          numbers rather than names
+     -q TRIES    how many packets per hop
+     -m MAXHOPS  how far to go
+
+SEE ALSO
+     ping(1), ip(8)

@@ -1,0 +1,14 @@
+NAME
+     chroot - run a program with another root directory
+
+SYNOPSIS
+     chroot DIR [COMMAND [ARG...]]
+
+DESCRIPTION
+     chroot runs COMMAND (a shell by default) with DIR as /. It is
+     root's alone, and it is not a container by itself: a process that
+     keeps a descriptor to a directory outside can walk out of it, which
+     is what pivot_root in a mount namespace is for.
+
+SEE ALSO
+     unshare(1), vmm(1)

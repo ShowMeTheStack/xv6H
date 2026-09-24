@@ -1,0 +1,16 @@
+NAME
+     ln - make links between files
+
+SYNOPSIS
+     ln [-s] TARGET NAME
+
+DESCRIPTION
+     ln makes NAME another name for TARGET: a hard link, which is the
+     same inode under two names, or with -s a symbolic link, which is a
+     small file holding the path to follow.
+
+OPTIONS
+     -s   make a symbolic link rather than a hard one
+
+SEE ALSO
+     ls(1), stat(1), readlink(1)

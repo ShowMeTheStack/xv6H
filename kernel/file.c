@@ -84,6 +84,8 @@ fileclose(struct file *f)
     sockclose(ff.sock);
   } else if (ff.type == FD_UNIX) {
     unixsock_close(ff.un);
+  } else if (ff.type == FD_VM) {
+    vm_fdput(ff.vm);
   } else if (ff.type == FD_PIPE) {
     pipeclose(ff.pipe, ff.writable);
   } else if (ff.type == FD_INODE || ff.type == FD_DEVICE || ff.type == FD_BLOCK) {
@@ -119,6 +121,12 @@ filestat(struct file *f, uint64 addr)
   case FD_UNIX:
     st.type = T_SOCK;
     break;
+  case FD_VM:
+    // a machine is not a file; what fstat can honestly say is that
+    // this descriptor is a character-like thing with an id of its own.
+    st.type = T_DEVICE;
+    st.ino = vm_fdid(f->vm);
+    break;
   default:
     return -1;
   }
@@ -141,8 +149,12 @@ fileread(struct file *f, uint64 addr, int n)
     r = sockread(f->sock, 1, addr, n);
   } else if (f->type == FD_UNIX) {
     r = unixsock_recv(f->un, 1, addr, n, 0, 0, 0, 0, 0, 0);
+  } else if (f->type == FD_VM) {
+    // reading a machine's descriptor reads what its console has said,
+    // which is what `vmm attach' does through vm_cons().
+    r = vm_cons_read(f->vm, 1, addr, n);
   } else if (f->type == FD_PIPE) {
-    r = piperead(f->pipe, addr, n);
+    r = piperead(f->pipe, addr, n, (f->flags & O_NONBLOCK) != 0);
   } else if (f->type == FD_BLOCK) {
     r = blkdev_read(f->disk, 1, addr, f->off, n);
     if (r > 0)
@@ -177,8 +189,10 @@ filewrite(struct file *f, uint64 addr, int n)
     ret = sockwrite(f->sock, 1, addr, n);
   } else if (f->type == FD_UNIX) {
     ret = unixsock_send(f->un, 1, addr, n, 0, 0, 0, 0);
+  } else if (f->type == FD_VM) {
+    ret = vm_cons_write(f->vm, 1, addr, n);
   } else if (f->type == FD_PIPE) {
-    ret = pipewrite(f->pipe, addr, n);
+    ret = pipewrite(f->pipe, addr, n, (f->flags & O_NONBLOCK) != 0);
   } else if (f->type == FD_BLOCK) {
     ret = blkdev_write(f->disk, 1, addr, f->off, n);
     if (ret > 0)
@@ -241,6 +255,8 @@ fileready(struct file *f, int write)
     return sockready(f->sock, write);
   case FD_UNIX:
     return unixsock_ready(f->un, write);
+  case FD_VM:
+    return vm_cons_ready(f->vm, write);
   case FD_DEVICE:
     if (f->major >= 0 && f->major < NDEV && devsw[f->major].ready)
       return devsw[f->major].ready(write);

@@ -1,0 +1,24 @@
+NAME
+     truncate - set a file's length
+
+SYNOPSIS
+     truncate [-c] -s SIZE FILE...
+     fallocate -l LEN [-o OFFSET] FILE...
+
+DESCRIPTION
+     truncate sets each FILE to SIZE, which may be bigger than it is --
+     the gap reads as zeroes and costs no blocks until something is
+     written into it. SIZE may end in K, M or G, and may begin with + or
+     - to mean relative to the length it has now.
+
+     Called as fallocate, it reserves LEN bytes at OFFSET instead, so
+     that a later write there cannot fail for want of space.
+
+OPTIONS
+     -s SIZE   the length to set
+     -c        do not create a file that is not there
+     -l LEN    fallocate: how much to reserve
+     -o OFF    fallocate: where to start
+
+SEE ALSO
+     dd(1), du(1), stat(1)

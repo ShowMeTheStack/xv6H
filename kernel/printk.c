@@ -172,18 +172,26 @@ printk(char *fmt, ...)
 void
 backtrace(void)
 {
-  uint64 fp;
+  uint64 fp, fp0;
+  extern char etext[];
 
   asm volatile("mv %0, s0" : "=r"(fp));
+  fp0 = fp;
   printk("backtrace:");
   for (int i = 0; i < 16; i++) {
-    // a frame lives on a kernel stack: one page-aligned region, and a
-    // pointer outside it ends the walk rather than faulting
-    if (fp < 0x80000000UL || (fp & 7) != 0)
+    // a frame lives on the stack this walk started on, and stacks grow
+    // down, so every frame is at or above the first one and within a few
+    // pages of it. Only the low bound was checked, and a kernel stack is
+    // at a high virtual address (KSTACK is just under the trampoline):
+    // so a garbage chain read its way into another process's stack, or
+    // into a page that is not mapped, and the fault inside panic turned
+    // one panic into a screenful of them.
+    if (fp < fp0 || fp >= fp0 + 16 * PGSIZE || (fp & 7) != 0)
       break;
     uint64 ra = *(uint64 *)(fp - 8);
     uint64 next = *(uint64 *)(fp - 16);
-    if (ra < 0x80000000UL)
+    // and a return address is somewhere in this kernel's own text
+    if (ra < KERNBASE || ra >= (uint64)etext)
       break;
     printk(" %p", (void *)ra);
     if (next <= fp)

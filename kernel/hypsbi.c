@@ -109,12 +109,14 @@ sbi_hsm(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
   switch (fid) {
   case 0: { // hart_start(hartid, start_addr, opaque)
     if (a0 >= (uint64)vm->nvcpu) {
-      printk("hyp: vm %d: hsm hart_start(%ld): no such vcpu\n", vm->id, a0);
+      if (vm_gripe(&vm->g_sbi))
+        printk("hyp: vm %d: hsm hart_start(%ld): no such vcpu\n", vm->id, a0);
       r.err = SBI_ERR_INVALID_PARAM;
       break;
     }
     if (a1 < G_RAM_BASE || a1 >= G_RAM_BASE + vm->ram_size) {
-      printk("hyp: vm %d: hsm hart_start(%ld): bad address 0x%lx\n", vm->id, a0, a1);
+      if (vm_gripe(&vm->g_sbi))
+        printk("hyp: vm %d: hsm hart_start(%ld): bad address 0x%lx\n", vm->id, a0, a1);
       r.err = SBI_ERR_INVALID_ADDRESS;
       break;
     }
@@ -122,8 +124,9 @@ sbi_hsm(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     int rc = vcpu_hsm_start(&vm->vcpu[a0], a1, a2);
     release(&vm->lock);
     if (rc < 0) {
-      printk("hyp: vm %d: hsm hart_start(%ld) refused: vcpu state %d\n", vm->id, a0,
-             vm->vcpu[a0].hsm_state);
+      if (vm_gripe(&vm->g_sbi))
+        printk("hyp: vm %d: hsm hart_start(%ld) refused: vcpu state %d\n", vm->id, a0,
+               vm->vcpu[a0].hsm_state);
       r.err = SBI_ERR_ALREADY_AVAILABLE;
     }
     break;

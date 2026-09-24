@@ -27,6 +27,7 @@
 #include "fs.h"
 #include "file.h"
 #include "net.h"
+#include "cgw.h"
 #include "sock.h"
 #include "tcp.h"
 
@@ -93,9 +94,11 @@ sockalloc(int type)
       s->want_errors = 0;
       s->deadline = 0;
       s->rcvtimeo = 0;
+      s->sndtimeo = 0;
       s->shut_rd = s->shut_wr = 0;
       s->tcp = 0;
       s->closed = 0;
+      s->ns = netns_cur();
       s->id = i;
       release(&socklock);
       return s;
@@ -106,16 +109,17 @@ sockalloc(int type)
 }
 
 static uint16
-port_alloc(void)
+port_alloc(struct netns *ns)
 {
-  // ephemeral ports 49152..65535, skipping ones in use.
+  // ephemeral ports 49152..65535, skipping ones in use in this namespace.
   for (int tries = 0; tries < 16384; tries++) {
     uint16 p = next_port++;
     if (next_port == 0)
       next_port = 49152;
     int used = 0;
     for (int i = 0; i < NSOCK; i++)
-      if (socks[i].type != SOCK_NONE && socks[i].lport == p)
+      if (socks[i].type != SOCK_NONE && socks[i].ns == ns &&
+          socks[i].lport == p)
         used = 1;
     if (!used)
       return p;
@@ -190,11 +194,12 @@ sock_enqueue(struct sock *s, struct mbuf *m)
 }
 
 int
-sock_udp_rx(struct mbuf *m, uint32 src, uint16 sport, uint16 dport)
+sock_udp_rx(struct netns *ns, struct mbuf *m, uint32 src, uint16 sport,
+            uint16 dport)
 {
   for (int i = 0; i < NSOCK; i++) {
     struct sock *s = &socks[i];
-    if (s->type == SOCK_DGRAM && s->lport == dport && (s->rport == 0 || (s->rip == src && s->rport == sport))) {
+    if (s->type == SOCK_DGRAM && s->ns == ns && s->lport == dport && (s->rport == 0 || (s->rip == src && s->rport == sport))) {
       m->arg = src;
       m->arg16 = sport;
       return sock_enqueue(s, m);
@@ -204,11 +209,11 @@ sock_udp_rx(struct mbuf *m, uint32 src, uint16 sport, uint16 dport)
 }
 
 int
-sock_icmp_rx(struct mbuf *m, uint32 src, uint16 id)
+sock_icmp_rx(struct netns *ns, struct mbuf *m, uint32 src, uint16 id)
 {
   for (int i = 0; i < NSOCK; i++) {
     struct sock *s = &socks[i];
-    if (s->type == SOCK_ICMP && s->lport == id) {
+    if (s->type == SOCK_ICMP && s->ns == ns && s->lport == id) {
       m->arg = src;
       m->arg16 = ntohs(((struct icmp *)m->head)->seq);
       mbufpull(m, sizeof(struct icmp));
@@ -224,12 +229,14 @@ sock_icmp_rx(struct mbuf *m, uint32 src, uint16 id)
 // so a program that does not care about errors never sees one and a
 // program that does can tell them apart.
 int
-sock_icmp_error(uint32 src, int type, int code, uint16 id, uint16 seq)
+sock_icmp_error(struct netns *ns, uint32 src, int type, int code, uint16 id,
+                uint16 seq)
 {
   (void)code;
   for (int i = 0; i < NSOCK; i++) {
     struct sock *s = &socks[i];
-    if (s->type != SOCK_ICMP || s->lport != id || !s->want_errors)
+    if (s->type != SOCK_ICMP || s->ns != ns || s->lport != id ||
+        !s->want_errors)
       continue;
     struct mbuf *m = mbufalloc(MBUF_HEADROOM);
     if (m == 0)
@@ -245,12 +252,13 @@ sock_icmp_error(uint32 src, int type, int code, uint16 id, uint16 seq)
 // the same for a UDP socket, named by the source port of the packet
 // the error is about
 int
-sock_udp_error(uint32 src, int type, int code, uint16 sport)
+sock_udp_error(struct netns *ns, uint32 src, int type, int code, uint16 sport)
 {
   (void)code;
   for (int i = 0; i < NSOCK; i++) {
     struct sock *s = &socks[i];
-    if (s->type != SOCK_DGRAM || s->lport != sport || !s->want_errors)
+    if (s->type != SOCK_DGRAM || s->ns != ns || s->lport != sport ||
+        !s->want_errors)
       continue;
     struct mbuf *m = mbufalloc(MBUF_HEADROOM);
     if (m == 0)
@@ -285,13 +293,15 @@ static int
 wait_up(int timeout)
 {
   uint t0 = ticks;
-  while (!netcfg.up) {
+  struct netns *ns = netns_cur();
+
+  while (!ns->cfg.up) {
     if (timeout && ticks - t0 >= timeout)
       return -1;
     if (killed(myproc()))
       return -1;
-    sleep_prepare(&netcfg);
-    if (!netcfg.up)
+    sleep_prepare(&ns->cfg);
+    if (!ns->cfg.up)
       sleep_intr();
   }
   return 0;
@@ -323,9 +333,10 @@ ipsock_bind(struct sock *s, int port)
     return -EINVAL;
   acquire(&socklock);
   if (port == 0)
-    port = port_alloc();
+    port = port_alloc(s->ns);
   for (int i = 0; i < NSOCK; i++)
-    if (&socks[i] != s && socks[i].type == s->type && socks[i].lport == port) {
+    if (&socks[i] != s && socks[i].type == s->type && socks[i].ns == s->ns &&
+        socks[i].lport == port) {
       release(&socklock);
       return -EADDRINUSE;
     }
@@ -343,7 +354,7 @@ ipsock_connect(struct sock *s, uint32 ip, int port)
     return -ENETDOWN;
   if (s->lport == 0) {
     acquire(&socklock);
-    s->lport = port_alloc();
+    s->lport = port_alloc(s->ns);
     release(&socklock);
   }
   s->rip = ip;
@@ -396,7 +407,10 @@ ipsock_sendto(struct sock *s, int user, uint64 buf, int n, uint32 dst, int port)
       net_policy_dropped++;
       return -EACCES; // the egress policy refused it
     }
-    return net_tx_icmp_echo(dst, s->lport, port, data, n, s->ttl) < 0 ? -EIO : n;
+    int rc = net_tx_icmp_echo_ns(s->ns, dst, s->lport, port, data, n, s->ttl);
+    if (rc < 0)
+      return rc < -1 ? rc : -EIO;   // the reason, when there is one
+    return n;
   }
   if (s->type != SOCK_DGRAM)
     return -EOPNOTSUPP;
@@ -404,7 +418,7 @@ ipsock_sendto(struct sock *s, int user, uint64 buf, int n, uint32 dst, int port)
     return -ENETDOWN;
   if (s->lport == 0) {
     acquire(&socklock);
-    s->lport = port_alloc();
+    s->lport = port_alloc(s->ns);
     release(&socklock);
   }
   if (!net_policy_ok(dst, IPPROTO_UDP, port, 0)) {
@@ -419,8 +433,9 @@ ipsock_sendto(struct sock *s, int user, uint64 buf, int n, uint32 dst, int port)
     mbuffree(m);
     return -EFAULT;
   }
-  if (net_tx_udp(m, dst, s->lport, port, s->ttl) < 0)
-    return -EIO;
+  int rc = net_tx_udp_ns(s->ns, m, dst, s->lport, port, s->ttl);
+  if (rc < 0)
+    return rc < -1 ? rc : -EIO;
   return n;
 }
 
@@ -511,6 +526,12 @@ ipsock_setopt(struct sock *s, int opt, int value)
     else
       s->rcvtimeo = value;
     break;
+  case SO_SNDTIMEO_TICKS:
+    if (value < 0)
+      r = -EINVAL;
+    else
+      s->sndtimeo = value;
+    break;
   default:
     r = -ENOPROTOOPT;
   }
@@ -535,11 +556,159 @@ ipsock_getopt(struct sock *s, int opt, int *value)
   case SO_RCVTIMEO_TICKS:
     *value = s->rcvtimeo;
     break;
+  case SO_SNDTIMEO_TICKS:
+    *value = s->sndtimeo;
+    break;
   default:
     r = -ENOPROTOOPT;
   }
   release(&s->lock);
   return r;
+}
+
+// ip route add|del|get: the routing table, changed or asked. Changing
+// it needs CAP_NET_ADMIN; asking does not, because a program is allowed
+// to know how its own packets will go.
+// vmm gw add|rm: a router inside the host. Making one is privileged --
+// it takes an address on the switch and a subnet of its own -- and so is
+// taking one away.
+uint64
+sys_netgw(void)
+{
+  struct gwreq r;
+  uint64 addr;
+  int op;
+
+  argint(0, &op);
+  argaddr(1, &addr);
+  if (either_copyin(&r, 1, addr, sizeof(r)) < 0)
+    return -EFAULT;
+  r.name[CGW_NAMELEN - 1] = 0;
+  if (!cap_ok(CAP_NET_ADMIN))
+    return -EPERM;
+  if (op == GW_ADD) {
+    struct cgw *g = 0;
+    int rc = cgw_create(r.name, r.addr, r.mask, r.pub_ip, &g);
+    if (rc < 0)
+      return rc;
+    r.pub_ip = g->pub_ip;
+    if (either_copyout(1, addr, &r, sizeof(r)) < 0)
+      return -EFAULT;
+    return rc;
+  }
+  if (op == GW_DEL) {
+    struct cgw *g = cgw_find(r.name);
+    if (g == 0)
+      return -ESRCH;
+    return cgw_destroy(g);
+  }
+  // the rest are a container runtime's, and are about the caller's own
+  // network namespace. They are privileged (CAP_NET_ADMIN, above) and
+  // the namespace has to be one of its own: attaching the machine's
+  // network to a gateway would put the host behind it.
+  if (op == GW_ATTACH || op == GW_PUB || op == GW_UNPUB) {
+    struct netns *ns = netns_cur();
+    struct cgw *g = r.name[0] ? cgw_find(r.name) : cgw_by_addr(r.addr);
+    if (g == 0)
+      return -ESRCH;
+    if (op == GW_ATTACH) {
+      if (ns == &rootns)
+        return -EPERM;
+      r.ifname[NETIF_NAMELEN - 1] = 0;
+      int rc = cgw_attach_ns(g, ns, r.addr, r.ifname);
+      if (rc < 0)
+        return rc;
+      // and what a program asks about its network: its address, the way
+      // out, and the name server the machine uses, which it reaches
+      // through the gateway like everything else
+      ns->cfg.ip = r.addr;
+      ns->cfg.mask = g->mask;
+      ns->cfg.gw = g->addr;
+      ns->cfg.dns = rootns.cfg.dns;
+      ns->cfg.up = 1;
+      struct netif *dev = netif_find(ns, r.ifname[0] ? r.ifname : "eth0");
+      if (dev)
+        memmove(ns->cfg.mac, dev->mac, ETHADDR_LEN);
+      return 0;
+    }
+    if (r.proto != IPPROTO_TCP && r.proto != IPPROTO_UDP)
+      return -EINVAL;
+    if (op == GW_PUB)
+      return cgw_publish_ns(g, r.proto, r.pport,
+                            r.addr ? r.addr : ns->cfg.ip, r.cport);
+    return cgw_unpublish_ns(g, r.proto, r.pport);
+  }
+  return -EINVAL;
+}
+
+uint64
+sys_netroute(void)
+{
+  struct rtreq r;
+  uint64 addr;
+  int op;
+
+  argint(0, &op);
+  argaddr(1, &addr);
+  if (either_copyin(&r, 1, addr, sizeof(r)) < 0)
+    return -EFAULT;
+  r.dev[NETIF_NAMELEN - 1] = 0;
+  struct netns *ns = netns_cur();
+
+  // an address on an interface: the address, the subnet it is on and the
+  // way out of it, which is what DHCP sets when it is answered and what
+  // nothing could set by hand until now. A host with no DHCP server on
+  // its wire -- two of them joined to each other for a migration -- has
+  // no other way to have an address at all.
+  if (op == RT_ADDR) {
+    if (!cap_ok(CAP_NET_ADMIN))
+      return -EPERM;
+    struct netif *dev = netif_find(ns, r.dev[0] ? r.dev : "eth0");
+    if (dev == 0)
+      return -ENODEV;
+    if (dev->flags & NETIF_LOOPBACK)
+      return -EINVAL;
+    netns_configure(ns, dev->name, r.dst, r.mask, r.gw);
+    ns->cfg.ip = r.dst;
+    ns->cfg.mask = r.mask;
+    ns->cfg.gw = r.gw;
+    if (r.metric)                 // the resolver's, if one was given
+      ns->cfg.dns = (uint32)r.metric;
+    ns->cfg.up = 1;
+    ns->cfg.dhcp = 0;
+    memmove(ns->cfg.mac, dev->mac, ETHADDR_LEN);
+    wakeup(&ns->cfg);             // anything waiting for the interface
+    return 0;
+  }
+
+  if (op == RT_GET) {
+    uint32 nexthop = r.dst;
+    struct netif *dev = route_lookup(ns, r.dst, &nexthop);
+    if (dev == 0)
+      return -ENETUNREACH;
+    r.gw = nexthop == r.dst ? 0 : nexthop;
+    safestrcpy(r.dev, dev->name, NETIF_NAMELEN);
+    if (either_copyout(1, addr, &r, sizeof(r)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+
+  if (!cap_ok(CAP_NET_ADMIN))
+    return -EPERM;
+  struct netif *dev = netif_find(ns, r.dev);
+  if (op == RT_ADD) {
+    if (dev == 0)
+      return -ENODEV;
+    // a gateway has to be on the interface own subnet. A next hop that
+    // is itself only reachable through a gateway is not a next hop:
+    // there would be nothing to put in the ethernet header.
+    if (r.gw && !(dev->mask && (r.gw & dev->mask) == (dev->ip & dev->mask)))
+      return -ENETUNREACH;
+    return route_add(ns, r.dst, r.mask, r.gw, dev, r.metric) < 0 ? -ENOSPC : 0;
+  }
+  if (op == RT_DEL)
+    return route_del(ns, r.dst & r.mask, r.mask, r.gw) < 0 ? -ESRCH : 0;
+  return -EINVAL;
 }
 
 uint64
@@ -607,7 +776,7 @@ sockwrite(struct sock *s, int user, uint64 addr, int n)
     mbuffree(m);
     return -1;
   }
-  if (net_tx_udp(m, s->rip, s->lport, s->rport, s->ttl) < 0)
+  if (net_tx_udp_ns(s->ns, m, s->rip, s->lport, s->rport, s->ttl) < 0)
     return -1;
   return n;
 }

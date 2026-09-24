@@ -3,6 +3,8 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "defs.h"
+#include "nsproxy.h"
+#include "cgroup.h"
 #include "platform.h"
 #include "intc.h"
 #include "unixsock.h"
@@ -38,6 +40,8 @@ main()
     kstackinit();       // the kernel stack region
     procinit_early();   // command-line settings for processes
     schedinit();        // the run queues, before any task is made
+    nsinit();      // the root namespaces
+    cginit();      // and the root control group
     procinit();         // processes
     trapinit();         // trap vectors
     trapinithart();     // install kernel trap vector
@@ -58,6 +62,8 @@ main()
     ext4_init();
     rtcinit();          // the real-time clock
     randominit();       // the random generator
+    auditinit();        // the record of privileged operations
+    auditdevinit();     // and /dev/audit, where a program adds to it
     bridgeinit();       // software switch between host, guests and the NIC
     netinit();          // network device and stack
     ksm_init();         // same-page merging between guests (off until asked)

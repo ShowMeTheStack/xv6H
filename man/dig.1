@@ -1,0 +1,19 @@
+NAME
+     dig - ask the name server
+
+SYNOPSIS
+     dig [@SERVER] NAME [TYPE] [+short]
+     dig -x ADDRESS
+     host NAME
+
+DESCRIPTION
+     dig sends a DNS query and prints the answer section in full. TYPE
+     is A, AAAA, CNAME, MX, NS, PTR, SOA or TXT.
+
+OPTIONS
+     @SERVER   ask this server rather than the configured one
+     +short    the answer alone
+     -x ADDR   a reverse lookup
+
+SEE ALSO
+     nslookup(1), ping(1), /etc/resolv.conf

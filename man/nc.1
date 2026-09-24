@@ -1,0 +1,22 @@
+NAME
+     nc - read and write over a connection
+
+SYNOPSIS
+     nc [-u] [-v] [-n] [-w SEC] HOST PORT
+     nc -l [-u] [-v] PORT
+
+DESCRIPTION
+     nc connects to HOST on PORT and copies standard input to it and what
+     comes back to standard output. With -l it listens instead. It is
+     the simplest way to test that something is listening, or to move a
+     file between two machines.
+
+OPTIONS
+     -l        listen rather than connect
+     -u        UDP rather than TCP
+     -v        say what it is doing
+     -n        no name lookups
+     -w SEC    give up after SEC seconds
+
+SEE ALSO
+     curl(1), wget(1), netstat(1)

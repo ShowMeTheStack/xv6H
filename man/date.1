@@ -1,0 +1,17 @@
+NAME
+     date - print or set the time
+
+SYNOPSIS
+     date [+FORMAT]
+     date -s STRING
+
+DESCRIPTION
+     date prints the time of day. With a +FORMAT it prints it that way:
+     %Y %m %d %H %M %S %j %a %A %b %B %Z %s and the rest of the usual
+     letters. With -s it sets the clock, which is root's alone.
+
+OPTIONS
+     -s STRING   set the clock from STRING
+
+SEE ALSO
+     cal(1), uptime(1), touch(1)

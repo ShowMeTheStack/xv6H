@@ -30,8 +30,11 @@
 #include "mm.h"
 #include "platform.h"
 #include "errno.h"
+#include "nsproxy.h"
 #include "net.h"
+#include "cgw.h"
 #include "sock.h"
+#include "vmm.h"
 #include "tcp.h"
 #include "unixsock.h"
 
@@ -61,6 +64,10 @@
 #define PINO_NET_UNIX   19
 #define PINO_SCHEDSTAT  20
 #define PINO_SLABINFO   21
+#define PINO_VMM        22
+#define PINO_AUDIT      23
+#define PINO_NET_CONNTRACK 24
+#define PINO_NET_GATEWAYS  25
 #define PINO_FIRST_PID 1024
 
 // a process's files: the inode number is (pid << 4) + index + base
@@ -72,10 +79,14 @@
 #define PPID_FD      5
 #define PPID_CWD     6
 #define PPID_ROOT    7
-#define PPID_NFILES  8
+#define PPID_NS      8
+#define PPID_UIDMAP  9
+#define PPID_GIDMAP 10
+#define PPID_NFILES 11
 
 static const char *const pid_files[PPID_NFILES] = {
-    0, "status", "cmdline", "stat", "maps", "fd", "cwd", "root"};
+    0, "status", "cmdline", "stat", "maps", "fd", "cwd", "root", "ns",
+    "uid_map", "gid_map"};
 
 // one inode per open descriptor, in a space of its own: the top bit
 // marks it, then the process and the descriptor number. a process may
@@ -99,6 +110,31 @@ is_fd_inum(uint inum, int *pid, int *fd)
   return 1;
 }
 
+// /proc/<pid>/ns/<kind>: one file per namespace the process is in, whose
+// contents name the namespace ("uts:[3]"), as Linux's do. Linux makes
+// them symbolic links into a file system of its own; here they are
+// ordinary files, because what matters is that a descriptor for one
+// names a namespace, and setns(2) takes such a descriptor.
+#define PINO_NS_FLAG 0x40000000u
+#define PINO_NS_SHIFT 4
+
+static uint
+ns_inum(int pid, int kind)
+{
+  return PINO_NS_FLAG | ((uint)pid << PINO_NS_SHIFT) | ((uint)kind & 0xf);
+}
+
+static int
+is_ns_inum(uint inum, int *pid, int *kind)
+{
+  if ((inum & PINO_NS_FLAG) == 0 || (inum & PINO_FD_FLAG) != 0)
+    return 0;
+  *pid = (int)((inum & ~PINO_NS_FLAG) >> PINO_NS_SHIFT);
+  *kind = (int)(inum & 0xf);
+  return 1;
+}
+
+
 struct topfile {
   const char *name;
   uint inum;
@@ -111,6 +147,7 @@ static const struct topfile topfiles[] = {
     {"partitions", PINO_PARTITIONS}, {"diskstats", PINO_DISKSTATS},
     {"self", PINO_SELF},             {"stat", PINO_STAT},
     {"schedstat", PINO_SCHEDSTAT}, {"slabinfo", PINO_SLABINFO},
+    {"vmm", PINO_VMM},           {"audit", PINO_AUDIT},
     {"net", PINO_NET},
     {0, 0},
 };
@@ -120,7 +157,8 @@ static const struct topfile netfiles[] = {
     {"dev", PINO_NET_DEV},     {"arp", PINO_NET_ARP},
     {"route", PINO_NET_ROUTE}, {"tcp", PINO_NET_TCP},
     {"udp", PINO_NET_UDP},     {"sockstat", PINO_NET_SOCKSTAT},
-    {"unix", PINO_NET_UNIX},
+    {"unix", PINO_NET_UNIX}, {"conntrack", PINO_NET_CONNTRACK},
+    {"gateways", PINO_NET_GATEWAYS},
     {0, 0},
 };
 
@@ -331,14 +369,133 @@ sock_emit(const struct sockinfo *si, void *arg)
   gen_str(c->g, "\n");
 }
 
+// how many leading ones a mask has.
+static int
+prefix_bits(uint32 mask)
+{
+  int n = 0;
+
+  for (uint32 m = mask; m & 0x80000000; m <<= 1)
+    n++;
+  return n;
+}
+
+// one line of /proc/net/dev, in the columns Linux prints.
+static void
+dev_emit(const struct netif *d, void *arg)
+{
+  struct gen *g = arg;
+
+  for (int k = strlen(d->name); k < 6; k++)
+    gen_str(g, " ");
+  gen_str(g, d->name);
+  gen_str(g, ": 0 ");
+  gen_num(g, d->rx_packets);
+  gen_str(g, " 0 ");
+  gen_num(g, d->rx_dropped);
+  gen_str(g, " 0 0 0 0 0 ");
+  gen_num(g, d->tx_packets);
+  gen_str(g, " 0 ");
+  gen_num(g, d->tx_dropped);
+  gen_str(g, " 0 0 0 0\n");
+}
+
+// one line of /proc/net/route: addresses little-endian hexadecimal, as
+// the kernel that invented the file happened to write them.
+static void
+route_emit(const struct route *r, void *arg)
+{
+  struct gen *g = arg;
+
+  gen_str(g, r->dev->name);
+  gen_str(g, "\t");
+  gen_addr_le(g, r->dst);
+  gen_str(g, "\t");
+  gen_addr_le(g, r->gw);
+  gen_str(g, r->gw ? "\t0003\t0\t0\t" : "\t0001\t0\t0\t");
+  gen_num(g, r->metric);
+  gen_str(g, "\t");
+  gen_addr_le(g, r->mask);
+  gen_str(g, "\t0\t0\t0\n");
+}
+
+// one conversation, in the shape conntrack has always printed them:
+// the protocol twice (by name and by number), how long this one has
+// left, the state if it has one, and the five numbers.
+static void
+ct_emit(const struct ct *c, void *arg)
+{
+  struct gen *g = arg;
+  static const char *tcpstate[] = {"NONE", "SYN_SENT", "ESTABLISHED",
+                                   "CLOSE_WAIT", "CLOSE"};
+
+  gen_str(g, "ipv4     2 ");
+  gen_str(g, c->proto == IPPROTO_TCP ? "tcp      6 " :
+             c->proto == IPPROTO_UDP ? "udp     17 " :
+             c->proto == IPPROTO_ICMP ? "icmp     1 " : "unknown  0 ");
+  gen_num(g, c->expires);
+  gen_str(g, " ");
+  if (c->proto == IPPROTO_TCP) {
+    gen_str(g, tcpstate[c->state <= CT_CLOSED ? c->state : 0]);
+    gen_str(g, " ");
+  }
+  gen_str(g, "src=");
+  gen_dotted(g, c->src);
+  gen_str(g, " dst=");
+  gen_dotted(g, c->dst);
+  if (c->proto == IPPROTO_ICMP) {
+    // an echo has no ports: what identifies it is its type and the
+    // identifier its reply carries back
+    gen_str(g, " type=");
+    gen_num(g, c->icmp_type);
+    gen_str(g, " code=0 id=");
+    gen_num(g, c->sport);
+  } else {
+    gen_str(g, " sport=");
+    gen_num(g, c->sport);
+    gen_str(g, " dport=");
+    gen_num(g, c->dport);
+  }
+  gen_str(g, " packets=");
+  gen_num(g, c->packets);
+  gen_str(g, " replies=");
+  gen_num(g, c->replies);
+  if (c->replies)
+    gen_str(g, " [ASSURED]");
+  if (c->published)
+    gen_str(g, " [PUBLISHED]");
+  gen_str(g, "\n");
+}
+
+// one gateway: the two sides of it, and what it has translated.
+static void
+gw_emit(const struct cgw *w, void *arg)
+{
+  struct gen *g = arg;
+
+  gen_str(g, w->name);
+  gen_str(g, "\t");
+  gen_dotted(g, w->addr);
+  gen_str(g, "/");
+  gen_num(g, prefix_bits(w->mask));
+  gen_str(g, "\tpublic ");
+  gen_dotted(g, w->pub_ip);
+  gen_str(g, "\tsnat ");
+  gen_num(g, w->snat);
+  gen_str(g, " dnat ");
+  gen_num(g, w->dnat);
+  gen_str(g, " flows ");
+  gen_num(g, w->translated);
+  gen_str(g, " dropped ");
+  gen_num(g, w->dropped);
+  gen_str(g, "\n");
+}
+
 static void
 gen_net(struct gen *g, uint inum)
 {
-  struct netinfo ni;
-
   switch (inum) {
   case PINO_NET_DEV:
-    net_stats(&ni);
     gen_str(g, "Inter-|   Receive                            "
                "                    |  Transmit\n");
     gen_str(g, " face |bytes    packets errs drop fifo frame compressed "
@@ -346,16 +503,7 @@ gen_net(struct gen *g, uint inum)
                "compressed\n");
     // bytes are not counted per interface here, so the columns that
     // hold them are zero rather than a number that is not true
-    gen_str(g, "    lo: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n");
-    gen_str(g, "  eth0: 0 ");
-    gen_num(g, ni.rx_packets);
-    gen_str(g, " 0 ");
-    gen_num(g, ni.rx_dropped);
-    gen_str(g, " 0 0 0 0 0 ");
-    gen_num(g, ni.tx_packets);
-    gen_str(g, " 0 ");
-    gen_num(g, ni.tx_dropped);
-    gen_str(g, " 0 0 0 0\n");
+    netif_walk(netns_cur(), dev_emit, g);
     break;
 
   case PINO_NET_ARP: {
@@ -368,24 +516,19 @@ gen_net(struct gen *g, uint inum)
     break;
   }
 
+  case PINO_NET_CONNTRACK:
+    ct_walk(ct_emit, g);
+    break;
+
+  case PINO_NET_GATEWAYS:
+    gen_str(g, "Name\tInside\t\tPublic\t\tTranslated\n");
+    cgw_walk(gw_emit, g);
+    break;
+
   case PINO_NET_ROUTE:
-    net_stats(&ni);
     gen_str(g, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\t"
                "Mask\t\tMTU\tWindow\tIRTT\n");
-    if (ni.up) {
-      // the route to the network this interface is on, and then the
-      // default route through the gateway
-      gen_str(g, "eth0\t");
-      gen_addr_le(g, ni.ip & ni.mask);
-      gen_str(g, "\t00000000\t0001\t0\t0\t0\t");
-      gen_addr_le(g, ni.mask);
-      gen_str(g, "\t0\t0\t0\n");
-      if (ni.gw) {
-        gen_str(g, "eth0\t00000000\t");
-        gen_addr_le(g, ni.gw);
-        gen_str(g, "\t0003\t0\t0\t0\t00000000\t0\t0\t0\n");
-      }
-    }
+    route_walk(netns_cur(), route_emit, g);
     break;
 
   case PINO_NET_TCP:
@@ -560,6 +703,69 @@ gen_top(struct gen *g, uint inum)
     break;
   }
 
+  case PINO_AUDIT: {
+    // the record of privileged operations. Who became whom, and when,
+    // is not for everybody to read: an unprivileged reader gets the
+    // header and nothing else. What fits is the newest part of the
+    // ring -- this file is one page, and the ring is larger.
+    uint64 seq, lost;
+    audit_stats(&seq, &lost);
+    gen_str(g, "# audit: ");
+    gen_num(g, seq);
+    gen_str(g, " records, ");
+    gen_num(g, lost);
+    gen_str(g, " dropped\n");
+    if (!cap_ok(CAP_SYS_ADMIN) || !userns_in_root())
+      break;
+    g->len += audit_snapshot(g->buf + g->len, g->cap - g->len);
+    break;
+  }
+
+  case PINO_VMM: {
+    // the machines this host is running: who owns each one, what state
+    // it is in, and how many descriptors name it. A machine is its
+    // owner's business, so a reader who is not privileged sees only
+    // their own -- the registry is not a list of who is running what.
+    // a page rather than a static array: two readers of this file at
+    // once would otherwise fill the same one, and NVM entries are too
+    // much to put on a kernel stack.
+    struct vmentry *vms = (struct vmentry *)kalloc();
+    if (vms == 0)
+      break;
+    int n = vm_list(vms, PGSIZE / (int)sizeof(struct vmentry));
+    static const char *const st[] = {"free", "new", "running", "halting",
+                                     "paused"};
+    static const char *const kd[] = {"plic", "aplic", "imsic"};
+    int all = cap_ok(CAP_SYS_ADMIN) && userns_in_root();
+    uint me = myproc()->cred.euid;
+    gen_str(g, "id name owner state intc vcpus mem_mb resident_mb fds\n");
+    for (int i = 0; i < n; i++) {
+      if (!all && vms[i].owner != me)
+        continue;
+      vms[i].name[VM_NAMELEN - 1] = 0;
+      gen_num(g, vms[i].id);
+      gen_str(g, " ");
+      gen_str(g, vms[i].name[0] ? vms[i].name : "-");
+      gen_str(g, " ");
+      gen_num(g, vms[i].owner);
+      gen_str(g, " ");
+      gen_str(g, st[vms[i].state <= VM_PAUSED ? vms[i].state : 0]);
+      gen_str(g, " ");
+      gen_str(g, kd[vms[i].kind >= 0 && vms[i].kind <= 2 ? vms[i].kind : 0]);
+      gen_str(g, " ");
+      gen_num(g, vms[i].nvcpu);
+      gen_str(g, " ");
+      gen_num(g, vms[i].mem_mb);
+      gen_str(g, " ");
+      gen_num(g, vms[i].resident_mb);
+      gen_str(g, " ");
+      gen_num(g, vms[i].fdref);
+      gen_str(g, "\n");
+    }
+    kfree(vms);
+    break;
+  }
+
   case PINO_SLABINFO: {
     // one line per object cache: what it holds, how big, how many fit
     // in a slab, how many slabs it owns, how many objects are out, and
@@ -628,7 +834,7 @@ gen_top(struct gen *g, uint inum)
   }
 
   case PINO_SELF:
-    gen_num(g, myproc()->pid);
+    gen_num(g, pid_in_ns(myproc(), pidns_current()));
     gen_str(g, "\n");
     break;
 
@@ -639,6 +845,8 @@ gen_top(struct gen *g, uint inum)
   case PINO_NET_UDP:
   case PINO_NET_SOCKSTAT:
   case PINO_NET_UNIX:
+  case PINO_NET_CONNTRACK:
+  case PINO_NET_GATEWAYS:
     gen_net(g, inum);
     break;
 
@@ -651,18 +859,20 @@ gen_top(struct gen *g, uint inum)
 static void
 gen_pid(struct gen *g, int pid, int which)
 {
-  struct proc *p = proc_get(pid);
+  struct proc *p = proc_get_ns(pidns_current(), pid);
 
   if (p == 0)
     return;
   switch (which) {
-  case PPID_STATUS:
+  case PPID_STATUS: {
+    struct pidns *pns = pidns_current();
     gen_str(g, "Name:\t");
     gen_str(g, p->name);
     gen_str(g, "\nPid:\t");
-    gen_num(g, p->pid);
+    gen_num(g, pid_in_ns(p, pns));
     gen_str(g, "\nPPid:\t");
-    gen_num(g, p->parent ? p->parent->pid : 0);
+    // a parent outside the namespace cannot be named in it
+    gen_num(g, p->parent ? pid_in_ns(p->parent, pns) : 0);
     gen_str(g, "\nState:\t");
     switch (p->state) {
     case RUNNING: gen_str(g, "R (running)"); break;
@@ -691,13 +901,14 @@ gen_pid(struct gen *g, int pid, int which)
     gen_num(g, p->stime);
     gen_str(g, "\n");
     break;
+  }
 
   case PPID_CMDLINE:
     gen_str(g, p->name);
     break;
 
   case PPID_STAT:
-    gen_num(g, p->pid);
+    gen_num(g, pid_in_ns(p, pidns_current()));
     gen_str(g, " (");
     gen_str(g, p->name);
     gen_str(g, ") ");
@@ -705,7 +916,7 @@ gen_pid(struct gen *g, int pid, int which)
                 : p->state == SLEEPING ? "S "
                 : p->state == ZOMBIE   ? "Z "
                                        : "R ");
-    gen_num(g, p->parent ? p->parent->pid : 0);
+    gen_num(g, p->parent ? pid_in_ns(p->parent, pidns_current()) : 0);
     gen_str(g, " ");
     gen_num(g, p->pgid);
     gen_str(g, " ");
@@ -720,6 +931,26 @@ gen_pid(struct gen *g, int pid, int which)
     gen_num(g, p->mm ? p->mm->pages : 0);
     gen_str(g, "\n");
     break;
+
+  case PPID_UIDMAP:
+  case PPID_GIDMAP: {
+    // "inside host count", as Linux writes it. A namespace with no
+    // mapping yet has an empty file.
+    struct nsproxy *nsp = p->ns;
+    struct userns *un = nsp ? nsp->user : 0;
+    unsigned int inside, host, count;
+    if (un == 0 || userns_map_of(un, which == PPID_UIDMAP, &inside, &host,
+                                 &count) < 0)
+      break;
+    gen_str(g, "        ");
+    gen_num(g, inside);
+    gen_str(g, "        ");
+    gen_num(g, host);
+    gen_str(g, "        ");
+    gen_num(g, count);
+    gen_str(g, "\n");
+    break;
+  }
 
   case PPID_MAPS:
     gen_str(g, "(areas are listed once the address space grows a reader)\n");
@@ -836,7 +1067,7 @@ name_inode(struct inode *ip, char *out, int size)
 static struct file *
 grab_fd(int pid, int fd, struct proc **held)
 {
-  struct proc *p = proc_get(pid);
+  struct proc *p = proc_get_ns(pidns_current(), pid);
   struct file *f = 0;
 
   *held = 0;
@@ -872,7 +1103,7 @@ procfs_load(struct inode *ip)
     // owner's business alone
     ip->type = T_SYMLINK;
     ip->mode = 0500;
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p) {
       ip->uid = p->cred.euid;
       ip->gid = p->cred.egid;
@@ -889,6 +1120,19 @@ procfs_load(struct inode *ip)
     ip->valid = 1;
     return;
   }
+  int nskind;
+  if (is_ns_inum(ip->inum, &pid, &nskind)) {
+    ip->type = T_FILE;
+    ip->mode = 0444;
+    struct proc *pp = proc_get_ns(pidns_current(), pid);
+    if (pp) {
+      ip->uid = pp->cred.euid;
+      ip->gid = pp->cred.egid;
+      proc_release(pp);
+    }
+    ip->valid = 1;
+    return;
+  }
   if (ip->inum == PINO_ROOT || ip->inum == PINO_NET) {
     ip->type = T_DIR;
     ip->mode = 0555;
@@ -902,6 +1146,17 @@ procfs_load(struct inode *ip)
       ip->mode = 0500;   // what a process holds open is its own affair
       ip->nlink = 2;
     }
+    if (which == PPID_UIDMAP || which == PPID_GIDMAP) {
+      // the one writable thing under a process: who its user namespace
+      // calls whom. Written once, by somebody the namespace above
+      // trusts.
+      ip->mode = 0644;
+    }
+    if (which == PPID_NS) {
+      ip->type = T_DIR;
+      ip->mode = 0555;   // which namespaces a process is in is not a secret
+      ip->nlink = 2;
+    }
     if (which == PPID_CWD || which == PPID_ROOT) {
       ip->type = T_SYMLINK;
       ip->mode = 0500;
@@ -909,7 +1164,7 @@ procfs_load(struct inode *ip)
     // a process's directory belongs to whoever runs it, and what is in
     // it is theirs: the environment of another user's process is not
     // something to hand out, and Linux does not either.
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p) {
       ip->uid = p->cred.euid;
       ip->gid = p->cred.egid;
@@ -923,6 +1178,17 @@ procfs_load(struct inode *ip)
   ip->valid = 1;
 }
 
+// what /proc/<pid>/ns/<kind> names, for setns(2): the process and the
+// kind, from which the kernel finds the namespace. -1 if this inode is
+// not one of those files.
+int
+procfs_ns_of(struct inode *ip, int *pid, int *kind)
+{
+  if (ip == 0 || ip->sb == 0 || strncmp(ip->sb->type, "procfs", 7) != 0)
+    return -1;
+  return is_ns_inum(ip->inum, pid, kind) ? 0 : -1;
+}
+
 static int
 procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
 {
@@ -932,10 +1198,21 @@ procfs_read(struct inode *ip, int user_dst, uint64 dst, uint off, uint n)
   if (page == 0)
     return -ENOMEM;
   struct gen g = {page, 0, PGSIZE};
-  if (is_pid_dir(ip->inum, &pid, &which))
+  int nskind;
+  if (is_ns_inum(ip->inum, &pid, &nskind)) {
+    // "uts:[3]": the kind and which one of it, so that two processes in
+    // the same namespace read the same thing and two in different ones
+    // do not. That is the whole of what this file is for, besides being
+    // something setns(2) can be given a descriptor for.
+    gen_str(&g, ns_kind_name(nskind));
+    gen_str(&g, ":[");
+    gen_num(&g, ns_id_of(pid, nskind));
+    gen_str(&g, "]\n");
+  } else if (is_pid_dir(ip->inum, &pid, &which)) {
     gen_pid(&g, pid, which);
-  else
+  } else {
     gen_top(&g, ip->inum);
+  }
   g.buf[g.len] = 0;
 
   int avail = g.len - (int)off;
@@ -987,7 +1264,7 @@ procfs_lookup(struct inode *dp, char *name, uint *poff)
         return 0;
       n = n * 10 + (*p - '0');
     }
-    struct proc *p = proc_get(n);
+    struct proc *p = proc_get_ns(pidns_current(), n);
     if (p == 0)
       return 0;
     proc_release(p);
@@ -1011,6 +1288,16 @@ procfs_lookup(struct inode *dp, char *name, uint *poff)
     for (int i = 1; i < PPID_NFILES; i++)
       if (pid_files[i] && strncmp(name, pid_files[i], DIRSIZ) == 0)
         return procfs_iget(pid_inum(pid, i));
+    return 0;
+  }
+  if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_NS) {
+    if (strncmp(name, ".", 2) == 0)
+      return procfs_iget(dp->inum);
+    if (strncmp(name, "..", 3) == 0)
+      return procfs_iget(pid_inum(pid, PPID_DIR));
+    for (int k = 0; k < NS_KINDS; k++)
+      if (ns_kind_name(k) && strncmp(name, ns_kind_name(k), DIRSIZ) == 0)
+        return procfs_iget(ns_inum(pid, k));
     return 0;
   }
   if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_FD) {
@@ -1068,15 +1355,21 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
       (*pos)++;
       return 1;
     }
-    // then one directory per process
+    // then one directory per process -- one per process the caller can
+    // see, numbered the way the caller numbers it. Inside a container
+    // that is the container's processes and nothing else, which is what
+    // makes `ps' inside one honest.
     uint64 want = i - ntop;
     uint64 seen = 0;
+    struct pidns *pns = pidns_current();
     proc_iter_start();
     for (struct proc *p = proc_iter_next(0); p; p = proc_iter_next(p)) {
       if (p->state == UNUSED)
         continue;
+      if (!pid_visible(p, pns))
+        continue;
       if (seen == want) {
-        int pidv = p->pid;
+        int pidv = pid_in_ns(p, pns);
         proc_iter_end();
         // the name is the number
         char tmp[16];
@@ -1133,6 +1426,34 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     return 0;
   }
 
+  if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_NS) {
+    uint64 i = *pos;
+    if (i == 0) {
+      safestrcpy(name, ".", namemax);
+      *ino = dp->inum;
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    if (i == 1) {
+      safestrcpy(name, "..", namemax);
+      *ino = pid_inum(pid, PPID_DIR);
+      *type = 4;
+      (*pos)++;
+      return 1;
+    }
+    for (uint64 k = i - 2; k < NS_KINDS; k++) {
+      if (ns_kind_name((int)k) == 0)
+        continue;
+      safestrcpy(name, ns_kind_name((int)k), namemax);
+      *ino = ns_inum(pid, (int)k);
+      *type = 8;
+      *pos = k + 3;
+      return 1;
+    }
+    return 0;
+  }
+
   if (is_pid_dir(dp->inum, &pid, &which) && which == PPID_FD) {
     uint64 i = *pos;
     if (i == 0) {
@@ -1151,7 +1472,7 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     }
     // one entry per open descriptor, walked from where the last call
     // left off rather than counted from the start
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p == 0 || p->fdt == 0) {
       if (p)
         proc_release(p);
@@ -1206,7 +1527,8 @@ procfs_readdir(struct inode *dp, uint64 *pos, char *name, int namemax, uint *ino
     if (i < PPID_NFILES && pid_files[i]) {
       safestrcpy(name, pid_files[i], namemax);
       *ino = pid_inum(pid, i);
-      *type = i == PPID_FD ? 4 : (i == PPID_CWD || i == PPID_ROOT) ? 10 : 8;
+      *type = (i == PPID_FD || i == PPID_NS) ? 4
+              : (i == PPID_CWD || i == PPID_ROOT) ? 10 : 8;
       (*pos)++;
       return 1;
     }
@@ -1242,7 +1564,7 @@ procfs_readlink(struct inode *ip, char *buf, int max)
     fileclose(f);
   } else if (is_pid_dir(ip->inum, &pid, &which) &&
              (which == PPID_CWD || which == PPID_ROOT)) {
-    struct proc *p = proc_get(pid);
+    struct proc *p = proc_get_ns(pidns_current(), pid);
     if (p == 0)
       return -ENOENT;
     struct inode *dir = 0;
@@ -1276,12 +1598,52 @@ procfs_readlink(struct inode *ip, char *buf, int max)
 static int
 procfs_write(struct inode *ip, int user_src, uint64 src, uint off, uint n)
 {
-  (void)ip;
-  (void)user_src;
-  (void)src;
+  int pid, which;
+
   (void)off;
-  (void)n;
-  return -EACCES;
+  if (!is_pid_dir(ip->inum, &pid, &which))
+    return -EACCES;
+  if (which != PPID_UIDMAP && which != PPID_GIDMAP)
+    return -EACCES;
+  if (n == 0 || n > 64)
+    return -EINVAL;
+  char buf[65];
+  if (either_copyin(buf, user_src, src, n) < 0)
+    return -EFAULT;
+  buf[n] = 0;
+
+  // three numbers: what it is called inside, what it is on the machine,
+  // and how many of them.
+  unsigned int v[3] = {0, 0, 0};
+  int got = 0;
+  for (char *q = buf; *q && got < 3;) {
+    while (*q == ' ' || *q == '\t' || *q == '\n')
+      q++;
+    if (*q < '0' || *q > '9')
+      break;
+    unsigned int x = 0;
+    while (*q >= '0' && *q <= '9')
+      x = x * 10 + (unsigned int)(*q++ - '0');
+    v[got++] = x;
+  }
+  if (got != 3)
+    return -EINVAL;
+
+  struct proc *t = proc_get_ns(pidns_current(), pid);
+  if (t == 0)
+    return -ESRCH;
+  struct nsproxy *nsp = t->ns;
+  struct userns *un = nsp ? nsp->user : 0;
+  proc_release(t);
+  if (un == 0 || un == userns_root())
+    return -EPERM;         // the machine's own numbering is not a map
+  // writing somebody's map is a privileged thing in the namespace above
+  // it: a container that could widen its own mapping would be a
+  // container in name only.
+  if (!cap_ok(CAP_SETUID) || !userns_in_root())
+    return -EPERM;
+  int r = userns_set_map(un, which == PPID_UIDMAP, v[0], v[1], v[2]);
+  return r < 0 ? r : (int)n;
 }
 
 static const struct inode_ops procfs_iops = {

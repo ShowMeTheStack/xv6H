@@ -1,0 +1,24 @@
+NAME
+     tcpdump - watch the packets
+
+SYNOPSIS
+     tcpdump [-i IFACE] [-n] [-c COUNT] [-s LEN] [-q] [-e] [-x] [-X]
+             [-w FILE]
+
+DESCRIPTION
+     tcpdump prints a line per packet as it arrives or leaves. With -w it
+     writes a pcap file instead, which can be read anywhere that reads
+     pcap.
+
+OPTIONS
+     -i IFACE    which interface
+     -n          numbers rather than names
+     -c COUNT    stop after COUNT packets
+     -s LEN      keep LEN bytes of each
+     -q          shorter lines
+     -e          print the ethernet header too
+     -x, -X      hexadecimal, with text
+     -w FILE     write a pcap file
+
+SEE ALSO
+     netstat(1), ip(8), ping(1)

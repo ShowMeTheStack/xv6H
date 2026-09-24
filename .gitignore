@@ -18,6 +18,7 @@ TAGS
 guest*.img
 guest/kernel
 guest/badguest
+guest/fuzzguest
 guest/*.o
 test-hyp.log
 guest/disk*.img
@@ -28,6 +29,9 @@ linux/Image*
 linux/linux.img
 guest/fdguest
 guest/vguest
+guest/vmbench
+mig*.img
+mig*.sock
 tls/obj/
 tls/libbearssl.a
 user/tls_date.h
@@ -41,3 +45,14 @@ mkfs/mkpasswd
 .DS_Store
 dbg.log
 user/syscallnames.h
+
+# what the test harness leaves behind: one log per run, one per job, and
+# the copies of the file system each job boots from.
+/test-hyp.log
+# TEST_LOG=<name> puts a run's console somewhere else
+/*.log
+/qresults.txt
+/q[0-9]*.log
+/qlogs/
+*-fs.img
+bench/campaign/
