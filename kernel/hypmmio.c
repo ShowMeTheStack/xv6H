@@ -97,13 +97,16 @@ decode(uint32 inst, struct memop *m)
 }
 
 void
-vm_add_dev(struct vm *vm, uint64 base, uint64 size,
+vm_add_dev(struct vm *vm, const char *name, int irq, uint64 base, uint64 size,
            int (*read)(struct vm *, struct vdev *, uint64, int, uint64 *),
            int (*write)(struct vm *, struct vdev *, uint64, int, uint64), void *priv)
 {
   if (vm->ndev >= VM_MAXDEV)
     panic("vm_add_dev");
   struct vdev *d = &vm->dev[vm->ndev++];
+  d->name = name;
+  d->irq = irq;
+  d->loads = d->stores = 0;
   d->base = base;
   d->size = size;
   d->read = read;
@@ -147,6 +150,13 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
 
   uint64 off = gpa - d->base;
   int rc;
+  // which device a guest's exits go to is the thing that says what to
+  // build next: a count here costs one increment on a path that already
+  // costs microseconds.
+  if (m.is_load)
+    d->loads++;
+  else
+    d->stores++;
   if (m.is_load) {
     uint64 val = 0;
     rc = d->read(vm, d, off, m.size, &val);

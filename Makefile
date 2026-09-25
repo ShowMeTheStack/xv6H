@@ -76,10 +76,12 @@ OBJS = \
   $K/fpu.o \
   $K/hypsbi.o \
   $K/virtio_net.o \
+  $K/virtio_con.o \
   $K/virtio_balloon.o \
   $K/net.o \
   $K/bridge.o \
   $K/vvnet.o \
+  $K/vvcon.o \
   $K/vballoon.o \
   $K/ksm.o \
   $K/rbtree.o \
@@ -448,6 +450,7 @@ UPROGS=\
 	$U/_id\
 	$U/_taskset\
 	$U/_schedbench\
+	$U/_netbench\
 	$U/_cgrun\
 	$U/_cgtest\
 	$U/_fuzzsys\

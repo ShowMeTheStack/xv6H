@@ -35,6 +35,14 @@ vic_init(struct vm *vm)
 void
 vic_set_level(struct vm *vm, int irq, int level)
 {
+  // Count the rising edges per interrupt line. This is the one place every
+  // device model's interrupt goes through, and what it answers is whether
+  // there is anything for VIRTIO_F_EVENT_IDX to coalesce: a device that
+  // raises one interrupt per request it completes has nothing to save, and
+  // one that raises fewer already coalesces. Cheap enough to leave in --
+  // an interrupt costs the guest four exits to take.
+  if (level && irq >= 0 && irq < VPLIC_NIRQ)
+    vm->irq_raised[irq]++;
   switch (vm->vic_kind) {
   case VIC_PLIC:
     vplic_set_level(vm, irq, level);

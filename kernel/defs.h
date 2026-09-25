@@ -156,6 +156,11 @@ int             memcmp(const void*, const void*, uint);
 void*           memmove(void*, const void*, uint);
 void*           memset(void*, int, uint);
 char*           safestrcpy(char*, const char*, int);
+
+// virtio_con.c
+void            virtio_con_init(void);
+int             virtio_con_present(void);
+void            virtio_con_write(const char*, int);
 int             strlen(const char*);
 int             strncmp(const char*, const char*, uint);
 char*           strncpy(char*, const char*, int);
@@ -251,6 +256,7 @@ const char *    sched_group_name(struct sched_group *);
 void            sched_bandwidth_tick(void);
 void            sched_balance(void);
 int             sched_hart_idle(void);
+int             sched_tickless_ok(void);
 int             sched_group_list(uint64 *, int max, char names[][SCHED_GROUP_NAMELEN]);
 uint32          sched_weight_of(int nice);
 #define SCHED_NEW     0   // a task that has just been made

@@ -35,10 +35,37 @@ def wait_up(q, timeout=30):
     raise AssertionError("interface never came up: " + out)
 
 
+def ping_counts(out, dst):
+    """(transmitted, received) for `ping dst' in out, or None if it printed no
+    summary (it was refused by the policy, say).
+
+    Which matters because of what the assertion below is allowed to require.
+    A destination inside this system -- the host, a guest, a gateway -- is
+    ours, and every packet to it must come back; losing one is a defect. But
+    8.8.8.8 is not ours and neither is the wifi in between: this laptop's
+    link has run at 44-72 ms with 9 ms of jitter and has lost 16-62% of its
+    pings for stretches, and `net-host', `net-tools', `net-conntrack',
+    `net-gateway', `net-published' and `ct-net' have all gone red for it.
+    What the test is for is that the translation path works, and one reply
+    proves that as well as four do. Requiring four proves the internet was
+    well, which is not this system's doing either way."""
+    i = out.find("PING %s " % dst)
+    if i < 0:
+        return None
+    chunk = out[i:]
+    j = chunk.find("PING ", 5)
+    if j > 0:
+        chunk = chunk[:j]
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", chunk)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def xv6_internet(q, https=True):
     """the xv6 stack (host or guest) reaches the internet: ICMP, DNS, HTTP, TLS."""
     out = run(q, "ping 8.8.8.8", 30)
-    assert "4 packets transmitted, 4 received" in out, out
+    c = ping_counts(out, "8.8.8.8")
+    assert c and c[0] == 4, out          # it sent what it was told to
+    assert c[1] >= 1, out                # and the world answered at least once
     out = run(q, "nslookup example.com", 30)
     assert re.search(r"Address: \d+\.\d+\.\d+\.\d+", out), out
     out = run(q, "wget http://example.com", 60)
@@ -650,7 +677,16 @@ def t_guest_net_static(QEMU, intc, cpus, log):
 
 def linux_internet(q, https=True):
     out = L.linux_cmd(q, "ping -c 2 -W 5 8.8.8.8", 40)
-    assert "2 packets received" in out, out
+    # as everywhere else in this file: it must send what it was told to, and
+    # the world must answer at least once. Requiring both replies is a
+    # statement about the wifi (see ping_counts above), and this laptop's has
+    # failed this test twice in an afternoon for one lost packet.
+    # busybox says "1 packets received" where xv6's own ping says "1
+    # received", and a regex that knows only one of the two reads a lost
+    # packet as a lost test.
+    m = re.search(r"(\d+) packets transmitted, (\d+) (?:packets )?received", out)
+    assert m and int(m.group(1)) == 2, out
+    assert int(m.group(2)) >= 1, out
     out = L.linux_cmd(q, "nslookup example.com", 40)
     assert re.search(r"Address: *\d+\.\d+\.\d+\.\d+", out), out
     out = L.linux_cmd(q, "wget -q -O - http://example.com", 60)

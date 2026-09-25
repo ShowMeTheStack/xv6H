@@ -291,8 +291,26 @@ timer_rearm(void)
   // timers everything else waits on.
   if (me != 0 && sched_hart_idle())
     next_tick[me] = now + tick_interval * 64;
+  // and a hart running a guest with nothing behind it: the tick would be
+  // an exit from the guest, and on this emulator an exit is about sixteen
+  // microseconds, so a hundred a second is most of what a guest that is
+  // busy computing pays for being a guest at all (827 of 1755 exits for a
+  // 300 MB dd, measured). Nothing on this hart needs it: there is nobody
+  // to preempt, the running task's time is charged from the time counter
+  // when it stops rather than by counting ticks, and hyp_next_deadline()
+  // below still brings the timer back for a guest whose own timer is due.
+  // Hart 0 keeps ticking regardless -- it owes the world `ticks', the
+  // network timers and the signal timers.
+  int tickless = (me != 0 && sched_tickless_ok());
+  if (tickless)
+    next_tick[me] = now + tick_interval * 8;
   uint64 next = next_tick[me];
-  uint64 slice = sched_slice_deadline();
+  // the slice has to go too, and it is the half that was actually firing:
+  // a slice divides a processor between tasks, and there is one task. With
+  // the tick stretched and the slice still set, the timer went off at the
+  // end of every slice instead and a busy guest paid the same hundred
+  // exits a second it had before.
+  uint64 slice = tickless ? 0 : sched_slice_deadline();
   if (slice > now && slice < next)
     next = slice;
   next = hyp_next_deadline(next);

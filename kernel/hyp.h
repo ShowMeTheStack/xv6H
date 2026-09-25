@@ -102,6 +102,8 @@
 #define G_VNET_IRQ   2
 #define G_BALLOON_BASE 0x10003000L
 #define G_BALLOON_IRQ  3
+#define G_CON_BASE   0x10004000L
+#define G_CON_IRQ    4
 #define G_RTC_BASE   0x101000L
 #define G_RTC_IRQ    11
 #define G_CLINT_BASE 0x02000000L
@@ -144,6 +146,9 @@ struct vdev {
   int (*read)(struct vm *, struct vdev *, uint64 off, int size, uint64 *val);
   int (*write)(struct vm *, struct vdev *, uint64 off, int size, uint64 val);
   void *priv;
+  const char *name;      // for `vmm info': which device the exits went to
+  int irq;               // the line it raises (-1: none, it is a controller)
+  uint64 loads, stores;  // and how many of each
 };
 #define VM_MAXDEV 12
 
@@ -197,6 +202,31 @@ struct vvnet {
   struct vq_state q[2];     // 0: receive, 1: transmit
   uint32 intr_status, status;
   uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
+};
+
+// virtio-console: the guest's console as a virtqueue rather than as a
+// register it writes one byte at a time.
+//
+// A booting xv6 guest makes 2840 emulated device accesses and 2319 of them
+// -- eighty-two per cent -- are the 16550: its driver reads the line status
+// register to see whether the transmit register is free and then writes one
+// character, so every character of output is two exits, and an exit is about
+// sixteen microseconds here. The same output through a queue is one
+// notification for as many characters as the guest cared to put in the
+// descriptor.
+//
+// Queue 0 carries what the host types to the guest, queue 1 what the guest
+// prints; both end up in the same two rings the 16550 uses (vm->cons_out and
+// vm->cons_in), so `vmm attach' cannot tell which device a machine is using
+// and a guest that never drives this one loses nothing.
+struct vvcon {
+  int present;
+  uint32 device_features_sel, driver_features_sel;
+  uint32 queue_sel;
+  struct vq_state q[2];     // 0: to the guest (receive), 1: from it (transmit)
+  uint32 intr_status, status;
+  uint64 rx_bytes, tx_bytes;   // what crossed, and in how few exits
+  uint64 notifies;
 };
 
 // virtio-balloon: the host says how much of the guest's memory it
@@ -424,6 +454,7 @@ struct vm {
   struct vuart uart;
   struct vvirtio blk;
   struct vvnet vnet;
+  struct vvcon con;
   struct vballoon balloon;
   uint64 rtc_latch;       // virtual RTC: TIME_HIGH latched by a TIME_LOW read
   struct vplic plic;
@@ -431,6 +462,8 @@ struct vm {
   uint32 clint_msip[NVCPU];
 
   struct vdev dev[VM_MAXDEV];
+  // rising edges per interrupt line, by irq number (see vic_set_level)
+  uint64 irq_raised[VPLIC_NIRQ];
   int ndev;
 
   struct cring cons_out, cons_in;
@@ -523,7 +556,10 @@ uint32 hyp_fetch(struct vcpu *v, uint64 gva);
 
 // hypmmio.c
 int hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst);
-void vm_add_dev(struct vm *vm, uint64 base, uint64 size,
+void vvcon_init(struct vm *vm);          // vvcon.c
+void vvcon_rx(struct vm *vm);            // host input -> the guest's queue 0
+int vvcon_active(struct vm *vm);         // is the guest driving it?
+void vm_add_dev(struct vm *vm, const char *name, int irq, uint64 base, uint64 size,
                 int (*read)(struct vm *, struct vdev *, uint64, int, uint64 *),
                 int (*write)(struct vm *, struct vdev *, uint64, int, uint64),
                 void *priv);
@@ -544,6 +580,7 @@ int vm_cons_read(struct vm *vm, int user, uint64 dst, int n);
 int vm_cons_ready(struct vm *vm, int write);
 int vm_cons_write(struct vm *vm, int user, uint64 src, int n);
 void vm_cons_putc(struct vm *vm, int c);
+void vm_cons_emit(struct vm *vm, const char *buf, int n);
 int vm_cons_getc(struct vm *vm);
 
 // vvirtio.c

@@ -165,6 +165,10 @@ struct proc {
   int killed;           // If non-zero, have been killed
   int xstate;           // Exit status to be returned to parent's wait
   int pid;              // Process ID
+  // non-zero while this process is inside a guest's vcpu. The timer path
+  // asks, because a tick delivered to a hart that is running a guest and
+  // nothing else costs the guest an exit and buys nobody anything.
+  void *vcpu;
 
   // wait_lock must be held when using these:
   struct proc *parent;   // Parent process

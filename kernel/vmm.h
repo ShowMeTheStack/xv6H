@@ -28,6 +28,14 @@
 #define VMF_RAW       2 // kernel is a raw binary loaded at load_addr (also the entry)
 #define VMF_HSM       4 // secondary vcpus start stopped, to be started via SBI HSM (Linux)
 #define VMF_NOHUGE    8 // back guest RAM 4 KB at a time, never with megapages
+// give the machine a virtio-console (0x10004000, irq 4) as well as the
+// 16550. Not the default, and deliberately: a guest that has a driver for
+// it pays one exit for a line of output instead of two for a character,
+// but a guest that has a *different* driver for it may prefer it to the
+// 16550 and be worse off. Linux does exactly that -- it binds hvc0 to this
+// device and its boot goes from six seconds to past the test's patience --
+// so a machine is given this device when its configuration asks for it.
+#define VMF_CONQUEUE 16
 
 // A machine's switch port is closed: what arrives from outside is
 // delivered only when it belongs to a conversation the machine itself
@@ -125,6 +133,10 @@ struct vminfo {
   uint64 disk_sectors;
   uint64 exits, mmio, csr, wfi, injected;
   uint64 exit_throttles, nudges;  // the exit-rate throttle, and the sibling nudge
+  // which device the emulated accesses went to, which is what says what is
+  // worth building next
+  int ndev;
+  struct { char name[12]; uint64 loads, stores, irqs; } dev[12];
   // its switch port: what it publishes, and what was turned away
   struct pport ports[NPPORT];
   int nports;

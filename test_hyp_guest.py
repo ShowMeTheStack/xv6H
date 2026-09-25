@@ -9,7 +9,13 @@ DETACH = "\x1d"
 
 def boot_host(QEMU, intc, cpus, log, **kw):
     q = QEMU(intc=intc, cpus=cpus, log=log, **kw)
-    q.expect(r"hyp: hypervisor extension present", 90)
+    # whichever of the two the machine prints: a host without the H
+    # extension says so and carries on, and the tests that boot a host
+    # without starting a guest -- the network, the processes, the
+    # namespaces, the containers -- are exactly the ones worth running on
+    # a machine that has none. Waiting only for "present" made four of
+    # them sit through six minutes of a banner that was never coming.
+    q.expect(r"hyp: (hypervisor extension present|no hypervisor extension)", 90)
     q.expect(r"init: starting sh", 90)
     q.expect(r"\$ ", 30)
     return q
@@ -659,7 +665,16 @@ def t_lifecycle(QEMU, intc, cpus, log):
         q.expect(r"after-resume\r?\n", 30)
         q.expect(r"\$ ", 30)
         detach(q)
-        # ps shows the guest's processes
+        # ps shows the guest's processes. `db' was started detached, so
+        # everything it has said since is still in its console ring and
+        # `vmm ps' prints that before the list: attaching once drains the
+        # ring and proves it has finished booting, and then the list is
+        # the only thing that arrives. (Without this the assertion raced
+        # the boot -- on eight harts it lost.)
+        attach(q, "db")
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        detach(q)
         q.send("vmm ps db\n")
         q.expect(r"sleep +init", 30)
         q.expect(r"\$ ", 30)

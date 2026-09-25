@@ -1,0 +1,55 @@
+NAME
+     netbench - what the network stack costs
+
+SYNOPSIS
+     netbench [-t SECONDS] [-p PORT] [-s SIZE] [-l | -c HOST]
+              [stream|rr|connect|udp ...]
+
+DESCRIPTION
+     netbench measures one connection at a time and prints what it
+     managed. With neither -l nor -c it does the whole thing to itself
+     over the loopback address, forking a server of its own: that is the
+     stack with no device underneath it. With -l it listens and with
+     -c HOST it connects, which is how the interesting number is taken
+     -- the same test run from a guest to its host crosses the software
+     switch and the guest's virtio-net, and the difference between the
+     two is what a guest pays for its network.
+
+     The tests:
+
+     stream   bytes a second through one connection, one way.
+     rr       one byte there and back: round trips a second, and the
+              latency of one.
+     connect  connect, exchange a byte, close: connections a second.
+     udp      datagrams a second, one way.
+
+     With no test named it runs stream and rr.
+
+OPTIONS
+     -t SECONDS  how long each test runs (default 3).
+     -p PORT     the port to listen on or connect to (default 5555).
+     -s SIZE     bytes per write, and per datagram (default 4096).
+     -l          listen, and serve whatever a client asks for.
+     -c HOST     connect to HOST and measure against it.
+
+EXAMPLES
+     The stack with nothing under it:
+
+           netbench -t 2 stream rr
+
+     A guest measuring what its NIC costs, with the host running
+     `netbench -l' first:
+
+           netbench -c 10.0.2.15 -t 2 stream rr
+
+NOTES
+     A guest cannot be the server for this unless the port is published
+     (see vmm(1) `port'): a frame arriving at a guest is delivered only
+     if the guest asked for it, and an unsolicited connection is not
+     that. Measuring with the guest as the client needs no such hole.
+
+     The same program builds and runs on Linux, which is the point: a
+     number with nothing to compare it against says very little.
+
+SEE ALSO
+     schedbench(1), fsbench(1), nc(1), vmm(1)

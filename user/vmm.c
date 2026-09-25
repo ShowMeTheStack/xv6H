@@ -45,7 +45,7 @@ static void
 usage(void)
 {
   fprintf(stderr, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
-             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-M mb] [-d]\n"
+             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-Q] [-M mb] [-d]\n"
              "                 [-w weight] [--cpu-max pct] [-p HPORT[:GPORT][/udp]]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
@@ -1470,6 +1470,8 @@ start(int argc, char *argv[])
       cfg.flags |= VMF_SOFTIMSIC;
     } else if (strcmp(a, "-4") == 0) {
       cfg.flags |= VMF_NOHUGE;
+    } else if (strcmp(a, "-Q") == 0) {
+      cfg.flags |= VMF_CONQUEUE;
     } else if (strcmp(a, "-d") == 0) {
       detach = 1;
     } else {
@@ -1534,7 +1536,8 @@ info(int id)
          vi.imsic_hw ? " (hardware guest files)" : "");
   printf("  memory: %d chunks split to pages, %d table pages%s%s",
          vi.split_chunks, vi.table_pages,
-         (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "", "");
+         (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "",
+         (vi.cfg.flags & VMF_CONQUEUE) ? ", console queue" : "");
   if (vi.mem_limit_mb)
     printf(", limit %d MB", vi.mem_limit_mb);
   printf("\n");
@@ -1566,6 +1569,19 @@ info(int id)
   }
   printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld", vi.exits, vi.mmio, vi.csr,
          vi.wfi, vi.injected);
+  // and which device they went to. Eighty-two per cent of a guest's exits
+  // being emulated accesses only names the work if it says *whose*.
+  {
+    int shown = 0;
+    for (int i = 0; i < vi.ndev; i++) {
+      if (vi.dev[i].loads + vi.dev[i].stores == 0)
+        continue;
+      printf("%s%s %ldr/%ldw", shown++ ? ", " : "\n  by device: ",
+             vi.dev[i].name, vi.dev[i].loads, vi.dev[i].stores);
+      if (vi.dev[i].irqs)
+        printf("/%ldi", vi.dev[i].irqs);
+    }
+  }
   // and what vcpu 0's exits were, which is what says where its time goes
   {
     static const char *const kinds[] = {"mmio-load", "mmio-store",
@@ -1690,7 +1706,12 @@ ps(int id)
   if (reader == 0)
     output_loop(id);
   vm_cons(id, VMCONS_WRITE, &c, 1);
-  ticksleep(5);
+  // half a second, not fifty milliseconds: the guest prints a line per
+  // process through an emulated 8250, and on a busy machine a list of a
+  // dozen of them arrives in pieces. Cutting the reader off early showed
+  // the first few and left the rest, which is how `vmm ps' came to print
+  // a list with its own init missing.
+  ticksleep(50);
   kill(reader, SIGKILL);
   wait(0);
   vm_cons(id, VMCONS_DETACH, 0, 0);

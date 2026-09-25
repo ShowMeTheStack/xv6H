@@ -938,6 +938,37 @@ sched_hart_idle(void)
   return rq->curr == 0 && rq->nr_running == 0;
 }
 
+// May this hart stop asking for timer interrupts altogether?
+//
+// Three things have to be true. One thing is running and nothing is waiting
+// behind it, so there is nobody to preempt for and the slice that would end
+// is dividing a processor between one task. That thing is a guest's vcpu, so
+// the interrupt would not merely be a trap but an exit -- about sixteen
+// microseconds here, and at a hundred a second most of what a guest busy
+// computing pays for being a guest. And its group has no ceiling: a quota is
+// enforced by charging the time as it is used (group_charge, from
+// update_curr), and a hart that never takes an interrupt never gets there,
+// so a capped group must keep its slice or it would overrun the cap.
+//
+// What is *not* needed is the tick for accounting: update_curr charges from
+// the time counter whenever the task stops, not by counting ticks.
+int
+sched_tickless_ok(void)
+{
+  struct rq *rq = &rqs[cpuid()];
+  struct proc *p = rq->curr;
+
+  // nr_running counts the task on the processor too (see the note above
+  // ent_count), so one means this task and nobody else.
+  if (p == 0 || rq->nr_running > 1 || p->vcpu == 0)
+    return 0;
+  struct gq *q = rq->curr_gq;
+  if (q && q->sg && __atomic_load_n(&q->sg->quota, __ATOMIC_RELAXED) != 0)
+    return 0;
+  return 1;
+}
+
+
 // once a tick, on every hart: a hart with tasks waiting and an idle
 // hart next to it moves one over. Stealing covers the case where the
 // idle hart is awake and looking; this covers the case where it is

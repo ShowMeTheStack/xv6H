@@ -22,6 +22,24 @@ def run(q, line, timeout=60):
     return q.output_since(m)
 
 
+def wait_running(q, name, tries=20):
+    """`vmm ls' until NAME is running, and the listing it said so in.
+
+    A machine that has just been restored or cloned is VM_NEW until one
+    of its vcpus enters the guest, and the vcpus are processes: on a
+    machine with one hart the shell asking `vmm ls' may well get there
+    first. What the tests mean is "it is running a moment later", not
+    "it is running before the command that started it has returned"."""
+    import time as _t
+    out = ""
+    for _ in range(tries):
+        out = run(q, "vmm ls", 30)
+        if re.search(r"\d+\s+%s\s+running" % re.escape(name), out):
+            return out
+        _t.sleep(0.5)
+    return out
+
+
 def guest_say(q, line, timeout=None):
     """type a line at the *guest's* console (attached) and return what it
     said. The guest's shell prompt is the same `$ ' as the host's, which
@@ -65,7 +83,7 @@ def t_snap_save_restore(QEMU, intc, cpus, log):
         run(q, "vmm kill g1", 60)
         out = run(q, "vmm restore /g1.vst -n g2 -d", 120)
         assert "restored from /g1.vst" in out, out
-        out = run(q, "vmm ls", 30)
+        out = wait_running(q, "g2")
         assert re.search(r"\d+\s+g2\s+running", out), out
 
         # it did not boot: what it says is what a shell says, and the
@@ -190,6 +208,7 @@ def t_snap_clone(QEMU, intc, cpus, log):
         assert "shared" in out, out
         out = run(q, "vmm ls", 30)
         assert re.search(r"0\s+g1\s+running", out), out
+        out = wait_running(q, "g2")
         assert re.search(r"1\s+g2\s+running", out), out
         # the clone holds the original's memory without a copy of it
         out = run(q, "vmm info 1", 60)
@@ -361,8 +380,25 @@ def t_migrate_busy(QEMU, intc, cpus, log):
                  extra_env={"LINK": link, "LINKSRV": "off"})
         b.expect(r"init: starting sh", 90)
         b.expect(r"\$ ", 30)
-        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
-        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        # the same as t_migrate, and for the same reason: the address has
+        # to be there before anything relies on it. `vmm migrate' connects
+        # to 10.7.0.2, and the egress policy lets a 10/8 address through
+        # only when it is on this machine's own configured subnet -- so a
+        # host whose `ip addr add' did not take refuses its own migration
+        # with "Permission denied" and says nothing about why. Asserting on
+        # ifconfig names it, and the ping is the barrier that makes the
+        # wire real before the migration needs it. Without these this test
+        # went from start to a refused connect in four seconds.
+        out = run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        assert "error" not in out.lower(), out
+        out = run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        assert "error" not in out.lower(), out
+        out = run(a, "ifconfig", 30)
+        assert "10.7.0.1" in out and "(static)" in out, out
+        out = run(b, "ifconfig", 30)
+        assert "10.7.0.2" in out and "(static)" in out, out
+        out = run(a, "ping 10.7.0.2 2", 60)
+        assert "2 packets transmitted, 2 received" in out, out
         b.send("vmm accept 9000 -n m2 -d &\n")
         b.expect(r"\$ ", 30)
         run(b, "sleep 1", 20)

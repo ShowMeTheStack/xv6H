@@ -20,6 +20,30 @@
 
 static struct spinlock rtclock;
 
+// The clock is read far more often than it moves: every inode timestamp
+// (ext4_write.c) and every journal commit (jbd2.c) asks for it, and a
+// 4 MB dd inside a guest asked 1028 times, which as two MMIO reads apiece
+// was 2056 of the 3084 emulated accesses that workload cost -- two thirds
+// of everything, for a number that could have been worked out.
+//
+// So it is worked out. The goldfish RTC and the RISC-V time counter are
+// the same clock seen twice: both come from the host, and they advance
+// together. Reading the device once and adding the monotonic counter's
+// progress since gives the same answer without leaving the guest, because
+// the time CSR is readable directly when hcounteren.TM is set, which it
+// is.
+//
+// It is re-read every RESYNC_NS anyway, which bounds the one case where
+// the two can disagree: a machine that was paused, saved or migrated has a
+// monotonic counter that did not advance while the world's clock did.
+#define RESYNC_NS 60000000000UL   // a minute
+
+static struct {
+  uint64 epoch_ns;   // what the device said
+  uint64 mono_ns;    // the monotonic reading when it said it
+  int valid;
+} rtc_off;
+
 void
 rtcinit(void)
 {
@@ -44,12 +68,25 @@ clock_realtime_ns(void)
 {
   if (plat.rtc_base == 0)
     return 0;
-  // the two reads must not be interleaved with another hart's.
+
+  uint64 mono = clock_monotonic_ns();
   acquire(&rtclock);
+  if (rtc_off.valid && mono >= rtc_off.mono_ns &&
+      mono - rtc_off.mono_ns < RESYNC_NS) {
+    uint64 ns = rtc_off.epoch_ns + (mono - rtc_off.mono_ns);
+    release(&rtclock);
+    return ns;
+  }
+  // the two reads must not be interleaved with another hart's: the low
+  // word latches the high one.
   uint32 lo = *(volatile uint32 *)(plat.rtc_base + RTC_TIME_LOW);
   uint32 hi = *(volatile uint32 *)(plat.rtc_base + RTC_TIME_HIGH);
+  uint64 ns = ((uint64)hi << 32) | lo;
+  rtc_off.epoch_ns = ns;
+  rtc_off.mono_ns = mono;
+  rtc_off.valid = 1;
   release(&rtclock);
-  return ((uint64)hi << 32) | lo;
+  return ns;
 }
 
 // nanoseconds since boot.

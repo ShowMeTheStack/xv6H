@@ -20,6 +20,12 @@ main()
     devnullinit();
     loginit();
     printkinit();
+    // before the first line of output, not after: what a guest prints
+    // while booting is most of what it prints at all, and each character
+    // of it on the 16550 is two exits. The device tree has already been
+    // read (plat is what the line below reports), and this needs nothing
+    // else -- its rings are static exactly so that it can run here.
+    virtio_con_init();
     printk("\n");
     printk("xv6 kernel is booting\n");
     printk("\n");

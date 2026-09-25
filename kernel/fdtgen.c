@@ -430,6 +430,20 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     node_end(&w);
   }
 
+  if (vm->con.present) {
+    // the console as a queue. The guest prefers it to the 16550 when it
+    // is here and falls back to the 16550 when it is not, so this node
+    // appearing is what makes a guest stop paying two exits a character.
+    node_begin(&w, "virtio_mmio@10004000");
+    prop_str(&w, "compatible", "virtio,mmio");
+    prop_reg(&w, G_CON_BASE, 0x1000);
+    prop_u32(&w, "interrupt-parent", ic_phandle);
+    cells[0] = G_CON_IRQ;
+    cells[1] = 4;
+    prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
+    node_end(&w);
+  }
+
   if (vm->vnet.present) {
     node_begin(&w, "virtio_mmio@10002000");
     prop_str(&w, "compatible", "virtio,mmio");

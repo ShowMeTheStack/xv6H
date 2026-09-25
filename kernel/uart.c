@@ -87,6 +87,12 @@ uartinit(void)
 void
 uartwrite(char buf[], int n)
 {
+  // a guest with a console queue pays one exit for this whole buffer
+  // instead of two for each character of it (kernel/virtio_con.c).
+  if (virtio_con_present()) {
+    virtio_con_write(buf, n);
+    return;
+  }
   acquiresleep(&tx_lock);
 
   int i = 0;
@@ -116,6 +122,10 @@ uartputs_sync(const char *s, int n)
     for (;;)
       ;
   }
+  if (virtio_con_present()) {
+    virtio_con_write(s, n);
+    return;
+  }
   if (panicking == 0)
     acquire(&tx_spin); // a panicking cpu must not wait for anyone
   for (int i = 0; i < n; i++) {
@@ -134,6 +144,13 @@ uartputs_sync(const char *s, int n)
 void
 uartputc_sync(int c)
 {
+  // the echo of a character typed at the console comes through here, and
+  // a guest with a queue should not pay two exits for it either.
+  if (virtio_con_present()) {
+    char ch = (char)c;
+    virtio_con_write(&ch, 1);
+    return;
+  }
   if (panicking == 0)
     push_off();
 

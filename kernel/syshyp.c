@@ -347,6 +347,15 @@ sys_vm_info(void)
       info.exit_throttles += v->exit_throttles;
       info.nudges += v->nudges;
     }
+    info.ndev = vm->ndev < 12 ? vm->ndev : 12;
+    for (int i = 0; i < info.ndev; i++) {
+      safestrcpy(info.dev[i].name, vm->dev[i].name ? vm->dev[i].name : "?",
+                 sizeof(info.dev[i].name));
+      info.dev[i].loads = vm->dev[i].loads;
+      info.dev[i].stores = vm->dev[i].stores;
+      info.dev[i].irqs = vm->dev[i].irq >= 0 && vm->dev[i].irq < VPLIC_NIRQ
+                             ? vm->irq_raised[vm->dev[i].irq] : 0;
+    }
     struct vcpu *v = &vm->vcpu[0];
     info.pc = v->pc;
     info.last_cause = v->last_cause;

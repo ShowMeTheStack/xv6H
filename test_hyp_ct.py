@@ -77,8 +77,15 @@ def t_ct_net(QEMU, intc, cpus, log, run_cmd):
         out = run_cmd(q, "vmm run -n c1 --rootfs /ct -i 10.9.0.5 /bin/sh /net",
                       180)
         assert "ip 10.9.0.5 mask 255.255.255.0 gateway 10.9.0.1" in out, out
-        # the gateway answers for itself, and the world answers through it
-        assert out.count("2 packets transmitted, 2 received") == 2, out
+        # the gateway answers for itself -- it is ours, so all of it -- and
+        # the world answers through it, for which one reply is the proof and
+        # four would only be a statement about the wifi (see ping_counts in
+        # test_hyp_net.py).
+        import test_hyp_net as netmod
+        c = netmod.ping_counts(out, "10.9.0.1")
+        assert c == (2, 2), out
+        c = netmod.ping_counts(out, "1.1.1.1")
+        assert c and c[0] == 2 and c[1] >= 1, out
         # the laptop is not reachable from inside a container, as it is not
         # reachable from the machine or from a guest
         assert out.count("blocked by the network policy") == 1, out

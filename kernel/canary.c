@@ -42,8 +42,20 @@ canary_init(uint64 hartid)
   // died with "stack smashing detected" in the middle of its boot,
   // reliably enough to take guest-churn and guest-parallel with it.)
   static int chosen;
-  if (__sync_lock_test_and_set(&chosen, 1))
+  static volatile int settled;
+  if (__sync_lock_test_and_set(&chosen, 1)) {
+    // somebody else is choosing it. Waiting for them is the whole of
+    // this: a hart that went on with the value as it stands would save
+    // the old one in the first frame it entered, and the winner's store
+    // a moment later would make that frame's check fail -- "stack
+    // smashing detected" in whatever the loser happened to be inside.
+    // (It was hart 0 inside the device-tree parse, on a machine with
+    // sixteen gigabytes, where QEMU takes long enough to set the memory
+    // up that the harts arrive here in a different order.)
+    while (!__atomic_load_n(&settled, __ATOMIC_ACQUIRE))
+      ;
     return;
+  }
 
   uint64 t = r_time();
   uint64 c = r_cycle();
@@ -58,6 +70,7 @@ canary_init(uint64 hartid)
     v |= 0x5a;
   if (v)
     __stack_chk_guard = v;
+  __atomic_store_n(&settled, 1, __ATOMIC_RELEASE);
 }
 
 void __attribute__((noreturn, no_stack_protector))

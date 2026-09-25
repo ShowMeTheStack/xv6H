@@ -1658,6 +1658,7 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   vic_init(vm);
   vvirtio_init(vm);
   vvnet_init(vm);
+  vvcon_init(vm);
   vballoon_init(vm);
   vrtc_init(vm);
   if (vm->blk.bounce == 0)
@@ -2408,6 +2409,7 @@ vm_run(struct vm *vm, int vcpuid)
     return -1;
   }
   v->p = p;
+  p->vcpu = v;          // the timer path asks (timer_rearm)
   vm->vcpus_running++;
   vm->state = VM_RUNNING;
   struct sched_group *sg = vm->sg;
@@ -2468,6 +2470,7 @@ vm_run(struct vm *vm, int vcpuid)
 
   acquire(&vm->lock);
   v->p = 0;
+  p->vcpu = 0;
   v->running_hart = -1;
   v->idle = 0;
   vm->vcpus_running--;

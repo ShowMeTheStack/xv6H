@@ -183,7 +183,20 @@ vuart_init(struct vm *vm)
   vm->cons_out.r = vm->cons_out.w = 0;
   vm->cons_in.r = vm->cons_in.w = 0;
   vm->cons_attached = 0;
-  vm_add_dev(vm, G_UART_BASE, 0x100, vuart_read, vuart_write, 0);
+  vm_add_dev(vm, "uart", G_UART_IRQ, G_UART_BASE, 0x100, vuart_read, vuart_write, 0);
+}
+
+// what the virtio-console hands over: a whole descriptor's worth of
+// output under one acquisition of the lock. tx_put may sleep while a host
+// reader is attached and the ring is full, which is why this is here
+// beside it rather than in vvcon.c reaching for a static.
+void
+vm_cons_emit(struct vm *vm, const char *buf, int n)
+{
+  acquire(&vm->lock);
+  for (int i = 0; i < n; i++)
+    tx_put(vm, buf[i]);
+  release(&vm->lock);
 }
 
 // SBI console putchar.
@@ -290,6 +303,10 @@ vm_cons_write(struct vm *vm, int user, uint64 src, int n)
     }
     update(vm);
     release(&vm->lock);
+    // and if the guest is reading its console through the queue rather
+    // than the 16550, hand it over there too. Both devices draw from the
+    // same ring, so whichever the guest drives is the one that sees it.
+    vvcon_rx(vm);
     done += k;
   }
   return n;

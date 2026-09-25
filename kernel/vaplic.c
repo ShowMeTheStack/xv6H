@@ -438,6 +438,6 @@ void
 vaplic_init(struct vm *vm, int msi)
 {
   memset(&vm->aplic, 0, sizeof(vm->aplic));
-  vm_add_dev(vm, G_APLIC_M, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_M);
-  vm_add_dev(vm, G_APLIC_S, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_S);
+  vm_add_dev(vm, "aplic-m", -1, G_APLIC_M, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_M);
+  vm_add_dev(vm, "aplic-s", -1, G_APLIC_S, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_S);
 }

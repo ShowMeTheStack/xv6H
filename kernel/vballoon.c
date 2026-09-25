@@ -455,7 +455,7 @@ vballoon_init(struct vm *vm)
   b->present = 1;
   if (vm->id >= 0 && vm->id < NVM)
     policy_floor[vm->id] = 0;
-  vm_add_dev(vm, G_BALLOON_BASE, 0x1000, vballoon_read, vballoon_write, 0);
+  vm_add_dev(vm, "balloon", G_BALLOON_IRQ, G_BALLOON_BASE, 0x1000, vballoon_read, vballoon_write, 0);
   if (!policy_started) {
     policy_started = 1;
     if (kthread_create(policy_thread, 0, "balloond") < 0)

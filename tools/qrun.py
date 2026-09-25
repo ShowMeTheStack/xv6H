@@ -144,6 +144,14 @@ def main():
                     help="which set of tests (see test-hyp.py --tier)")
     ap.add_argument("--json", default=None, metavar="FILE",
                     help="write the summary there as JSON")
+    ap.add_argument("--progress", default=None, metavar="FILE",
+                    help="where the per-test results are written as they "
+                         "happen, and read back by --resume (default "
+                         "qresults.txt; one run's file must not be another's)")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep the tests already recorded in qresults.txt and "
+                         "run only the rest (for a machine that does not stay up "
+                         "long enough to finish the matrix in one go)")
     args = ap.parse_args()
     # what every job is told, over and above its own name
     extra = []
@@ -188,8 +196,70 @@ def main():
     print("%d jobs on %d cores: %d in parallel (capacity %d harts), %d one at a time"
           % (len(queue), cores, len(parallel), capacity, len(serial)), flush=True)
 
-    WEIGHT = {"light": 1, "heavy": 3, "huge": 8, "exclusive": capacity}
+    # the build box this runs on resets itself, and a matrix of 140 tests
+    # takes longer than it stays up: 95 of them had passed when it went
+    # down, and without this every one of the 95 would be run again. Each
+    # result is written the moment it is known, so the file on disk is
+    # always what is already true; --resume believes it and runs the rest.
+    # Without --resume the file is started afresh, so a plain run never
+    # inherits yesterday's results by accident.
+    done_path = args.progress or os.path.join(HERE, "qresults.txt")
+    elapsed_path = done_path + ".elapsed"
     results = []
+    before = 0.0
+    if args.resume:
+        # A line at a time, and a line that does not parse is skipped rather
+        # than fatal. The machine this runs on resets itself, and a reset
+        # while this file is being appended to leaves NUL bytes in it: the
+        # last line is then neither a result nor absent. Losing that one line
+        # costs a test; refusing to read the file costs every test in it, and
+        # once nearly did -- five hours of a matrix went because a `grep -v'
+        # treated the file as binary and wrote nothing back.
+        try:
+            for line in open(done_path, errors="replace"):
+                f = line.replace("\0", "").split()
+                if len(f) != 4:
+                    continue
+                try:
+                    results.append((f[0], int(f[1]), f[2] == "PASS", float(f[3])))
+                except ValueError:
+                    continue
+        except OSError:
+            pass
+        try:
+            before = float(open(elapsed_path).read().strip())
+        except (OSError, ValueError):
+            before = 0.0
+        already = {(n, r) for (n, r, _, _) in results}
+        queue = [(s_, n, r) for (s_, n, r) in queue if (n, r) not in already]
+        parallel = [j for j in queue if classify(j[1]) != "exclusive"]
+        serial = [j for j in queue if classify(j[1]) == "exclusive"]
+        if results:
+            print("resuming: %d already done (%d failed), %d to go"
+                  % (len(results),
+                     sum(1 for (_, _, ok, _) in results if not ok),
+                     len(queue)), flush=True)
+    else:
+        try:
+            os.remove(done_path)
+        except OSError:
+            pass
+        try:
+            os.remove(elapsed_path)
+        except OSError:
+            pass
+    total = len(queue) + len(results)
+
+    def record(n, r, ok, dt):
+        with open(done_path, "a") as f:
+            f.write("%s %d %s %.0f\n" % (n, r, "PASS" if ok else "FAIL", dt))
+        # the clock is written with every result, not at the end: an attempt
+        # that a reset cuts short still spent the time it spent, and a run
+        # that reports the sum of its attempts has to have kept it.
+        with open(elapsed_path, "w") as f:
+            f.write("%.1f\n" % (before + (time.time() - t0)))
+
+    WEIGHT = {"light": 1, "heavy": 3, "huge": 8, "exclusive": capacity}
     free_slots = list(range(slots))
     running = []
     t0 = time.time()
@@ -201,13 +271,27 @@ def main():
             if j.done() or time.time() - j.t0 > limit:
                 if not j.done():
                     j.proc.kill(); j.proc.wait()
+                # and the emulators it left behind, whether it was killed
+                # or ended by itself. A harness killed with a signal never
+                # runs QEMU.close(), so its machines keep this slot's disk
+                # image open -- and the next job in the slot dies at once
+                # with "Failed to get write lock", which is how mm-16g came
+                # to fail in one second having never booted. A job that
+                # ended by itself is meant to have closed its machines, so
+                # this costs it a signal sent to nobody; the slot is only
+                # safe to hand on if that is checked rather than assumed.
+                if subprocess.run(["pkill", "-f", "file=q%d-fs.img" % j.slot],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL).returncode == 0:
+                    time.sleep(1)
                 ok, dt, txt = j.result()
                 results.append((j.name, j.run, ok, dt))
+                record(j.name, j.run, ok, dt)
                 running.remove(j)
                 free_slots.append(j.slot)
                 mark = "ok  " if ok else "FAIL"
                 print("  %s %-34s %5.0fs  (%d/%d)"
-                      % (mark, j.name, dt, len(results), len(queue)), flush=True)
+                      % (mark, j.name, dt, len(results), total), flush=True)
 
     for phase, group, limit in (("parallel", parallel, slots),
                                 ("serial", serial, 1)):
@@ -234,18 +318,20 @@ def main():
             time.sleep(1)
 
     bad = [(n, r) for (n, r, ok, dt) in results if not ok]
-    print("\n%d jobs in %.0fs; %d failed" % (len(results), time.time() - t0, len(bad)))
+    # wall clock over every attempt, not just this one: a matrix that took
+    # three restarts to finish took the sum of the three.
+    secs = before + (time.time() - t0)
+    with open(elapsed_path, "w") as f:
+        f.write("%.1f\n" % secs)
+    print("\n%d jobs in %.0fs; %d failed" % (len(results), secs, len(bad)))
     for n, r in bad:
         print("  FAIL %s (run %d) -- qlogs/%s.%d.out" % (n, r, n, r))
-    open(os.path.join(HERE, "qresults.txt"), "w").write(
-        "".join("%s %d %s %.0f\n" % (n, r, "PASS" if ok else "FAIL", dt)
-                for (n, r, ok, dt) in results))
     if args.json:
         import json
         with open(args.json, "w") as f:
             json.dump({"axis": args.axis or "", "tier": args.tier,
                        "suites": args.suite or SUITES,
-                       "seconds": round(time.time() - t0, 1),
+                       "seconds": round(secs, 1),
                        "jobs": len(results), "failed": len(bad),
                        "tests": [{"test": n, "run": r,
                                   "result": "pass" if ok else "fail",

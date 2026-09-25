@@ -172,5 +172,5 @@ void
 vplic_init(struct vm *vm)
 {
   memset(&vm->plic, 0, sizeof(vm->plic));
-  vm_add_dev(vm, G_PLIC_BASE, G_PLIC_SIZE, vplic_read, vplic_write, 0);
+  vm_add_dev(vm, "plic", -1, G_PLIC_BASE, G_PLIC_SIZE, vplic_read, vplic_write, 0);
 }

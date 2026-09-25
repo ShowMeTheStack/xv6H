@@ -1621,10 +1621,32 @@ def t_sysfs(log):
         run_cmd(q, "losetup -d /dev/loop0")
 
         # what the machine has
+        # the same for the hypervisor extension: `--axis hyp=0' hides it,
+        # and /sys then says 0, which is the machine it is on being
+        # described correctly.
         out = run_cmd(q, "cat /sys/hypervisor/present")
-        assert re.search(r"(?m)^1\s*$", out), out
+        assert re.search(r"(?m)^[01]\s*$", out), out
+        # the vector unit as this machine has it: /sys says what is there,
+        # and on a machine built without the V extension (`--axis vec=0')
+        # what is there is nothing, which is the right answer and not a
+        # failure.
+        out = run_cmd(q, "cat /sys/vector/present")
+        has_v = re.search(r"(?m)^1\s*$", out) is not None
         out = run_cmd(q, "cat /sys/vector/vlen")
-        assert re.search(r"(?m)^128\s*$", out), out
+        m = re.search(r"(?m)^(\d+)\s*$", out)
+        assert m, out
+        vlen = int(m.group(1))
+        if not has_v:
+            assert vlen == 0, out
+        else:
+            # whatever width this machine was built with (`--axis
+            # vlen=512'), and the same number the kernel printed at boot:
+            # what is being tested is that /sys agrees with the machine,
+            # not that the machine is 128 bits wide.
+            assert vlen >= 128 and (vlen & (vlen - 1)) == 0, out
+            boot = q.buf.decode(errors="replace")
+            bm = re.search(r"vector extension: vlen (\d+) bits", boot)
+            assert bm and int(bm.group(1)) == vlen, (vlen, bm and bm.group(1))
 
         # and /tmp is a tmpfs init mounted
         out = run_cmd(q, "cat /sys/fs/tmp/type")
@@ -2017,7 +2039,13 @@ def main():
     if args.suite in ("native", "all"):
         for m in modes:
             tests.append(("native-%s" % m, lambda m=m: t_native(m, args.cpus, log)))
-        if args.intc in (None, "plic"):
+        # these do not depend on which interrupt controller the machine
+        # has, so they are registered once whatever it is -- which is
+        # what makes `--axis intc=imsic' run the same thirty-six tests as
+        # the baseline rather than the handful whose names carry a
+        # controller. (They used to be registered only for plic, and an
+        # axis of another controller quietly lost ten of them.)
+        if True:
             tests.append(("native-no-hypervisor", lambda: t_native("plic", args.cpus, log, hyp=0)))
             tests.append(("native-no-vector", lambda: t_native("plic", args.cpus, log, vec=0)))
             tests.append(("native-vlen-512", lambda: t_native("plic", args.cpus, log, vlen=512)))
@@ -2078,6 +2106,20 @@ def main():
         import test_hyp_snap
         tests += test_hyp_snap.tests(modes, args.cpus, log, QEMU)
 
+    if AXIS.get("hyp") == "0":
+        # A machine built without the H extension cannot start a guest, so
+        # every test that starts one would fail for the same uninteresting
+        # reason -- and while they sat waiting for a vcpu that never comes
+        # they held the queue's capacity and took the light jobs behind
+        # them down on the clock. What is left is the part of this system
+        # that a machine without the extension still has.
+        needs_guest = re.compile(r"^(clock|mm-|guest-|linux-|snap-|net-guest|"
+                                 r"net-linux|sched-vm-)")
+        keep = [t for t in tests if not needs_guest.match(t[0])]
+        if len(keep) != len(tests) and not args.list:
+            print("(no hypervisor extension on this machine: leaving out %d "
+                  "tests that start a guest)" % (len(tests) - len(keep)))
+        tests = keep
     if args.tier == "quick":
         # the set for every commit: one of each kind of thing, and
         # §11.3's quarter of an hour is met -- ten minutes on a laptop,
@@ -2085,13 +2127,19 @@ def main():
         # What it leaves out is the long ones -- the 16 GB and 512 GB
         # memory tests, a hundred thousand processes, the Linux guests,
         # the campaign benchmarks -- not whole areas.
-        quick = ("native-plic|manual|utils|libc|clock|tty|users|sysfs|aslr|"
-                 "audit|ramfs|namespaces|pidns|mntns|userns|mount-privilege|"
-                 "cgroups|containers|sysfilter|ct-net|ct-exec|"
-                 "guest-boot-plic|guest-lifecycle-plic|guest-pages-plic|"
-                 "guest-ksm-plic|net-host-plic|net-routes|net-tools|"
-                 "mm-1g|proc-8000|sched-fair|sched-group-max|"
-                 "snap-save-restore|snap-live|snap-clone|snap-migrate")
+        # the tests whose names carry the interrupt controller are named
+        # after the one this run is on, so that an axis of intc=imsic
+        # gets the same thirty-six tests rather than the handful whose
+        # names happen to end in -plic.
+        m0 = modes[0]
+        quick = (("native-%s|manual|utils|libc|clock|tty|users|sysfs|aslr|"
+                  "audit|ramfs|namespaces|pidns|mntns|userns|mount-privilege|"
+                  "cgroups|containers|sysfilter|ct-net|ct-exec|"
+                  "guest-boot-%s|guest-lifecycle-%s|guest-pages-%s|"
+                  "guest-ksm-%s|net-host-%s|net-routes|net-tools|"
+                  "mm-1g|proc-8000|sched-fair|sched-group-max|"
+                  "snap-save-restore|snap-live|snap-clone|snap-migrate")
+                 % (m0, m0, m0, m0, m0, m0))
         tests = [t for t in tests if re.fullmatch(quick, t[0])]
     if args.test:
         # a name, part of one, or a pattern: "-t 'pidns|sysfilter'" runs

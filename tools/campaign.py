@@ -47,13 +47,88 @@ MACHINES = [
     ("no-hyp",     "hyp=0",               "no hypervisor extension: the host alone"),
 ]
 
-# what the quick tier cannot ask for on a machine that has no hypervisor
-NO_HYP_SUITES = ["native", "ns", "ct", "sched", "proc", "mm", "net"]
+# What the quick tier can ask for on a machine that has no hypervisor
+# extension: everything that does not start a guest. The guest, linux and
+# snap suites are guests by definition; the mm suite is *about* guest
+# memory (mm-1g starts one and waits for its vcpu, which on this machine
+# never comes); and what is left -- the kernel and userland, the
+# namespaces, the containers, the scheduler, the processes and the host's
+# own network -- is the part of this system that a machine without the H
+# extension still has.
+NO_HYP_SUITES = ["native", "ns", "ct", "sched", "proc", "net"]
 
 
 def run(cmd, **kw):
     print("+ %s" % " ".join(cmd), flush=True)
     return subprocess.run(cmd, cwd=HERE, **kw)
+
+
+# the pattern is bracketed so that it cannot match a command line that
+# merely mentions the emulator -- a shell, an ssh, a wrapper script. pgrep
+# and pkill leave themselves out but not their neighbours, and killing the
+# shell this runs in has happened.
+EMU = "qemu-system-riscv6[4]"
+
+
+def quiet():
+    return subprocess.run(["pgrep", "-f", EMU],
+                          stdout=subprocess.DEVNULL).returncode != 0
+
+
+def wait_quiet(limit=90):
+    """see the machines of the last row gone before the next one starts.
+
+    Every row uses the same disk images (q0-fs.img and its friends), and
+    an emulator that has been told to stop is not an emulator that has
+    stopped: the next row's first jobs opened images the last row's
+    stragglers still had, and failed with "Failed to get write lock"
+    -- four tests red for a reason that had nothing to do with them.
+
+    Waiting politely is not enough. An emulator whose harness was killed
+    on the clock was never told to stop at all, and waits for a console
+    that will never be read again; it is still there after any limit. So
+    the limit is where asking ends and killing begins: between two rows
+    nothing in this tree is meant to be running, so anything that is, is
+    a straggler, and the row that comes next is entitled to a clean
+    tree. (Without this the whole full-matrix row came back red: the
+    first job of 140 failed on an image the row before had left open,
+    and sixty-six of the failures were that same lock.)"""
+    for _ in range(limit):
+        if quiet():
+            return True
+        time.sleep(1)
+    print("  (emulators still running after %ds; killing them)" % limit,
+          flush=True)
+    for sig in ("-TERM", "-KILL"):
+        subprocess.run(["pkill", sig, "-f", EMU],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(10):
+            if quiet():
+                return True
+            time.sleep(1)
+    print("  (emulators survived SIGKILL; going on anyway)", flush=True)
+    return False
+
+
+def finished(path, resume):
+    """the numbers of a row that has already run, or None.
+
+    The build box this campaign runs on resets itself under load -- six
+    rows of ten, and then the machine was gone -- and a row costs four
+    minutes that nobody should pay twice. Each row writes its JSON as it
+    finishes, so the ones already there are the ones already done.
+
+    Believing them is opt-in (--resume) on purpose: a JSON left over from
+    an older tree would otherwise walk into a published table and read as
+    a result of this one."""
+    if not resume:
+        return None
+    try:
+        with open(path) as f:
+            r = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return r if all(k in r for k in ("jobs", "failed", "seconds")) else None
 
 
 def campaign(args):
@@ -76,15 +151,36 @@ def campaign(args):
         if args.only and not re.search(args.only, name):
             continue
         js = os.path.join(OUT, "%s.json" % name)
+        done = finished(js, args.resume)
+        if done:
+            print("+ %s: kept from %s (%d tests, %d failed)"
+                  % (name, os.path.basename(js), done["jobs"], done["failed"]),
+                  flush=True)
+            rows.append((name, why, done["jobs"], done["failed"],
+                         done["seconds"]))
+            continue
         cmd = [sys.executable, "tools/qrun.py", "--no-build", "--tier", "quick",
-               "--json", js]
+               "--json", js, "--progress", js + ".progress"]
+        if args.resume:
+            # a row cut in half resumes inside itself, too: the progress
+            # file is the row's own, so one row can never read another's.
+            cmd += ["--resume"]
+        if args.capacity:
+            cmd += ["--capacity", str(args.capacity)]
         if axis:
             cmd += ["--axis", axis]
         if "hyp=0" in axis:
             for s in NO_HYP_SUITES:
                 cmd += ["-s", s]
         t0 = time.time()
+        wait_quiet()
         run(cmd)
+        # each row's console logs kept under its own name: they are
+        # written to qlogs/NAME.0.out, and the next row writes over them,
+        # so a failure three rows back had nothing left to look at.
+        keep = os.path.join(HERE, "qlogs-%s" % name)
+        subprocess.run(["rm", "-rf", keep])
+        subprocess.run(["cp", "-a", os.path.join(HERE, "qlogs"), keep])
         try:
             with open(js) as f:
                 r = json.load(f)
@@ -97,14 +193,23 @@ def campaign(args):
     # tier: everything, every interrupt controller, the long tests.
     if not args.quick_only and (not args.only or re.search(args.only, "full")):
         js = os.path.join(OUT, "full.json")
-        run([sys.executable, "tools/qrun.py", "--no-build", "--json", js])
-        try:
-            with open(js) as f:
-                r = json.load(f)
+        r = finished(js, args.resume)
+        if r:
+            print("+ full matrix: kept from full.json (%d tests, %d failed)"
+                  % (r["jobs"], r["failed"]), flush=True)
+        else:
+            cmd = [sys.executable, "tools/qrun.py", "--no-build", "--json", js,
+                   "--progress", js + ".progress"]
+            if args.resume:
+                cmd += ["--resume"]
+            if args.capacity:
+                cmd += ["--capacity", str(args.capacity)]
+            wait_quiet()
+            run(cmd)
+            r = finished(js, True)
+        if r:
             rows.append(("full matrix", "every test, every controller",
                          r["jobs"], r["failed"], r["seconds"]))
-        except OSError:
-            pass
 
     print()
     print("| machine | what it is | tests | failed | time |")
@@ -126,6 +231,12 @@ def main():
     ap.add_argument("--quick-only", action="store_true",
                     help="skip the full matrix on the baseline")
     ap.add_argument("--no-build", action="store_true")
+    ap.add_argument("--resume", action="store_true",
+                    help="keep the rows whose JSON is already in bench/campaign")
+    ap.add_argument("--capacity", type=int, default=0, metavar="HARTS",
+                    help="how many harts' worth of jobs at a time (qrun's "
+                         "default is five eighths of the cores; a smaller "
+                         "number is a cooler machine)")
     return campaign(ap.parse_args())
 
 

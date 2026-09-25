@@ -80,6 +80,54 @@ def sched():
     return rows
 
 
+def net():
+    """what the network costs: the stack alone, and across a guest's NIC.
+
+    Two numbers, and the pair is the point. On the host over the loopback
+    address there is no device at all and nothing is emulated: that is the
+    stack's own cost. Between a guest and its host the same bytes cross the
+    software switch and the guest's virtio-net, and the difference is what a
+    guest pays for its network.
+
+    The guest is the one that connects, and that is not an accident. A frame
+    arriving at a guest is delivered only if it is the guest's DHCP lease, an
+    answer to a name it asked about, a reply to something it said, or destined
+    for a port published with `vmm port' -- otherwise the bridge drops it and
+    says "frame nobody asked for". Measuring in this direction needs no hole
+    made in that policy, and the bytes cross exactly the same two devices."""
+    rows = []
+    q = boot()
+    try:
+        out = th.run_cmd(q, "netbench -t 2 -s 4096 stream rr", 240)
+        rows.append(("the host, to itself (no device)", out))
+
+        # the host listens; a guest on the switch measures against it
+        q.send("netbench -l -p 5555 &\n")
+        q.expect(r"\$ ", 30)
+        q.send("vmm start -n nb -f /disk0.img -i 10.0.2.40/24 -d\n")
+        q.expect(r"vm \d+ nb:", 30)
+        q.expect(r"\$ ", 15)
+        time.sleep(5)
+        g.attach(q, "nb")
+        q.expect(r"\$ ", 90)
+        out = th.run_cmd(q, "netbench -c 10.0.2.15 -p 5555 -t 2 -s 4096 stream rr", 240)
+        rows.append(("a guest to its host (switch + virtio-net)", out))
+        # g.detach() waits for the host's prompt itself; expecting a second
+        # one leaves every command after it a prompt out of step.
+        g.detach(q)
+        q.send("vmm kill --all\n")
+        q.expect(r"\$ ", 30)
+    finally:
+        q.close()
+    parsed = []
+    for where, out in rows:
+        mb = re.search(r"stream ([\d.]+) MB/s", out)
+        us = re.search(r"rr [\d.]+ round trips/s \(([\d.]+) us each\)", out)
+        parsed.append((where, float(mb.group(1)) if mb else 0.0,
+                       float(us.group(1)) if us else 0.0))
+    return parsed
+
+
 def migration():
     """a busy guest crossing to another host."""
     tag = "bench%d" % os.getpid()
@@ -165,6 +213,12 @@ def main():
         print("|---|---|---|---|---|")
         print("| %d | %d KB | %d KB | %d | %.1f s |"
               % (r["rounds"], r["live_kb"], r["stop_kb"], r["stop_pages"], r["seconds"]))
+    if "net" in what:
+        print("\n### What the network costs\n")
+        print("| where | one-way stream | round trip |")
+        print("|---|---|---|")
+        for where, mb, us in net():
+            print("| %s | %.1f MB/s | %.0f us |" % (where, mb, us))
     if "files" in what:
         print("\n### fsbench on the host's own root\n")
         print("| phase | value | unit |")

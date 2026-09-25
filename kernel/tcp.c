@@ -106,7 +106,7 @@ tring_write(struct tring *t, const char *src, uint n)
 // ---- control blocks ----
 
 static struct tcpcb *
-tcb_alloc(void)
+tcb_take(void)
 {
   for (int i = 0; i < NTCP; i++) {
     if (!tcbs[i].used) {
@@ -128,6 +128,41 @@ tcb_alloc(void)
     }
   }
   return 0;
+}
+
+static void tcb_free(struct tcpcb *t);
+
+// A control block, reclaiming one from TIME_WAIT if that is what it takes.
+//
+// There are NTCP of these and TIME_WAIT holds one for three seconds, so a
+// program opening and closing connections as fast as it can ran out after
+// about thirty of them and then went at the speed the oldest TIME_WAIT
+// expired: netbench measured 8 connections a second on the loopback address,
+// which is 32/3 and not a coincidence.
+//
+// TIME_WAIT is a courtesy to the network -- it absorbs a stale duplicate for
+// one four-tuple -- and it must not be the reason this machine cannot open
+// an unrelated connection. So when nothing is free the oldest one is taken:
+// the one with the least of its timer left, which is the one whose duplicates
+// are least likely to still be in flight.
+static struct tcpcb *
+tcb_alloc(void)
+{
+  struct tcpcb *t = tcb_take();
+
+  if (t)
+    return t;
+  struct tcpcb *victim = 0;
+  for (int i = 0; i < NTCP; i++) {
+    struct tcpcb *c = &tcbs[i];
+    if (c->used && c->state == TCPS_TIME_WAIT &&
+        (victim == 0 || c->timewait_timer < victim->timewait_timer))
+      victim = c;
+  }
+  if (victim == 0)
+    return 0;
+  tcb_free(victim);
+  return tcb_take();
 }
 
 static void ooo_free(struct tcpcb *t);
