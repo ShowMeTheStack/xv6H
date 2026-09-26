@@ -97,7 +97,7 @@ decode(uint32 inst, struct memop *m)
 }
 
 void
-vm_add_dev(struct vm *vm, const char *name, int irq, uint64 base, uint64 size,
+vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, uint64 size,
            int (*read)(struct vm *, struct vdev *, uint64, int, uint64 *),
            int (*write)(struct vm *, struct vdev *, uint64, int, uint64), void *priv)
 {
@@ -106,6 +106,7 @@ vm_add_dev(struct vm *vm, const char *name, int irq, uint64 base, uint64 size,
   struct vdev *d = &vm->dev[vm->ndev++];
   d->name = name;
   d->irq = irq;
+  d->obs = obs;
   d->loads = d->stores = 0;
   d->base = base;
   d->size = size;
@@ -157,6 +158,11 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
     d->loads++;
   else
     d->stores++;
+  // and the first access to a device is the moment this guest learned the
+  // device is there, which is what decides whether it could still be moved
+  // to a machine that has no such device (OBS_* in hyp.h).
+  if (d->loads + d->stores == 1)
+    vm_observe(vm, d->obs);
   if (m.is_load) {
     uint64 val = 0;
     rc = d->read(vm, d, off, m.size, &val);

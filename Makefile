@@ -77,6 +77,7 @@ OBJS = \
   $K/hypsbi.o \
   $K/virtio_net.o \
   $K/virtio_con.o \
+  $K/machine.o \
   $K/virtio_balloon.o \
   $K/net.o \
   $K/bridge.o \

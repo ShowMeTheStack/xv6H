@@ -782,6 +782,69 @@ vm_snap_unprotect(struct vm *vm)
 // being compared, it becomes writable again. returns 1 when something
 // was done, 0 when the page was already writable (another hart got
 // there first), -1 when it is not a page this can help with.
+// Record that this guest has looked at something about its machine, the first
+// time it does so. Called from paths that already trap, so the cost is a test
+// and a branch on an exit that already costs microseconds.
+//
+// The point of keeping the *time* as well as the fact: a guest's compatibility
+// set collapses as it learns about its machine, and how fast that happens is
+// the thing worth measuring. `obs_t0' is the tick the machine started.
+void
+vm_observe(struct vm *vm, uint32 what)
+{
+  if (vm == 0 || (vm->obs & what))
+    return;
+  acquire(&vm->lock);
+  uint32 fresh = what & ~vm->obs;
+  if (fresh) {
+    vm->obs |= fresh;
+    uint64 now = r_time();
+    for (int i = 0; i < OBS_COUNT; i++)
+      if (fresh & (1u << i))
+        vm->obs_first[i] = (vm->obs_t0 && now > vm->obs_t0) ? now - vm->obs_t0 : 0;
+  }
+  release(&vm->lock);
+}
+
+// Ask a guest to look at its machine again.
+//
+// The description is rebuilt where the guest already has it, the generation is
+// bumped, and the guest is poked with a supervisor software interrupt. The poke
+// deliberately does not go through the interrupt controller: a revision may be
+// *changing* the interrupt controller, and a notification that depends on the
+// thing being replaced cannot work. A software interrupt with no IPI reason
+// behind it is a channel the guest never sees otherwise.
+//
+// This returns as soon as the guest has been told. Whether it adopted anything
+// is in `revise_adopted' once `revise_acked' catches up with `revise_gen';
+// a guest that does not know about revision never acks, and nothing breaks --
+// it keeps the description it had, which is still true of the machine it is on.
+int
+vm_revise(struct vm *vm, uint32 what)
+{
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -1;
+
+  // rebuild the blob in place, so a guest that re-reads the address it was
+  // given at boot sees the new description
+  int n = hyp_make_dtb(vm, vm->dtb_gpa, VM_DTB_MAX);
+  if (n < 0)
+    return -1;
+
+  acquire(&vm->lock);
+  vm->revise_gen++;
+  vm->revise_adopted = 0;
+  vm->revise_asked = r_time();
+  vm->revise_done = 0;
+  struct vcpu *v = &vm->vcpu[0];
+  v->ssip_req = 1;          // delivered as VSSIP on the next entry
+  release(&vm->lock);
+  vcpu_kick(v);             // and wake it if it is idle
+  printk("hyp: vm %d: revision %d asked for (what=0x%x)\n", vm->id,
+         vm->revise_gen, what);
+  return 0;
+}
+
 int
 vm_unshare(struct vm *vm, uint64 gpa)
 {
@@ -813,15 +876,28 @@ vm_unshare(struct vm *vm, uint64 gpa)
       } else {
         memmove(fresh, (void *)frame, PGSIZE);
         gc_pages(c)[i] = (uint64)fresh;
+        // read-only again while a snapshot is running, for the same reason
+        // vm_unprotect_page leaves it alone: the copy this guest is about to
+        // write to is a page the snapshot has already sent, and if it is
+        // handed back writable the next write to it goes unrecorded. The
+        // write that brought us here is charged to the snapshot by
+        // vmsnap_before_write; the ones after it need a fault of their own.
         *pte = PA2PTE(fresh) | GPTE_LEAF;
+        if (vm->snap.active)
+          *pte &= ~(uint64)PTE_W;
         old = frame;
         fresh = 0;
         r = 1;
       }
     } else {
-      // nobody else has it: writing again is all it takes
+      // nobody else has it: writing again is all it takes -- unless a
+      // snapshot is running, in which case this page is write-protected
+      // because the snapshot wants to hear about every write to it, not
+      // just the first. Leaving PTE_W set here is what made five pages of
+      // a 48 MB migration change with nobody marking them.
       pg->flags &= ~(uint16)PG_KSM;
-      *pte |= PTE_W;
+      if (!vm->snap.active)
+        *pte |= PTE_W;
       r = 1;
     }
   }
@@ -1544,6 +1620,10 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   vm->state = VM_NEW;
   vm->owner = uid;
   vm->cfg = *cfg;
+  // the observation clock starts here, after the memset above and on the one
+  // path both a fresh slot and a reused one go through
+  vm->obs = 0;
+  vm->obs_t0 = r_time();
   initlock(&vm->portlock, "vmports");
   // a machine whose gateway is a gateway object is behind it, on that
   // object's private subnet rather than on the switch's own segment.

@@ -183,7 +183,7 @@ vuart_init(struct vm *vm)
   vm->cons_out.r = vm->cons_out.w = 0;
   vm->cons_in.r = vm->cons_in.w = 0;
   vm->cons_attached = 0;
-  vm_add_dev(vm, "uart", G_UART_IRQ, G_UART_BASE, 0x100, vuart_read, vuart_write, 0);
+  vm_add_dev(vm, "uart", G_UART_IRQ, OBS_UART, G_UART_BASE, 0x100, vuart_read, vuart_write, 0);
 }
 
 // what the virtio-console hands over: a whole descriptor's worth of

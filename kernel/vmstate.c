@@ -34,6 +34,7 @@
 #include "proc.h"
 #include "defs.h"
 #include "errno.h"
+#include "platform.h"
 #include "vmm.h"
 #include "hyp.h"
 #include "vmstate.h"
@@ -176,6 +177,60 @@ pcs(const char *p)
   for (int i = 0; i < (int)(PGSIZE / 4); i++)
     h = (h ^ q[i]) * 16777619u;
   return h ? h : 1;
+}
+
+// The same hash, with the accessed and dirty bits taken out of anything that
+// looks like a page-table entry: for every 8-byte word whose bit 0 (V) is set,
+// bits 6 (A) and 7 (D) are cleared before hashing.
+//
+// This exists to answer one question and it is the question the whole paper
+// turns on. A page whose raw checksum has changed but whose masked checksum has
+// not changed *only in the A/D bits of PTE-shaped words* -- which is the
+// signature of the MMU maintaining the guest's page tables behind the
+// hypervisor's back, and not of any writer this kernel could have hooked.
+//
+// Only computed when `admeasure=1' is on the host's command line: it is a
+// second pass over every page of every round, which a migration should not pay
+// for a measurement.
+#define PTE_V_BIT 1UL
+#define PTE_AD_BITS 0xc0UL       // bit 6 (A) and bit 7 (D)
+
+static uint32
+pcs_masked(const char *p)
+{
+  const uint64 *w = (const uint64 *)p;
+  uint32 h = 2166136261u;
+
+  for (int i = 0; i < (int)(PGSIZE / 8); i++) {
+    uint64 v = w[i];
+    if (v & PTE_V_BIT)
+      v &= ~PTE_AD_BITS;
+    uint32 lo = (uint32)v, hi = (uint32)(v >> 32);
+    h = (h ^ lo) * 16777619u;
+    h = (h ^ hi) * 16777619u;
+  }
+  return h ? h : 1;
+}
+
+// admeasure=1 on the host's command line (see procinit_early for the pattern).
+static int admeasure = -1;
+
+static int
+ad_measuring(void)
+{
+  if (admeasure < 0) {
+    const char *s = plat.bootargs;
+    admeasure = 0;
+    while (*s) {
+      while (*s == ' ')
+        s++;
+      if (memcmp(s, "admeasure=", 10) == 0 && s[10] == '1')
+        admeasure = 1;
+      while (*s && *s != ' ')
+        s++;
+    }
+  }
+  return admeasure;
 }
 
 // is this page worth writing down?
@@ -358,9 +413,30 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d)
 // checksum per page, which is what the other end now has. With `verify'
 // the call ignores `only' and sends every page whose checksum says the
 // other end has something else -- see precopy_verify.
+// What the verifying last round found, which is the only place this system
+// can see the thing that makes write-protection unsound here.
+//
+// `marked' is the set of pages somebody remembered: the guest's own stores
+// (caught by write-protecting the G-stage) and the host's writes on its
+// behalf (caught in vm_copyout). A page whose checksum has changed and
+// which is *not* in that set changed for a third reason -- the hardware
+// setting accessed and dirty bits in the guest's own page tables, through
+// a mapping this kernel made read-only, with no fault arriving. Counting
+// those separately turns a sentence in a comment into a number, and it is
+// the number that says whether a list of dirty pages could ever have been
+// enough.
+struct lastround {
+  uint32 *marked;   // pages somebody marked (may be 0: then no attribution)
+  uint32 *msums;    // masked checksums, when admeasure=1 (else 0)
+  int nsent;        // pages the comparison sent
+  int nunmarked;    // of those, pages nobody had marked
+  int nadonly;      // of those, pages differing only in PTE A/D bits
+  int nunmarked_adonly;  // and both at once -- the number the paper turns on
+};
+
 static int
 save_mem(struct vm *vm, struct sink *s, uint64 *nbytes, uint32 *only,
-         int drop_zero, uint32 *sums, int verify, int *nsent)
+         int drop_zero, uint32 *sums, int verify, struct lastround *lr)
 {
   char *page = kalloc();
   uint64 written = 0;
@@ -387,18 +463,42 @@ save_mem(struct vm *vm, struct sink *s, uint64 *nbytes, uint32 *only,
       if (vm_copyin(vm, page, gpa, PGSIZE) < 0) {
         if (sums)
           sums[pidx] = 0;               // not backed: zeroes over there
+        if (lr && lr->msums)
+          lr->msums[pidx] = 0;
         continue;
       }
       uint32 now = page_is_zero(page) ? 0 : pcs(page);
       if (verify && sums && now == sums[pidx])
         continue;                       // the other end has this already
+      if (verify && lr) {
+        int unmarked = lr->marked && !vmsnap_bit(lr->marked, pidx);
+        // A/D-only means: the raw checksum moved (we are here) but the
+        // checksum that ignores A and D in PTE-shaped words did not. That
+        // is the signature of the MMU writing the guest's page tables
+        // through a mapping this kernel made read-only.
+        int adonly = 0;
+        if (lr->msums) {
+          uint32 mnow = pcs_masked(page);
+          adonly = (mnow == lr->msums[pidx]);
+        }
+        if (unmarked)
+          lr->nunmarked++;
+        if (adonly)
+          lr->nadonly++;
+        if (unmarked && adonly)
+          lr->nunmarked_adonly++;
+      }
       if (drop_zero && page_is_zero(page)) {
         if (sums)
           sums[pidx] = 0;               // left out, so zeroes over there
+        if (lr && lr->msums)
+          lr->msums[pidx] = 0;          // 0 means "unknown": never reads as A/D-only
         continue;
       }
       if (sums)
         sums[pidx] = now;
+      if (lr && lr->msums)
+        lr->msums[pidx] = pcs_masked(page);
       sent++;
       struct vmstate_page ph = {.gpa = gpa};
       if ((r = put(s, &ph, sizeof(ph))) < 0)
@@ -419,8 +519,8 @@ save_mem(struct vm *vm, struct sink *s, uint64 *nbytes, uint32 *only,
     written += sizeof(end);
   }
   *nbytes = written;
-  if (nsent)
-    *nsent = sent;
+  if (lr)
+    lr->nsent = sent;
 out:
   kfree(page);
   return r;
@@ -484,6 +584,7 @@ struct precopy {
   uint32 *dirty;           // written since this round began
   uint32 *send;            // what this round carries
   uint32 *sum;             // what the other end has, per page
+  uint32 *msum;            // and the same with A/D bits masked out (admeasure=1)
   int npages, order, mapbytes, sumorder;
 };
 
@@ -505,6 +606,14 @@ precopy_begin(struct vm *vm, struct precopy *pc)
   pc->sum = kalloc_order(pc->sumorder);
   if (pc->sum)
     memset(pc->sum, 0, pc->npages * 4);   // it has nothing yet
+  pc->msum = 0;
+  if (ad_measuring() && pc->sum) {
+    pc->msum = kalloc_order(pc->sumorder);
+    if (pc->msum)
+      memset(pc->msum, 0, pc->npages * 4);
+    // a missing msum is not fatal: the measurement is skipped, the
+    // migration is not
+  }
   if (pc->dirty == 0 || pc->send == 0 || pc->sum == 0) {
     if (pc->dirty)
       kfree_order(pc->dirty, pc->order);
@@ -512,7 +621,9 @@ precopy_begin(struct vm *vm, struct precopy *pc)
       kfree_order(pc->send, pc->order);
     if (pc->sum)
       kfree_order(pc->sum, pc->sumorder);
-    pc->dirty = pc->send = pc->sum = 0;
+    if (pc->msum)
+      kfree_order(pc->msum, pc->sumorder);
+    pc->dirty = pc->send = pc->sum = pc->msum = 0;
     return -ENOMEM;
   }
   memset(pc->dirty, 0, pc->mapbytes);
@@ -553,7 +664,9 @@ precopy_end(struct vm *vm, struct precopy *pc)
   kfree_order(pc->dirty, pc->order);
   kfree_order(pc->send, pc->order);
   kfree_order(pc->sum, pc->sumorder);
-  pc->dirty = pc->send = pc->sum = 0;
+  if (pc->msum)
+    kfree_order(pc->msum, pc->sumorder);
+  pc->dirty = pc->send = pc->sum = pc->msum = 0;
 }
 
 // take the dirty set as this round's work and start counting again. The
@@ -632,7 +745,12 @@ save_to(struct vm *vm, struct sink *s)
       // the first round is every page there is, so a page of zeroes can
       // be left out as in a plain save; from the second round on it
       // cannot (see save_mem).
-      if ((r = save_mem(vm, s, &mem, pc.send, round == 1, pc.sum, 0, 0)) < 0) {
+      // an lr with no `marked' and no counters: it is here only so that the
+      // masked checksums are recorded as pages go over (admeasure=1)
+      struct lastround rlr;
+      memset(&rlr, 0, sizeof(rlr));
+      rlr.msums = pc.msum;
+      if ((r = save_mem(vm, s, &mem, pc.send, round == 1, pc.sum, 0, &rlr)) < 0) {
         precopy_end(vm, &pc);
         goto out;
       }
@@ -693,23 +811,44 @@ save_to(struct vm *vm, struct sink *s)
     // than a list: every page whose checksum differs from what the other
     // end was sent goes again.
     //
-    // A list of pages somebody marked is not enough, and the reason is
-    // worth writing down. Write-protecting the G-stage catches the
-    // guest's own stores, and vm_copyout catches what the host writes on
-    // its behalf -- but the *hardware* writes guest memory too: it sets
-    // the accessed and dirty bits in the guest's own page tables, and it
-    // does that through a mapping this kernel has made read-only without
-    // any fault arriving here. Those pages -- 7 to 10 of them in a
-    // migration of a 48 MB guest -- arrived holding an earlier copy of
-    // the guest's page tables, and the guest panicked in its own kernel a
-    // moment after it started running. A checksum of what was sent, kept
-    // per page, costs four bytes a page and makes the last round right
-    // whatever the reason a page changed.
-    int last = 0;
-    r = save_mem(vm, s, &mem, 0, 0, pc.sum, 1, &last);
+    // The last round is a comparison and not a list, and the history of
+    // why is worth keeping because the first explanation was wrong.
+    //
+    // Pages did arrive at the far end stale -- 2 to 7 of them in a
+    // migration of a 48 MB guest -- and the guest panicked in its own
+    // kernel a moment after it started running. The explanation written
+    // here for some time was that the *hardware* writes guest memory
+    // without a fault arriving, setting accessed and dirty bits in the
+    // guest's own page tables through a mapping this kernel had made
+    // read-only. That was plausible, it was never measured, and it was
+    // false.
+    //
+    // What was actually happening: vm_unshare() handed write permission
+    // back to a page in the middle of a snapshot, so the first write to it
+    // faulted and was recorded and every write after that was invisible.
+    // With that fixed, this round finds *nothing* -- zero pages, under a
+    // tmpfs writer and under a fork-heavy workload that churns page tables
+    // as hard as a 48 MB guest can. The MMU's implicit writes do take a
+    // guest-page fault here.
+    //
+    // So the comparison stays, as insurance rather than as a repair: it
+    // costs four bytes a page and one hash per page, and it is what found
+    // that bug when six migration tests could not. A dirty set that is
+    // wrong is indistinguishable from one that is right until something
+    // checks it. See journal.md and `admeasure=1' for the measurements.
+    struct lastround lr;
+    memset(&lr, 0, sizeof(lr));
+    lr.marked = pc.dirty;     // everything anyone remembered, not yet sent
+    lr.msums = pc.msum;       // 0 unless admeasure=1
+    r = save_mem(vm, s, &mem, 0, 0, pc.sum, 1, &lr);
     printk("hyp: vm %d: stopped for %d page(s), %ld KB; %ld written by the "
-           "guest under the copy\n", vm->id, last, (long)(mem / 1024),
-           (long)vm->snap.faulted);
+           "guest under the copy; %d page(s) nobody had marked\n",
+           vm->id, lr.nsent, (long)(mem / 1024), (long)vm->snap.faulted,
+           lr.nunmarked);
+    if (pc.msum)
+      printk("hyp: vm %d: admeasure: sent %d, unmarked %d, A/D-only %d, "
+             "unmarked+A/D-only %d\n", vm->id, lr.nsent, lr.nunmarked,
+             lr.nadonly, lr.nunmarked_adonly);
     precopy_end(vm, &pc);
     if (r < 0)
       goto out;

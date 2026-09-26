@@ -112,6 +112,12 @@ struct vmentry {
 #define VMCTL_PORT(proto, hport, gport) \
   (((unsigned long)(proto) << 32) | ((unsigned)(hport) << 16) | (unsigned)(gport))
 
+// vm_ctl(id, VMCTL_REVISE, what): tell the guest its machine description has
+// changed and it should look again (mutable.md). `what' is the REV_* mask of
+// what the host intends to change; a guest that does not speak the revision
+// protocol ignores the notification and keeps the description it booted with.
+#define VMCTL_REVISE 9
+
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
 #define VMCONS_DETACH 2
@@ -137,6 +143,11 @@ struct vminfo {
   // worth building next
   int ndev;
   struct { char name[12]; uint64 loads, stores, irqs; } dev[12];
+  // what the guest has observed about its machine, and when (host ticks since
+  // the machine was created). See OBS_* in hyp.h.
+  uint32 obs;
+  uint64 obs_first[14];
+  uint64 obs_now;        // ticks since creation, so `when' has a scale
   // its switch port: what it publishes, and what was turned away
   struct pport ports[NPPORT];
   int nports;

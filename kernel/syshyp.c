@@ -227,6 +227,10 @@ sys_vm_ctl(void)
     return vm_pause(vm);
   case VMCTL_RESUME:
     return vm_resume(vm);
+  case VMCTL_REVISE:
+    // arg is the REV_* mask of what the host intends to change; for now the
+    // description is simply rebuilt and the guest asked to look again.
+    return vm_revise(vm, (uint32)arg);
   case VMCTL_BALLOON:
     return vballoon_request(vm, arg * 1024 * 1024);
   case VMCTL_WEIGHT:
@@ -347,6 +351,10 @@ sys_vm_info(void)
       info.exit_throttles += v->exit_throttles;
       info.nudges += v->nudges;
     }
+    info.obs = vm->obs;
+    for (int i = 0; i < OBS_COUNT && i < 14; i++)
+      info.obs_first[i] = vm->obs_first[i];
+    info.obs_now = vm->obs_t0 ? r_time() - vm->obs_t0 : 0;
     info.ndev = vm->ndev < 12 ? vm->ndev : 12;
     for (int i = 0; i < info.ndev; i++) {
       safestrcpy(info.dev[i].name, vm->dev[i].name ? vm->dev[i].name : "?",

@@ -65,5 +65,5 @@ void
 vclint_init(struct vm *vm)
 {
   memset(vm->clint_msip, 0, sizeof(vm->clint_msip));
-  vm_add_dev(vm, "clint", -1, G_CLINT_BASE, 0x10000, vclint_read, vclint_write, 0);
+  vm_add_dev(vm, "clint", -1, OBS_TIMER, G_CLINT_BASE, 0x10000, vclint_read, vclint_write, 0);
 }

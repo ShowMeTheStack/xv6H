@@ -462,7 +462,7 @@ vvirtio_init(struct vm *vm)
     b->capacity = vm->disk_ip->size / 512;
     iunlock(vm->disk_ip);
   }
-  vm_add_dev(vm, "virtio-blk", G_VIRTIO_IRQ, G_VIRTIO_BASE, 0x1000, vvirtio_read, vvirtio_write, 0);
+  vm_add_dev(vm, "virtio-blk", G_VIRTIO_IRQ, OBS_VIRTIO_BLK, G_VIRTIO_BASE, 0x1000, vvirtio_read, vvirtio_write, 0);
   if (b->capacity && kthread_create(blk_worker, vm, "vblk") >= 0)
     b->running = 1;
   else if (b->capacity)

@@ -415,6 +415,11 @@ devintr()
       kstack_flush_ack();
     if (reasons & IPI_RESCHED)
       mycpu()->resched = 1;
+    // nobody asked for this one. As a guest, that is how the hypervisor says
+    // the machine description has changed -- a channel that does not pass
+    // through the interrupt controller, because a revision may be changing it.
+    if (reasons == 0)
+      machine_revise_check();
     return 1;
   } else if (scause == 0x8000000000000005L) {
     // timer interrupt.

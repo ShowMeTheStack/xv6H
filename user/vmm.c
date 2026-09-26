@@ -49,6 +49,7 @@ usage(void)
              "                 [-w weight] [--cpu-max pct] [-p HPORT[:GPORT][/udp]]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
+             "       vmm revise VM\n"
              "       vmm weight VM N | vmm cpumax VM PCT\n"
              "       vmm port VM [ls] | vmm port VM add|rm SPEC...\n"
              "       vmm gw [ls] | vmm gw add NAME ADDR/PREFIX [pub IP] | vmm gw rm NAME\n"
@@ -1569,6 +1570,22 @@ info(int id)
   }
   printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld", vi.exits, vi.mmio, vi.csr,
          vi.wfi, vi.injected);
+  // What this guest has learned about its machine, and when. A guest that has
+  // not looked at something can still be moved to a machine that lacks it, so
+  // this list is the machine's migration freedom, shrinking as it is read.
+  {
+    static const char *const obsname[14] = {
+        "misa", "menvcfg", "mhartid", "mvendor", "vector", "intc",
+        "timer", "rtc", "blk", "net", "con", "balloon", "uart", "dtb"};
+    int shown = 0;
+    for (int i = 0; i < 14; i++)
+      if (vi.obs & (1u << i))
+        printf("%s%s@%ldms", shown++ ? " " : "\n  observed: ", obsname[i],
+               (long)(vi.obs_first[i] / 10000));
+    if (shown)
+      printf(" (of %ld ms alive)", (long)(vi.obs_now / 10000));
+  }
+
   // and which device they went to. Eighty-two per cent of a guest's exits
   // being emulated accesses only names the work if it says *whose*.
   {
@@ -1815,6 +1832,10 @@ main(int argc, char *argv[])
       printf("vm %d %s\n", id, vm_ctl(id, VMCTL_PAUSE, 0) == 0 ? "paused" : "not paused");
     else if (strcmp(cmd, "resume") == 0)
       printf("vm %d %s\n", id, vm_ctl(id, VMCTL_RESUME, 0) == 0 ? "resumed" : "not resumed");
+    else if (strcmp(cmd, "revise") == 0)
+      printf("vm %d %s\n", id,
+             vm_ctl(id, VMCTL_REVISE, 0) == 0 ? "asked to re-read its machine"
+                                              : "not asked");
     else if (strcmp(cmd, "ps") == 0)
       ps(id);
     else if (strcmp(cmd, "info") == 0)

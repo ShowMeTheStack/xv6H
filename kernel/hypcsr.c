@@ -55,9 +55,17 @@ hyp_fetch(struct vcpu *v, uint64 gva)
 static int
 mcsr_read(struct vcpu *v, int csr, uint64 *val)
 {
+  // which of these a guest asks for is what decides where it can still be
+  // migrated to, so the asking is recorded (see OBS_* in hyp.h)
   switch (csr) {
-  case CSR_MHARTID:    *val = v->id; return 0;
-  case CSR_MISA:       *val = plat.misa & ~(1L << 7); return 0; // no nested H
+  case CSR_MHARTID:
+    vm_observe(v->vm, OBS_MHARTID);
+    *val = v->id;
+    return 0;
+  case CSR_MISA:
+    vm_observe(v->vm, OBS_MISA);
+    *val = plat.misa & ~(1L << 7);
+    return 0; // no nested H
   case CSR_MSTATUS:
     *val = (v->m_mstatus & ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK)) |
            (v->vsstatus & (SSTATUS_FS_MASK | SSTATUS_VS_MASK));
@@ -67,7 +75,7 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
   case CSR_MIE:        *val = v->m_mie; return 0;
   case CSR_MTVEC:      *val = v->m_mtvec; return 0;
   case CSR_MCOUNTEREN: *val = v->m_mcounteren; return 0;
-  case CSR_MENVCFG:    *val = v->m_menvcfg; return 0;
+  case CSR_MENVCFG:    vm_observe(v->vm, OBS_MENVCFG); *val = v->m_menvcfg; return 0;
   case CSR_MSCRATCH:   *val = v->m_mscratch; return 0;
   case CSR_MEPC:       *val = v->m_mepc; return 0;
   case CSR_PMPCFG0:    *val = v->m_pmpcfg0; return 0;
@@ -78,7 +86,7 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
   case CSR_MVENDORID:
   case CSR_MARCHID:
   case CSR_MIMPID:
-    *val = 0;
+    vm_observe(v->vm, OBS_MVENDOR); *val = 0;
     return 0;
   }
   return -1;

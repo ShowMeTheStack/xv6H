@@ -47,5 +47,5 @@ vrtc_init(struct vm *vm)
 {
   vm->rtc_latch = 0;
   if (rtc_present())
-    vm_add_dev(vm, "rtc", G_RTC_IRQ, G_RTC_BASE, 0x1000, vrtc_read, vrtc_write, 0);
+    vm_add_dev(vm, "rtc", G_RTC_IRQ, OBS_RTC, G_RTC_BASE, 0x1000, vrtc_read, vrtc_write, 0);
 }

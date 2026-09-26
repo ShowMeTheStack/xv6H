@@ -40,6 +40,9 @@
 #define SBI_EXT_HSM    0x48534D
 #define SBI_EXT_SRST   0x53525354
 #define SBI_EXT_DBCN   0x4442434E
+// "MACH" -- machine revision (mutable.md). Not a registered SBI extension id;
+// it sits in the experimental space until it is one.
+#define SBI_EXT_MACHINE 0x4D414348
 
 struct sbiret {
   long err, val;
@@ -87,6 +90,7 @@ sbi_base(struct vcpu *v, uint64 fid, uint64 a0)
     switch (a0) {
     case SBI_EXT_BASE: case SBI_EXT_TIME: case SBI_EXT_IPI: case SBI_EXT_RFENCE:
     case SBI_EXT_HSM: case SBI_EXT_SRST: case SBI_EXT_DBCN:
+    case SBI_EXT_MACHINE:
     case SBI_EXT_LEGACY_SET_TIMER: case SBI_EXT_LEGACY_PUTCHAR: case SBI_EXT_LEGACY_GETCHAR:
     case SBI_EXT_LEGACY_SHUTDOWN:
       r.val = 1;
@@ -97,6 +101,53 @@ sbi_base(struct vcpu *v, uint64 fid, uint64 a0)
     break;
   case 4: case 5: case 6: r.val = 0; break; // mvendorid, marchid, mimpid
   default: r.err = SBI_ERR_NOT_SUPPORTED;
+  }
+  return r;
+}
+
+// Machine revision. A guest that implements this can be told its machine
+// description has changed and re-enumerate; a guest that does not simply never
+// calls it, never acks, and keeps the description it booted with.
+//
+//   fid 0  version()            -> protocol version (1)
+//   fid 1  pending()            -> revision generation; 0 means never revised
+//   fid 2  describe()           -> a0 = guest-physical address of the device tree
+//                                  a1 = its length
+//   fid 3  ack(adopted)         -> the guest reports what it managed (REV_*)
+static struct sbiret
+sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
+{
+  struct vm *vm = v->vm;
+  struct sbiret r = {SBI_SUCCESS, 0};
+
+  switch (fid) {
+  case 0:
+    r.val = 1;
+    break;
+  case 1:
+    r.val = vm->revise_gen;
+    break;
+  case 2:
+    // the guest asks where its description is; a1 is returned in the second
+    // register, which the caller reads as sbiret.val after a second call --
+    // simpler to hand back the address here and the length on fid 4.
+    r.val = vm->dtb_gpa;
+    break;
+  case 3:
+    acquire(&vm->lock);
+    vm->revise_acked = vm->revise_gen;
+    vm->revise_adopted = (uint32)a0;
+    vm->revise_done = r_time();
+    release(&vm->lock);
+    printk("hyp: vm %d: revision %d adopted (0x%lx) after %ld us\n", vm->id,
+           vm->revise_acked, a0,
+           (long)((vm->revise_done - vm->revise_asked) / 10));
+    break;
+  case 4:
+    r.val = VM_DTB_MAX;
+    break;
+  default:
+    r.err = SBI_ERR_NOT_SUPPORTED;
   }
   return r;
 }
@@ -236,6 +287,9 @@ hyp_ecall(struct vcpu *v)
     break;
   case SBI_EXT_HSM:
     r = sbi_hsm(v, fid, a0, a1, a2);
+    break;
+  case SBI_EXT_MACHINE:
+    r = sbi_machine(v, fid, a0, a1, a2);
     break;
   case SBI_EXT_SRST:
     if (fid == 0) {

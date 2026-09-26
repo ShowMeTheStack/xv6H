@@ -161,6 +161,9 @@ char*           safestrcpy(char*, const char*, int);
 void            virtio_con_init(void);
 int             virtio_con_present(void);
 void            virtio_con_write(const char*, int);
+
+// machine.c
+void            machine_revise_check(void);
 int             strlen(const char*);
 int             strncmp(const char*, const char*, uint);
 char*           strncpy(char*, const char*, int);

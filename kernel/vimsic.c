@@ -393,6 +393,6 @@ vimsic_init(struct vm *vm)
 {
   for (int i = 0; i < NVCPU; i++)
     memset(&vm->vcpu[i].imsic, 0, sizeof(struct vimsic));
-  vm_add_dev(vm, "imsic-m", -1, G_IMSIC_M, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)0);
-  vm_add_dev(vm, "imsic-s", -1, G_IMSIC_S, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)1);
+  vm_add_dev(vm, "imsic-m", -1, OBS_INTC, G_IMSIC_M, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)0);
+  vm_add_dev(vm, "imsic-s", -1, OBS_INTC, G_IMSIC_S, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)1);
 }

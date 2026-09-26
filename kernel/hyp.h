@@ -148,6 +148,7 @@ struct vdev {
   void *priv;
   const char *name;      // for `vmm info': which device the exits went to
   int irq;               // the line it raises (-1: none, it is a controller)
+  uint32 obs;            // the observation a first access to it implies
   uint64 loads, stores;  // and how many of each
 };
 #define VM_MAXDEV 12
@@ -203,6 +204,34 @@ struct vvnet {
   uint32 intr_status, status;
   uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
 };
+
+// ---- what a guest has observed about its machine ----
+//
+// A hypervisor tells a guest what machine it is on once and can never take it
+// back, which is why fleets mask CPU features down to a common floor and pin
+// machines to instance families for life. The first half of doing better is
+// knowing what this particular guest has actually looked at: a guest that has
+// never asked whether it has a vector unit can be moved to a machine without
+// one, whatever the fleet-wide floor says.
+//
+// Every bit below is set from a path that already traps to the host, so
+// observing costs nothing that was not already being paid. The device tree is
+// the exception -- it is read with ordinary loads -- and is handled separately.
+#define OBS_MISA        (1u << 0)   // asked which extensions exist
+#define OBS_MENVCFG     (1u << 1)   // asked which of them are enabled
+#define OBS_MHARTID     (1u << 2)   // asked which hart it is
+#define OBS_MVENDOR     (1u << 3)   // asked whose silicon this is
+#define OBS_VECTOR_USED (1u << 4)   // executed a vector instruction
+#define OBS_INTC        (1u << 5)   // touched its interrupt controller
+#define OBS_TIMER       (1u << 6)   // read the time or armed a timer
+#define OBS_RTC         (1u << 7)   // read the wall clock device
+#define OBS_VIRTIO_BLK  (1u << 8)   // probed the disk
+#define OBS_VIRTIO_NET  (1u << 9)   // probed the NIC
+#define OBS_VIRTIO_CON  (1u << 10)  // probed the console queue
+#define OBS_BALLOON     (1u << 11)
+#define OBS_UART        (1u << 12)
+#define OBS_DTB         (1u << 13)  // read its own device tree
+#define OBS_COUNT 14
 
 // virtio-console: the guest's console as a virtqueue rather than as a
 // register it writes one byte at a time.
@@ -464,6 +493,25 @@ struct vm {
   struct vdev dev[VM_MAXDEV];
   // rising edges per interrupt line, by irq number (see vic_set_level)
   uint64 irq_raised[VPLIC_NIRQ];
+  // ---- machine revision (mutable.md) ----
+  //
+  // The description a guest was given is not final. `revise_gen' counts
+  // revisions; the guest learns of one through a supervisor software interrupt
+  // with no IPI reason behind it -- a channel chosen because it does not pass
+  // through the interrupt controller, which is one of the things a revision may
+  // be changing. `revise_acked' is the generation the guest has adopted, and
+  // `revise_adopted' is the bitmask of what it managed (REV_* below).
+  uint32 revise_gen;
+  uint32 revise_acked;
+  uint32 revise_adopted;
+  uint64 revise_asked;    // host tick when the notification went out
+  uint64 revise_done;     // host tick when the ack came back
+
+  // what this guest has observed about its machine (OBS_*), and the host tick
+  // at which each fact was first observed. See vm_observe().
+  uint32 obs;
+  uint64 obs_first[OBS_COUNT];
+  uint64 obs_t0;
   int ndev;
 
   struct cring cons_out, cons_in;
@@ -559,7 +607,15 @@ int hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst);
 void vvcon_init(struct vm *vm);          // vvcon.c
 void vvcon_rx(struct vm *vm);            // host input -> the guest's queue 0
 int vvcon_active(struct vm *vm);         // is the guest driving it?
-void vm_add_dev(struct vm *vm, const char *name, int irq, uint64 base, uint64 size,
+// What a revision can change, and what the guest reports adopting.
+#define REV_DEVICES  (1u << 0)   // the device tree changed (devices, addresses)
+#define REV_INTC     (1u << 1)   // the interrupt controller is a different kind
+#define REV_VLEN     (1u << 2)   // the vector register file is a different width
+#define REV_NONE     0u
+
+int  vm_revise(struct vm *vm, uint32 what);   // hyp.c: ask a guest to look again
+void vm_observe(struct vm *vm, uint32 what);   // hyp.c: record an observation
+void vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, uint64 size,
                 int (*read)(struct vm *, struct vdev *, uint64, int, uint64 *),
                 int (*write)(struct vm *, struct vdev *, uint64, int, uint64),
                 void *priv);

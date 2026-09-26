@@ -296,5 +296,5 @@ vvcon_init(struct vm *vm)
   memset(c, 0, sizeof(*c));
   c->present = (vm->cfg.flags & VMF_CONQUEUE) ? 1 : 0;
   if (c->present)
-    vm_add_dev(vm, "virtio-con", G_CON_IRQ, G_CON_BASE, 0x1000, vvcon_read, vvcon_write, 0);
+    vm_add_dev(vm, "virtio-con", G_CON_IRQ, OBS_VIRTIO_CON, G_CON_BASE, 0x1000, vvcon_read, vvcon_write, 0);
 }
