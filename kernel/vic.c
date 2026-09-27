@@ -31,6 +31,89 @@ vic_init(struct vm *vm)
   }
 }
 
+// the three models by name, for the messages that report a change
+const char *
+vic_kindname(int kind)
+{
+  switch (kind) {
+  case VIC_PLIC:  return "plic";
+  case VIC_APLIC: return "aplic";
+  case VIC_IMSIC: return "imsic";
+  }
+  return "?";
+}
+
+// how many interrupt lines a level set holds down. There is no libgcc in the
+// kernel, so no __builtin_popcountll.
+int
+vic_held(uint64 levels)
+{
+  int n = 0;
+  for (uint64 b = levels; b; b &= b - 1)
+    n++;
+  return n;
+}
+
+// ---- changing the kind of interrupt controller under a running guest ----
+//
+// The thing that makes this tractable is what does *not* have to be carried
+// over. A guest's controller configuration -- which sources are enabled, at
+// what priority, targeted at which hart -- is the guest's own, and the guest
+// rebuilds all of it when it re-enumerates (intc_init() re-enables the sources
+// it cares about). So translating PLIC enable bits into IMSIC EIE bits would be
+// copying something that is about to be overwritten.
+//
+// What must be carried is the part the *host* owns: which interrupt lines are
+// currently asserted. Every virtual device here is level-triggered -- vvirtio
+// raises the line when intr_status becomes non-zero and drops it when the guest
+// acknowledges -- so the set of asserted lines is a faithful summary of what the
+// devices want, independent of any controller. Re-asserting them into the new
+// model is exact rather than approximate.
+//
+// What cannot be carried: an interrupt the guest has claimed but not completed.
+// The guest is inside its handler, holding an identity that the new controller
+// will not recognise, and it will complete it against a controller that no
+// longer exists. So a revision is refused while any source is in service, which
+// is a bounded wait -- handlers are short.
+//
+// Returns 0, or -1 if this is not a safe moment.
+int
+vic_levels_snapshot(struct vm *vm, uint64 *levels)
+{
+  *levels = 0;
+  switch (vm->vic_kind) {
+  case VIC_PLIC:
+    if (vm->plic.inservice)
+      return -1;                       // mid-handler; ask again shortly
+    *levels = vm->plic.level;
+    return 0;
+  case VIC_APLIC:
+  case VIC_IMSIC:
+    *levels = vm->aplic.level;
+    return 0;
+  }
+  return -1;
+}
+
+// Build the new model from nothing and re-assert what the devices are holding.
+// caller holds vm->lock; vm->vic_kind has already been changed.
+void
+vic_levels_restore(struct vm *vm, uint64 levels)
+{
+  // the outgoing controller's device models first, or they alias the incoming
+  // ones (PLIC and APLIC-M both live at 0x0c000000) and the guest goes on
+  // talking to the one it is leaving
+  vm_del_dev(vm, "plic");
+  vm_del_dev(vm, "aplic-m");
+  vm_del_dev(vm, "aplic-s");
+  vm_del_dev(vm, "imsic-m");
+  vm_del_dev(vm, "imsic-s");
+  vic_init(vm);
+  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+    if (levels & (1ull << irq))
+      vic_set_level(vm, irq, 1);
+}
+
 // a virtual device's interrupt line changed. caller holds vm->lock.
 void
 vic_set_level(struct vm *vm, int irq, int level)

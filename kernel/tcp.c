@@ -45,7 +45,7 @@ tring_init(struct tring *t, uint size)
 {
   t->size = size;
   t->r = t->w = 0;
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < TRING_PAGES; i++)
     t->pg[i] = 0;
   for (uint i = 0; i * PGSIZE < size; i++) {
     if ((t->pg[i] = kalloc()) == 0)
@@ -57,7 +57,7 @@ tring_init(struct tring *t, uint size)
 static void
 tring_free(struct tring *t)
 {
-  for (int i = 0; i < 4; i++) {
+  for (int i = 0; i < TRING_PAGES; i++) {
     if (t->pg[i])
       kfree(t->pg[i]);
     t->pg[i] = 0;
@@ -482,8 +482,8 @@ tcp_ack(struct tcpcb *t, uint32 ack)
       t->dupacks++;
       // Fast retransmit, with the threshold the window can actually
       // reach. Three duplicate acknowledgements need four segments in
-      // flight, and this stack's send ring is eight kilobytes: a window
-      // of two segments never gets there, so every lost segment used to
+      // flight, and this stack's send ring was eight kilobytes: a window
+      // of two segments never got there, so every lost segment used to
       // cost a whole retransmission timeout -- and the timeout doubles.
       // A migration on a link that drops one frame of a back-to-back
       // pair went from 45 KB/s to a dead stop that way, one segment per

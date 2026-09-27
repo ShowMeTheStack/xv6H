@@ -128,6 +128,14 @@ virtio_net_present(void)
   return nic.present;
 }
 
+// the register window moved (machine.c, REV_DEVICES): repoint the driver.
+void
+virtio_net_rebase(uint64 old, uint64 nw)
+{
+  if (nic.base == old)
+    nic.base = nw;
+}
+
 int
 virtio_net_init(void)
 {

@@ -39,16 +39,25 @@ sync_tree() { # NAME
   # called init.d or rc.d just as happily, so directories ending in .d
   # are included first: a trailing slash makes a pattern match only
   # those. that cost a whole matrix run once.
+  #
+  # and '*.img' is excluded wholesale rather than by a list of the names
+  # images have had. The list was fs.img, *-fs.img, test-*.img, mig*.img,
+  # guest[0-9]*.img, guest/*.img, ext4check.img -- and a scratch script
+  # that named its disks ad<pid>-a.img matched none of them, so a sync
+  # spent a slow link pushing 2.3 GB of them to the build box. Nothing
+  # tracked in this tree is a .img (.gitignore excludes them all) and the
+  # box builds its own file system image, so there is nothing to lose by
+  # excluding the extension.
   rsync -a --delete --delete-excluded \
     --include '*.d/' --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
-    --exclude 'fs.img' --exclude '*-fs.img' --exclude 'test-*.img' --exclude 'mig*.img' --exclude 'mig*.sock' --exclude 'user/_*' --exclude 'user/usys.S' \
+    --exclude '*.img' --exclude '*.sock' --exclude 'user/_*' --exclude 'user/usys.S' \
     --exclude 'qlogs' --exclude 'qresults.txt' \
-    --exclude 'ext4check.img' --exclude 'ext4check.mnt' --exclude '*.cow' --exclude '*.log' \
-    --exclude 'guest[0-9]*.img' --exclude 'build' --exclude '__pycache__' \
+    --exclude 'ext4check.mnt' --exclude '*.cow' --exclude '*.log' \
+    --exclude 'build' --exclude '__pycache__' \
     --exclude 'kernel/kernel' --exclude 'mkfs/mkfs' --exclude 'mkfs/mkext4' --exclude 'mkfs/mkpasswd' --exclude 'tls/obj' --exclude 'tls/libbearssl.a' \
-    --exclude 'guest/*.img' --exclude 'guest/kernel' --exclude 'guest/hello' --exclude 'guest/hello.bin' \
+    --exclude 'guest/kernel' --exclude 'guest/hello' --exclude 'guest/hello.bin' \
     --exclude 'guest/fdguest' --exclude 'guest/vguest' --exclude 'guest/badguest' \
-    --exclude 'linux/Image*' --exclude 'linux/linux.img' --exclude 'user/tls_date.h' \
+    --exclude 'linux/Image*' --exclude 'user/tls_date.h' \
     --exclude 'results.out' --exclude 'done' --exclude 'test-hyp.log' --exclude '.git' \
     "$HERE/" "$HOST:$RUNS/.seed/"
   ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/.seed $RUNS/$name && \

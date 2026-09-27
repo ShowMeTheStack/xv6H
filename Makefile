@@ -604,6 +604,12 @@ guest/vguest: guest/vguest.c guest/hello.S guest/hello.ld
 	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/hello.ld -o guest/vguest \
 	  guest/hello.S guest/vguest.c
 
+# a second, independent guest that speaks the machine-revision protocol.
+guest/revguest: guest/revguest.c guest/revguest.S guest/hello.ld
+	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
+	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/hello.ld -o guest/revguest \
+	  guest/revguest.S guest/revguest.c
+
 # what an exit costs, measured from inside a guest (guest/vmbench.c).
 guest/vmbench: guest/vmbench.c guest/hello.S guest/hello.ld
 	$(CC) -Wall -Werror -O -march=rv64g -mcmodel=medany -ffreestanding -fno-common -nostdlib \
@@ -621,7 +627,7 @@ guest/badguest: guest/badguest.c guest/badentry.S guest/badguest.ld
 	  -fno-stack-protector -fno-pie -no-pie -Wl,-T,guest/badguest.ld -o guest/badguest \
 	  guest/badentry.S guest/badguest.c
 
-GUESTBINS = guest/kernel guest/badguest guest/fuzzguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench
+GUESTBINS = guest/kernel guest/badguest guest/fuzzguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench guest/revguest
 
 # the loader and the shared library belong in every file system image
 # everything an image carries is stripped: the debug information is for
@@ -859,7 +865,7 @@ clean:
 	rm -rf tls/obj build
 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
 	*/*.o */*.d */*.asm */*.sym \
-	$K/kernel fs.img test-fs.img guest/kernel guest/badguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench guest/disk*.img \
+	$K/kernel fs.img test-fs.img guest/kernel guest/badguest guest/hello guest/hello.bin guest/fdguest guest/vguest guest/vmbench guest/revguest guest/disk*.img \
 	mkfs/mkext4 .gdbinit \
         $U/usys.S $U/tls_date.h tls/libbearssl.a \
 	$(UPROGS)

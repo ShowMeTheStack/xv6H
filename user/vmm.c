@@ -45,7 +45,7 @@ static void
 usage(void)
 {
   fprintf(stderr, "usage: vmm start [-n name] [-k kernel] [-f disk|none] [-c ncpu] [-m mb] [-r addr]\n"
-             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-Q] [-M mb] [-d]\n"
+             "                 [-a bootargs] [-i dhcp|IP/PREFIX[,GW[,DNS]]] [-H] [-s] [-4] [-Q] [-P] [-M mb] [-d]\n"
              "                 [-w weight] [--cpu-max pct] [-p HPORT[:GPORT][/udp]]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
@@ -1473,6 +1473,15 @@ start(int argc, char *argv[])
       cfg.flags |= VMF_NOHUGE;
     } else if (strcmp(a, "-Q") == 0) {
       cfg.flags |= VMF_CONQUEUE;
+    } else if (strcmp(a, "-P") == 0) {
+      cfg.flags |= VMF_WANT_PLIC;
+    } else if (strcmp(a, "-A") == 0) {
+      cfg.flags |= VMF_WANT_APLIC;     // the software APLIC, whatever the host has
+    } else if (strcmp(a, "-I") == 0) {
+      cfg.flags |= VMF_WANT_IMSIC;     // and the software IMSIC
+    } else if (strcmp(a, "-M") == 0 && i + 1 < argc) {
+      cfg.flags |= VMF_MMIO_SET;       // virtio block offset from the default map
+      cfg.mmio_shift = strtoul(argv[++i], 0, 0);
     } else if (strcmp(a, "-d") == 0) {
       detach = 1;
     } else {
@@ -1535,6 +1544,9 @@ info(int id)
   printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB (%d MB resident), intc %s%s\n", id, vi.cfg.name,
          states[vi.state % 5], vi.nvcpu, vi.mem_mb, vi.resident_mb, intcs[vi.intc % 3],
          vi.imsic_hw ? " (hardware guest files)" : "");
+  printf("  revision: %s, generation %d\n",
+         vi.revise_capable ? "guest speaks the protocol" : "guest does not speak it",
+         vi.revise_gen);
   printf("  memory: %d chunks split to pages, %d table pages%s%s",
          vi.split_chunks, vi.table_pages,
          (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "",
@@ -1593,8 +1605,11 @@ info(int id)
     for (int i = 0; i < vi.ndev; i++) {
       if (vi.dev[i].loads + vi.dev[i].stores == 0)
         continue;
-      printf("%s%s %ldr/%ldw", shown++ ? ", " : "\n  by device: ",
-             vi.dev[i].name, vi.dev[i].loads, vi.dev[i].stores);
+      // the address as well as the name: where a device is is part of the
+      // machine's shape now (a map can be revised), and a host's view of it
+      // is what a reader compares with the guest's
+      printf("%s%s@%lx %ldr/%ldw", shown++ ? ", " : "\n  by device: ",
+             vi.dev[i].name, vi.dev[i].base, vi.dev[i].loads, vi.dev[i].stores);
       if (vi.dev[i].irqs)
         printf("/%ldi", vi.dev[i].irqs);
     }
@@ -1660,11 +1675,29 @@ stats(void)
          s[6 + MAXVM]);
 }
 
+// how long to wait for a machine to be gone. A tick is 1/TICK_HZ of a second
+// and TICK_HZ is 100, so the old count of 100 was one second -- which was
+// calibrated on guests whose RAM is backed by megapages, where there are
+// sixty-four blocks to give back and it takes a few hundred milliseconds.
+//
+// A guest started with -4 has a frame per page: 32768 of them for a 128 MB
+// machine, each one walked and freed, and a guest that has touched all its
+// memory has all of them. On a loaded laptop that crosses a second often
+// enough to matter -- measured at 0.4 s when the machine was quiet and past
+// the deadline when it was not, with the machine reliably gone a moment
+// later. `guest-pages' then failed for a reason that was nothing to do with
+// what it tests: `vmm kill' gave up and exited without printing, and the
+// test sat waiting for a line nobody was going to write.
+//
+// Thirty seconds is not a real wait -- nothing takes it -- it is long enough
+// that reaching it means something is actually wrong.
+#define FREE_TICKS 3000
+
 static void
 wait_freed(int id)
 {
   struct vminfo vi;
-  for (int i = 0; i < 100; i++) {
+  for (int i = 0; i < FREE_TICKS; i++) {
     if (getinfo(id, &vi) < 0 || vi.state == VM_FREE)
       return;
     ticksleep(1);
@@ -1820,6 +1853,30 @@ main(int argc, char *argv[])
       exit(1);
     }
     printf("vm %d: asked for %d MB back\n", id, mb);
+  } else if (argc == 4 && strcmp(cmd, "revise") == 0) {
+    // give a running guest a different kind of interrupt controller
+    int id = must_lookup(argv[2]);
+    // `vmm revise VM vector' / `novector' take the unit away or give it back
+    if (strcmp(argv[3], "vector") == 0 || strcmp(argv[3], "novector") == 0) {
+      int on = strcmp(argv[3], "vector") == 0;
+      int rv = vm_ctl(id, VMCTL_REVISE_VEC, on);
+      printf("vm %d: vector unit %s: %s\n", id, on ? "granted" : "revoked",
+             rv == 0 ? "asked" : strerror(-rv));
+      exit(rv == 0 ? 0 : 1);
+    }
+    int kind = strcmp(argv[3], "plic") == 0    ? 0
+               : strcmp(argv[3], "aplic") == 0 ? 1
+               : strcmp(argv[3], "imsic") == 0 ? 2
+                                              : -1;
+    if (kind < 0)
+      usage();
+    int r = vm_ctl(id, VMCTL_REVISE_INTC, kind);
+    if (r == 0)
+      printf("vm %d: interrupt controller -> %s\n", id, argv[3]);
+    else
+      printf("vm %d: not changed (%s)\n", id,
+             r == -EAGAIN ? "inside an interrupt handler, try again"
+                          : strerror(-r));
   } else if (argc == 3) {
     int id = must_lookup(argv[2]);
     if (strcmp(cmd, "attach") == 0)

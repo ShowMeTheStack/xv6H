@@ -2,8 +2,19 @@
 
 #define NTCP 32
 #define TCP_MSS 1400
+// Four pages a ring, and that number is the migration wire's speed limit: with
+// at most 8 KB in flight per ~10 ms round trip through the emulated path, a
+// machine crosses at 0.83 MB/s (116 MB in 136 s between hosts that ping in 0 ms).
+// It is NOT raised here, and the reason is measured: at sixteen pages the same
+// transfer ran at 0.05 MB/s -- sixteen times slower -- because forty-odd
+// segments in flight overrun the receiver's frame queue and its four-segment
+// out-of-order buffer, and every burst became retransmission timeouts. Bigger
+// rings need a deeper receive queue and real out-of-order recovery (SACK) to go
+// with them; that is a change to make on purpose, with a TCP throughput test,
+// not a constant to bump.
+#define TRING_PAGES 4
 #define TCP_SNDBUF (2 * 4096)
-#define TCP_RCVBUF (4 * 4096)
+#define TCP_RCVBUF (TRING_PAGES * 4096)
 #define TCP_BACKLOG 4
 // Segments kept while there is a hole in front of them. Throwing away
 // what arrives after a lost segment turns one loss into a window of
@@ -19,7 +30,7 @@ enum tcpstate {
 
 // a byte ring over a few non-contiguous pages.
 struct tring {
-  char *pg[4];
+  char *pg[TRING_PAGES];
   uint size;
   uint r, w; // read/write positions (mod size); w - r = bytes held
 };

@@ -52,6 +52,12 @@ struct platform {
   uint64 misa;          // read in machine mode at boot
   int has_h;            // misa reports the hypervisor extension
   int has_v;            // misa reports the vector extension
+  // the AIA CSRs -- hvictl, vsiselect/vsireg/vstopei -- exist on this CPU. Not in
+  // misa (Ssaia is not a letter), and no trap-safe way to probe a CSR here, so
+  // it is inferred from the machine: qemu's virt gives the CPU those CSRs with
+  // aia=aplic-imsic and a host booted on aia=none took an illegal instruction on
+  // hvictl. Conservative: only an IMSIC host is assumed to have them.
+  int has_aia_csrs;
   uint64 vlenb;         // bytes per vector register (0 without V)
   int is_guest;         // device tree carries the "xv6h,guest" marker
   int guest_id;         // from the xv6h,vmid property, if a guest

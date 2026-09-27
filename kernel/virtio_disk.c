@@ -163,6 +163,17 @@ disk_init(struct disk *d)
 // probe every virtio-mmio slot the device tree lists; slot i with a
 // block device becomes disk i. slots without a device are skipped but
 // keep their index so that disk numbering matches qemu's bus numbering.
+// a device's register window moved (machine.c, REV_DEVICES): repoint the driver.
+// Everything else -- the queues in our memory, the device's state on the host --
+// is untouched, so this is a pointer update and nothing more.
+void
+virtio_disk_rebase(uint64 old, uint64 nw)
+{
+  for (int i = 0; i < NVIRTIO; i++)
+    if (disks[i].base == old)
+      disks[i].base = nw;
+}
+
 void
 virtio_disk_init(void)
 {

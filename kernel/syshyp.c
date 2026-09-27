@@ -151,9 +151,23 @@ sys_vm_migrate(void)
     return err;
   if ((f = fdget(myproc(), fd)) == 0)
     return -EBADF;
+  // whether it was running matters for the failure path below: a machine the
+  // caller had paused must not come back running because a migration was
+  // refused. save_to() leaves a successfully-sent machine stopped either way.
+  int was_running = (vm->state == VM_RUNNING);
   int r = vm_save_file(vm, f);
   if (r < 0)
     return r;
+  // Sending it is not the same as it having been taken. The destination may
+  // still refuse what it has read -- no vector unit for a save area, no room
+  // for the memory, no free slot -- so wait to be told before giving it up.
+  // Without this the machine could be destroyed here while the other end
+  // reported "Invalid argument", and the guest existed nowhere.
+  if ((r = vmstate_ack_get(f)) < 0) {
+    if (was_running)
+      vm_resume(vm);        // it was stopped for the last round; it stays ours
+    return r;
+  }
   // it is over there now. What is here must stop being a machine before
   // the other end starts it, which is why this is not a copy.
   vm_destroy(vm);
@@ -176,6 +190,8 @@ sys_vm_accept(void)
   if ((f = fdget(myproc(), fd)) == 0)
     return -EBADF;
   int r = vm_restore_file(f, name, &id);
+  // and tell the other end, which is still holding the machine until it hears.
+  vmstate_ack_put(f, r >= 0);
   return r < 0 ? r : id;
 }
 
@@ -231,6 +247,10 @@ sys_vm_ctl(void)
     // arg is the REV_* mask of what the host intends to change; for now the
     // description is simply rebuilt and the guest asked to look again.
     return vm_revise(vm, (uint32)arg);
+  case VMCTL_REVISE_INTC:
+    return vm_revise_intc(vm, (int)arg);
+  case VMCTL_REVISE_VEC:
+    return vm_revise_vector(vm, (int)arg);
   case VMCTL_BALLOON:
     return vballoon_request(vm, arg * 1024 * 1024);
   case VMCTL_WEIGHT:
@@ -338,6 +358,8 @@ sys_vm_info(void)
     }
     info.intc = vm->vic_kind;
     info.imsic_hw = vm->imsic_hw;
+    info.revise_capable = vm->revise_capable;
+    info.revise_gen = vm->revise_gen;
     info.cfg = vm->cfg;
     info.entry = vm->entry;
     info.disk_sectors = vm->blk.capacity;
@@ -363,6 +385,7 @@ sys_vm_info(void)
       info.dev[i].stores = vm->dev[i].stores;
       info.dev[i].irqs = vm->dev[i].irq >= 0 && vm->dev[i].irq < VPLIC_NIRQ
                              ? vm->irq_raised[vm->dev[i].irq] : 0;
+    info.dev[i].base = vm->dev[i].base;
     }
     struct vcpu *v = &vm->vcpu[0];
     info.pc = v->pc;

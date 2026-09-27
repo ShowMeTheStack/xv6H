@@ -163,6 +163,11 @@ int             virtio_con_present(void);
 void            virtio_con_write(const char*, int);
 
 // machine.c
+void            machine_init(void);
+void            virtio_disk_rebase(uint64, uint64);
+void            virtio_net_rebase(uint64, uint64);
+void            virtio_balloon_rebase(uint64, uint64);
+void            virtio_con_rebase(uint64, uint64);
 void            machine_revise_check(void);
 int             strlen(const char*);
 int             strncmp(const char*, const char*, uint);
@@ -339,6 +344,7 @@ void            procinit_early(void);
 
 // vm.c (runtime kernel mappings)
 int             kvmmap_rt(uint64 va, uint64 pa, uint64 sz, int perm);
+int             kvm_mapped(uint64 va);
 uint64          kvmunmap_rt(uint64 va, uint64 sz);
 uint64          kvmprune_rt(uint64 va);
 

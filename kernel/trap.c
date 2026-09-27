@@ -90,8 +90,10 @@ usertrap(void)
 
   // the vector registers are saved here rather than in the trampoline
   // (nothing in the kernel touches them); only if the process used them.
-  if (p->vstate && (r_sstatus() & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY)
+  if (p->vstate && (r_sstatus() & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY) {
+    p->vec_used = 1;      // it has really used the unit, not merely been given one
     vec_save(p->vstate, p->trapframe->vcsrs);
+  }
 
   if (r_scause() == 8) {
     // system call

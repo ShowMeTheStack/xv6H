@@ -84,7 +84,14 @@ struct vmstate_dev {
   uint64 entry;
 };
 
-// the configuration, and the shape of the machine the file describes
+// the configuration, and the shape of the machine the file describes.
+//
+// `vic_kind' and `obs' are what make a machine movable to a host of a different
+// shape. The kind says what the guest is *currently* bound to, so a destination
+// that gives it something else knows a revision is owed; `obs' says what the
+// guest has actually looked at, which is what decides whether this destination
+// is allowed to have it at all. A guest that has never executed a vector
+// instruction may land on a machine with no vector unit; one that has may not.
 struct vmstate_cfg {
   struct vmconfig cfg;
   uint64 ram_size;
@@ -93,7 +100,35 @@ struct vmstate_cfg {
   int imsic_hw;
   int prefer_huge;
   uint64 mem_limit;
-  uint64 pad;
+  uint32 obs;             // OBS_* : what the guest has observed about itself
+  uint32 vlenb;           // the vector register width it was given (0: none)
+  // The revision generation belongs to the *machine*, not to the host, and this
+  // is why. The guest remembers the last generation it applied, and that memory
+  // travels with it. The host's counter, if it started from zero on every host,
+  // would hand a migrated guest "revision 1" for the second time -- and the
+  // guest, which already applied a revision 1, would correctly conclude it was
+  // up to date and ignore it. A guest that had been revised once on its way
+  // could then never be revised again on arrival. Carried, so the sequence
+  // continues across hosts.
+  uint32 revise_gen;
+  uint64 mmio_shift;      // where its virtio block sat (the layout axis)
+  // bit 0: the guest has given the vector unit up (vm->vec_revoked). It matters
+  // for legality and it is not the same question as `has it ever used one'. A
+  // guest that used the unit and then *accepted* a revocation is holding no
+  // state in it -- the guest itself refused the revocation if any task was, and
+  // this bit is only set because it agreed. So it may move to a host with no
+  // unit, even though `vector' is in its observation set for the rest of its
+  // life. That is the negotiation being worth something: a machine that could
+  // not move becomes one that can, because the guest gave something up.
+#define VMSTATE_F_VEC_REVOKED 1u
+  // bit 1: the guest has spoken the revision protocol. Without it, a machine
+  // arriving at a host of another shape keeps the description it left with --
+  // the controller it was bound to, as a software model -- because a guest that
+  // has never asked about revisions would never read a new one and would be left
+  // deaf. That is the legacy tier: correct anywhere, paying emulation exits. A
+  // guest that has asked is revised to the host's native controller instead.
+#define VMSTATE_F_CAPABLE 2u
+  uint32 flags2;
 };
 
 _Static_assert(sizeof(struct vmstate_dev) <= PGSIZE,
@@ -233,6 +268,23 @@ ad_measuring(void)
   return admeasure;
 }
 
+// norevise=1 on the host's command line: take a machine of another shape and
+// say nothing. This exists to be *measured against*. The claim of this work is
+// that a guest which is told its machine changed shape keeps running, and a
+// claim like that is worth nothing without the control -- what happens to the
+// same guest, on the same two hosts, over the same wire, when the revision is
+// withheld. Same pattern as admeasure=1 above; default off, so an ordinary host
+// always tells the truth.
+static int norevise = -1;
+
+static int
+revise_muted(void)
+{
+  if (norevise < 0)
+    norevise = plat_bootarg("norevise=1");
+  return norevise;
+}
+
 // is this page worth writing down?
 static int
 page_is_zero(const char *p)
@@ -358,11 +410,34 @@ save_dev(struct vm *vm, struct vmstate_dev *d)
 }
 
 static void
-restore_dev(struct vm *vm, const struct vmstate_dev *d)
+restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind)
 {
   vm->uart = d->uart;
   vm->plic = d->plic;
   vm->aplic = d->aplic;
+  // A machine that arrives on a host of a different shape gets that host's
+  // interrupt controller, not the one it left. The register state just copied
+  // in belongs to a model this machine no longer has, and translating it would
+  // be copying something the guest is about to overwrite anyway: it
+  // re-enumerates when it adopts the new description, and re-enables the
+  // sources it cares about itself.
+  //
+  // What cannot be re-derived by the guest is which lines the *host's* devices
+  // are currently holding down, because that is the host's state and not the
+  // guest's. Every virtual device here is level-triggered, so that set is a
+  // faithful summary of what the devices want, independent of any controller --
+  // which is the whole reason a controller can be exchanged under a running
+  // guest at all. Take it from whichever model was live on the source and
+  // re-assert it into the one this host has built.
+  if (src_kind != vm->vic_kind && !revise_muted()) {
+    uint64 levels = (src_kind == VIC_PLIC) ? d->plic.level : d->aplic.level;
+    acquire(&vm->lock);
+    vic_levels_restore(vm, levels);
+    release(&vm->lock);
+    printk("hyp: vm %d: arrived as %s, this host gives %s: %d line(s) still held\n",
+           vm->id, vic_kindname(src_kind), vic_kindname(vm->vic_kind),
+           vic_held(levels));
+  }
   // the network device keeps the hardware address this host gave it: the
   // switch knows the machine by that, and a saved one may be restored
   // beside the machine it was saved from.
@@ -727,6 +802,12 @@ save_to(struct vm *vm, struct sink *s)
   w->cfg.imsic_hw = vm->imsic_hw;
   w->cfg.prefer_huge = vm->prefer_huge;
   w->cfg.mem_limit = vm->mem_limit;
+  w->cfg.obs = vm->obs;
+  w->cfg.vlenb = (uint32)(vm->vec_revoked ? 0 : plat.vlenb);
+  w->cfg.revise_gen = vm->revise_gen;
+  w->cfg.mmio_shift = vm->mmio_shift;
+  w->cfg.flags2 = (vm->vec_revoked ? VMSTATE_F_VEC_REVOKED : 0) |
+                  (vm->revise_capable ? VMSTATE_F_CAPABLE : 0);
   if ((r = put_sec(s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
     goto out;
 
@@ -882,6 +963,88 @@ out:
   if (dev)
     kfree(dev);
   return r;
+}
+
+// ---- the acknowledgement ----
+//
+// A migration used to be: send everything, and if the sending worked, destroy
+// the machine here. The destination can still refuse *after* it has read the
+// stream -- it may have no vector unit for a save area, no room for the memory,
+// or no free slot -- and the machine was then gone from both ends. A guest lost
+// because two hosts disagreed about whether the move was legal is the worst
+// outcome this code can produce, and it was reachable.
+//
+// So the destination says one byte when it knows, and the source waits for it
+// before giving anything up. 'Y' means the machine is safe over there. Anything
+// else, including the connection closing, means it is not, and the source keeps
+// running it.
+int
+vmstate_ack_put(struct file *f, int ok)
+{
+  char c = ok ? 'Y' : 'N';
+
+  if (f == 0 || f->type != FD_SOCK || f->sock == 0)
+    return -EINVAL;
+  if (sockwrite(f->sock, 0, (uint64)&c, 1) != 1)
+    return -EIO;
+  return 0;
+}
+
+// and the source's side of it: 0 when the far end said yes.
+//
+// Bounded, because an unbounded wait here would be a worse bug than the one this
+// fixes. A destination that crashes closes the connection and sockread says so at
+// once; one that *hangs* says nothing at all, and a source blocked forever on it
+// is a machine that is neither running nor migrated. So the wait has a deadline,
+// and running out of it is a no: the guest stays here, which is the safe answer
+// whichever way the far end eventually goes -- a destination that has not said yes
+// has not started it.
+// Thirty seconds at TICK_HZ 100. Deliberately generous: the destination restores
+// the machine as it reads it, so by the time the source has finished writing the
+// far end is nearly done and the answer comes in milliseconds. A deadline tight
+// enough to be tripped by a loaded destination would invent the very failure this
+// is here to prevent -- a machine kept here that the far end was about to accept.
+// Like FREE_TICKS in user/vmm.c: not a real wait, just long enough that reaching
+// it means something is genuinely wrong.
+#define ACK_TICKS 3000
+
+static uint
+now_ticks(void)
+{
+  acquire(&tickslock);
+  uint t = ticks;
+  release(&tickslock);
+  return t;
+}
+
+int
+vmstate_ack_get(struct file *f)
+{
+  char c = 0;
+
+  if (f == 0 || f->type != FD_SOCK || f->sock == 0)
+    return -EINVAL;
+  uint deadline = now_ticks() + ACK_TICKS;
+  for (;;) {
+    int ready = sockready(f->sock, 0);
+    if (ready < 0)
+      return -EIO;             // it closed without answering
+    if (ready > 0)
+      break;
+    if (killed(myproc()))
+      return -EINTR;
+    if (now_ticks() >= deadline)
+      return -ETIMEDOUT;       // it said nothing: the machine stays here
+    // a tick at a time, on the channel the timer wakes; registered before
+    // tickslock is dropped, so a tick in between is not missed
+    acquire(&tickslock);
+    sleep_prepare((void *)&ticks);
+    release(&tickslock);
+    sleep();
+  }
+  if (sockread(f->sock, 0, (uint64)&c, 1) != 1)
+    return -EIO;
+  return c == 'Y' ? 0 : -ECONNRESET;
 }
 
 int
@@ -1082,6 +1245,12 @@ vm_snapshot(struct vm *vm, char *path)
   w->cfg.imsic_hw = vm->imsic_hw;
   w->cfg.prefer_huge = vm->prefer_huge;
   w->cfg.mem_limit = vm->mem_limit;
+  w->cfg.obs = vm->obs;
+  w->cfg.vlenb = (uint32)(vm->vec_revoked ? 0 : plat.vlenb);
+  w->cfg.revise_gen = vm->revise_gen;
+  w->cfg.mmio_shift = vm->mmio_shift;
+  w->cfg.flags2 = (vm->vec_revoked ? VMSTATE_F_VEC_REVOKED : 0) |
+                  (vm->revise_capable ? VMSTATE_F_CAPABLE : 0);
   if ((r = put_sec(&s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
     goto resume;
   memset(&w->tm, 0, sizeof(w->tm));
@@ -1342,7 +1511,9 @@ vm_clone(struct vm *src, const char *name, const char *disk, int *idp)
       memmove(dst->vcpu[i].vstate, src->vcpu[i].vstate, PGSIZE);
   }
   save_dev(src, dev);
-  restore_dev(dst, dev);
+  restore_dev(dst, dev, src->vic_kind);
+  dst->revise_gen = src->revise_gen;
+  dst->revise_acked = src->revise_gen;
   dst->cons_out = src->cons_out;
   dst->cons_in = src->cons_in;
   dst->htimedelta = src->htimedelta;
@@ -1442,6 +1613,8 @@ restore_from(struct src *s, const char *name, int *idp)
   int nvs = 0, r, id = -1;
   uint64 got = 0;
   struct vm *vm = 0;
+  int src_kind = -1;        // the controller the machine was bound to when it left
+  uint64 src_shift = 0;     // and where its devices sat
   // a file too short to hold a header is not a saved machine, and saying
   // "invalid argument" is the answer; "input/output error" would be a
   // complaint about the disk, which is not what is wrong.
@@ -1486,6 +1659,69 @@ restore_from(struct src *s, const char *name, int *idp)
         goto out;
       if (name && name[0])
         safestrcpy(w->cfg.cfg.name, name, VM_NAMELEN);
+      // ---- is this host allowed to have this machine? ----
+      //
+      // Not "is this host identical to the one it left", which is the question a
+      // compatibility set asks and the reason a fleet is pinned to an instance
+      // family for life. The question is whether this host can honour what the
+      // guest currently *has*.
+      //
+      // A vector unit the guest still has cannot be taken away by arriving
+      // somewhere without one: the register file is state, thirty-two registers
+      // per task that has touched it, and a host with no unit has nowhere to put
+      // it. So the machine is refused -- and the refusal is not the end of it.
+      // The way to make this move legal is to ask the guest to give the unit up
+      // *before* moving, which it will do if no task is relying on it
+      // (vm_revise_vector, and the guest answers). A guest that has agreed
+      // arrives with VMSTATE_F_VEC_REVOKED set and is taken.
+      //
+      // Deliberately NOT keyed on OBS_VECTOR_USED, and the reason is a result in
+      // itself: the host cannot observe vector use reliably or cheaply.
+      // vsstatus.VS going Dirty is the only free signal, and it is a transient --
+      // the guest's own trap handler saves the register file and sets it back to
+      // Clean, so whether the host ever samples a Dirty depends on when its exits
+      // happen to fall. Measured: the same guest running the same vecbench showed
+      // `vector' in its observation set on some runs and not others. The exact
+      // answer lives in the guest, which knows which tasks hold state, so the
+      // decision is a negotiation rather than an observation.
+      if (!(w->cfg.flags2 & VMSTATE_F_VEC_REVOKED) && w->cfg.vlenb > 0 &&
+          (!plat.has_v || plat.vlenb < (uint64)w->cfg.vlenb)) {
+        printk("hyp: refusing a machine with a %d-byte vector unit: this host has "
+               "%s. Ask the guest to give it up first\n", w->cfg.vlenb,
+               plat.has_v ? "narrower ones" : "none");
+        r = -ENOTSUP;
+        goto out;
+      }
+      src_kind = w->cfg.vic_kind;
+      // ---- which tier is this machine? ----
+      //
+      // A guest that has spoken the revision protocol will read a new description
+      // and rebind, so it is built with this host's native controller and told.
+      // One that has not -- an unmodified guest -- would never read it, so the
+      // shape it left with is kept: the same controller kind, as a software model
+      // on this host. Correct on any host, at the price of emulation exits for
+      // every interrupt; and the exits are exactly what a participating guest
+      // saves, which is the whole argument for speaking the protocol.
+      int native = plat.intc_kind == INTC_PLIC ? VIC_PLIC
+                 : plat.intc_kind == INTC_APLIC ? VIC_APLIC : VIC_IMSIC;
+      uint64 native_shift = plat_bootarg("guestmap=alt") ? G_MMIO_ALT_SHIFT : 0;
+      w->cfg.cfg.flags &= ~(VMF_WANT_MASK | VMF_MMIO_SET);
+      // the layout axis, same rule: a guest that cannot be told keeps the map
+      // it left with; one that can is given this host's and told
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.mmio_shift != native_shift) {
+        w->cfg.cfg.flags |= VMF_MMIO_SET;
+        w->cfg.cfg.mmio_shift = w->cfg.mmio_shift;
+        printk("hyp: a machine arriving with its devices at +0x%lx does not speak "
+               "revision: keeping that map\n", w->cfg.mmio_shift);
+      }
+      src_shift = w->cfg.mmio_shift;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && src_kind != native) {
+        w->cfg.cfg.flags |= src_kind == VIC_PLIC  ? VMF_WANT_PLIC
+                          : src_kind == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
+        printk("hyp: a machine arriving as %s does not speak revision: keeping "
+               "%s on this %s host\n", vic_kindname(src_kind),
+               vic_kindname(src_kind), vic_kindname(native));
+      }
       id = vm_create_blank(&w->cfg.cfg);
       if (id < 0) {
         r = -ENOSPC;
@@ -1496,6 +1732,14 @@ restore_from(struct src *s, const char *name, int *idp)
         goto out;
       }
       vm->mem_limit = w->cfg.mem_limit;
+      // go on from the generation the guest last saw, not from zero, and count
+      // it as settled: nothing is pending until this host asks for something.
+      vm->revise_gen = w->cfg.revise_gen;
+      vm->revise_acked = w->cfg.revise_gen;
+      // a machine that gave the unit up stays without it here, whatever this
+      // host has: the guest is running code that was told there is none.
+      vm->vec_revoked = (w->cfg.flags2 & VMSTATE_F_VEC_REVOKED) ? 1 : 0;
+      vm->revise_capable = (w->cfg.flags2 & VMSTATE_F_CAPABLE) ? 1 : 0;
     } else if (strncmp(sec.name, "TIME", sizeof(sec.name)) == 0) {
       if ((r = get(s, &w->tm, sizeof(w->tm))) < 0)
         goto out;
@@ -1509,13 +1753,22 @@ restore_from(struct src *s, const char *name, int *idp)
       restore_vcpu(&vm->vcpu[nvs], &w->vs);
       if (w->vs.has_vstate) {
         // straight into the vcpu's own page: the machine has one for
-        // every vcpu when the host supports vectors
+        // every vcpu when the host supports vectors.
+        //
+        // A host without a vector unit has no page to put it in, and used to
+        // refuse the machine here with EINVAL -- after the source had already
+        // handed it over, which lost the guest. It is now read and dropped,
+        // and that is sound rather than merely convenient: the legality test in
+        // the CFG section has already established that this guest never wrote
+        // its vector registers (OBS_VECTOR_USED is not in its observation set),
+        // so the page being dropped contains nothing the guest has looked at.
+        // A guest that *had* used the unit never reaches this point.
         if (vm->vcpu[nvs].vstate == 0) {
-          r = -EINVAL;
+          if ((r = get(s, page, PGSIZE)) < 0)
+            goto out;
+        } else if ((r = get(s, vm->vcpu[nvs].vstate, PGSIZE)) < 0) {
           goto out;
         }
-        if ((r = get(s, vm->vcpu[nvs].vstate, PGSIZE)) < 0)
-          goto out;
       }
       nvs++;
     } else if (strncmp(sec.name, "DEV", sizeof(sec.name)) == 0) {
@@ -1525,7 +1778,7 @@ restore_from(struct src *s, const char *name, int *idp)
       }
       if ((r = get(s, dev, sizeof(*dev))) < 0)
         goto out;
-      restore_dev(vm, dev);
+      restore_dev(vm, dev, src_kind);
     } else if (strncmp(sec.name, "CONSO", sizeof(sec.name)) == 0) {
       if (vm == 0 || sec.len != sizeof(vm->cons_out)) {
         r = -EINVAL;
@@ -1580,6 +1833,32 @@ restore_from(struct src *s, const char *name, int *idp)
   // to the host's: htimedelta is what the guest adds to the host's
   // counter, and the difference between then and now is what it lost.
   vm->htimedelta = w->tm.htimedelta - (r_time() - w->tm.saved_time);
+  // A machine that has landed on a host of a different shape owes its guest a
+  // new description. It is asked for here, with no vcpu running yet: the request
+  // is a flag and a pending VSSIP per vcpu, so the guest meets it on its very
+  // first instruction on this host rather than running for a while against a
+  // machine that is no longer the one underneath it.
+  //
+  // This has to be after the memory, not before: vm_revise() writes the new
+  // device tree into guest RAM, and the MEM section would have put the old one
+  // back over it.
+  uint32 owed = 0;
+  if (src_kind >= 0 && src_kind != vm->vic_kind)
+    owed |= REV_INTC | REV_DEVICES;
+  if (src_kind >= 0 && src_shift != vm->mmio_shift) {
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived with devices at +0x%lx, this host puts them at "
+           "+0x%lx\n", vm->id, src_shift, vm->mmio_shift);
+  }
+  if (owed && revise_muted())
+    printk("hyp: vm %d: arrived needing revision 0x%x and norevise=1: not telling it\n",
+           vm->id, owed);
+  else if (owed && vm_revise(vm, owed) < 0) {
+    printk("hyp: vm %d: arrived needing a new description and could not be told\n",
+           vm->id);
+    r = -EINVAL;
+    goto out;
+  }
   vmstate_restored(vm);
   if (idp)
     *idp = id;

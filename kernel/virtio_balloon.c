@@ -275,6 +275,13 @@ virtio_balloon_pages(void)
   return bal.present ? bal.nheld : 0;
 }
 
+void
+virtio_balloon_rebase(uint64 old, uint64 nw)
+{
+  if (bal.base == old)
+    bal.base = nw;
+}
+
 int
 virtio_balloon_init(void)
 {

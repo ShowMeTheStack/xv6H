@@ -280,6 +280,13 @@ struct proc {
   void *karg;
   struct trapframe *trapframe; // data page for trampoline.S
   char *vstate;                // vector registers v0..v31 (32 * vlenb bytes), or 0
+  // has this task ever left the vector unit dirty? Set where the state is
+  // saved, so it means "has executed a vector instruction that changed a
+  // register" and not "was given a buffer". It is what decides whether the
+  // vector unit can be taken away from this machine (kernel/machine.c): the
+  // contents cannot be used for that, because a task operating on zeroed data
+  // leaves zeroed registers behind.
+  int vec_used;
   struct context context;      // swtch() here to run process
   struct fdtable *fdt;         // open files, shared by the threads of a process
   struct fsinfo *fs;           // working directory, shared likewise

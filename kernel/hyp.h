@@ -103,6 +103,7 @@
 #define G_BALLOON_BASE 0x10003000L
 #define G_BALLOON_IRQ  3
 #define G_CON_BASE   0x10004000L
+#define G_MMIO_ALT_SHIFT 0x100000L   // the alternative map: virtio block at 0x1010xxxx
 #define G_CON_IRQ    4
 #define G_RTC_BASE   0x101000L
 #define G_RTC_IRQ    11
@@ -501,6 +502,25 @@ struct vm {
   // through the interrupt controller, which is one of the things a revision may
   // be changing. `revise_acked' is the generation the guest has adopted, and
   // `revise_adopted' is the bitmask of what it managed (REV_* below).
+  // the vector unit can be taken away from a running guest and given back
+  // (mutable.md Phase 3). Revoking is masking V out of the misa this guest is
+  // told about and out of its device tree, and forcing vsstatus.VS to Off so
+  // that any vector instruction traps. A guest with live vector state in a task
+  // refuses, which is the whole argument: what a machine may become depends on
+  // what its guest is relying on at that moment.
+  int vec_revoked;
+
+  // set the first time the guest asks the protocol's version: a guest that has
+  // never asked does not speak it, and on arrival at a host of another shape is
+  // given the description it left with rather than one it would never read.
+  // where this machine's virtio devices sit relative to the default map
+  // (G_VIRTIO_BASE and friends): the second axis a description can be revised
+  // on. A host's own guests get the host's default; a machine arriving from a
+  // host with a different map either keeps the one it left with (legacy) or is
+  // revised to this host's and told (participating). Controllers, UART and RTC
+  // are not moved: the UART is where earlycon expects it.
+  uint64 mmio_shift;
+  int revise_capable;
   uint32 revise_gen;
   uint32 revise_acked;
   uint32 revise_adopted;
@@ -614,7 +634,14 @@ int vvcon_active(struct vm *vm);         // is the guest driving it?
 #define REV_NONE     0u
 
 int  vm_revise(struct vm *vm, uint32 what);   // hyp.c: ask a guest to look again
+int  vm_revise_intc(struct vm *vm, int kind); // hyp.c: and give it a different controller
+int  vm_revise_vector(struct vm *vm, int on);  // hyp.c: take the vector unit away, or give it back
+int  vic_levels_snapshot(struct vm *vm, uint64 *levels);   // vic.c
+void vic_levels_restore(struct vm *vm, uint64 levels);     // vic.c
+const char *vic_kindname(int kind);                         // vic.c
+int  vic_held(uint64 levels);                              // vic.c
 void vm_observe(struct vm *vm, uint32 what);   // hyp.c: record an observation
+void vm_del_dev(struct vm *vm, const char *name);   // hypmmio.c
 void vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, uint64 size,
                 int (*read)(struct vm *, struct vdev *, uint64, int, uint64 *),
                 int (*write)(struct vm *, struct vdev *, uint64, int, uint64),

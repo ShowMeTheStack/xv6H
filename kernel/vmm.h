@@ -36,6 +36,17 @@
 // device and its boot goes from six seconds to past the test's patience --
 // so a machine is given this device when its configuration asks for it.
 #define VMF_CONQUEUE 16
+// present a plain PLIC to this machine even when the host has the AIA. Needed
+// to set up the *source* shape for a controller revision (mutable.md): a guest
+// that starts as a PLIC guest and is given an IMSIC while it runs.
+#define VMF_WANT_PLIC 32
+// and the other two kinds, as software models wherever the host is. These are
+// how a machine arriving from a host of another shape keeps the controller it
+// left with when its guest cannot be told about a new one (vmstate.c).
+#define VMF_WANT_APLIC 64
+#define VMF_WANT_IMSIC 128
+#define VMF_WANT_MASK (VMF_WANT_PLIC | VMF_WANT_APLIC | VMF_WANT_IMSIC)
+#define VMF_MMIO_SET  256  // cfg.mmio_shift is a request, not the host's default
 
 // A machine's switch port is closed: what arrives from outside is
 // delivered only when it belongs to a conversation the machine itself
@@ -61,6 +72,7 @@ struct vmconfig {
   int mem_limit_mb;        // host memory this VM may hold at once (0: no limit)
   int nvcpu;
   int flags;
+  uint64 mmio_shift;       // virtio block offset from the default map (VMF_MMIO_SET)
   uint64 load_addr;        // VMF_RAW: guest-physical load address
   char bootargs[128];      // kernel command line (device tree /chosen/bootargs)
   int net;                 // 0: no address configuration, 1: dhcp, 2: static
@@ -117,6 +129,14 @@ struct vmentry {
 // what the host intends to change; a guest that does not speak the revision
 // protocol ignores the notification and keeps the description it booted with.
 #define VMCTL_REVISE 9
+// vm_ctl(id, VMCTL_REVISE_INTC, kind): give a running guest a different kind of
+// interrupt controller (0 plic, 1 aplic, 2 imsic). -EAGAIN while the guest is
+// inside an interrupt handler.
+#define VMCTL_REVISE_INTC 10
+// vm_ctl(id, VMCTL_REVISE_VEC, on): take the vector unit away from a running
+// guest (0) or give it back (1). The guest may refuse to lose it while a task
+// still holds vector state.
+#define VMCTL_REVISE_VEC 11
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -124,6 +144,7 @@ struct vmentry {
 
 struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
+  int revise_capable, revise_gen;  // speaks the revision protocol; generation
   int resident_mb;        // guest RAM actually backed by host memory
   int split_chunks;       // 2 MB chunks backed a page at a time
   int table_pages;        // G-stage page table pages below the root
@@ -142,7 +163,7 @@ struct vminfo {
   // which device the emulated accesses went to, which is what says what is
   // worth building next
   int ndev;
-  struct { char name[12]; uint64 loads, stores, irqs; } dev[12];
+  struct { char name[12]; uint64 loads, stores, irqs; uint64 base; } dev[12];
   // what the guest has observed about its machine, and when (host ticks since
   // the machine was created). See OBS_* in hyp.h.
   uint32 obs;

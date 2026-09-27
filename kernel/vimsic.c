@@ -23,6 +23,11 @@
 #include "proc.h"
 #include "defs.h"
 #include "platform.h"
+
+#ifndef CSR_STOPI
+#define CSR_STOPI  0xdb0
+#define CSR_VSTOPI 0xeb0
+#endif
 #include "intc.h"
 #include "imsic.h"
 #include "hyp.h"
@@ -121,12 +126,17 @@ vimsic_seip(struct vcpu *v)
 static void
 soft_vseip(int on)
 {
+  // hvictl names the interrupt for vstopi; on a host without the AIA CSRs there
+  // is no vstopi to name it for (the guest's reads of stopei trap here and are
+  // answered from top_id), and touching hvictl is an illegal instruction in HS.
   if (on) {
-    csr_write(CSR_HVICTL, HVICTL_VSEIP);
+    if (plat.has_aia_csrs)
+      csr_write(CSR_HVICTL, HVICTL_VSEIP);
     csr_set(CSR_HVIP, HVIP_VSEIP);
   } else {
     csr_clear(CSR_HVIP, HVIP_VSEIP);
-    csr_write(CSR_HVICTL, 0);
+    if (plat.has_aia_csrs)
+      csr_write(CSR_HVICTL, 0);
   }
 }
 
@@ -203,12 +213,17 @@ vimsic_csr(struct vcpu *v, uint32 inst)
 
   // in VS mode, siselect/sireg/stopei (0x15x) are the guest's names for
   // vsiselect/vsireg/vstopei (0x25x).
-  if (csr == CSR_SISELECT || csr == CSR_SIREG || csr == CSR_STOPEI)
+  // and stopi (0xdb0) is the guest's name for vstopi (0xeb0): the same 0x100.
+  if (csr == CSR_SISELECT || csr == CSR_SIREG || csr == CSR_STOPEI || csr == CSR_STOPI)
     csr += 0x100;
 
   // vsiselect itself is a real register the guest writes without
   // trapping; it names the register that a vsireg access means.
-  im->iselect = csr_read(CSR_VSISELECT);
+  // ... on a CPU that has it. Without the AIA CSRs the guest's writes to siselect
+  // arrive here as illegal instructions (the register does not exist) and the
+  // selection lives only in im->iselect, which the write below keeps.
+  if (plat.has_aia_csrs)
+    im->iselect = csr_read(CSR_VSISELECT);
 
   acquire(&v->vm->lock);
   int rc = 0;
@@ -218,6 +233,26 @@ vimsic_csr(struct vcpu *v, uint32 inst)
   case CSR_VSTOPEI: {
     int id = top_id(im);
     old = id ? ((uint64)id << 16) | id : 0;
+    break;
+  }
+  case CSR_VSTOPI: {
+    // Supervisor top interrupt: (iid << 16) | priority for the highest pending
+    // and enabled S-level interrupt, 0 if none. On a CPU with the AIA CSRs this
+    // is hardware (vstopi, with hvictl naming the external one); on one without,
+    // the guest's read arrives here as an illegal instruction. Linux's AIA
+    // interrupt entry reads it to learn what it is taking, so a guest arriving on
+    // such a host died at its first interrupt until this existed -- xv6 never
+    // reads it, which is why an xv6 guest passed the same crossing. Priority
+    // order as the ISA gives it for S level: external, software, timer.
+    uint64 ie = v->vsie;
+    if ((ie & (1L << 9)) && top_id(im) != 0)
+      old = (9L << 16) | 1;
+    else if ((ie & (1L << 1)) && v->vssip)
+      old = (1L << 16) | 1;
+    else if ((ie & (1L << 5)) && r_time() >= v->vstimecmp)
+      old = (5L << 16) | 1;
+    else
+      old = 0;
     break;
   }
   default: rc = -1;
@@ -235,7 +270,11 @@ vimsic_csr(struct vcpu *v, uint32 inst)
   }
   if (dowrite) {
     switch (csr) {
-    case CSR_VSISELECT: im->iselect = nw; csr_write(CSR_VSISELECT, nw); break;
+    case CSR_VSISELECT:
+      im->iselect = nw;
+      if (plat.has_aia_csrs)
+        csr_write(CSR_VSISELECT, nw);
+      break;
     case CSR_VSIREG: rc = ireg_write(im, im->iselect, nw); break;
     case CSR_VSTOPEI: {
       // any write claims the top interrupt: clear its pending bit.
@@ -244,6 +283,9 @@ vimsic_csr(struct vcpu *v, uint32 inst)
         im->eip[id / 64] &= ~(1UL << (id % 64));
       break;
     }
+    case CSR_VSTOPI:
+      rc = -1;               // read-only: a write is the illegal instruction it looks like
+      break;
     }
   }
   // the external interrupt line follows the file's state at once: we are
@@ -290,7 +332,8 @@ vimsic_enter(struct vcpu *v)
   if (!v->vm->imsic_hw || gf.geilen == 0) {
     v->vgein = 0;
     int on = top_id(im) != 0;
-    csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
+    if (plat.has_aia_csrs)
+      csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
     return on ? HVIP_VSEIP : 0;
   }
 
@@ -300,7 +343,8 @@ vimsic_enter(struct vcpu *v)
     // no free guest file on this hart: run with the software model.
     v->vgein = 0;
     int on = top_id(im) != 0;
-    csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
+    if (plat.has_aia_csrs)
+      csr_write(CSR_HVICTL, on ? HVICTL_VSEIP : 0);
     return on ? HVIP_VSEIP : 0;
   }
   csr_write(CSR_HVICTL, 0); // the guest file reports its own interrupts

@@ -25,6 +25,7 @@ main()
     // of it on the 16550 is two exits. The device tree has already been
     // read (plat is what the line below reports), and this needs nothing
     // else -- its rings are static exactly so that it can run here.
+    machine_init();     // the revision lock, before any other hart can arrive
     virtio_con_init();
     printk("\n");
     printk("xv6 kernel is booting\n");

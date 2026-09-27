@@ -18,7 +18,7 @@
 // and what makes the version matter.
 //
 #define VMSTATE_MAGIC "XV6HVMST"
-#define VMSTATE_VERSION 2
+#define VMSTATE_VERSION 3   // 3: the CFG section carries obs and vlenb
 
 struct vmstate_hdr {
   char magic[8];
@@ -105,6 +105,8 @@ int vm_restore(char *path, const char *name, int *idp);
 struct file;
 int vm_save_file(struct vm *vm, struct file *f);
 int vm_restore_file(struct file *f, const char *name, int *idp);
+int vmstate_ack_put(struct file *f, int ok);
+int vmstate_ack_get(struct file *f);
 // vmm clone BASE NEW [-f DISK]: the same machine again, sharing its pages
 int vm_clone(struct vm *src, const char *name, const char *disk, int *idp);
 

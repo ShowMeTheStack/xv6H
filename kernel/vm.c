@@ -166,6 +166,29 @@ kvm_check_wx(pagetable_t pt)
 // the caller of kvmunmap_rt arranges the TLB flush on every hart.
 static struct spinlock kpt_lock;
 
+// Is this virtual address already mapped in the kernel table?
+//
+// A non-panicking walk, unlike kwalk: the device ranges of two interrupt
+// controllers overlap by design (a PLIC and an APLIC's M domain both live at
+// 0x0c000000), and a guest adopting a new controller has to be able to ask
+// rather than assume. Large-page leaves count as mapped -- that is what
+// kwalk panics on.
+int
+kvm_mapped(uint64 va)
+{
+  pagetable_t pt = kernel_pagetable;
+
+  for (int l = plat.mmu_levels - 1; l >= 0; l--) {
+    pte_t *pte = &pt[PX(l, va)];
+    if (!(*pte & PTE_V))
+      return 0;
+    if (*pte & (PTE_R | PTE_W | PTE_X))
+      return 1;             // a leaf, of whatever size, covers this address
+    pt = (pagetable_t)PTE2PA(*pte);
+  }
+  return 0;
+}
+
 int
 kvmmap_rt(uint64 va, uint64 pa, uint64 sz, int perm)
 {

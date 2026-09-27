@@ -822,7 +822,13 @@ vm_observe(struct vm *vm, uint32 what)
 int
 vm_revise(struct vm *vm, uint32 what)
 {
-  if (vm == 0 || vm->state != VM_RUNNING)
+  // A machine that has not started yet may also be owed a revision: one that
+  // has just arrived from a host of a different shape is asked before its vcpus
+  // are spawned, so that the guest meets the new description on its first
+  // instruction here. There is nothing to wake in that case, and the pending
+  // VSSIP is delivered on the first entry.
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_NEW &&
+                 vm->state != VM_PAUSED))
     return -1;
 
   // rebuild the blob in place, so a guest that re-reads the address it was
@@ -836,12 +842,138 @@ vm_revise(struct vm *vm, uint32 what)
   vm->revise_adopted = 0;
   vm->revise_asked = r_time();
   vm->revise_done = 0;
-  struct vcpu *v = &vm->vcpu[0];
-  v->ssip_req = 1;          // delivered as VSSIP on the next entry
+  // every vcpu, not just the first. A guest with several harts has per-hart
+  // controller state, and each hart has to bring its own up against the new
+  // description. The obvious way -- have the first hart IPI the others -- does
+  // not work, because sending an IPI goes *through* the controller
+  // (intc_ipi(), which dispatches on plat.intc_kind) and a hart that has not
+  // re-initialised its interrupt file would never receive it. So the host pokes
+  // all of them over the same channel it used for the first, which depends on
+  // nothing the revision is changing.
+  for (int i = 0; i < vm->nvcpu; i++)
+    vm->vcpu[i].ssip_req = 1;
   release(&vm->lock);
-  vcpu_kick(v);             // and wake it if it is idle
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);   // and wake the idle ones
   printk("hyp: vm %d: revision %d asked for (what=0x%x)\n", vm->id,
          vm->revise_gen, what);
+  return 0;
+}
+
+// Give a running guest a different kind of interrupt controller.
+//
+// This is the thing that cannot be done anywhere else: a feature mask can hide a
+// bit, but it cannot change which driver is bound or what a register file means.
+// PLIC, APLIC and APLIC-MSI+IMSIC are three different programming models, and a
+// guest that booted against one is holding a driver for it.
+//
+// The sequence, and the order is the whole of the correctness argument:
+//
+//   1. refuse if the guest is inside an interrupt handler (claimed but not
+//      completed): it would complete against a controller that no longer exists.
+//   2. remember which lines the devices are asserting -- the part the host owns.
+//   3. switch kind, build the new model empty, re-assert those lines. The guest's
+//      own configuration is deliberately not translated: it rebuilds it.
+//   4. rebuild the device tree, which now describes the new controller.
+//   5. poke the guest, which re-reads, re-binds its driver and re-enables its
+//      sources. Interrupts asserted in (3) are delivered as soon as it does.
+//
+// Between (3) and (5) the guest has a controller it has not configured, so
+// nothing is delivered. That window is the outage, and it is measured.
+int
+vm_revise_intc(struct vm *vm, int kind)
+{
+  // A paused machine may be revised too, and it is the safest moment to do it:
+  // its vcpus are asleep, so there is no guest code between the old controller
+  // going away and the new description arriving. The request waits as a pending
+  // VSSIP and is delivered on the first entry after the resume. It is also the
+  // only way to *construct* the case where a device is holding a line across the
+  // exchange -- a running guest acknowledges its interrupts in microseconds, so
+  // the window is too narrow to catch on purpose.
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (kind != VIC_PLIC && kind != VIC_APLIC && kind != VIC_IMSIC)
+    return -EINVAL;
+  if (kind == vm->vic_kind)
+    return 0;                       // already what was asked for
+  // the AIA models need the machine to have been built with them available
+  if ((kind == VIC_APLIC || kind == VIC_IMSIC) && plat.intc_kind == INTC_PLIC)
+    return -ENOTSUP;                // this host cannot present them honestly
+
+  acquire(&vm->lock);
+  uint64 levels = 0;
+  if (vic_levels_snapshot(vm, &levels) < 0) {
+    release(&vm->lock);
+    return -EAGAIN;                 // inside a handler; the caller retries
+  }
+  int old = vm->vic_kind;
+  vm->vic_kind = kind;
+  vm->imsic_hw = (kind == VIC_IMSIC && vimsic_geilen() > 0 &&
+                  !(vm->cfg.flags & VMF_SOFTIMSIC));
+  vic_levels_restore(vm, levels);
+  release(&vm->lock);
+
+  printk("hyp: vm %d: interrupt controller %s -> %s, %d line(s) held\n", vm->id,
+         vic_kindname(old), vic_kindname(kind), vic_held(levels));
+
+  int r = vm_revise(vm, REV_INTC);
+  if (r < 0) {
+    // could not tell it; put it back rather than leave a guest with a
+    // controller it has never heard of
+    acquire(&vm->lock);
+    vm->vic_kind = old;
+    vic_levels_restore(vm, levels);
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// Take the vector unit away from a running guest, or give it back.
+//
+// The second thing a feature mask cannot do. A mask can hide V from a guest that
+// has not looked yet; it cannot take it away from one that has, because the
+// register file is *state* -- thirty-two registers of vlenb bytes per task that
+// has used it -- and that state has nowhere to go on a machine without the unit.
+//
+// So the host asks and the guest answers. Revoking is masking V out of the misa
+// this machine is told about (hypcsr.c) and out of its device tree (fdtgen.c),
+// and forcing vsstatus.VS to Off so that a vector instruction traps rather than
+// quietly using registers the description says are absent. The guest checks
+// whether any task is holding vector state and refuses if so -- which is the
+// paper's argument in one exchange: what a machine may become depends on what
+// its guest is relying on at that moment, not on what the fleet can offer.
+int
+vm_revise_vector(struct vm *vm, int on)
+{
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -EINVAL;
+  if (on && !plat.has_v)
+    return -ENOTSUP;                  // this host has no vector unit to give
+  if (on == !vm->vec_revoked)
+    return 0;                         // already as asked
+
+  acquire(&vm->lock);
+  vm->vec_revoked = !on;
+  // Off when revoked, so the next vector instruction is an illegal-instruction
+  // trap; Initial when granted, which is what a guest expects of a unit it has
+  // not used yet.
+  for (int i = 0; i < vm->nvcpu; i++) {
+    struct vcpu *v = &vm->vcpu[i];
+    v->vsstatus &= ~SSTATUS_VS_MASK;
+    if (on)
+      v->vsstatus |= SSTATUS_VS_INITIAL;
+  }
+  release(&vm->lock);
+
+  printk("hyp: vm %d: vector unit %s\n", vm->id, on ? "granted" : "revoked");
+  int r = vm_revise(vm, REV_VLEN);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->vec_revoked = !vm->vec_revoked;
+    release(&vm->lock);
+    return r;
+  }
   return 0;
 }
 
@@ -1729,9 +1861,24 @@ vm_create_flags(struct vmconfig *cfg, int noload)
     }
   }
 
-  vm->vic_kind = plat.intc_kind;
-  vm->imsic_hw = (plat.intc_kind == INTC_IMSIC && vimsic_geilen() > 0 && !(cfg->flags & VMF_SOFTIMSIC));
+  // a machine normally sees the kind of controller the host has; VMF_WANT_PLIC
+  // asks for a plain PLIC instead, which is how a revision's starting point is
+  // set up on an AIA host (all three models are ours, so this is honest).
+  vm->vic_kind = (cfg->flags & VMF_WANT_PLIC)  ? VIC_PLIC
+               : (cfg->flags & VMF_WANT_APLIC) ? VIC_APLIC
+               : (cfg->flags & VMF_WANT_IMSIC) ? VIC_IMSIC
+                                               : plat.intc_kind;
+  // hardware guest interrupt files only when the machine is an IMSIC one *and*
+  // this host has them; an IMSIC asked for on a host without is the software
+  // model, which is what a machine preserving the shape it left with gets.
+  vm->imsic_hw = (vm->vic_kind == VIC_IMSIC && plat.intc_kind == INTC_IMSIC &&
+                  vimsic_geilen() > 0 && !(cfg->flags & VMF_SOFTIMSIC));
 
+  // the memory map this machine gets: what was asked for, else the host's own
+  // default (`guestmap=alt' on the host command line moves every guest's virtio
+  // block up by a megabyte, which is how a host of a different shape is made)
+  vm->mmio_shift = (cfg->flags & VMF_MMIO_SET) ? cfg->mmio_shift
+                 : plat_bootarg("guestmap=alt") ? G_MMIO_ALT_SHIFT : 0;
   vm->ndev = 0;
   vuart_init(vm);
   vclint_init(vm);
@@ -2181,6 +2328,39 @@ vcpu_enter(struct vcpu *v)
   v->vsatp = csr_read(CSR_VSATP);
   v->vstimecmp = csr_read(CSR_VSTIMECMP);
   v->vssip = (csr_read(CSR_HVIP) & HVIP_VSSIP) ? 1 : 0;
+  // Has this guest used its vector unit? Nothing traps when it does -- the unit
+  // is enabled and a vector instruction is just an instruction -- so there is no
+  // exit to hook, which is why OBS_VECTOR_USED went unset until now and the
+  // observation set said `vector' of a guest that had run vecbench.
+  //
+  // The hardware has already answered it, and the line above has just read
+  // vsstatus back on an exit that was happening anyway -- so the cost is a mask
+  // and a compare on a value already in a register.
+  //
+  // Dirty, specifically, and not "Clean or better", which is what this tested
+  // first and why every guest looked like a vector user. A guest kernel that
+  // supports vectors marks the unit Clean on every return to userspace for any
+  // task that has a save area, and in xv6 that is every task (trap.c does
+  // exactly this). So Clean says "this kernel was built with vectors", which is
+  // not the question. Dirty says the register file has been *written* since it
+  // was last marked clean, which is the question -- and the guest's own
+  // vec_restore() runs under Initial and sets Clean afterwards, so the kernel
+  // saving and restoring state does not raise it.
+  //
+  // This is the third time in this work that "is the unit in use?" has been
+  // asked with the wrong signal: `vstate != 0' is every task, register contents
+  // are zero for a program that computed zeros, and VS >= Clean is every kernel
+  // that supports the unit.
+  //
+  // And Dirty is a *lower bound*, not an answer. It is a transient: the guest's
+  // own trap handler saves the register file and sets the unit back to Clean, so
+  // whether the host ever samples a Dirty depends on when its exits happen to
+  // fall. The same guest running the same vecbench sets this on some runs and not
+  // others. When it fires the guest has certainly used the unit; when it does not,
+  // nothing follows. So it is reported, and no decision is made on it -- migration
+  // legality asks the guest instead (see vmstate.c).
+  if ((v->vsstatus & SSTATUS_VS_MASK) == SSTATUS_VS_DIRTY)
+    vm_observe(vm, OBS_VECTOR_USED);
   if (plat.intc_kind == INTC_IMSIC)
     v->vsiselect = csr_read(CSR_VSISELECT);
   v->scounteren = csr_read(0x106);

@@ -115,6 +115,29 @@ vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, ui
   d->priv = priv;
 }
 
+// Take a device model out of the table.
+//
+// Needed because an interrupt controller can be *replaced* under a running
+// guest (mutable.md), and the models alias each other: a PLIC lives at
+// 0x0c000000 and so does the APLIC's M domain. Adding the new one without
+// removing the old leaves two models claiming one address, find_dev() returns
+// whichever was registered first, and the guest keeps talking to the controller
+// it is supposed to be leaving -- while the host delivers through the new one.
+// A guest alive and deaf is the symptom.
+void
+vm_del_dev(struct vm *vm, const char *name)
+{
+  for (int i = 0; i < vm->ndev; i++) {
+    if (vm->dev[i].name == 0 || strncmp(vm->dev[i].name, name, 12) != 0)
+      continue;
+    for (int j = i; j + 1 < vm->ndev; j++)
+      vm->dev[j] = vm->dev[j + 1];
+    vm->ndev--;
+    memset(&vm->dev[vm->ndev], 0, sizeof(vm->dev[0]));
+    i--;
+  }
+}
+
 static struct vdev *
 find_dev(struct vm *vm, uint64 gpa)
 {

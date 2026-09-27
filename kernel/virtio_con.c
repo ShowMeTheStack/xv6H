@@ -74,6 +74,13 @@ virtio_con_present(void)
 // Called from main() after kinit, and silent when there is no such device,
 // which is the normal case: this machine is only a guest sometimes.
 void
+virtio_con_rebase(uint64 old, uint64 nw)
+{
+  if (con.base == old)
+    con.base = nw;
+}
+
+void
 virtio_con_init(void)
 {
   initlock(&con.lock, "vcon");

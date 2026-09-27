@@ -95,6 +95,21 @@ def enumerate_tests(suites, extra=()):
     return jobs
 
 
+# Every job's disk image carries this run's name as well as its slot.
+#
+# It used to be just the slot -- q0-fs.img -- and the slot is also how a finished
+# job's leftover emulators are cleaned up: pkill -f "file=q0-fs.img". That pattern
+# is a *command line* match, and it is identical in every copy of this tree, so two
+# qrun runs on the same box silently killed each other's machines. The victim dies
+# instantly with "qemu exited while waiting for 'xv6 kernel is booting'", which
+# reads exactly like a broken build and is what made a repeat-run of one test fail
+# twenty times out of twenty while the tree was fine.
+#
+# The run directory's name is unique per run and stable across --resume, so it is
+# the tag.
+RUNTAG = re.sub(r"[^A-Za-z0-9]", "", os.path.basename(HERE))[:16] or "run"
+
+
 class Job:
     def __init__(self, suite, name, slot, run, extra=()):
         self.suite, self.name, self.slot, self.run = suite, name, slot, run
@@ -103,8 +118,8 @@ class Job:
         self.t0 = time.time()
         assert self.kind in ("light", "heavy", "huge", "exclusive")
         env = dict(os.environ,
-                   TEST_FSIMG="q%d-fs.img" % slot,
-                   TEST_LOG="q%d.log" % slot,
+                   TEST_FSIMG="q%d-%s-fs.img" % (slot, RUNTAG),
+                   TEST_LOG="q%d-%s.log" % (slot, RUNTAG),
                    # a job sharing the machine gets longer to wait; one
                    # that has it to itself keeps the honest numbers.
                    TEST_TIMEOUT_SCALE="1" if self.kind == "exclusive" else "4")
@@ -280,7 +295,8 @@ def main():
                 # ended by itself is meant to have closed its machines, so
                 # this costs it a signal sent to nobody; the slot is only
                 # safe to hand on if that is checked rather than assumed.
-                if subprocess.run(["pkill", "-f", "file=q%d-fs.img" % j.slot],
+                if subprocess.run(["pkill", "-f",
+                                   "file=q%d-%s-fs.img" % (j.slot, RUNTAG)],
                                   stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL).returncode == 0:
                     time.sleep(1)

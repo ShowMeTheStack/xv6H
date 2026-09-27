@@ -64,8 +64,12 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
     return 0;
   case CSR_MISA:
     vm_observe(v->vm, OBS_MISA);
-    *val = plat.misa & ~(1L << 7);
-    return 0; // no nested H
+    // bit 7 is H: no nested virtualization. bit 21 is V, and it is masked out
+    // for a machine whose vector unit has been revoked -- which is how a guest
+    // is told the unit is gone, because has_v is computed from misa
+    // (platform.c). A guest that re-reads misa after a revision sees it.
+    *val = plat.misa & ~(1L << 7) & ~(v->vm->vec_revoked ? (1L << 21) : 0);
+    return 0;
   case CSR_MSTATUS:
     *val = (v->m_mstatus & ~(SSTATUS_FS_MASK | SSTATUS_VS_MASK)) |
            (v->vsstatus & (SSTATUS_FS_MASK | SSTATUS_VS_MASK));
@@ -187,7 +191,10 @@ hyp_illegal(struct vcpu *v, uint32 inst)
       int csr = inst >> 20;
       // AIA indirect CSRs: qemu reports some VS-mode accesses with
       // VGEIN=0 as illegal rather than virtual instructions.
-      if (csr == 0x150 || csr == 0x151 || csr == 0x15c || csr == 0x250 || csr == 0x251 || csr == 0x25c) {
+      // ... and stopi/vstopi (0xdb0/0xeb0), which do not exist at all on a host
+      // without the AIA CSRs and are answered by the software model.
+      if (csr == 0x150 || csr == 0x151 || csr == 0x15c || csr == 0x250 || csr == 0x251 || csr == 0x25c ||
+          csr == 0xdb0 || csr == 0xeb0) {
         if (vic_csr(v, inst) == 0)
           return 0;
       } else if (csr_rmw(v, inst, mcsr_read, mcsr_write) == 0) {

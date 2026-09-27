@@ -303,6 +303,10 @@ wait_up(int timeout)
     sleep_prepare(&ns->cfg);
     if (!ns->cfg.up)
       sleep_intr();
+    else
+      sleep_cancel();   // came up in between: give the registration back, or
+                        // this task is freed while still on the queue
+
   }
   return 0;
 }

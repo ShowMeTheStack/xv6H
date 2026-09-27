@@ -315,6 +315,7 @@ platform_init(uint64 fdt_pa)
   plat.misa = r_misa();
   plat.has_h = (plat.misa >> 7) & 1;
   plat.has_v = (plat.misa >> 21) & 1;
+  plat.has_aia_csrs = (plat.intc_kind == INTC_IMSIC);
   if (plat.has_v) {
     // vlenb is only readable with the vector unit enabled (mstatus.VS).
     uint64 ms = r_mstatus();

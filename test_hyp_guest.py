@@ -999,6 +999,223 @@ def t_churn(QEMU, intc, cpus, log, rounds=4):
         q.close()
 
 
+
+def host_cmd(q, line, timeout=30):
+    """a command on the host shell, and everything it printed."""
+    m = q.mark()
+    q.send(line + "\n")
+    q.expect(r"\$ ", timeout)
+    return q.output_since(m)
+
+
+def vm_info(q, vmid, timeout=30):
+    """the text of `vmm info N', synchronised on its first line rather than on the
+    prompt alone: right after a detach the host shell can leave a second prompt in
+    the buffer, and an expect for `$ ' then returns before the command has
+    printed anything, handing the caller half a line."""
+    m = q.mark()
+    q.send("vmm info %d\n" % vmid)
+    q.expect(r"vm %d: name" % vmid, timeout)   # past any stale prompt, onto the output
+    q.expect(r"\$ ", timeout)                    # and now the prompt is the real one
+    return q.output_since(m)
+
+
+def wait_adopted(q, mark, timeout=90):
+    """the guest's acknowledgement of a revision.
+
+    The host prints this when the guest acks, which is asynchronous: it can land
+    before the prompt the `vmm revise' command leaves or some milliseconds after
+    it. Waiting for it with a plain expect() after the prompt therefore misses it
+    about half the time, because the prompt's expect() had already consumed it.
+    So the search is rewound to the caller's mark, which is sound here --
+    everything between the mark and now has already been asserted on."""
+    q.consumed = mark
+    hit = q.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", timeout)
+    # and put the cursor back at the end, or the next expect() for a prompt
+    # matches the one this command already left and returns before the next
+    # command has printed anything. Everything up to here has been asserted on.
+    q.consumed = len(q.buf)
+    return hit
+
+
+def t_revise_intc(QEMU, intc, cpus, log):
+    """the interrupt controller exchanged under a running guest, twice, and once
+    while it is paused.
+
+    This is the mechanism the revisable-machine work is built on and it had no
+    test: it was demonstrated by hand and then left to the honour system. What is
+    checked is not that the host said it did something -- it is that the guest
+    went on working afterwards, on a controller it was not booted with, with its
+    file and its disk intact, and that it says itself what it adopted. A guest
+    that quietly rebooted would pass every other check, so that is checked too."""
+    q = boot_host(QEMU, "imsic", cpus, log)
+    try:
+        # booted on the PLIC on a host that also has the AIA, so it can be moved
+        # up and back down again
+        vmid = start_guest(q, "-c 1 -m 64 -P")
+        q.send("echo before-the-switch > /keep\n")
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "intc plic" in out, out
+
+        for want, shown in (("imsic", "aplic-msi+imsic"), ("plic", "plic")):
+            m = q.mark()
+            q.send("vmm revise %d %s\n" % (vmid, want))
+            q.expect(r"interrupt controller -> %s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            sw = q.output_since(m)
+            assert re.search(r"interrupt controller \w+ -> %s, \d+ line\(s\) held" % want,
+                             sw), sw
+            # the guest re-read its description and rebound its driver
+            wait_adopted(q, m)
+            out = host_cmd(q, "vmm info %d" % vmid)
+            assert ("intc " + shown) in out, out
+            # alive: userspace runs, the file is there, the disk still works
+            attach(q, str(vmid))
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("cat /keep\n")
+            q.expect(r"before-the-switch", 60)
+            q.expect(r"\$ ", ATONCE)
+            mm = q.mark()
+            q.send("echo on-%s > /after; sync; cat /after\n" % want)
+            q.expect(r"on-%s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+            detach(q)
+
+        # and while it is stopped, which is the safest moment there is: its vcpus
+        # are asleep, so no guest code runs between the old model going away and
+        # the new description arriving. The request waits as a pending VSSIP.
+        host_cmd(q, "vmm pause %d" % vmid)
+        out = vm_ls(q)
+        assert re.search(r"^%d\s+\S+\s+paused" % vmid, out, re.M), out
+        q.send("vmm revise %d imsic\n" % vmid)
+        q.expect(r"interrupt controller -> imsic", 60)
+        q.expect(r"\$ ", ATONCE)
+        mp = q.mark()
+        host_cmd(q, "vmm resume %d" % vmid)
+        wait_adopted(q, mp)
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        q.send("echo after-the-pause\n")
+        q.expect(r"after-the-pause", 60)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        kill_vm(q, vmid)
+        print("    a guest changed interrupt controller three times and kept running")
+    finally:
+        q.close()
+
+
+def t_revise_vector(QEMU, intc, cpus, log):
+    """the vector unit taken away from a running guest, and given back.
+
+    A feature mask can hide V from a guest that has not looked; it cannot take it
+    away from one that is using it, because the register file is *state*. So the
+    host asks and the guest answers, and the answer depends on what its tasks are
+    doing at that moment rather than on what the fleet can offer. Skipped on a
+    machine built without vectors, where there is nothing to revoke."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        m = q.mark()
+        q.send("vecbench 2\n")
+        q.expect(r"vecbench: (ok|no vector extension)", 90)
+        q.expect(r"\$ ", ATONCE)
+        if "no vector extension" in q.output_since(m):
+            detach(q)
+            kill_vm(q, vmid)
+            print("    no vector unit on this machine: nothing to revoke")
+            return
+        detach(q)
+
+        # revoke it. Between programs no task is holding vector state, so the
+        # guest has nothing to strand and takes it.
+        mv = q.mark()
+        q.send("vmm revise %d novector\n" % vmid)
+        q.expect(r"vector unit revoked: asked", 60)
+        q.expect(r"\$ ", ATONCE)
+        wait_adopted(q, mv)
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        # and the guest now believes it has none: the description changed, so the
+        # program takes its no-vector path rather than trapping on an instruction
+        q.send("vecbench 2\n")
+        q.expect(r"vecbench: no vector extension", 90)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+
+        # give it back, and it works again
+        mv = q.mark()
+        q.send("vmm revise %d vector\n" % vmid)
+        q.expect(r"vector unit granted: asked", 60)
+        q.expect(r"\$ ", ATONCE)
+        wait_adopted(q, mv)
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        q.send("vecbench 2\n")
+        q.expect(r"vecbench: ok", 90)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        kill_vm(q, vmid)
+        print("    a guest lost its vector unit, noticed, and got it back")
+    finally:
+        q.close()
+
+
+
+def t_revguest(QEMU, intc, cpus, log):
+    """a second, independent guest speaks the revision protocol.
+
+    guest/revguest.c is not xv6 and shares no code with it: three hundred lines
+    that parse the device tree, bind an interrupt driver to whichever controller
+    it describes, take the UART's interrupt through it, and rebind when the host
+    says the description changed. If only xv6 could do this, "the guest speaks
+    the protocol" would mean xv6; this is what makes it mean the protocol."""
+    q = boot_host(QEMU, "imsic", cpus, log)
+    try:
+        q.send("vmm start -k /revguest -P -c 1 -f none\n")
+        m = q.expect(r"vm (\d+): 1 vcpu", 20)
+        vmid = int(m.group(1))
+        q.expect(r"revguest: interrupt controller plic at 0xc000000", 30)
+        q.expect(r"revguest: revision protocol version 1", 30)
+        q.expect(r"revguest: ready", 30)
+        # a keystroke is an interrupt: the UART raises its line, the PLIC delivers it
+        q.send("a")
+        q.expect(r"revguest: irq via plic \(key a, total 1\)", 30)
+        detach(q)
+        out = vm_info(q, vmid)
+        assert "guest speaks the protocol" in out, out
+        assert "intc plic" in out, out
+
+        # now change its interrupt controller under it
+        mr = q.mark()
+        q.send("vmm revise %d imsic\n" % vmid)
+        q.expect(r"interrupt controller -> imsic", 60)
+        q.expect(r"\$ ", ATONCE)
+        wait_adopted(q, mr)
+        out = vm_info(q, vmid)
+        assert "intc aplic-msi+imsic" in out, out
+        attach(q, str(vmid))
+        # what the guest itself said when it rebound. It said it while detached, so
+        # this is the console ring replaying -- which lands a moment *after* the
+        # attach banner, not with it: wait for it rather than look for it.
+        q.expect(r"revguest: revision \d+: now on imsic \(adopted 0x2\)", 30)
+        # and the next keystroke arrives through a controller that did not exist
+        # when this guest booted
+        q.send("b")
+        q.expect(r"revguest: irq via imsic \(key b, total 2\)", 30)
+        detach(q)
+        kill_vm(q, vmid)
+        print("    a guest that is not xv6 rebound its interrupt driver on request")
+    finally:
+        q.close()
+
 def tests(modes, cpus, log, QEMU, usertests_ok):
     t = []
     for m in modes:
@@ -1022,6 +1239,11 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
         t.append(("guest-fd-vector-%s" % m, lambda m=m: t_fdv_guests(QEMU, m, cpus, log)))
     t.append(("guest-fd-vector-novec-plic", lambda: t_fdv_guests(QEMU, "plic", cpus, log, vec=0)))
     t.append(("guest-ownership-plic", lambda: t_ownership(QEMU, "plic", cpus, log)))
+    # the revisable-machine mechanism: one host boot each, and they name their
+    # own controllers because the point of them is a controller changing.
+    t.append(("guest-revise-intc", lambda: t_revise_intc(QEMU, "imsic", cpus, log)))
+    t.append(("guest-revise-vector", lambda: t_revise_vector(QEMU, "plic", cpus, log)))
+    t.append(("guest-revguest", lambda: t_revguest(QEMU, "imsic", cpus, log)))
     for m in modes:
         t.append(("guest-fuzz-%s" % m, lambda m=m: t_fuzz(QEMU, m, cpus, log)))
     # host configurations: a single hart, and more harts than the default.

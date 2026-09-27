@@ -35,6 +35,7 @@ struct proc *initproc;
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
+static void waitq_cancel(struct proc *p);
 static void proc_put(struct proc *p);
 static void waitq_cancel(struct proc *p);
 static void unlink_child(struct proc *parent, struct proc *child);
@@ -846,6 +847,16 @@ freeproc(struct proc *p)
   p->futex_until = 0;
   p->autoreap = 0;
   sigq_free_all(p);
+  // still registered on a wait queue at exit? Report it here rather than in
+  // proc_put(), which is where the dangling link is actually broken: by then
+  // p->chan has been cleared below and the message cannot say which channel it
+  // was, which is the one thing worth knowing.
+  if (p->wq) {
+    static int leaked;
+    if (leaked++ < 8)
+      printk("proc: pid %d exits still queued on chan %p (state %d)\n",
+             p->pid, p->chan, p->state);
+  }
   p->name[0] = 0;
   p->chan = 0;
   p->killed = 0;
@@ -858,6 +869,25 @@ freeproc(struct proc *p)
 static void
 proc_put(struct proc *p)
 {
+  // Off any wait queue it is still on, before the object goes back to its
+  // cache. freeproc() clears p->chan but cannot do this: it runs with p->lock
+  // held, and a wait queue is taken wq->lock first and p->lock second (see
+  // wakeup), so reaching for wq->lock there would invert the order. Here no
+  // lock is held, which is why this is the place.
+  //
+  // What it prevents: a task that died while still linked into a queue left
+  // wq->head pointing at it, this function handed the object back to
+  // proc_cache, and the next wakeup() on that channel walked into freed memory.
+  // Seen once, as a load page fault in wakeup() at the p->wq_next dereference
+  // with the faulting address 0x0101010101...: kalloc fills freed pages with 1
+  // "to catch dangling references", and it caught this one.
+  //
+  // The printk is not defensive noise. Every path that registers on a queue is
+  // supposed to leave it through wakeup(), sleep() or sleep_cancel(), so
+  // arriving here still queued means one of them does not -- and that path is
+  // worth finding rather than papering over. Say so a few times, not forever.
+  if (p->wq)
+    waitq_cancel(p);
   if (p->detached_mm) {
     proc_mm_free(p->detached_mm); // may sleep: no locks are held here
     p->detached_mm = 0;
@@ -1472,6 +1502,15 @@ freeze_point(void)
     sleep_prepare(p->sg);
     if (sched_group_frozen(p->sg) && !killed(p))
       sleep_intr();
+    else
+      // and if the second check says do not sleep -- unfrozen in between, or
+      // killed -- the registration has to be given back. Leaving it was a
+      // dangling pointer with a long fuse: the task walks out of this loop
+      // still linked into the group's wait queue, and if it then exits (which
+      // is exactly what a killed one does) the object goes back to proc_cache
+      // while wq->head still points at it. The next wakeup() on the group
+      // walks into freed memory.
+      sleep_cancel();
   }
 }
 

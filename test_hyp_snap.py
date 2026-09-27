@@ -452,6 +452,419 @@ def t_migrate_busy(QEMU, intc, cpus, log):
                 pass
 
 
+def t_migrate_hetero(QEMU, cpus, log):
+    """a machine moved to a host that is not the same shape as the one it left.
+
+    This is the one a compatibility set forbids. Host A presents its guests an
+    APLIC-MSI+IMSIC, because that is what A was built with; host B presents a
+    PLIC, because that is what B has. Today a fleet answers this by refusing the
+    move, or by masking every guest down to the PLIC for life so that the move is
+    always legal. Neither is necessary: the guest is told, on arrival, that its
+    machine is a different shape, and it rebinds.
+
+    What is checked is not that the migration returns success -- it is that the
+    guest is *alive and working* afterwards, on a controller it was not booted
+    with, with its disk and its userspace intact, and that it is running on the
+    destination's controller rather than pretending."""
+    import os
+    tag = "het%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    # A has the AIA, B has only the PLIC: the heterogeneity is the hosts' own,
+    # not a flag on the guest.
+    a = QEMU(intc="imsic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        out = run(a, "ping 10.7.0.2 2", 60)
+        assert "2 packets transmitted, 2 received" in out, out
+
+        # a machine on A, on A's controller, with something of its own on disk
+        vm = g.start_guest(a, "-n h1 -m 32 -c 1", 120)
+        a.send("echo crossed-shapes > /tmp/keep\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        out = run(a, "vmm info h1", 30)
+        assert "intc aplic-msi+imsic" in out, out
+        # and it has looked at its interrupt controller, so the naive
+        # compatibility answer would be that it may not move at all
+        assert re.search(r"observed:.*\bintc@", out), out
+
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate h1 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+
+        # B says what it noticed and what it did about it
+        b.expect(r"arrived as imsic, this host gives plic: \d+ line\(s\) still held", 120)
+        b.expect(r"revision 1 asked for", 60)
+        b.expect(r"arrived: 1 vcpu", 120)
+        # and the guest took it. This is the load-bearing line of the test: the
+        # guest re-read its description and rebound to a controller it was not
+        # booted with, while holding the state it had on A.
+        b.expect(r"revision 1 adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        out = run(b, "vmm info h1", 30)
+        assert "intc plic" in out, out
+
+        # alive: its userspace runs, its file is there, and its disk still works
+        g.attach(b, "h1")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /tmp/keep\n")
+        b.expect(r"crossed-shapes", 60)
+        b.expect(r"\$ ", ATONCE)
+        m = b.mark()
+        b.send("echo after-the-move > /tmp/after; cat /tmp/after\n")
+        b.expect(r"after-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        # its disk, which needs interrupts from a controller that did not exist
+        # when the driver bound: a read that reaches the platter, not the cache
+        b.send("sync; echo disk-ok\n")
+        b.expect(r"disk-ok", 60)
+        b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(m), b.output_since(m)
+        g.detach(b)
+        out = run(b, "vmm info h1", 30)
+        # the exits kept coming after the switch, which is the difference
+        # between a guest that is running and one that is merely not dead
+        mm = re.search(r"exits (\d+):", out)
+        assert mm and int(mm.group(1)) > 0, out
+
+        # and back the other way, which is not the same exercise: arriving on A
+        # the guest is given a controller that is *more* capable than the one it
+        # is bound to, and has to take up hardware guest interrupt files it was
+        # not using a moment ago.
+        a.send("vmm accept 9000 -d &\n")
+        a.expect(r"\$ ", 30)
+        run(a, "sleep 1", 20)
+        out = run(b, "vmm migrate h1 10.7.0.1:9000", 300)
+        assert "migrated to 10.7.0.1:9000" in out, out
+        a.expect(r"arrived as plic, this host gives imsic: \d+ line\(s\) still held", 120)
+        a.expect(r"arrived: 1 vcpu", 120)
+        a.expect(r"revision \d+ adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        a.send("\n")
+        a.expect(r"\$ ", 30)
+        out = run(a, "vmm info h1", 30)
+        assert "intc aplic-msi+imsic" in out, out
+        g.attach(a, "h1")
+        a.send("\n")
+        a.expect(r"\$ ", 60)
+        a.send("cat /tmp/keep\n")
+        a.expect(r"crossed-shapes", 60)
+        a.expect(r"\$ ", ATONCE)
+        ma = a.mark()
+        a.send("echo and-back > /back; sync; cat /back\n")
+        a.expect(r"and-back", 60)
+        a.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in a.output_since(ma), a.output_since(ma)
+        g.detach(a)
+        run(a, "vmm kill h1", 60)
+        print("    a machine crossed to a host of another shape, rebound, and came back")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_refused(QEMU, cpus, log, give_up):
+    """a migration that is refused, and the same one made legal by negotiation.
+
+    Host A has a vector unit; host B was built without one. In both halves the
+    guest *uses* the unit, so its register file is state that has nowhere to go on
+    B, and B refuses -- the guest keeps running on A rather than being lost.
+
+    In the second half the host then asks the guest to give the unit up. The guest
+    checks whether any task is relying on it and agrees, and the same migration
+    that was refused a moment ago is now allowed. That is the point of the whole
+    mechanism in one sequence: a machine that could not move becomes one that can,
+    because the guest was asked and gave something up. A fleet-wide feature floor
+    gets the same freedom only by taking vectors away from every guest for life."""
+    import os
+    tag = "ref%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, vec=1, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, vec=0, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        vmid = g.start_guest(a, "-n r1 -m 32 -c 1", 120)
+        a.send("vecbench 2\n")
+        a.expect(r"vecbench: (ok|no vector extension)", 90)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+
+        # this guest has a vector unit, and B has none: state with nowhere to go.
+        # (Not asserted through the observation set: vsstatus.VS going Dirty is a
+        # transient the guest's own trap handler clears, so whether the host ever
+        # samples one depends on when its exits fall -- the same guest running the
+        # same vecbench shows `vector' on some runs and not others. The decision
+        # is made by asking the guest, not by sampling it.)
+        out = run(a, "vmm info r1", 30)
+        assert re.search(r"observed:", out), out
+
+        def try_move():
+            b.send("vmm accept 9000 -d &\n")
+            b.expect(r"\$ ", 30)
+            run(b, "sleep 1", 20)
+            o = run(a, "vmm migrate r1 10.7.0.2:9000", 300)
+            return "migrated to" in o, o
+
+        moved, out = try_move()
+        assert not moved, out
+        # and it was not lost in the refusing: it is still running on A. Before
+        # the acknowledgement existed this is where the guest disappeared -- the
+        # source had handed it over and the destination had said no.
+        assert re.search(r"\br1\b", run(a, "vmm ls", 30)), run(a, "vmm ls", 30)
+        g.attach(a, "r1")
+        a.send("\n")
+        a.expect(r"\$ ", 60)
+        a.send("echo survived-the-refusal\n")
+        a.expect(r"survived-the-refusal", 60)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        if not give_up:
+            print("    a guest holding vector state was refused, and kept running")
+            return
+
+        # now ask it to give the unit up. It checks whether any task is relying
+        # on it, and between programs none is.
+        ma = a.mark()
+        a.send("vmm revise %d novector\n" % vmid)
+        a.expect(r"vector unit revoked: asked", 60)
+        a.expect(r"\$ ", ATONCE)
+        a.consumed = ma
+        a.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 90)
+        a.consumed = len(a.buf)
+
+        # and the same move is now legal
+        moved, out = try_move()
+        assert moved, out
+        for _ in range(10):
+            o = run(a, "vmm ls", 30)
+            if "no vms" in o:
+                break
+            run(a, "sleep 1", 20)
+        assert "no vms" in o, o
+        b.expect(r"arrived: 1 vcpu", 120)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "r1")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("echo moved-after-giving-it-up\n")
+        b.expect(r"moved-after-giving-it-up", 60)
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        print("    a refused guest gave up its vector unit and the move became legal")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_legacy(QEMU, cpus, log):
+    """the legacy tier: a guest that does not speak the revision protocol, moved to
+    a host of another shape.
+
+    Host A has an APLIC-MSI+IMSIC, host B only a PLIC. The guest is xv6 told
+    `norevise' on its command line, which makes it behave like a guest that
+    predates the protocol: it never asks and never acks. The destination cannot
+    tell it anything, so it must not change anything -- the machine keeps the
+    controller it left with, as a software model on B. Correct on any host, at the
+    price of emulation exits; the participating tier (snap-migrate-hetero) is the
+    same crossing without that price, which is the whole argument."""
+    import os
+    tag = "leg%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="imsic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+
+        g.start_guest(a, "-n old -m 32 -c 1 -a norevise", 120)
+        a.send("echo from-before > /tmp/keep\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        out = run(a, "vmm info old", 30)
+        assert "intc aplic-msi+imsic (hardware guest files)" in out, out
+        assert "guest does not speak it" in out, out
+
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate old 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        # B says what it decided, and why
+        b.expect(r"does not speak revision: keeping imsic on this plic host", 120)
+        b.expect(r"arrived: 1 vcpu", 120)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        out = run(b, "vmm info old", 30)
+        # the same kind it left with, as the software model: no hardware files
+        # on a host that has none, and no revision was asked for
+        assert re.search(r"intc aplic-msi\+imsic\s*$", out, re.M), out
+        assert "revision 1 asked for" not in b.buf.decode(errors="replace"), out
+        g.attach(b, "old")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /tmp/keep\n")
+        b.expect(r"from-before", 60)
+        b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        b.send("echo on-the-plic-host > /after; sync; cat /after\n")
+        b.expect(r"on-the-plic-host", 60)
+        b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        # and it pays for the shape it kept: interrupts still go through an
+        # emulated controller, which is the exits the participating tier saves
+        out = run(b, "vmm info old", 30)
+        assert re.search(r"(aplic-s|imsic-s) \d+r/\d+w", out), out
+        run(b, "vmm kill old", 60)
+        print("    a guest that cannot be told kept its controller across the move")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_layout(QEMU, cpus, log, legacy):
+    """the second axis a description can be revised on: where the devices are.
+
+    Both hosts have a PLIC, so the controller is not what changes. Host B is
+    booted with `guestmap=alt', which puts every guest's virtio block a megabyte
+    up the map -- a host of a different *layout*, as real SoCs are. A guest that
+    speaks the protocol arrives, is told, remaps the windows and repoints its
+    drivers; the queues in its own memory and the device state on the host are
+    untouched, so nothing is renegotiated. A guest that cannot be told keeps the
+    map it left with. Either way its disk still works afterwards, which is the
+    check that matters."""
+    import os
+    tag = "lay%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestmap=alt"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n mv -m 32 -c 1" + (" -a norevise" if legacy else ""), 120)
+        a.send("echo before-the-move > /keep; sync\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate mv 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        if legacy:
+            b.expect(r"arriving with its devices at \+0x0 does not speak revision: keeping that map", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+        else:
+            b.expect(r"arrived with devices at \+0x0, this host puts them at \+0x100000", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            assert int(m.group(1), 16) & 1, m.group(0)     # REV_DEVICES taken
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "mv")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        if not legacy:
+            # the guest says what it did, from inside -- after all four moved, since
+            # the console it says it on is one of them
+            assert re.search(r"machine: virtio device moved 0x1000[1-4]000 -> 0x1010[1-4]000",
+                             b.buf.decode(errors="replace")), b.buf.decode(errors="replace")[-3000:]
+        b.send("cat /keep\n")
+        b.expect(r"before-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        # the disk, through a register window that is somewhere else now
+        b.send("echo after-the-move > /after; sync; cat /after\n")
+        b.expect(r"after-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        run(b, "vmm kill mv", 60)
+        print("    " + ("a guest that cannot be told kept its device map across the move"
+                        if legacy else "a guest followed its devices to a new address without a reboot"))
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
 def tests(modes, cpus, log, QEMU):
     m = modes[0]
     return [
@@ -461,4 +874,15 @@ def tests(modes, cpus, log, QEMU):
         ("snap-refused", lambda: t_snap_refused(QEMU, m, cpus, log)),
         ("snap-migrate", lambda: t_migrate(QEMU, m, cpus, log)),
         ("snap-migrate-busy", lambda: t_migrate_busy(QEMU, m, cpus, log)),
+        # the heterogeneous one names no mode: the two hosts are
+        # deliberately different, which is the whole point of it.
+        ("snap-migrate-hetero", lambda: t_migrate_hetero(QEMU, cpus, log)),
+        # and one that is refused, for the right reason, and one that is not
+        ("snap-migrate-refused", lambda: t_migrate_refused(QEMU, cpus, log, 0)),
+        ("snap-migrate-negotiated", lambda: t_migrate_refused(QEMU, cpus, log, 1)),
+        # and a guest that cannot be told anything, kept as it was
+        ("snap-migrate-legacy", lambda: t_migrate_legacy(QEMU, cpus, log)),
+        # the layout axis: devices somewhere else on the destination
+        ("snap-migrate-layout", lambda: t_migrate_layout(QEMU, cpus, log, 0)),
+        ("snap-migrate-layout-legacy", lambda: t_migrate_layout(QEMU, cpus, log, 1)),
     ]

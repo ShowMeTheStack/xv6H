@@ -123,6 +123,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
   switch (fid) {
   case 0:
     r.val = 1;
+    vm->revise_capable = 1;   // it asked, so it speaks: the legacy tier is off
     break;
   case 1:
     r.val = vm->revise_gen;

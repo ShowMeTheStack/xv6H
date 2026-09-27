@@ -70,6 +70,21 @@ strofs(struct fdtw *w, const char *s)
   return off;
 }
 
+// "virtio_mmio@10001000": a node name carrying its unit address, built rather
+// than written down, because the address is per machine now (vm->mmio_shift).
+static const char *
+unit_name(char *buf, const char *prefix, uint64 addr)
+{
+  int n = 0;
+  while (prefix[n]) { buf[n] = prefix[n]; n++; }
+  buf[n++] = '@';
+  char hex[17]; int k = 0;
+  do { hex[k++] = "0123456789abcdef"[addr & 15]; addr >>= 4; } while (addr);
+  while (k) buf[n++] = hex[--k];
+  buf[n] = 0;
+  return buf;
+}
+
 static void
 node_begin(struct fdtw *w, const char *name)
 {
@@ -166,6 +181,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   w.ss = sspage;
   w.ssmax = PGSIZE;
 
+  char uname[32];
   uint32 cells[32];
   char name[32];
 
@@ -231,10 +247,15 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     {
       char isa[96], ext[128];
       int n = 0, e = 0;
-      const char *base = plat.has_v ? "rv64imafdcv_zicsr_zifencei_sstc" : "rv64imafdc_zicsr_zifencei_sstc";
-      const char *exts = plat.has_v ? "i\0m\0a\0f\0d\0c\0v\0zicsr\0zifencei\0sstc\0"
-                                    : "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0sstc\0";
-      int extlen = plat.has_v ? 34 : 32;
+      // the vector unit may have been revoked from this machine even though
+      // the host has one (mutable.md): the description must agree with the
+      // misa this guest is told about, or it would read V in one place and
+      // not the other.
+      int vec = plat.has_v && !vm->vec_revoked;
+      const char *base = vec ? "rv64imafdcv_zicsr_zifencei_sstc" : "rv64imafdc_zicsr_zifencei_sstc";
+      const char *exts = vec ? "i\0m\0a\0f\0d\0c\0v\0zicsr\0zifencei\0sstc\0"
+                             : "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0sstc\0";
+      int extlen = vec ? 34 : 32;
       for (const char *p = base; *p; p++)
         isa[n++] = *p;
       memmove(ext, exts, extlen);
@@ -399,9 +420,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_u32(&w, "reg-io-width", 1);
   node_end(&w);
 
-  node_begin(&w, "virtio_mmio@10001000");
+  node_begin(&w, unit_name(uname, "virtio_mmio", G_VIRTIO_BASE + vm->mmio_shift));
   prop_str(&w, "compatible", "virtio,mmio");
-  prop_reg(&w, G_VIRTIO_BASE, 0x1000);
+  prop_reg(&w, G_VIRTIO_BASE + vm->mmio_shift, 0x1000);
   prop_u32(&w, "interrupt-parent", ic_phandle);
   cells[0] = G_VIRTIO_IRQ;
   cells[1] = 4;
@@ -420,9 +441,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   }
 
   if (vm->balloon.present) {
-    node_begin(&w, "virtio_mmio@10003000");
+    node_begin(&w, unit_name(uname, "virtio_mmio", G_BALLOON_BASE + vm->mmio_shift));
     prop_str(&w, "compatible", "virtio,mmio");
-    prop_reg(&w, G_BALLOON_BASE, 0x1000);
+    prop_reg(&w, G_BALLOON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
     cells[0] = G_BALLOON_IRQ;
     cells[1] = 4;
@@ -434,9 +455,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     // the console as a queue. The guest prefers it to the 16550 when it
     // is here and falls back to the 16550 when it is not, so this node
     // appearing is what makes a guest stop paying two exits a character.
-    node_begin(&w, "virtio_mmio@10004000");
+    node_begin(&w, unit_name(uname, "virtio_mmio", G_CON_BASE + vm->mmio_shift));
     prop_str(&w, "compatible", "virtio,mmio");
-    prop_reg(&w, G_CON_BASE, 0x1000);
+    prop_reg(&w, G_CON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
     cells[0] = G_CON_IRQ;
     cells[1] = 4;
@@ -445,9 +466,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   }
 
   if (vm->vnet.present) {
-    node_begin(&w, "virtio_mmio@10002000");
+    node_begin(&w, unit_name(uname, "virtio_mmio", G_VNET_BASE + vm->mmio_shift));
     prop_str(&w, "compatible", "virtio,mmio");
-    prop_reg(&w, G_VNET_BASE, 0x1000);
+    prop_reg(&w, G_VNET_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
     cells[0] = G_VNET_IRQ;
     cells[1] = 4;

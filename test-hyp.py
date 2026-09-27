@@ -1665,7 +1665,19 @@ def t_aslr(log):
     same ones. What moves at each level is checked separately, because
     "some of the numbers changed" would pass even if only the stack
     were moving."""
-    q = QEMU(intc="plic", cpus=3, log=log)
+    # 512 MB rather than the default gigabyte, and the reason is `execout'
+    # below. It allocates every page the machine has, one page at a time,
+    # touching each, and does that fifteen times over -- so its cost is
+    # proportional to RAM and has nothing to do with what this test is about.
+    # Measured on an idle 32-core box with a gigabyte: **214 seconds**, against
+    # the 300-second allowance the loop below gives it. That is no headroom at
+    # all, which is why this test failed on a busy laptop, failed twelve times
+    # out of twelve when run in parallel, and looked like a regression at three
+    # different commits. Half the memory is half the work and the coverage is
+    # identical: execout still exhausts the machine and still execs with nothing
+    # left, just with less to exhaust. (It skips itself only above 4 GB, so
+    # going down does not lose the test.)
+    q = QEMU(intc="plic", cpus=3, mem="512M", log=log)
     try:
         q.expect(r"init: starting sh", 60)
         q.expect(r"\$ ", 10)

@@ -317,5 +317,5 @@ vvnet_init(struct vm *vm)
   n->mac[3] = 0x78;
   n->mac[4] = 0x76;
   n->mac[5] = 0x10 + vm->id;
-  vm_add_dev(vm, "virtio-net", G_VNET_IRQ, OBS_VIRTIO_NET, G_VNET_BASE, 0x1000, vvnet_read, vvnet_write, 0);
+  vm_add_dev(vm, "virtio-net", G_VNET_IRQ, OBS_VIRTIO_NET, G_VNET_BASE + vm->mmio_shift, 0x1000, vvnet_read, vvnet_write, 0);
 }
