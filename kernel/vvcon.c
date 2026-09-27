@@ -60,7 +60,7 @@ static void
 raise_irq(struct vm *vm)
 {
   vm->con.intr_status |= 1;
-  vic_set_level(vm, G_CON_IRQ, 1);
+  vic_set_level(vm, vm_irq(vm, G_CON_IRQ), 1);
 }
 
 // is the guest actually using this device? The 16550 stays wired up
@@ -156,8 +156,10 @@ vvcon_rx(struct vm *vm)
 
   acquire(&vm->lock);
   struct vq_state *q = &c->q[0];
+  // as vvnet_rx: nothing is written into a machine that is not running (the
+  // input stays in the ring and is delivered when it runs again)
   if (!c->present || !q->ready || q->num == 0 || q->num > MAXQ ||
-      !(c->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+      !(c->status & VIRTIO_CONFIG_S_DRIVER_OK) || vm->state != VM_RUNNING) {
     release(&vm->lock);
     return;
   }
@@ -262,7 +264,7 @@ vvcon_write(struct vm *vm, struct vdev *dev, uint64 off, int size, uint64 val)
     break;
   case VIRTIO_MMIO_INTERRUPT_ACK:
     c->intr_status &= ~val;
-    vic_set_level(vm, G_CON_IRQ, c->intr_status != 0);
+    vic_set_level(vm, vm_irq(vm, G_CON_IRQ), c->intr_status != 0);
     break;
   case VIRTIO_MMIO_STATUS:
     c->status = val;
@@ -273,7 +275,7 @@ vvcon_write(struct vm *vm, struct vdev *dev, uint64 off, int size, uint64 val)
         c->q[i].last_avail = 0;
       }
       c->intr_status = 0;
-      vic_set_level(vm, G_CON_IRQ, 0);
+      vic_set_level(vm, vm_irq(vm, G_CON_IRQ), 0);
     }
     break;
   case VIRTIO_MMIO_QUEUE_DESC_LOW: if (q) q->desc = (q->desc & ~0xffffffffUL) | val; break;
@@ -294,7 +296,15 @@ vvcon_init(struct vm *vm)
   struct vvcon *c = &vm->con;
 
   memset(c, 0, sizeof(*c));
-  c->present = (vm->cfg.flags & VMF_CONQUEUE) ? 1 : 0;
+  c->present = vm->console_kind == CON_VIRTIO;    // F18
   if (c->present)
-    vm_add_dev(vm, "virtio-con", G_CON_IRQ, OBS_VIRTIO_CON, G_CON_BASE + vm->mmio_shift, 0x1000, vvcon_read, vvcon_write, 0);
+    vvcon_add(vm);
+}
+
+// the model as a device of the machine; also what a revision that makes the
+// console a virtio one registers (F18, hyp.c vm_revise_console)
+void
+vvcon_add(struct vm *vm)
+{
+  vm_add_dev(vm, "virtio-con", G_CON_IRQ, OBS_VIRTIO_CON, G_CON_BASE + vm->mmio_shift, 0x1000, vvcon_read, vvcon_write, 0);
 }

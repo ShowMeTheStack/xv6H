@@ -39,8 +39,32 @@ struct page {
 
 extern struct page *pages;      // the database, indexed by (pa - plat.ram_base) >> PGSHIFT
 
-#define PA2PAGE(pa) (&pages[((uint64)(pa) - plat.ram_base) >> PGSHIFT])
-#define PAGE2PA(pg) (plat.ram_base + ((uint64)((pg) - pages) << PGSHIFT))
+// F13: memory that arrived after boot is a second range with its own page
+// database, carved from its own first pages (kalloc_grow). Two ranges at most:
+// the machine as it booted, and what it has been given since.
+struct pgrange {
+  uint64 base, end;             // physical range
+  uint64 alloc_start, alloc_end; // the allocatable part (after its database)
+  struct page *pages;
+};
+extern struct pgrange pgr[2];
+extern int npgr;
+
+static inline struct page *
+PA2PAGE(uint64 pa)
+{
+  if (npgr > 1 && pa >= pgr[1].base)
+    return &pgr[1].pages[(pa - pgr[1].base) >> PGSHIFT];
+  return &pages[(pa - pgr[0].base) >> PGSHIFT];
+}
+
+static inline uint64
+PAGE2PA(struct page *pg)
+{
+  if (npgr > 1 && pg >= pgr[1].pages)
+    return pgr[1].base + ((uint64)(pg - pgr[1].pages) << PGSHIFT);
+  return pgr[0].base + ((uint64)(pg - pages) << PGSHIFT);
+}
 
 struct meminfo {
   uint64 total_pages;     // frames the allocator manages

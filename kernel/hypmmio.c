@@ -105,7 +105,8 @@ vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, ui
     panic("vm_add_dev");
   struct vdev *d = &vm->dev[vm->ndev++];
   d->name = name;
-  d->irq = irq;
+  d->irq0 = irq;
+  d->irq = irq < 0 ? irq : vm_irq(vm, irq);   // F3: the numbering this machine has
   d->obs = obs;
   d->loads = d->stores = 0;
   d->base = base;

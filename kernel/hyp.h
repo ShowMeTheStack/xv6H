@@ -80,6 +80,9 @@
 // henvcfg
 #define HENVCFG_STCE (1L << 63)
 #define HENVCFG_ADUE (1L << 61)
+#define HENVCFG_CBZE (1L << 7)
+#define HENVCFG_CBCFE (1L << 6)
+#define HENVCFG_CBIE (3L << 4)
 
 // exception causes seen from guests
 #define EXC_ILLEGAL       2
@@ -104,7 +107,13 @@
 #define G_BALLOON_IRQ  3
 #define G_CON_BASE   0x10004000L
 #define G_MMIO_ALT_SHIFT 0x100000L   // the alternative map: virtio block at 0x1010xxxx
+// F2: where the interrupt controller sits is a fact of the machine too. The
+// alternative puts PLIC/APLIC at 0x1c00_0000/0x1d00_0000 and the IMSICs at
+// 0x3400_0000/0x3800_0000 (`guestintc=alt' on the host command line).
+#define G_INTC_ALT_SHIFT 0x10000000L
 #define G_CON_IRQ    4
+#define G_MACHREV_BASE 0x10005000L   // the anchor: where a revision is announced (vmachrev.c); never moves
+#define G_MACHREV_IRQ  5
 #define G_RTC_BASE   0x101000L
 #define G_RTC_IRQ    11
 #define G_CLINT_BASE 0x02000000L
@@ -149,10 +158,11 @@ struct vdev {
   void *priv;
   const char *name;      // for `vmm info': which device the exits went to
   int irq;               // the line it raises (-1: none, it is a controller)
+  int irq0;              // the same in the default numbering (F3: vm_irq(vm, irq0) == irq)
   uint32 obs;            // the observation a first access to it implies
   uint64 loads, stores;  // and how many of each
 };
-#define VM_MAXDEV 12
+#define VM_MAXDEV 16
 
 #define CRING 8192
 struct cring {
@@ -276,6 +286,7 @@ struct vballoon {
   uint32 config_gen;
   uint64 inflated, deflated; // pages taken and given back, in total
   uint64 stats[8];          // what the guest last reported, if it does
+  int stats_go;             // the statistics buffer may be taken now (the poller, once a second)
   int have_stats;
 };
 
@@ -480,6 +491,7 @@ struct vm {
   uint64 hgatp;
 
   int vic_kind;
+  int vic_hold;           // vcpus stay out of the guest while the controller model is rebuilt
   int imsic_hw;           // use hardware guest interrupt files
   struct vuart uart;
   struct vvirtio blk;
@@ -509,6 +521,14 @@ struct vm {
   // refuses, which is the whole argument: what a machine may become depends on
   // what its guest is relying on at that moment.
   int vec_revoked;
+  int vec_pending;   // a REV_VLEN revision is out and unanswered; a refusal flips vec_revoked back
+  int vec_ceded;     // F11: the unit was given up for a move; the destination gives its own back
+  // Lazy revelation: the machine is presented without a vector unit until the
+  // guest executes a vector instruction, which traps here (illegal instruction,
+  // not delegated) and is the one exact observation of *use* the host can have.
+  // The unit is then granted and the instruction re-executed. A guest that never
+  // tries keeps a compatibility set that includes every host without a unit.
+  int lazy_v;
 
   // set the first time the guest asks the protocol's version: a guest that has
   // never asked does not speak it, and on arrival at a host of another shape is
@@ -520,11 +540,37 @@ struct vm {
   // revised to this host's and told (participating). Controllers, UART and RTC
   // are not moved: the UART is where earlycon expects it.
   uint64 mmio_shift;
+  uint64 intc_shift;       // F2: where its interrupt controller's registers sit (+shift)
+  int irq_alt;             // F3: its interrupt lines numbered the alternative way (guestirq=alt)
+  uint32 sbi_hidden;       // F22: SBI extensions this machine is not offered (SBIH_*)
+  int hart_shift;          // F9: the guest's harts are numbered id+shift (mhartid, cpus reg, a0 at boot)
+  int mac_alt;             // F19: the NIC's identity (mac[3] 0x79 instead of 0x78), this host's policy
+  int no_rtc;              // F16/F17: the machine has no RTC (the device that comes and goes)
+  int console_kind;        // F18: CON_UART (16550), CON_VIRTIO (virtio-console), CON_SBI (DBCN)
+  int online;              // F7/F8: vcpus [0, online) are started; the rest are described `disabled' and HSM-stopped
+  int cboz_block;          // F21: the cache-block size described (bytes cbo.zero clears). The host's own: native
+                           // (henvcfg.CBZE). Another: cbo.zero traps and is done here at the described size
+  int cboz_prev;           // the size before a revision still pending: cleared at the larger of the two
+  int machrev_line;        // the anchor device's line is up (a revision announced, not yet taken by the driver)
+  // Where the description is. `dtb_gpa' is the blob the guest booted from, in
+  // the last 64 KB of its RAM at birth; it is never written again, because a
+  // guest may keep pointers into it (Linux's live tree does). A revision is
+  // written to one of the two slots below it, alternately, and `desc_gpa' is
+  // the slot the current description is in -- what `describe' answers. All
+  // three are declared /reserved-memory (no-map) to the guest.
+  uint64 desc_gpa;
+  int no_clint;            // F4: no CLINT; the guest sends IPIs through SBI
+  int no_sstc;             // F5: no Sstc; the guest's timer is the SBI timer, VSTIP injected
+  uint32 timebase;         // F6: the timebase-frequency presented; 0 = the host's own (10 MHz).
+                           // When it differs, `time' is trapped and scaled and the timer is SBI's.
+  uint64 tb_x0, tb_g0;     // the clock's value is continuous across a rate change: guest time is
+                           // tb_g0 + scale(X - tb_x0), X = host time + htimedelta, set at each change
   int revise_capable;
   uint32 revise_gen;
   uint32 revise_acked;
   uint32 revise_adopted;
   uint64 revise_asked;    // host tick when the notification went out
+  uint32 revise_what;     // what the last revision said had changed (REV_*), for MACH fid 6
   uint64 revise_done;     // host tick when the ack came back
 
   // what this guest has observed about its machine (OBS_*), and the host tick
@@ -631,11 +677,64 @@ int vvcon_active(struct vm *vm);         // is the guest driving it?
 #define REV_DEVICES  (1u << 0)   // the device tree changed (devices, addresses)
 #define REV_INTC     (1u << 1)   // the interrupt controller is a different kind
 #define REV_VLEN     (1u << 2)   // the vector register file is a different width
+#define REV_SBI      (1u << 3)   // the set of SBI extensions on offer changed (F22)
+#define REV_TIMER    (1u << 4)   // the timer source changed: Sstc or the SBI timer (F5)
+#define REV_MEM      (1u << 5)   // F14: host to host only -- the guest is asked (through its balloon) to be smaller
+#define REV_MEMORY   (1u << 6)   // F13: the machine has more RAM than it had (the memory node grew)
+// F18: the kinds of console a machine may be described with
+#define CON_UART   0
+#define CON_VIRTIO 1
+#define CON_SBI    2
+// F22: SBI extensions a machine can be described without. Bits of vm->sbi_hidden.
+#define SBIH_TIME    1u
+#define SBIH_IPI     2u
+#define SBIH_RFENCE  4u
+#define SBIH_HSM     8u
+#define SBIH_SRST    16u
+#define SBIH_DBCN    32u
+#define SBIH_ALL     63u
 #define REV_NONE     0u
 
 int  vm_revise(struct vm *vm, uint32 what);   // hyp.c: ask a guest to look again
 int  vm_revise_intc(struct vm *vm, int kind); // hyp.c: and give it a different controller
 int  vm_revise_vector(struct vm *vm, int on);  // hyp.c: take the vector unit away, or give it back
+int  vm_revise_intc_addr(struct vm *vm, uint64 shift);  // hyp.c: move the controller's registers (F2)
+int  vm_irq(struct vm *vm, int irq);            // hyp.c: the line a device raises on this machine (F3)
+int  vm_set_imsic_hw(struct vm *vm, int on);    // hyp.c: hardware guest file or software model (F23)
+int  vm_revise_sbi(struct vm *vm, uint32 hidden); // hyp.c: change the SBI extensions on offer (F22)
+int  vm_peek(struct vm *vm, void *dst, uint64 gpa, uint64 n);  // hyp.c: vm_copyin that backs nothing
+int  vm_revise_ipi(struct vm *vm, int sbi);       // hyp.c: CLINT or SBI IPIs (F4)
+void vclint_add(struct vm *vm);                   // vclint.c: register the CLINT model
+int  vm_revise_timer(struct vm *vm, int sbi);     // hyp.c: Sstc or the SBI timer (F5)
+int  vm_revise_timebase(struct vm *vm, uint32 hz); // hyp.c: another timebase-frequency (F6)
+int  vm_revise_hartid(struct vm *vm, int shift);  // hyp.c: renumber the harts (F9)
+int  vm_revise_mac(struct vm *vm, int alt);       // hyp.c: another NIC identity (F19)
+int  vm_revise_rtc(struct vm *vm, int on);        // hyp.c: an RTC comes or goes (F16/F17)
+int  vm_revise_console(struct vm *vm, int kind);  // hyp.c: another kind of console (F18)
+int  vm_grow(struct vm *vm, uint64 bytes);        // hyp.c: more RAM for a running machine (F13)
+int  vm_revise_cpus(struct vm *vm, int online);   // hyp.c: harts started or parked (F7/F8)
+int  vm_revise_cboz(struct vm *vm, int bytes);    // hyp.c: another cache-block size (F21)
+void vmachrev_init(struct vm *vm);                // vmachrev.c: the anchor device
+void vmachrev_notify(struct vm *vm);              // vmachrev.c: raise its line (caller holds vm->lock)
+extern uint64 hyp_cboz_exits;                     // cbo.zero instructions done in software
+void vballoon_pin(struct vm *vm);                 // vballoon.c: the arriving balloon is what it is (F14)
+void vvcon_add(struct vm *vm);                    // vvcon.c: register the virtio-console model
+void vrtc_add(struct vm *vm);                     // vrtc.c: register the RTC model
+void vvnet_mac_changed(struct vm *vm);            // vvnet.c: tell the guest through the device
+// F9: a guest addresses its harts by hart id; the models index vcpus. -1: no such hart.
+static inline int vm_vcpu_of_hart(struct vm *vm, long hart) {
+  long i = hart - vm->hart_shift;
+  return (i >= 0 && i < vm->nvcpu) ? (int)i : -1;
+}
+uint64 vm_guest_time(struct vm *vm);              // hyp.c: `time' as this machine sees it
+uint64 vm_host_time_of(struct vm *vm, uint64 gt); // hyp.c: and back
+uint64 vm_guest_time_of(struct vm *vm, uint64 x); // hyp.c: a host moment as the guest would read it
+#define HOST_TIMEBASE 10000000UL
+#define vm_scaled_time(vm) ((vm)->timebase != 0 && (vm)->timebase != HOST_TIMEBASE)
+uint32 sbi_hidden_default(void);                // hyp.c: what the host command line withholds
+uint64 hyp_guest_room_bytes(void);              // hyp.c: memory this host has for an arriving guest (F14)
+int  vm_split_all(struct vm *vm);               // hyp.c: 4 KB pages everywhere (F24)
+int  vm_revise_irqmap(struct vm *vm, int alt);  // hyp.c: renumber a running guest's lines (F3)
 int  vic_levels_snapshot(struct vm *vm, uint64 *levels);   // vic.c
 void vic_levels_restore(struct vm *vm, uint64 levels);     // vic.c
 const char *vic_kindname(int kind);                         // vic.c

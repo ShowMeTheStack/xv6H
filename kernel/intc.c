@@ -92,10 +92,12 @@ intc_ipi(int hart, uint64 reason)
   __atomic_fetch_or(&ipi_pending[hart], reason, __ATOMIC_SEQ_CST);
   if (plat.intc_kind == INTC_IMSIC) {
     imsic_ipi(hart);
-  } else {
+  } else if (plat.clint_base) {
     // write the target hart's CLINT msip; its machine-mode stub (mvec.S)
     // converts the resulting MSIP into a supervisor software interrupt.
-    *(volatile uint32 *)(plat.clint_base + 4 * hart) = 1;
+    *(volatile uint32 *)(plat.clint_base + 4 * plat.hartid[hart]) = 1;   // F9: by hart id
+  } else {
+    machine_sbi_ipi(plat.hartid[hart]);   // F4: a machine without a CLINT asks its firmware
   }
 }
 
@@ -105,8 +107,14 @@ uint64
 ipi_handle(void)
 {
   int hart = cpuid();
-  if (plat.intc_kind != INTC_IMSIC)
-    c_sip(SIP_SSIP);
+  // SSIP is cleared whatever the controller. With an IMSIC our own IPIs come
+  // as external interrupts (IMSIC_IPI_ID) and SSIP is never set by them -- but
+  // it *is* how the hypervisor tells us the machine description changed, on
+  // any controller (trap.c: "nobody asked for this one"). Left set on an IMSIC
+  // guest, that one notification re-trapped forever: a revision of anything
+  // but the controller itself (irqmap, m2a) spun the guest in cause-1 traps,
+  // one MACH_PENDING ecall each (11 661 of them in the probe).
+  c_sip(SIP_SSIP);
   uint64 reasons = __atomic_exchange_n(&ipi_pending[hart], 0, __ATOMIC_SEQ_CST);
   ipi_count[hart]++;
   return reasons;

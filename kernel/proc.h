@@ -31,6 +31,7 @@ struct cpu {
   int intena;             // Were interrupts enabled before push_off()?
   int resched;            // something with less virtual time is waiting
   int tick;               // a whole timer tick passed at the last interrupt
+  int offline;            // F8: this hart is to drain its run queue and park
 };
 
 extern struct cpu cpus[NCPU];

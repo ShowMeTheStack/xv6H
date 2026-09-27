@@ -49,7 +49,10 @@ usage(void)
              "                 [-w weight] [--cpu-max pct] [-p HPORT[:GPORT][/udp]]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
-             "       vmm revise VM\n"
+             "       vmm revise VM [plic|aplic|imsic|vector|novector|intcmap alt|default|irqmap alt|default]\n"
+             "                     [sbi LIST|none|ipi sbi|clint|timer sbi|sstc|timebase HZ|hartid SHIFT|mac alt|default|rtc on|off]\n"
+             "                     [console uart|virtio|sbi|cpus N|cboz BYTES]\n"
+             "       vmm resize VM MB\n"
              "       vmm weight VM N | vmm cpumax VM PCT\n"
              "       vmm port VM [ls] | vmm port VM add|rm SPEC...\n"
              "       vmm gw [ls] | vmm gw add NAME ADDR/PREFIX [pub IP] | vmm gw rm NAME\n"
@@ -1072,6 +1075,8 @@ cmd_clone(int argc, char *argv[])
 // takes to cross. Iterative pre-copy -- sending the memory while the guest
 // runs and then only what it dirtied -- is what §9 asks for and is not
 // here; the snapshot machinery from E9 is what it would be built on.
+static void wait_freed(int id);
+
 static int
 cmd_migrate(int argc, char *argv[])
 {
@@ -1112,11 +1117,20 @@ cmd_migrate(int argc, char *argv[])
     return 1;
   }
   if (vm_migrate(id, fd) < 0) {
-    fprintf(stderr, "vmm: migrating vm %d: %s\n", id, strerror(errno));
+    const char *why = errno == ENOTSUP ? "the destination refused the machine (nothing was sent)"
+                    : errno == EBUSY   ? "the guest would not give up what the destination needed"
+                    : errno == ETIMEDOUT ? "the destination did not answer"
+                    : strerror(errno);
+    fprintf(stderr, "vmm: migrating vm %d: %s\n", id, why);
     close(fd);
     return 1;
   }
   close(fd);
+  // the source's slot is HALTING until its vcpu processes have left the guest
+  // and freed it; wait for that, so that what follows this command (the same
+  // disk image for a new machine, the same name) finds it released. lazy1:
+  // `vmm start' right after a move failed with EBUSY on the disk.
+  wait_freed(id);
   printf("vm %d migrated to %s\n", id, argv[1]);
   return 0;
 }
@@ -1229,7 +1243,8 @@ launch(struct vmconfig *cfg)
 {
   int id = vm_create(cfg);
   if (id < 0) {
-    fprintf(stderr, "vmm: cannot create vm (kernel/disk missing, disk in use, no memory, or no hypervisor?)\n");
+    fprintf(stderr, "vmm: cannot create vm: %s (kernel/disk missing, disk in use, no memory, or no hypervisor?)\n",
+            strerror(errno));
     return -1;
   }
   if (spawn_vcpus(id, cfg->nvcpu) < 0)
@@ -1479,6 +1494,8 @@ start(int argc, char *argv[])
       cfg.flags |= VMF_WANT_APLIC;     // the software APLIC, whatever the host has
     } else if (strcmp(a, "-I") == 0) {
       cfg.flags |= VMF_WANT_IMSIC;     // and the software IMSIC
+    } else if (strcmp(a, "-L") == 0) {
+      cfg.flags |= VMF_LAZYV;          // no vector unit until the guest uses one
     } else if (strcmp(a, "-M") == 0 && i + 1 < argc) {
       cfg.flags |= VMF_MMIO_SET;       // virtio block offset from the default map
       cfg.mmio_shift = strtoul(argv[++i], 0, 0);
@@ -1582,6 +1599,8 @@ info(int id)
   }
   printf("  exits %ld: mmio %ld, csr %ld, wfi sleeps %ld, injected %ld", vi.exits, vi.mmio, vi.csr,
          vi.wfi, vi.injected);
+  if (vi.cboz_soft)
+    printf(", cbo.zero in software %ld (host total)", vi.cboz_soft);
   // What this guest has learned about its machine, and when. A guest that has
   // not looked at something can still be moved to a machine that lacks it, so
   // this list is the machine's migration freedom, shrinking as it is read.
@@ -1645,11 +1664,14 @@ info(int id)
          vi.vstimecmp);
   printf("         scounteren 0x%lx senvcfg 0x%lx hcounteren 0x%lx\n", vi.scounteren, vi.senvcfg,
          vi.hcounteren);
+  printf("  clock: host time 0x%lx, htimedelta 0x%lx, guest time 0x%lx (%s vstimecmp)\n", vi.host_time,
+         vi.htimedelta, vi.host_time + vi.htimedelta,
+         (long)(vi.host_time + vi.htimedelta - vi.vstimecmp) >= 0 ? "past" : "before");
   printf("         imsic0: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n", vi.deliv0, vi.thr0, vi.eie0_0, vi.eip0_0);
   if (vi.nvcpu > 1)
-    printf("  vcpu1: pc 0x%lx last cause 0x%lx exits %ld idle %d hsm %d hart %d\n"
+    printf("  vcpu1: pc 0x%lx last cause 0x%lx exits %ld idle %d hsm %d hart %d vstimecmp 0x%lx\n"
            "         imsic1: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n",
-           vi.pc1, vi.cause1, vi.exits1, vi.idle1, vi.hsm1, vi.hart1, vi.deliv1, vi.thr1, vi.eie0_1,
+           vi.pc1, vi.cause1, vi.exits1, vi.idle1, vi.hsm1, vi.hart1, vi.vstimecmp1, vi.deliv1, vi.thr1, vi.eie0_1,
            vi.eip0_1);
 }
 
@@ -1816,6 +1838,22 @@ main(int argc, char *argv[])
       exit(1);
     }
     printf("same-page merging %s\n", on ? "on" : "off");
+  } else if (argc == 4 && strcmp(cmd, "imsichw") == 0) {
+    // `vmm imsichw VM on|off': hardware guest interrupt file or the software model (F23)
+    int id = must_lookup(argv[2]);
+    int on = strcmp(argv[3], "on") == 0;
+    if (!on && strcmp(argv[3], "off") != 0)
+      usage();
+    int rv = vm_ctl(id, VMCTL_IMSIC_HW, on);
+    printf("vm %d: imsic delivery %s: %s\n", id, on ? "hardware file" : "software model",
+           rv == 0 ? "ok" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 3 && strcmp(cmd, "split") == 0) {
+    // `vmm split VM': 4 KB pages everywhere (F24)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_SPLIT, 0);
+    printf("vm %d: memory split to pages: %s\n", id, rv == 0 ? "ok" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
   } else if (argc == 4 && strcmp(cmd, "weight") == 0) {
     int id = lookup(argv[2]);
     int w = atoi(argv[3]);
@@ -1853,6 +1891,122 @@ main(int argc, char *argv[])
       exit(1);
     }
     printf("vm %d: asked for %d MB back\n", id, mb);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "cpus") == 0) {
+    // `vmm revise VM cpus N': N harts running, the rest parked (F7/F8)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_REVISE_CPUS, atoi(argv[4]));
+    printf("vm %d: cpus -> %s: %s\n", id, argv[4], rv == 0 ? "done" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "cboz") == 0) {
+    // `vmm revise VM cboz BYTES': the cache-block size it is described with (F21)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_REVISE_CBOZ, atoi(argv[4]));
+    printf("vm %d: cache block -> %s bytes: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 4 && strcmp(cmd, "resize") == 0) {
+    // `vmm resize VM MB': more memory for a running machine (F13)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_GROW, atoi(argv[3]));
+    printf("vm %d: memory -> %s MB: %s\n", id, argv[3], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "console") == 0) {
+    // `vmm revise VM console uart|virtio|sbi': another kind of console (F18)
+    int id = must_lookup(argv[2]);
+    int kind = strcmp(argv[4], "uart") == 0 ? 0 : strcmp(argv[4], "virtio") == 0 ? 1
+             : strcmp(argv[4], "sbi") == 0 ? 2 : -1;
+    if (kind < 0)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_CONSOLE, kind);
+    printf("vm %d: console -> %s: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "rtc") == 0) {
+    // `vmm revise VM rtc on|off': the device comes or goes (F16/F17)
+    int id = must_lookup(argv[2]);
+    int on = strcmp(argv[4], "on") == 0 ? 1 : strcmp(argv[4], "off") == 0 ? 0 : -1;
+    if (on < 0)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_RTC, on);
+    printf("vm %d: rtc %s: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "mac") == 0) {
+    // `vmm revise VM mac alt|default': the NIC's identity (F19)
+    int id = must_lookup(argv[2]);
+    int alt = strcmp(argv[4], "alt") == 0 ? 1 : strcmp(argv[4], "default") == 0 ? 0 : -1;
+    if (alt < 0)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_MAC, alt);
+    printf("vm %d: nic identity -> %s: %s\n", id, argv[4], rv == 0 ? "changed" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "hartid") == 0) {
+    // `vmm revise VM hartid SHIFT': the harts numbered from SHIFT (F9)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_REVISE_HARTID, atoi(argv[4]));
+    printf("vm %d: harts numbered from %s: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "timebase") == 0) {
+    // `vmm revise VM timebase HZ' (F6)
+    int id = must_lookup(argv[2]);
+    int rv = vm_ctl(id, VMCTL_REVISE_TIMEBASE, atoi(argv[4]));
+    printf("vm %d: timebase -> %s Hz: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 &&
+             (strcmp(argv[3], "ipi") == 0 || strcmp(argv[3], "timer") == 0)) {
+    // `vmm revise VM ipi sbi|clint' (F4), `vmm revise VM timer sbi|sstc' (F5)
+    int id = must_lookup(argv[2]);
+    int ipi = strcmp(argv[3], "ipi") == 0;
+    int sbi = strcmp(argv[4], "sbi") == 0;
+    if (!sbi && strcmp(argv[4], ipi ? "clint" : "sstc") != 0)
+      usage();
+    int rv = vm_ctl(id, ipi ? VMCTL_REVISE_IPI : VMCTL_REVISE_TIMER, sbi);
+    printf("vm %d: %s -> %s: %s\n", id, ipi ? "ipis" : "timer", argv[4],
+           rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "sbi") == 0) {
+    // `vmm revise VM sbi LIST|none': the SBI extensions withheld (F22),
+    // LIST a comma-separated subset of time,ipi,rfence,hsm,srst,dbcn
+    int id = must_lookup(argv[2]);
+    static const char *names[] = {"time", "ipi", "rfence", "hsm", "srst", "dbcn"};
+    uint32 hidden = 0;
+    char *s = argv[4];
+    if (strcmp(s, "none") != 0) {
+      while (*s) {
+        char *e = s;
+        while (*e && *e != ',')
+          e++;
+        int found = -1;
+        for (int i = 0; i < 6; i++)
+          if ((int)strlen(names[i]) == e - s && memcmp(names[i], s, e - s) == 0)
+            found = i;
+        if (found < 0)
+          usage();
+        hidden |= 1u << found;
+        s = *e ? e + 1 : e;
+      }
+    }
+    int rv = vm_ctl(id, VMCTL_REVISE_SBI, hidden);
+    printf("vm %d: sbi extensions withheld 0x%x: %s\n", id, hidden, rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "irqmap") == 0) {
+    // `vmm revise VM irqmap alt|default': renumber the interrupt lines (F3)
+    int id = must_lookup(argv[2]);
+    int alt = strcmp(argv[4], "alt") == 0 ? 1 : strcmp(argv[4], "default") == 0 ? 0 : -1;
+    if (alt < 0)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_IRQMAP, alt);
+    printf("vm %d: interrupt lines -> %s: %s\n", id, argv[4],
+           rv == 0 ? "asked" : rv == -EAGAIN ? "inside an interrupt handler, try again" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "intcmap") == 0) {
+    // `vmm revise VM intcmap alt|default': move the controller's registers (F2)
+    int id = must_lookup(argv[2]);
+    uint64 shift = strcmp(argv[4], "alt") == 0 ? 0x10000000UL
+                 : strcmp(argv[4], "default") == 0 ? 0 : (uint64)-1;
+    if (shift == (uint64)-1)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_INTCMAP, shift);
+    printf("vm %d: interrupt controller map -> %s: %s\n", id, argv[4],
+           rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
   } else if (argc == 4 && strcmp(cmd, "revise") == 0) {
     // give a running guest a different kind of interrupt controller
     int id = must_lookup(argv[2]);

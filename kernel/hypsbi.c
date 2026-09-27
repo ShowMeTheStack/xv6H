@@ -44,6 +44,8 @@
 // it sits in the experimental space until it is one.
 #define SBI_EXT_MACHINE 0x4D414348
 
+static int sbi_hidden(struct vm *vm, uint64 ext);   // F22, below
+
 struct sbiret {
   long err, val;
 };
@@ -57,11 +59,16 @@ for_each_hart(struct vm *vm, uint64 mask, uint64 base, void (*fn)(struct vcpu *,
       fn(&vm->vcpu[i], arg);
     return 0;
   }
-  if (base >= (uint64)vm->nvcpu)
+  // F9: the mask names hart ids; the vcpus are id - shift
+  if (base >= (uint64)(vm->nvcpu + vm->hart_shift))
     return -1;
-  for (int b = 0; b < 64 && base + b < (uint64)vm->nvcpu; b++)
-    if (mask & (1UL << b))
-      fn(&vm->vcpu[base + b], arg);
+  for (int b = 0; b < 64; b++) {
+    if (!(mask & (1UL << b)))
+      continue;
+    int i = vm_vcpu_of_hart(vm, base + b);
+    if (i >= 0)
+      fn(&vm->vcpu[i], arg);
+  }
   return 0;
 }
 
@@ -87,6 +94,10 @@ sbi_base(struct vcpu *v, uint64 fid, uint64 a0)
   case 1: r.val = 0x58; break;       // implementation id (not one of the registered ones)
   case 2: r.val = 1; break;          // implementation version
   case 3:                            // probe_extension
+    if (sbi_hidden(v->vm, a0)) {     // F22: withheld from this machine
+      r.val = 0;
+      break;
+    }
     switch (a0) {
     case SBI_EXT_BASE: case SBI_EXT_TIME: case SBI_EXT_IPI: case SBI_EXT_RFENCE:
     case SBI_EXT_HSM: case SBI_EXT_SRST: case SBI_EXT_DBCN:
@@ -114,6 +125,28 @@ sbi_base(struct vcpu *v, uint64 fid, uint64 a0)
 //   fid 2  describe()           -> a0 = guest-physical address of the device tree
 //                                  a1 = its length
 //   fid 3  ack(adopted)         -> the guest reports what it managed (REV_*)
+//   fid 4  dtb_max              -> the room the description may take
+//   fid 5  request(what)        -> the guest asks for a fact it was described
+//                                  without (a vector unit it was shown none of):
+//                                  the description negotiated the other way
+//   fid 6  what                 -> what the last revision said had changed (REV_*):
+//                                  the part the tree cannot say (the SBI set)
+// F22: is this extension withheld from this machine?
+static int
+sbi_hidden(struct vm *vm, uint64 ext)
+{
+  uint32 h = vm->sbi_hidden;
+  switch (ext) {
+  case SBI_EXT_TIME:   return (h & SBIH_TIME) != 0;
+  case SBI_EXT_IPI:    return (h & SBIH_IPI) != 0;
+  case SBI_EXT_RFENCE: return (h & SBIH_RFENCE) != 0;
+  case SBI_EXT_HSM:    return (h & SBIH_HSM) != 0;
+  case SBI_EXT_SRST:   return (h & SBIH_SRST) != 0;
+  case SBI_EXT_DBCN:   return (h & SBIH_DBCN) != 0;
+  }
+  return 0;
+}
+
 static struct sbiret
 sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
 {
@@ -132,13 +165,31 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // the guest asks where its description is; a1 is returned in the second
     // register, which the caller reads as sbiret.val after a second call --
     // simpler to hand back the address here and the length on fid 4.
-    r.val = vm->dtb_gpa;
+    r.val = vm->desc_gpa;   // the current slot (hyp.h)
     break;
   case 3:
     acquire(&vm->lock);
     vm->revise_acked = vm->revise_gen;
+    vm->cboz_prev = vm->cboz_block;   // F21: the old stride is gone
     vm->revise_adopted = (uint32)a0;
     vm->revise_done = r_time();
+    if (vm->vec_pending) {
+      // A revocation the guest declined is not a revocation: the description
+      // must say what the guest is actually holding, or the next move carries a
+      // machine "without a unit" to a host without one while a task inside is
+      // using it (busy2: the guest arrived and executed nothing but faults).
+      vm->vec_pending = 0;
+      if (!(a0 & REV_VLEN)) {
+        vm->vec_revoked = !vm->vec_revoked;
+        for (int i = 0; i < vm->nvcpu; i++) {
+          vm->vcpu[i].vsstatus &= ~SSTATUS_VS_MASK;
+          if (!vm->vec_revoked)
+            vm->vcpu[i].vsstatus |= SSTATUS_VS_INITIAL;
+        }
+        printk("hyp: vm %d: the guest declined: its vector unit stays %s\n", vm->id,
+               vm->vec_revoked ? "absent" : "present");
+      }
+    }
     release(&vm->lock);
     printk("hyp: vm %d: revision %d adopted (0x%lx) after %ld us\n", vm->id,
            vm->revise_acked, a0,
@@ -146,6 +197,27 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     break;
   case 4:
     r.val = VM_DTB_MAX;
+    break;
+  case 6:
+    r.val = vm->revise_what;
+    break;
+  case 5:
+    // Lazy revelation, from the guest's side: a machine presented without a
+    // vector unit (-L) is asked for one the moment a program asks its kernel
+    // whether there is one. A guest that believes its description never
+    // executes a vector instruction, so the first-use trap (hypcsr.c) alone
+    // would never fire for a well-behaved program; the question is the
+    // observation. Granted iff this host has a unit and it was only hidden.
+    if ((a0 & REV_VLEN) && vm->lazy_v && vm->vec_revoked && plat.has_v) {
+      vm_observe(vm, OBS_VECTOR_USED);
+      printk("hyp: vm %d: the guest asks for a vector unit: granting it\n", vm->id);
+      if (vm_revise_vector(vm, 1) == 0)
+        r.val = REV_VLEN;
+      else
+        r.err = SBI_ERR_FAILED;
+    } else {
+      r.err = SBI_ERR_NOT_SUPPORTED;
+    }
     break;
   default:
     r.err = SBI_ERR_NOT_SUPPORTED;
@@ -160,12 +232,14 @@ sbi_hsm(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
   struct sbiret r = {SBI_SUCCESS, 0};
   switch (fid) {
   case 0: { // hart_start(hartid, start_addr, opaque)
-    if (a0 >= (uint64)vm->nvcpu) {
+    int t = vm_vcpu_of_hart(vm, a0);     // F9: a hart id
+    if (t < 0) {
       if (vm_gripe(&vm->g_sbi))
         printk("hyp: vm %d: hsm hart_start(%ld): no such vcpu\n", vm->id, a0);
       r.err = SBI_ERR_INVALID_PARAM;
       break;
     }
+    a0 = t;
     if (a1 < G_RAM_BASE || a1 >= G_RAM_BASE + vm->ram_size) {
       if (vm_gripe(&vm->g_sbi))
         printk("hyp: vm %d: hsm hart_start(%ld): bad address 0x%lx\n", vm->id, a0, a1);
@@ -188,12 +262,14 @@ sbi_hsm(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     v->hsm_state = HSM_STOPPED;
     release(&vm->lock);
     break;
-  case 2: // hart_get_status
-    if (a0 >= (uint64)vm->nvcpu)
+  case 2: { // hart_get_status(hartid)
+    int t = vm_vcpu_of_hart(vm, a0);     // F9
+    if (t < 0)
       r.err = SBI_ERR_INVALID_PARAM;
     else
-      r.val = vm->vcpu[a0].hsm_state == HSM_STARTED ? 0 : 1; // STARTED=0, STOPPED=1
+      r.val = vm->vcpu[t].hsm_state == HSM_STARTED ? 0 : 1; // STARTED=0, STOPPED=1
     break;
+  }
   default:
     r.err = SBI_ERR_NOT_SUPPORTED;
   }
@@ -242,6 +318,8 @@ sbi_dbcn_read(struct vcpu *v, uint64 num, uint64 lo, uint64 hi)
     done++;
   }
   r.val = done;
+  if (done && plat_bootarg("condbg"))
+    printk("hyp: vm %d: dbcn read %ld byte(s) to 0x%lx\n", v->vm->id, (long)done, gpa);
   return r;
 }
 
@@ -254,14 +332,27 @@ hyp_ecall(struct vcpu *v)
   struct sbiret r = {SBI_SUCCESS, 0};
   int legacy = 0;
 
+  if (sbi_hidden(vm, ext)) {
+    // F22: an extension this machine was described without behaves as one
+    // the firmware does not have -- not as one that is broken
+    v->regs[10] = SBI_ERR_NOT_SUPPORTED;
+    v->regs[11] = 0;
+    v->pc += 4;
+    return 0;
+  }
   switch (ext) {
   case SBI_EXT_BASE:
     r = sbi_base(v, fid, a0);
     break;
   case SBI_EXT_TIME:
-    if (fid == 0)
-      v->vstimecmp = a0; // loaded into the hart on the next entry
-    else
+    if (fid == 0) {
+      v->vstimecmp = vm_host_time_of(vm, a0); // in host units; loaded into the hart on the next entry (F6 scales)
+      // and the host's timer to it: a guest without Sstc gets its VSTIP from
+      // this hypervisor, at the deadline -- not at the next host tick, which
+      // is up to ten milliseconds later and made a Linux boot with its
+      // thousands of millisecond sleeps take over ninety seconds (lx8)
+      timer_rearm();
+    } else
       r.err = SBI_ERR_NOT_SUPPORTED;
     break;
   case SBI_EXT_IPI:

@@ -42,10 +42,18 @@ vrtc_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
   return 0; // the clock is the host's; alarms and time writes are ignored
 }
 
+// the model as a device of the machine; also what a revision that gives a
+// machine an RTC registers (F16, hyp.c vm_revise_rtc)
+void
+vrtc_add(struct vm *vm)
+{
+  vm_add_dev(vm, "rtc", G_RTC_IRQ, OBS_RTC, G_RTC_BASE, 0x1000, vrtc_read, vrtc_write, 0);
+}
+
 void
 vrtc_init(struct vm *vm)
 {
   vm->rtc_latch = 0;
-  if (rtc_present())
-    vm_add_dev(vm, "rtc", G_RTC_IRQ, OBS_RTC, G_RTC_BASE, 0x1000, vrtc_read, vrtc_write, 0);
+  if (rtc_present() && !vm->no_rtc)    // F16/F17: a machine may have none
+    vrtc_add(vm);
 }

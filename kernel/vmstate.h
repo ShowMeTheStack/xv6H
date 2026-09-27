@@ -18,7 +18,15 @@
 // and what makes the version matter.
 //
 #define VMSTATE_MAGIC "XV6HVMST"
-#define VMSTATE_VERSION 3   // 3: the CFG section carries obs and vlenb
+#define VMSTATE_VERSION 7   // 4: a handshake after CFG before any memory moves
+// the destination's answer to the CFG section, over a connection
+#define MIG_HS_ACCEPT    'A'
+#define MIG_HS_REFUSE    'R'   // followed by a reason (MIG_REFUSE_*)
+#define MIG_HS_NEGOTIATE 'N'   // followed by a REV_* mask the guest must cede first
+#define MIG_HS_ABORT     'X'   // the source gives up (the guest would not cede)
+#define MIG_REFUSE_VECTOR 1    // the guest holds a vector unit this host cannot give it
+#define MIG_REFUSE_PAGING 2    // the guest's paging mode is deeper than this host's
+#define MIG_REFUSE_MEMORY 3    // the guest holds more memory than this host has
 
 struct vmstate_hdr {
   char magic[8];

@@ -33,6 +33,8 @@
 extern char end[]; // first address after the kernel (kernel.ld)
 
 struct page *pages;
+struct pgrange pgr[2];   // F13
+int npgr = 1;
 
 static struct {
   struct spinlock lock;
@@ -51,6 +53,17 @@ static struct {
 } pcache[NCPU];
 
 #define BLOCK_BYTES(order) ((uint64)PGSIZE << (order))
+
+// does [a, a+bytes) lie within one range's allocatable part? (F13: two ranges)
+static int
+in_alloc_range(uint64 a, uint64 bytes)
+{
+  if (a >= km.alloc_start && a + bytes <= km.alloc_end)
+    return 1;
+  if (npgr > 1 && a >= pgr[1].alloc_start && a + bytes <= pgr[1].alloc_end)
+    return 1;
+  return 0;
+}
 
 // ---- free lists (km.lock held) ----
 
@@ -133,7 +146,13 @@ free_block(struct page *pg, int order)
   km.free_pages += 1UL << order; // the buddies merged below are already counted
   while (order < MAXORDER) {
     uint64 bpa = pa ^ BLOCK_BYTES(order);
-    if (bpa < km.alloc_start || bpa + BLOCK_BYTES(order) > km.alloc_end)
+    // the buddy must lie in the same range's allocatable part (F13: two ranges)
+    uint64 lo = km.alloc_start, hi = km.alloc_end;
+    if (npgr > 1 && pa >= pgr[1].base) {
+      lo = pgr[1].alloc_start;
+      hi = pgr[1].alloc_end;
+    }
+    if (bpa < lo || bpa + BLOCK_BYTES(order) > hi)
       break;
     struct page *bp = PA2PAGE(bpa);
     if (!(bp->flags & PG_FREE) || bp->order != order)
@@ -161,10 +180,15 @@ kinit(void)
   }
 
   // the database covers every frame of RAM and takes the top of it.
+  // (below the description slots the machine keeps at the very top: resv_top)
   uint64 nframes = (plat.ram_end - plat.ram_base) >> PGSHIFT;
   uint64 dbbytes = (nframes * sizeof(struct page) + (2UL << 20) - 1) & ~((2UL << 20) - 1);
-  uint64 dbbase = (plat.ram_end - dbbytes) & ~((2UL << 20) - 1);
+  uint64 dbbase = (plat.ram_end - plat.resv_top - dbbytes) & ~((2UL << 20) - 1);
   pages = (struct page *)dbbase;
+  pgr[0].base = plat.ram_base;      // PA2PAGE/PAGE2PA go through the range table from here on (F13)
+  pgr[0].end = plat.ram_end;
+  pgr[0].pages = pages;
+  npgr = 1;
   km.db_pages = (plat.ram_end - dbbase) >> PGSHIFT;
 
   km.alloc_start = PGROUNDUP((uint64)end);
@@ -175,6 +199,8 @@ kinit(void)
   km.reserve = HOSTMEM >> PGSHIFT;
   if (km.reserve > km.total / 2)
     km.reserve = km.total / 2;
+  if (plat.is_guest)
+    km.reserve = 0;   // the reserve is a host's, kept for its guests; a guest has none to keep (F14: the balloon could not reach it)
 
   // tile the range with the largest aligned blocks that fit: one entry
   // written per block, the rest of the database untouched.
@@ -192,6 +218,51 @@ kinit(void)
   }
   printk("kalloc: %ld MB in %d blocks, page database %ld MB at 0x%lx, host reserve %ld MB\n",
          km.total >> 8, nblocks, km.db_pages >> 8, dbbase, km.reserve >> 8);
+  pgr[0].alloc_start = km.alloc_start;
+  pgr[0].alloc_end = km.alloc_end;
+}
+
+// F13: memory that arrived after boot, [base, end). Mapped into the kernel's
+// direct map, given a page database out of its own first pages, and its
+// blocks handed to the free lists exactly as kinit does for the first range.
+int
+kalloc_grow(uint64 base, uint64 end)
+{
+  if (npgr > 1 || end <= base || (base & (PGSIZE - 1)) || (end & (PGSIZE - 1)))
+    return -1;
+  kvmmap_rt(base, base, end - base, PTE_R | PTE_W);
+  uint64 nframes = (end - base) >> PGSHIFT;
+  uint64 dbbytes = PGROUNDUP(nframes * sizeof(struct page));
+  if (base + dbbytes + 64 * PGSIZE > end)
+    return -1;
+  struct page *db = (struct page *)base;
+  memset(db, 0, dbbytes);
+  acquire(&km.lock);
+  pgr[1].base = base;
+  pgr[1].end = end;
+  pgr[1].alloc_start = base + dbbytes;
+  pgr[1].alloc_end = end;
+  pgr[1].pages = db;
+  __sync_synchronize();
+  npgr = 2;
+  uint64 pa = pgr[1].alloc_start;
+  int nblocks = 0;
+  while (pa < end) {
+    int order = 0;
+    while (order < MAXORDER && (pa & (BLOCK_BYTES(order + 1) - 1)) == 0 &&
+           pa + BLOCK_BYTES(order + 1) <= end)
+      order++;
+    list_add(order, PA2PAGE(pa));
+    km.free_pages += 1UL << order;
+    km.total += 1UL << order;
+    pa += BLOCK_BYTES(order);
+    nblocks++;
+  }
+  km.db_pages += dbbytes >> PGSHIFT;
+  release(&km.lock);
+  printk("kalloc: %ld MB more in %d blocks at 0x%lx, page database %ld KB\n",
+         (end - base) >> 20, nblocks, base, dbbytes >> 10);
+  return 0;
 }
 
 // ---- the interface ----
@@ -259,8 +330,7 @@ kmem_split(void *pa, int order)
 
   if (order <= 0)
     return;
-  if (a < km.alloc_start || a + BLOCK_BYTES(order) > km.alloc_end ||
-      (a & (BLOCK_BYTES(order) - 1)))
+  if (!in_alloc_range(a, BLOCK_BYTES(order)) || (a & (BLOCK_BYTES(order) - 1)))
     panic("kmem_split: bad block");
   struct page *head = PA2PAGE(a);
   if ((head->flags & (PG_INIT | PG_HEAD)) != (PG_INIT | PG_HEAD) ||
@@ -279,7 +349,7 @@ void
 kfree_order(void *pa, int order)
 {
   uint64 a = (uint64)pa;
-  if (a < km.alloc_start || a + BLOCK_BYTES(order) > km.alloc_end || (a & (BLOCK_BYTES(order) - 1)))
+  if (!in_alloc_range(a, BLOCK_BYTES(order)) || (a & (BLOCK_BYTES(order) - 1)))
     panic("kfree_order: bad block");
   struct page *pg = PA2PAGE(a);
   if ((pg->flags & (PG_INIT | PG_HEAD)) != (PG_INIT | PG_HEAD) || pg->order != order)
@@ -400,7 +470,7 @@ void
 kfree(void *pa)
 {
   uint64 a = (uint64)pa;
-  if ((a % PGSIZE) != 0 || a < km.alloc_start || a >= km.alloc_end)
+  if ((a % PGSIZE) != 0 || !in_alloc_range(a, PGSIZE))
     panic("kfree");
   struct page *pg = PA2PAGE(a);
   if ((pg->flags & (PG_INIT | PG_HEAD)) != (PG_INIT | PG_HEAD))
@@ -450,6 +520,31 @@ page_put(struct page *pg)
 // it, and asks whether every page came back. A page of slack there is
 // a page of leak that nobody notices. The lock order is the one kfree
 // uses: a hart's cache first, then the global lists.
+// F21: a page of zeroes. With Zicboz, one cbo.zero per cache block -- at the
+// block size the machine is described with, which is the one fact here a
+// wrong value of does not fail loudly: a stride longer than the block leaves
+// every other block as it was. A revision changes plat.cboz_block, and the
+// next page is zeroed at the new stride.
+void
+page_zero(void *pa)
+{
+  int blk = plat.cboz_block;
+  if (blk >= 16 && blk <= PGSIZE && (blk & (blk - 1)) == 0) {
+    for (char *p = (char *)pa; p < (char *)pa + PGSIZE; p += blk)
+      asm volatile(".insn i 0x0f, 0x2, x0, %0, 4" ::"r"(p) : "memory");   // cbo.zero (p)
+    return;
+  }
+  memset(pa, 0, PGSIZE);
+}
+
+// what the machine has, in pages: grows with F13 (the reserve, if any, is
+// still counted; it is the machine's)
+uint64
+kmem_total_pages(void)
+{
+  return km.total;
+}
+
 uint64
 kmem_free_pages(void)
 {

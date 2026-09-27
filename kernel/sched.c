@@ -1082,6 +1082,28 @@ pick_locked(struct rq *rq)
 // the next task for this hart, taken off the queue, or 0. The caller
 // has not got p->lock; it takes it and checks the state, as the old
 // scheduler did.
+// F8: everything queued on hart `me' goes to hart 0, which is never parked.
+// Only what is here: stealing would pull work from the harts that stay.
+void
+sched_offline_drain(int me)
+{
+  struct rq *rq = &rqs[me];
+  struct proc *p;
+  int n = 0;
+  for (;;) {
+    acquire(&rq->lock);
+    update_curr(rq, sched_now());
+    p = pick_locked(rq);
+    release(&rq->lock);
+    if (p == 0)
+      break;
+    put_here(&rqs[0], p, 0);
+    n++;
+  }
+  if (n)
+    printk("machine: hart %d handed %d task(s) to hart 0\n", me, n);
+}
+
 struct proc *
 sched_pick(void)
 {

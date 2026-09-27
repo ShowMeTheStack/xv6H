@@ -228,7 +228,7 @@ process_queue(struct vm *vm, struct vvirtio *b)
   if (any) {
     acquire(&vm->lock);
     b->intr_status |= 1;
-    vic_set_level(vm, G_VIRTIO_IRQ, 1);
+    vic_set_level(vm, vm_irq(vm, G_VIRTIO_IRQ), 1);
     release(&vm->lock);
   }
 }
@@ -408,7 +408,7 @@ vvirtio_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
     break;
   case VIRTIO_MMIO_INTERRUPT_ACK:
     b->intr_status &= ~val;
-    vic_set_level(vm, G_VIRTIO_IRQ, b->intr_status != 0);
+    vic_set_level(vm, vm_irq(vm, G_VIRTIO_IRQ), b->intr_status != 0);
     break;
   case VIRTIO_MMIO_STATUS:
     b->status = val;
@@ -419,7 +419,7 @@ vvirtio_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
       b->last_avail = 0;
       b->intr_status = 0;
       b->driver_features = 0;
-      vic_set_level(vm, G_VIRTIO_IRQ, 0);
+      vic_set_level(vm, vm_irq(vm, G_VIRTIO_IRQ), 0);
     }
     break;
   case VIRTIO_MMIO_QUEUE_DESC_LOW:

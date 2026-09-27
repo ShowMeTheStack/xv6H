@@ -28,10 +28,14 @@ start(uint64 hartid, uint64 fdt)
 {
   canary_init(hartid);
 
-  // hart 0 learns about the machine from the device tree and configures
-  // the machine-level parts of the interrupt controller; the other harts
-  // wait for it (they may well get here first).
-  if (hartid == 0) {
+  // The first hart to get here is the boot hart -- not "hart 0": a machine may
+  // number its harts from anywhere (F9), and a guest's are numbered by its
+  // host. It learns about the machine from the device tree and configures the
+  // machine-level parts of the interrupt controller; the others wait for it
+  // (they may well get here first).
+  static volatile int booted;
+  int first = __sync_lock_test_and_set(&booted, 1) == 0;
+  if (first) {
     platform_init(fdt);
     aplic_minit();
   } else {
@@ -78,12 +82,20 @@ start(uint64 hartid, uint64 fdt)
 
   // enable hardware updates of page table A and D bits
   w_menvcfg(r_menvcfg() | MENVCFG_ADUE);
+  // and of the cache-block operations (Zicboz/Zicbom), which page zeroing uses (F21)
+  w_menvcfg(r_menvcfg() | MENVCFG_CBZE | MENVCFG_CBCFE | MENVCFG_CBIE);
 
   // ask for clock interrupts.
   timerinit();
 
-  // keep each CPU's hartid in its tp register, for cpuid().
-  w_tp(hartid);
+  // tp is this cpu's *logical* index -- its position among the tree's cpu
+  // nodes -- and cpuid() is that; plat.hartid[cpuid()] is the hart id the
+  // hardware and the controllers know it by. On a machine numbered 0..n-1 the
+  // two agree, as they always did here.
+  int idx = plat_cpu_of_hart(hartid);
+  if (idx < 0)
+    idx = first ? 0 : (int)(hartid % NCPU);
+  w_tp(idx);
 
   // switch to supervisor mode and jump to main().
   asm volatile("mret");

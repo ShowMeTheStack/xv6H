@@ -81,8 +81,7 @@ target_hart(struct vm *vm, int irq)
 {
   if (irq <= 0 || irq >= VAPLIC_NSRC)
     return -1;
-  int h = vm->aplic.target[irq] >> 18;
-  return h < vm->nvcpu ? h : -1;
+  return vm_vcpu_of_hart(vm, vm->aplic.target[irq] >> 18);   // F9: a hart id
 }
 
 static int
@@ -148,10 +147,12 @@ msi_flush(struct vm *vm)
     if (!((cand >> i) & 1))
       continue;
     uint32 t = a->target[i];
-    int hart = t >> 18, eiid = t & 0x7ff;
+    int vcpu = vm_vcpu_of_hart(vm, t >> 18), eiid = t & 0x7ff;   // F9: the target is a hart id
     a->pending &= ~(1UL << i);
-    if (hart < vm->nvcpu && eiid != 0)
-      vic_msi(vm, hart, eiid);
+    if (vm->hart_shift && plat_bootarg("aplicdbg"))
+      printk("aplic: vm %d msi irq %d -> hart %d vcpu %d eiid %d\n", vm->id, i, (int)(t >> 18), vcpu, eiid);
+    if (vcpu >= 0 && eiid != 0)
+      vic_msi(vm, vcpu, eiid);
   }
 }
 
@@ -207,6 +208,10 @@ vaplic_set_level(struct vm *vm, int irq, int level)
   if (irq <= 0 || irq >= VAPLIC_NSRC)
     return;
   int old = (a->level >> irq) & 1;
+  if (vm->hart_shift && plat_bootarg("aplicdbg"))     // only once the harts have moved: the boot would drown
+    printk("aplic: vm %d irq %d level %d->%d active %d pend %lx en %lx ie %d tgt %x\n", vm->id, irq,
+           old, level, is_active(a, irq), (unsigned long)a->pending,
+           (unsigned long)a->enable, (a->domaincfg[DOM_S] & APLIC_DOMAINCFG_IE) != 0, a->target[irq]);
   if (old == level)
     return;
   if (level)
@@ -307,9 +312,9 @@ vaplic_read(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 *val)
     int irq = (off - 0x3004) / 4 + 1;
     v = (dom == DOM_S && is_active(a, irq)) ? a->target[irq] : 0;
   } else if (off >= 0x4000 && off < 0x4000 + 32 * NVCPU) {
-    int h = (off - 0x4000) / 32;
+    int h = vm_vcpu_of_hart(vm, (off - 0x4000) / 32);   // F9: IDCs are per hart id
     int reg = (off - 0x4000) % 32;
-    if (dom == DOM_S && h < vm->nvcpu && !msimode(vm)) {
+    if (dom == DOM_S && h >= 0 && !msimode(vm)) {
       int prio = 0, irq;
       switch (reg) {
       case APLIC_IDC_IDELIVERY: v = a->idelivery[h]; break;
@@ -418,10 +423,12 @@ vaplic_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
       a->target[irq] = w & ((0x3fffu << 18) | (0x3f << 12) | 0x7ff);
     else
       a->target[irq] = (w & (0x3fffu << 18)) | ((w & 0xff) ? (w & 0xff) : 1);
+    if (vm->hart_shift && plat_bootarg("aplicdbg"))
+      printk("aplic: vm %d target irq %d <- %x\n", vm->id, irq, a->target[irq]);
   } else if (off >= 0x4000 && off < 0x4000 + 32 * NVCPU) {
-    int h = (off - 0x4000) / 32;
+    int h = vm_vcpu_of_hart(vm, (off - 0x4000) / 32);   // F9
     int reg = (off - 0x4000) % 32;
-    if (h < vm->nvcpu && !msimode(vm)) {
+    if (h >= 0 && !msimode(vm)) {
       switch (reg) {
       case APLIC_IDC_IDELIVERY: a->idelivery[h] = w & 1; break;
       case APLIC_IDC_IFORCE: a->iforce[h] = w & 1; break;
@@ -438,6 +445,6 @@ void
 vaplic_init(struct vm *vm, int msi)
 {
   memset(&vm->aplic, 0, sizeof(vm->aplic));
-  vm_add_dev(vm, "aplic-m", -1, OBS_INTC, G_APLIC_M, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_M);
-  vm_add_dev(vm, "aplic-s", -1, OBS_INTC, G_APLIC_S, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_S);
+  vm_add_dev(vm, "aplic-m", -1, OBS_INTC, G_APLIC_M + vm->intc_shift, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_M);
+  vm_add_dev(vm, "aplic-s", -1, OBS_INTC, G_APLIC_S + vm->intc_shift, APLIC_MMIO_SIZE, vaplic_read, vaplic_write, (void *)(uint64)DOM_S);
 }

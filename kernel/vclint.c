@@ -27,9 +27,9 @@ vclint_read(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 *val)
 {
   *val = 0;
   if (off < 4 * NVCPU) {
-    int i = off / 4;
+    int i = vm_vcpu_of_hart(vm, off / 4);    // F9
     acquire(&vm->lock);
-    if (i < vm->nvcpu)
+    if (i >= 0)
       *val = vm->clint_msip[i];
     release(&vm->lock);
     return 0;
@@ -46,9 +46,9 @@ static int
 vclint_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
 {
   if (off < 4 * NVCPU) {
-    int i = off / 4;
+    int i = vm_vcpu_of_hart(vm, off / 4);    // F9
     acquire(&vm->lock);
-    if (i < vm->nvcpu) {
+    if (i >= 0) {
       struct vcpu *v = &vm->vcpu[i];
       vm->clint_msip[i] = val & 1;
       if (val & 1) {
@@ -61,9 +61,18 @@ vclint_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
   return 0;
 }
 
+// the model as a device of the machine; also what a revision that gives a
+// machine its CLINT back registers (F4, hyp.c vm_revise_ipi)
+void
+vclint_add(struct vm *vm)
+{
+  vm_add_dev(vm, "clint", -1, OBS_TIMER, G_CLINT_BASE, 0x10000, vclint_read, vclint_write, 0);
+}
+
 void
 vclint_init(struct vm *vm)
 {
   memset(vm->clint_msip, 0, sizeof(vm->clint_msip));
-  vm_add_dev(vm, "clint", -1, OBS_TIMER, G_CLINT_BASE, 0x10000, vclint_read, vclint_write, 0);
+  if (!vm->no_clint)     // F4: a machine without a CLINT sends its IPIs through SBI
+    vclint_add(vm);
 }

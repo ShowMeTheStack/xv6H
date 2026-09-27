@@ -56,7 +56,7 @@ static void
 raise_irq(struct vm *vm, uint32 bits)
 {
   vm->balloon.intr_status |= bits;
-  vic_set_level(vm, G_BALLOON_IRQ, 1);
+  vic_set_level(vm, vm_irq(vm, G_BALLOON_IRQ), 1);
 }
 
 // one buffer of page frame numbers. `take` says whether the pages are
@@ -122,10 +122,23 @@ process_queue(struct vm *vm, int qi)
   struct vq_state *q = &b->q[qi];
   int any = 0, cfg = 0;
 
+  // The statistics queue is not drained when the guest kicks it. The guest
+  // posts a buffer and the device is to use it *when it wants a report*
+  // (the spec's words; QEMU asks only when its monitor does). Taking it at
+  // once made Linux's driver -- which posts the next buffer as soon as one
+  // is taken -- run round the queue at the speed of its workqueue: 11,000
+  // interrupts a second, a Linux guest crawling, and a spinlock touched
+  // before its probe had initialised it (tm1: `spinlock bad magic' in
+  // stats_request). The poller (policy_once, once a second) takes one.
+  if (qi == 2 && !b->stats_go)
+    return;
+
   // bounded, for the reason process_queue in vvirtio.c is bounded: a
   // guest that keeps the available index moving must not be able to
   // keep this loop running.
   for (int done = 0; done < MAXQ; done++) {
+    if (qi == 2 && any)
+      break;              // one report per poll
     uint16 avail_idx, head, used_idx;
     acquire(&vm->lock);
     uint32 num = q->num;
@@ -244,12 +257,27 @@ vballoon_set(struct vm *vm, uint64 bytes)
 
 static uint64 policy_floor[NVM];   // what `vmm balloon` asked for, per VM
 
+// take the statistics report a guest has posted, if any: once a second
+static void
+stats_poll(void)
+{
+  for (int i = 0; i < NVM; i++) {
+    struct vm *vm = vmtab[i];
+    if (vm == 0 || vm->state != VM_RUNNING || !vm->balloon.present)
+      continue;
+    vm->balloon.stats_go = 1;
+    process_queue(vm, 2);
+    vm->balloon.stats_go = 0;
+  }
+}
+
 static void
 policy_once(void)
 {
   struct meminfo mi;
   uint64 free, want;
 
+  stats_poll();
   kmem_info(&mi);
   free = mi.free_pages + blk_reclaimable();
   if (mi.reserve_pages == 0)
@@ -392,7 +420,7 @@ vballoon_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
     break;
   case VIRTIO_MMIO_INTERRUPT_ACK:
     b->intr_status &= ~(uint32)val;
-    vic_set_level(vm, G_BALLOON_IRQ, b->intr_status != 0);
+    vic_set_level(vm, vm_irq(vm, G_BALLOON_IRQ), b->intr_status != 0);
     break;
   case VIRTIO_MMIO_STATUS:
     b->status = val;
@@ -405,7 +433,7 @@ vballoon_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
       b->intr_status = 0;
       b->driver_features = 0;
       b->actual = 0;
-      vic_set_level(vm, G_BALLOON_IRQ, 0);
+      vic_set_level(vm, vm_irq(vm, G_BALLOON_IRQ), 0);
     }
     break;
   case VIRTIO_MMIO_QUEUE_DESC_LOW:
@@ -435,6 +463,18 @@ vballoon_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
 
 // what a person asked for by hand, which the policy thread will not
 // undo. vm_ctl calls this; the thread calls vballoon_set directly.
+// F14: a machine arriving with a balloon the source inflated for this host's
+// sake keeps it: the policy thread's floor is set to what the guest holds, or
+// it would hand the memory back within seconds and the room this host had for
+// the machine would be gone (f14d: 16 MB negotiated, 24 MB resident a moment
+// after arrival).
+void
+vballoon_pin(struct vm *vm)
+{
+  if (vm->id >= 0 && vm->id < NVM)
+    policy_floor[vm->id] = (uint64)vm->balloon.target * PGSIZE;
+}
+
 int
 vballoon_request(struct vm *vm, uint64 bytes)
 {

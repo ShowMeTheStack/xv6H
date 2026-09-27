@@ -200,9 +200,38 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_u32(&w, "xv6h,vmid", vm->id);
 
   node_begin(&w, "chosen");
-  if (vm->cfg.bootargs[0])
+  if ((vm->cfg.flags & VMF_HSM) && vm->online < vm->nvcpu) {
+    // F7/F8 for a guest that boots its own harts: the ones beyond the count
+    // stay offline until its driver is told otherwise
+    char ba[160];
+    int n = 0;
+    for (const char *p = vm->cfg.bootargs; *p && n < 140; p++)
+      ba[n++] = *p;
+    if (n)
+      ba[n++] = ' ';
+    const char *m = "maxcpus=";
+    while (*m)
+      ba[n++] = *m++;
+    if (vm->online >= 10)
+      ba[n++] = '0' + vm->online / 10;
+    ba[n++] = '0' + vm->online % 10;
+    ba[n] = 0;
+    prop_str(&w, "bootargs", ba);
+  } else if (vm->cfg.bootargs[0])
     prop_str(&w, "bootargs", vm->cfg.bootargs);
-  prop_str(&w, "stdout-path", "/soc/serial@10000000");
+  // F18: which console this machine has. The 16550 is always there as a
+  // device (a guest that knows nothing else finds it); what the description
+  // names as *the* console is the fact, and the virtio one exists only when
+  // it is that.
+  if (vm->console_kind == CON_VIRTIO) {
+    char path[48] = "/soc/";
+    unit_name(path + 5, "virtio_mmio", G_CON_BASE + vm->mmio_shift);
+    prop_str(&w, "stdout-path", path);
+  } else if (vm->console_kind == CON_SBI) {
+    prop_str(&w, "stdout-path", "sbi-dbcn");
+  } else {
+    prop_str(&w, "stdout-path", "/soc/serial@10000000");
+  }
   if (vm->cfg.net == 2) {
     // static address for an xv6 guest: ip, mask, gateway, dns.
     uint32 ipc[4] = {vm->cfg.ip, vm->cfg.mask, vm->cfg.gw, vm->cfg.dns};
@@ -226,21 +255,32 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   node_begin(&w, "cpus");
   prop_u32(&w, "#address-cells", 1);
   prop_u32(&w, "#size-cells", 0);
-  prop_u32(&w, "timebase-frequency", 10000000);
+  prop_u32(&w, "timebase-frequency", vm->timebase ? vm->timebase : 10000000);   // F6
   for (int i = 0; i < vm->nvcpu; i++) {
+    int hid = i + vm->hart_shift;     // F9: the hart id this machine gives vcpu i
     memmove(name, "cpu@", 4);
-    if (i >= 10) {
-      name[4] = '0' + i / 10;
-      name[5] = '0' + i % 10;
+    if (hid >= 10) {
+      name[4] = '0' + hid / 10;
+      name[5] = '0' + hid % 10;
       name[6] = 0;
     } else {
-      name[4] = '0' + i;
+      name[4] = '0' + hid;
       name[5] = 0;
     }
     node_begin(&w, name);
     prop_str(&w, "device_type", "cpu");
-    prop_u32(&w, "reg", i);
-    prop_str(&w, "status", "okay");
+    prop_u32(&w, "reg", hid);
+    // F7/F8: a hart beyond the online count. An xv6 guest takes `disabled'
+    // and re-reads it. Linux drops a disabled cpu from its possible set for
+    // good, so for a guest that boots its own harts (VMF_HSM) every hart is
+    // `okay', the parked ones carry a mark, and maxcpus= in bootargs keeps
+    // them offline; the driver (machrev.ko) brings them up and down.
+    if (vm->cfg.flags & VMF_HSM) {
+      prop_str(&w, "status", "okay");
+      if (i >= vm->online)
+        prop_empty(&w, "xv6h,parked");
+    } else
+      prop_str(&w, "status", i < vm->online ? "okay" : "disabled");
     prop_str(&w, "compatible", "riscv");
     // the ISA as this guest may use it; in IMSIC mode the AIA CSRs
     // (Ssaia/Smaia) are part of it, or Linux's IMSIC driver refuses.
@@ -252,14 +292,26 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
       // misa this guest is told about, or it would read V in one place and
       // not the other.
       int vec = plat.has_v && !vm->vec_revoked;
-      const char *base = vec ? "rv64imafdcv_zicsr_zifencei_sstc" : "rv64imafdc_zicsr_zifencei_sstc";
-      const char *exts = vec ? "i\0m\0a\0f\0d\0c\0v\0zicsr\0zifencei\0sstc\0"
-                             : "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0sstc\0";
-      int extlen = vec ? 34 : 32;
+      const char *base = vec ? "rv64imafdcv_zicsr_zifencei" : "rv64imafdc_zicsr_zifencei";
+      const char *exts = vec ? "i\0m\0a\0f\0d\0c\0v\0zicsr\0zifencei\0"
+                             : "i\0m\0a\0f\0d\0c\0zicsr\0zifencei\0";
+      int extlen = vec ? 29 : 27;
       for (const char *p = base; *p; p++)
         isa[n++] = *p;
       memmove(ext, exts, extlen);
       e = extlen;
+      if (!vm->no_sstc && !vm_scaled_time(vm)) {    // F5/F6: the timer this machine has
+        memmove(isa + n, "_sstc", 5);
+        n += 5;
+        memmove(ext + e, "sstc\0", 5);
+        e += 5;
+      }
+      if (vm->cboz_block) {                        // F21: the cache-block size cbo.zero clears
+        memmove(isa + n, "_zicboz", 7);
+        n += 7;
+        memmove(ext + e, "zicboz\0", 7);
+        e += 7;
+      }
       if (vm->vic_kind == VIC_IMSIC) {
         memmove(isa + n, "_smaia_ssaia", 12);
         n += 12;
@@ -272,6 +324,8 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
       prop(&w, "riscv,isa-extensions", ext, e);
     }
     prop_str(&w, "mmu-type", plat.mmu_max >= 48 ? "riscv,sv48" : "riscv,sv39");
+    if (vm->cboz_block)
+      prop_u32(&w, "riscv,cboz-block-size", vm->cboz_block);   // F21
     node_begin(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 1);
     prop_empty(&w, "interrupt-controller");
@@ -288,6 +342,22 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_reg(&w, G_RAM_BASE, vm->ram_size);
   node_end(&w);
 
+  // where the description lives: the boot blob and the two revision slots
+  // below it (hyp.h: desc_gpa). Linux keeps its hands off no-map memory; xv6
+  // reads this node too (platform.c: resv_top)
+  node_begin(&w, "reserved-memory");
+  prop_u32(&w, "#address-cells", 2);
+  prop_u32(&w, "#size-cells", 2);
+  prop_empty(&w, "ranges");
+  {
+    uint64 rbase = vm->dtb_gpa - 2 * VM_DTB_MAX;
+    node_begin(&w, unit_name(uname, "xv6h-description", rbase));
+    prop_reg(&w, rbase, 3 * VM_DTB_MAX);
+    prop_empty(&w, "no-map");
+    node_end(&w);
+  }
+  node_end(&w);
+
   // soc
   node_begin(&w, "soc");
   prop_u32(&w, "#address-cells", 2);
@@ -295,6 +365,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_str(&w, "compatible", "simple-bus");
   prop_empty(&w, "ranges");
 
+  if (!vm->no_clint) {   // F4
   node_begin(&w, "clint@2000000");
   prop_str(&w, "compatible", "riscv,clint0");
   prop_reg(&w, G_CLINT_BASE, 0x10000);
@@ -306,11 +377,12 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   }
   prop_cells(&w, "interrupts-extended", cells, 4 * vm->nvcpu);
   node_end(&w);
+  }
 
   if (vm->vic_kind == VIC_PLIC) {
-    node_begin(&w, "plic@c000000");
+    node_begin(&w, unit_name(uname, "plic", G_PLIC_BASE + vm->intc_shift));
     prop_str(&w, "compatible", "riscv,plic0");
-    prop_reg(&w, G_PLIC_BASE, G_PLIC_SIZE);
+    prop_reg(&w, G_PLIC_BASE + vm->intc_shift, G_PLIC_SIZE);
     prop_u32(&w, "riscv,ndev", 31);
     prop_empty(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 1);
@@ -326,9 +398,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     node_end(&w);
   } else {
     // APLIC: machine domain (root, with the supervisor domain as its child)
-    node_begin(&w, "interrupt-controller@c000000");
+    node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_M + vm->intc_shift));
     prop_str(&w, "compatible", "riscv,aplic");
-    prop_reg(&w, G_APLIC_M, 0x8000);
+    prop_reg(&w, G_APLIC_M + vm->intc_shift, 0x8000);
     prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
     prop_empty(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 2);
@@ -349,9 +421,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_u32(&w, "phandle", 5);
     node_end(&w);
 
-    node_begin(&w, "interrupt-controller@d000000");
+    node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_S + vm->intc_shift));
     prop_str(&w, "compatible", "riscv,aplic");
-    prop_reg(&w, G_APLIC_S, 0x8000);
+    prop_reg(&w, G_APLIC_S + vm->intc_shift, 0x8000);
     prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
     prop_empty(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 2);
@@ -368,9 +440,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     node_end(&w);
 
     if (vm->vic_kind == VIC_IMSIC) {
-      node_begin(&w, "interrupt-controller@24000000");
+      node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_M + vm->intc_shift));
       prop_str(&w, "compatible", "riscv,imsics");
-      prop_reg(&w, G_IMSIC_M, 0x1000L * vm->nvcpu);
+      prop_reg(&w, G_IMSIC_M + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
       for (int i = 0; i < vm->nvcpu; i++) {
         cells[2 * i] = CPU_PHANDLE(i);
         cells[2 * i + 1] = 11;
@@ -387,9 +459,9 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
       prop_u32(&w, "phandle", 7);
       node_end(&w);
 
-      node_begin(&w, "interrupt-controller@28000000");
+      node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_S + vm->intc_shift));
       prop_str(&w, "compatible", "riscv,imsics");
-      prop_reg(&w, G_IMSIC_S, 0x1000L * vm->nvcpu);
+      prop_reg(&w, G_IMSIC_S + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
       for (int i = 0; i < vm->nvcpu; i++) {
         cells[2 * i] = CPU_PHANDLE(i);
         cells[2 * i + 1] = 9;
@@ -408,11 +480,21 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     }
   }
 
+  // the anchor (vmachrev.c): fixed address, fixed line, whatever F2/F3 do
+  node_begin(&w, "machrev@10005000");
+  prop_str(&w, "compatible", "xv6h,machrev");
+  prop_reg(&w, G_MACHREV_BASE, 0x1000);
+  prop_u32(&w, "interrupt-parent", ic_phandle);
+  cells[0] = G_MACHREV_IRQ;
+  cells[1] = 4;
+  prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
+  node_end(&w);
+
   node_begin(&w, "serial@10000000");
   prop_str(&w, "compatible", "ns16550a");
   prop_reg(&w, G_UART_BASE, 0x100);
   prop_u32(&w, "interrupt-parent", ic_phandle);
-  cells[0] = G_UART_IRQ;
+  cells[0] = vm_irq(vm, G_UART_IRQ);
   cells[1] = 4;
   prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
   prop_u32(&w, "clock-frequency", 3686400);
@@ -424,17 +506,17 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_str(&w, "compatible", "virtio,mmio");
   prop_reg(&w, G_VIRTIO_BASE + vm->mmio_shift, 0x1000);
   prop_u32(&w, "interrupt-parent", ic_phandle);
-  cells[0] = G_VIRTIO_IRQ;
+  cells[0] = vm_irq(vm, G_VIRTIO_IRQ);
   cells[1] = 4;
   prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
   node_end(&w);
 
-  if (rtc_present()) {
+  if (rtc_present() && !vm->no_rtc) {    // F16/F17
     node_begin(&w, "rtc@101000");
     prop_str(&w, "compatible", "google,goldfish-rtc");
     prop_reg(&w, G_RTC_BASE, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = G_RTC_IRQ;
+    cells[0] = vm_irq(vm, G_RTC_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -445,7 +527,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_BALLOON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = G_BALLOON_IRQ;
+    cells[0] = vm_irq(vm, G_BALLOON_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -459,7 +541,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_CON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = G_CON_IRQ;
+    cells[0] = vm_irq(vm, G_CON_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -470,7 +552,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_VNET_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = G_VNET_IRQ;
+    cells[0] = vm_irq(vm, G_VNET_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);

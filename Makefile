@@ -96,6 +96,7 @@ OBJS = \
   $K/futex.o \
   $K/sigtramp.o \
   $K/vrtc.o \
+  $K/vmachrev.o \
   $K/sock.o \
   $K/pktcap.o \
   $K/ptrace.o \
@@ -447,6 +448,8 @@ UPROGS=\
 	$U/_editest\
 	$U/_fsbench\
 	$U/_dd\
+	$U/_cksum\
+	$U/_zerocheck\
 	$U/_blkid\
 	$U/_id\
 	$U/_taskset\
@@ -916,7 +919,9 @@ endif
 # in guests. none of these carry state the hypervisor must switch.
 RVA23 ?= 1
 ifeq ($(RVA23),1)
-CPUOPT := $(CPUOPT),zba=true,zbb=true,zbs=true,zcb=true,zicond=true,zfa=true,zfhmin=true,zimop=true,zcmop=true,zawrs=true,zicbom=true,zicboz=true,zicbop=true,zihintntl=true,zihintpause=true,zicntr=true,zihpm=true,zkt=true,supm=true
+# CBOZ sets the cache-block size cbo.zero clears (F21: a fact of the host)
+CBOZ ?= 64
+CPUOPT := $(CPUOPT),zba=true,zbb=true,zbs=true,zcb=true,zicond=true,zfa=true,zfhmin=true,zimop=true,zcmop=true,zawrs=true,zicbom=true,zicboz=true,cboz_blocksize=$(CBOZ),zicbop=true,zihintntl=true,zihintpause=true,zicntr=true,zihpm=true,zkt=true,supm=true
 ifneq ($(VEC),0)
 CPUOPT := $(CPUOPT),zvfhmin=true,zvbb=true,zvkb=true,zvkt=true
 endif

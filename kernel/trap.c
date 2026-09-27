@@ -119,6 +119,15 @@ usertrap(void)
     // a fault the process must answer for
     uint64 cause = r_scause(), addr = r_stval();
     int sig = SIGSEGV, code = SEGV_MAPERR;
+    if (cause == 2 && plat.has_v && p->vstate == 0 &&
+        (p->vstate = kalloc()) != 0) {
+      // a vector instruction (VS was Off, so it traps) from a task created
+      // before the unit was revealed: give it a save area and let it retry
+      memset(p->vstate, 0, PGSIZE);
+      for (int k = 0; k < 4; k++)
+        p->trapframe->vcsrs[k] = 0;
+      goto retry;
+    }
     if (cause == 2) {
       sig = SIGILL;
       code = ILL_ILLOPC;
@@ -134,6 +143,7 @@ usertrap(void)
     }
     signal_fault(p, sig, code, addr);
   }
+retry:
 
   if (killed(p))
     kexit(0);
@@ -207,6 +217,13 @@ prepare_return(void)
     w_sstatus((r_sstatus() & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL);
     vec_restore(p->vstate, p->trapframe->vcsrs);
     w_sstatus((r_sstatus() & ~SSTATUS_VS_MASK) | SSTATUS_VS_CLEAN);
+  } else if (plat.has_v) {
+    // a unit that arrived after this task was created (a revision granted it):
+    // the task has nowhere to save vector state, so it may not use the unit
+    // until it has -- Off makes its first vector instruction trap, and the
+    // trap allocates (usertrap). Without this the registers would be used and
+    // never saved across a context switch.
+    w_sstatus(r_sstatus() & ~SSTATUS_VS_MASK);
   }
 
   // set up the registers that trampoline.S's sret will use
@@ -278,6 +295,16 @@ static uint64 programmed[NCPU];   // what stimecmp is set to
 // end of the running task's slice, and anything a guest is waiting
 // for. Called from the timer interrupt and whenever a task goes on
 // the processor with a slice that ends sooner than the timer is set.
+// F6: the counter's rate changed; the tick deadline set at the old rate would
+// arrive late (or early) at the new one. Forget it: the next re-arm schedules
+// one interval ahead at the new rate. Per hart, called by each as it takes
+// the revision.
+void
+tick_reanchor(void)
+{
+  next_tick[cpuid()] = 0;
+}
+
 void
 timer_rearm(void)
 {
@@ -319,7 +346,10 @@ timer_rearm(void)
   if (next < now + 100)
     next = now + 100;
   programmed[me] = next;
-  w_stimecmp(next);
+  if (plat.has_sstc)
+    w_stimecmp(next);
+  else
+    machine_sbi_set_timer(next);   // F5: a machine without Sstc asks its firmware
 }
 
 // a task has just gone on the processor. If its slice ends before the
@@ -361,6 +391,8 @@ clockintr()
 
   // let the hypervisor wake guests whose virtual timers expired.
   hyp_tick();
+  if (me == 0)
+    console_poll_sbi();    // F18: an SBI console has no line; it is asked
 
   timer_rearm();
 }
@@ -382,6 +414,7 @@ extintr(int irq)
     virtio_disk_intr(idx);
     virtio_net_intr(idx);
     virtio_balloon_intr(idx);
+    virtio_con_intr(idx);
   } else {
     printk("unexpected interrupt irq=%d\n", irq);
   }

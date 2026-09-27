@@ -1529,6 +1529,13 @@ scheduler(void)
 
   c->proc = 0;
   for (;;) {
+    if (c->offline) {
+      // F8: the description no longer has this hart. What was queued here
+      // goes to the harts that remain; then the hart stops, through the
+      // firmware, and comes back only through it (F7).
+      sched_offline_drain(cpuid());
+      machine_hart_park();
+    }
     // The most recent process to run may have had interrupts
     // turned off; enable them to avoid a deadlock if all
     // processes are waiting. Then turn them back off

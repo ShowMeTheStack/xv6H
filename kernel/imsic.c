@@ -93,5 +93,5 @@ imsic_claim(void)
 void
 imsic_ipi(int hart)
 {
-  *(volatile uint32 *)imsic_file_addr(hart, 0) = IMSIC_IPI_ID;
+  *(volatile uint32 *)imsic_file_addr(plat.hartid[hart], 0) = IMSIC_IPI_ID;   // F9: files are per hart id
 }

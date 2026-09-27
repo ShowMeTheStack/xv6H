@@ -831,14 +831,23 @@ vm_revise(struct vm *vm, uint32 what)
                  vm->state != VM_PAUSED))
     return -1;
 
-  // rebuild the blob in place, so a guest that re-reads the address it was
-  // given at boot sees the new description
-  int n = hyp_make_dtb(vm, vm->dtb_gpa, VM_DTB_MAX);
+  // The new description goes to a slot of its own, never over the blob the
+  // guest booted from: Linux's live device tree keeps pointers into that
+  // blob (property values are not copied at unflatten), and rewriting it in
+  // place turned every `reg' in the running kernel's tree into whatever the
+  // new blob had at that offset (lxp3: cpu@0 with reg 3). Two slots below the
+  // boot blob, used alternately, so the one the guest may still be reading
+  // is not the one being written. `describe' answers the current slot.
+  uint64 slot1 = vm->dtb_gpa - VM_DTB_MAX, slot2 = vm->dtb_gpa - 2 * VM_DTB_MAX;
+  uint64 gpa = vm->desc_gpa == slot1 ? slot2 : slot1;
+  int n = hyp_make_dtb(vm, gpa, VM_DTB_MAX);
   if (n < 0)
     return -1;
+  vm->desc_gpa = gpa;
 
   acquire(&vm->lock);
   vm->revise_gen++;
+  vm->revise_what = what;
   vm->revise_adopted = 0;
   vm->revise_asked = r_time();
   vm->revise_done = 0;
@@ -852,6 +861,7 @@ vm_revise(struct vm *vm, uint32 what)
   // nothing the revision is changing.
   for (int i = 0; i < vm->nvcpu; i++)
     vm->vcpu[i].ssip_req = 1;
+  vmachrev_notify(vm);         // and over the anchor, for a guest that listens there (Linux)
   release(&vm->lock);
   for (int i = 0; i < vm->nvcpu; i++)
     vcpu_kick(&vm->vcpu[i]);   // and wake the idle ones
@@ -900,9 +910,38 @@ vm_revise_intc(struct vm *vm, int kind)
   if ((kind == VIC_APLIC || kind == VIC_IMSIC) && plat.intc_kind == INTC_PLIC)
     return -ENOTSUP;                // this host cannot present them honestly
 
+  // Every vcpu out of the guest first, and kept out: rebuilding the model
+  // zeroes each vcpu's IMSIC bookkeeping, and a vcpu inside the guest with a
+  // hardware guest file loaded would come out to find `hwfile == 0', read
+  // nothing back and free nothing -- the file leaks, still delivering to
+  // nobody (a candidate for `frame nobody asked for'). vic_hold is checked in
+  // vcpu_enter under the lock; the kick makes the running ones exit, and the
+  // exit path (vic_vcpu_exit, under the lock) gives the file back.
   acquire(&vm->lock);
+  vm->vic_hold = 1;
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);
+  release(&vm->lock);
+  for (int spins = 0; ; spins++) {
+    int inside = 0;
+    acquire(&vm->lock);
+    for (int i = 0; i < vm->nvcpu; i++)
+      if (vm->vcpu[i].running_hart >= 0 && vm->vcpu[i].running_hart != cpuid())
+        inside++;
+    if (inside == 0)
+      break;                        // the lock is held from here
+    release(&vm->lock);
+    if (spins > 100000) {
+      acquire(&vm->lock);
+      vm->vic_hold = 0;
+      release(&vm->lock);
+      printk("hyp: vm %d: a vcpu would not leave the guest\n", vm->id);
+      return -EAGAIN;
+    }
+  }
   uint64 levels = 0;
   if (vic_levels_snapshot(vm, &levels) < 0) {
+    vm->vic_hold = 0;
     release(&vm->lock);
     return -EAGAIN;                 // inside a handler; the caller retries
   }
@@ -911,6 +950,7 @@ vm_revise_intc(struct vm *vm, int kind)
   vm->imsic_hw = (kind == VIC_IMSIC && vimsic_geilen() > 0 &&
                   !(vm->cfg.flags & VMF_SOFTIMSIC));
   vic_levels_restore(vm, levels);
+  vm->vic_hold = 0;
   release(&vm->lock);
 
   printk("hyp: vm %d: interrupt controller %s -> %s, %d line(s) held\n", vm->id,
@@ -923,6 +963,705 @@ vm_revise_intc(struct vm *vm, int kind)
     acquire(&vm->lock);
     vm->vic_kind = old;
     vic_levels_restore(vm, levels);
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F4: whether the machine has a CLINT -- the guest writes another hart's msip
+// to send an IPI -- or sends its IPIs through SBI is a fact of the machine.
+// Both end as a pending VSSIP on the target vcpu (vclint.c, hypsbi.c send_ipi),
+// so the exchange carries nothing: the model appears or disappears and the
+// guest is told (REV_DEVICES: a device came or went).
+int
+vm_revise_ipi(struct vm *vm, int sbi)
+{
+  sbi = sbi != 0;
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (sbi == vm->no_clint)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->no_clint;
+  vm->no_clint = sbi;
+  if (sbi)
+    vm_del_dev(vm, "clint");
+  else
+    vclint_add(vm);
+  release(&vm->lock);
+  printk("hyp: vm %d: ipis %s -> %s\n", vm->id, old ? "sbi" : "clint", sbi ? "sbi" : "clint");
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->no_clint = old;
+    if (old)
+      vm_del_dev(vm, "clint");
+    else
+      vclint_add(vm);
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F5: where the guest's timer is. With Sstc the guest writes stimecmp (as
+// vstimecmp, in hardware, henvcfg.STCE=1) and VSTIP comes from the hardware
+// comparator. Without it (STCE=0) stimecmp traps as a virtual instruction, the
+// guest asks the SBI timer for its deadline -- which lands in the same
+// v->vstimecmp -- and VSTIP is the hypervisor's to raise: hyp_next_deadline
+// keeps the host timer at the earliest guest deadline, hyp_tick kicks the vcpu
+// out when it passes, and vcpu_enter injects VSTIP through hvip while the
+// deadline is behind. One machine, two timers; the description says which.
+int
+vm_revise_timer(struct vm *vm, int sbi)
+{
+  sbi = sbi != 0;
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (sbi == vm->no_sstc)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->no_sstc;
+  vm->no_sstc = sbi;
+  release(&vm->lock);
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);    // re-enter with the other henvcfg
+  printk("hyp: vm %d: timer %s -> %s\n", vm->id, old ? "sbi" : "sstc", sbi ? "sbi" : "sstc");
+  int r = vm_revise(vm, REV_TIMER);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->no_sstc = old;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F9: how the harts are numbered is a fact of the machine. The guest sees the
+// numbers in mhartid, in a0 at boot and in the tree's cpu nodes, and uses them
+// to address its harts through every controller (the CLINT's msip, the PLIC's
+// contexts, the APLIC's IDCs and MSI targets, the IMSIC's files, the SBI's hart
+// masks); the models translate with vm_vcpu_of_hart(). A guest that keeps a
+// logical index apart from the hart id (xv6: tp) takes a renumbering as a
+// change of the cpu nodes and rebinds its per-hart controller state.
+int
+vm_revise_hartid(struct vm *vm, int shift)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (shift < 0 || shift + vm->nvcpu > NVCPU)
+    return -EINVAL;
+  if (shift == vm->hart_shift)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->hart_shift;
+  vm->hart_shift = shift;
+  release(&vm->lock);
+  printk("hyp: vm %d: harts renumbered %d.. -> %d..\n", vm->id, old, shift);
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->hart_shift = old;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F7/F8: how many of the machine's harts are running. The tree describes all
+// of them; `status' says which. Up: the description changes first and the
+// guest extends its tables, then the host starts the vcpus (SBI HSM, at the
+// kernel's entry, as a hart started late boots) -- in that order, so that a
+// hart finds its own id in the guest's table when it comes up. Down: the
+// description changes and the guest drains and stops the harts itself
+// (SBI HSM stop); the host waits to see them stopped.
+extern struct spinlock tickslock;
+extern uint ticks;
+
+extern struct spinlock tickslock;
+extern uint ticks;
+
+static uint
+now_ticks_hyp(void)
+{
+  acquire(&tickslock);
+  uint t = ticks;
+  release(&tickslock);
+  return t;
+}
+
+int
+vm_revise_cpus(struct vm *vm, int online)
+{
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -EINVAL;
+  if (online < 1 || online > vm->nvcpu)
+    return -EINVAL;
+  if (online == vm->online)
+    return 0;
+  int old = vm->online;
+  acquire(&vm->lock);
+  vm->online = online;
+  release(&vm->lock);
+  printk("hyp: vm %d: cpus %d -> %d\n", vm->id, old, online);
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->online = old;
+    release(&vm->lock);
+    return r;
+  }
+  // the guest's answer, then the harts
+  uint deadline = now_ticks_hyp() + 300;
+  while (now_ticks_hyp() < deadline) {
+    acquire(&vm->lock);
+    int acked = vm->revise_acked == vm->revise_gen;
+    release(&vm->lock);
+    if (acked)
+      break;
+    acquire(&tickslock);
+    sleep_prepare(&ticks);
+    release(&tickslock);
+    sleep();
+  }
+  if (online > old && (vm->cfg.flags & VMF_HSM)) {
+    // a guest that boots its harts itself (Linux: cpu_up -> SBI HSM start at
+    // its own secondary entry) starts them; the host starting them at the
+    // kernel's entry would boot a second kernel
+    printk("hyp: vm %d: hart(s) %d..%d for the guest to start\n", vm->id, old, online - 1);
+  } else if (online > old) {
+    acquire(&vm->lock);
+    for (int i = old; i < online; i++) {
+      struct vcpu *v = &vm->vcpu[i];
+      if (v->hsm_state == HSM_STOPPED && vcpu_hsm_start(v, vm->entry, vm->dtb_gpa) == 0)
+        wakeup(v);
+    }
+    release(&vm->lock);
+    printk("hyp: vm %d: hart(s) %d..%d started\n", vm->id, old, online - 1);
+  } else {
+    // the guest parks them; seen here as HSM-stopped. A Linux guest takes a
+    // second or two per hart (cpu_down: migrate its work, quiesce, HSM stop)
+    deadline = now_ticks_hyp() + ((vm->cfg.flags & VMF_HSM) ? 3000 : 500);
+    int left;
+    do {
+      left = 0;
+      acquire(&vm->lock);
+      for (int i = online; i < old; i++)
+        if (vm->vcpu[i].hsm_state != HSM_STOPPED)
+          left++;
+      release(&vm->lock);
+      if (left == 0)
+        break;
+      acquire(&tickslock);
+      sleep_prepare(&ticks);
+      release(&tickslock);
+      sleep();
+    } while (now_ticks_hyp() < deadline);
+    printk("hyp: vm %d: hart(s) %d..%d %s\n", vm->id, online, old - 1, left ? "did not stop" : "parked");
+  }
+  return 0;
+}
+
+// F21: another cache-block size. The description changes; until the guest has
+// adopted it, cbo.zero is done in software at the larger of the two sizes,
+// so a page zeroed at either stride is a page of zeroes.
+int
+vm_revise_cboz(struct vm *vm, int bytes)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (bytes < 16 || bytes > PGSIZE || (bytes & (bytes - 1)))
+    return -EINVAL;
+  if (bytes == vm->cboz_block)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->cboz_block;
+  vm->cboz_prev = old;
+  vm->cboz_block = bytes;
+  release(&vm->lock);
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);    // re-enter with the other henvcfg
+  printk("hyp: vm %d: cache block %d -> %d bytes (%s)\n", vm->id, old, bytes,
+         bytes == plat.cboz_block ? "the host's, in hardware" : "not the host's, in software");
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->cboz_block = old;
+    vm->cboz_prev = old;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+uint64 hyp_cboz_exits;
+
+// F13: more RAM. The memory node grows; the new chunks are backed as the guest
+// touches them, like the old ones; the guest is told (REV_MEMORY) and adds the
+// range to its allocator. Only *up*: down is F14, negotiated through the
+// balloon, because a description cannot take back memory a kernel has data in.
+int
+vm_grow(struct vm *vm, uint64 bytes)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED && vm->state != VM_NEW))
+    return -EINVAL;
+  if (bytes <= vm->ram_size || (bytes % HCHUNK) != 0 || bytes > VM_MAXMEM)
+    return -EINVAL;
+  if (vm->snap.active)
+    return -EBUSY;                  // a copy is in progress with the old page count
+  int nn = bytes / HCHUNK;
+  uint64 tbytes = (uint64)nn * sizeof(uint64);
+  int order = 0;
+  while (((uint64)PGSIZE << order) < tbytes)
+    order++;
+  uint64 *nt = kalloc_order(order);
+  if (nt == 0)
+    return -ENOMEM;
+  memset(nt, 0, (uint64)PGSIZE << order);
+  acquire(&vm->memlock);
+  uint64 *old = vm->chunk;
+  int on = vm->nchunks;
+  memmove(nt, old, (uint64)on * sizeof(uint64));
+  vm->chunk = nt;                   // the pointer first: readers bound by nchunks
+  __sync_synchronize();
+  vm->nchunks = nn;
+  vm->ram_size = bytes;
+  vm->cfg.mem_mb = bytes >> 20;
+  release(&vm->memlock);
+  // the old table is not freed: vm_touch() and its kin read vm->chunk[k]
+  // without memlock (k bounded by nchunks), and one of them may be holding the
+  // old pointer this instant. A page or two per growth, kept.
+  (void)old;
+  printk("hyp: vm %d: memory %d -> %d MB\n", vm->id, (int)(((uint64)on * HCHUNK) >> 20), (int)(bytes >> 20));
+  return 0;
+}
+
+// F18: the console is a class change beside the interrupt controller: a 16550
+// the guest drives register by register, a virtio-console it feeds by
+// descriptor, or the SBI debug console it calls into -- three programming
+// models for one function. The description names the one this machine has;
+// the guest rebinds its console to it and says so through the new one.
+int
+vm_revise_console(struct vm *vm, int kind)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (kind < CON_UART || kind > CON_SBI)
+    return -EINVAL;
+  if (kind == vm->console_kind)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->console_kind;
+  vm->console_kind = kind;
+  if (kind == CON_VIRTIO && !vm->con.present) {
+    vm->con.present = 1;
+    vvcon_add(vm);
+  } else if (kind != CON_VIRTIO && vm->con.present) {
+    vm->con.present = 0;
+    vm_del_dev(vm, "virtio-con");
+  }
+  release(&vm->lock);
+  static const char *names[] = {"uart", "virtio", "sbi"};
+  printk("hyp: vm %d: console %s -> %s\n", vm->id, names[old], names[kind]);
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->console_kind = old;
+    if (old == CON_VIRTIO && !vm->con.present) {
+      vm->con.present = 1;
+      vvcon_add(vm);
+    } else if (old != CON_VIRTIO && vm->con.present) {
+      vm->con.present = 0;
+      vm_del_dev(vm, "virtio-con");
+    }
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F16/F17: a device that comes or goes. The RTC is the one chosen for it: a
+// machine may have a wall clock or not, the tree says which, and a guest that
+// loses it keeps a software clock from the last reading while one that gains
+// it re-anchors. Nothing to negotiate: an RTC is never "in use" in the sense
+// a mounted disk is (F17's refusal is for those), so the removal is told and
+// taken.
+int
+vm_revise_rtc(struct vm *vm, int on)
+{
+  on = on != 0;
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (on && !rtc_present())
+    return -ENOTSUP;            // this host has no clock to model
+  if (on == !vm->no_rtc)
+    return 0;
+  acquire(&vm->lock);
+  int old = vm->no_rtc;
+  vm->no_rtc = !on;
+  if (on)
+    vrtc_add(vm);
+  else
+    vm_del_dev(vm, "rtc");
+  release(&vm->lock);
+  printk("hyp: vm %d: rtc %s\n", vm->id, on ? "added" : "removed");
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->no_rtc = old;
+    if (old)
+      vm_del_dev(vm, "rtc");
+    else
+      vrtc_add(vm);
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F19: the NIC's identity. Not a fact of the *description* -- the tree does
+// not carry a MAC -- but a fact of the machine the guest can observe, and one
+// that changes at a host of another policy. It is told the way the device
+// class provides: a configuration change, re-read by the driver.
+int
+vm_revise_mac(struct vm *vm, int alt)
+{
+  alt = alt != 0;
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -EINVAL;
+  if (alt == vm->mac_alt)
+    return 0;
+  acquire(&vm->lock);
+  vm->mac_alt = alt;
+  vm->vnet.mac[3] = alt ? 0x79 : 0x78;
+  vvnet_mac_changed(vm);
+  release(&vm->lock);
+  printk("hyp: vm %d: nic identity -> 52:54:00:%x:76:%x\n", vm->id, vm->vnet.mac[3], vm->vnet.mac[5]);
+  return 0;
+}
+
+// F6: the timebase-frequency is a fact of the machine, and the one whose
+// change has a stated cost. A machine described with a rate other than the
+// host's cannot be allowed to read `time' directly (hcounteren.TM=0: the read
+// traps and is scaled), and its timer cannot be the hardware comparator (the
+// deadline is in its units): the SBI timer path of F5 carries it, with the
+// deadline converted here. The guest's clock stays continuous across the
+// change because the conversion is of the whole count, not of a delta.
+//
+// The *value* of the clock is continuous across a change of rate: what changes
+// is how fast it advances from here. A kernel that computes elapsed ticks from
+// two readings cannot survive its counter jumping to a tenth or ten times of
+// itself (m2c: the guest never acknowledged). So guest time is
+// tb_g0 + scale(X - tb_x0), with X = host time + htimedelta and (tb_x0, tb_g0)
+// the moment and the value at the last change; and a machine described as
+// 1 MHz from birth simply has tb_x0 = tb_g0 = 0.
+static uint64
+scale_by(uint64 x, uint64 num, uint64 den)
+{
+  return (x / den) * num + ((x % den) * num) / den;
+}
+
+uint64
+vm_guest_time(struct vm *vm)
+{
+  uint64 x = r_time() + vm->htimedelta;
+  if (!vm_scaled_time(vm))
+    return x;
+  return vm->tb_g0 + scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
+}
+
+uint64
+vm_guest_time_of(struct vm *vm, uint64 x)
+{
+  if (!vm_scaled_time(vm) || x == ~0UL)
+    return x;
+  if (x < vm->tb_x0)
+    return vm->tb_g0;
+  return vm->tb_g0 + scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
+}
+
+uint64
+vm_host_time_of(struct vm *vm, uint64 gt)
+{
+  if (!vm_scaled_time(vm) || gt == ~0UL)
+    return gt;
+  if (gt < vm->tb_g0)
+    return vm->tb_x0;                       // already behind: fires at once
+  return vm->tb_x0 + scale_by(gt - vm->tb_g0, HOST_TIMEBASE, vm->timebase);
+}
+
+int
+vm_revise_timebase(struct vm *vm, uint32 hz)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (hz == HOST_TIMEBASE)
+    hz = 0;
+  if (hz != 0 && (hz < 1000 || hz > 1000000000))
+    return -EINVAL;
+  if (hz == vm->timebase)
+    return 0;
+  acquire(&vm->lock);
+  uint32 old = vm->timebase;
+  uint64 ox0 = vm->tb_x0, og0 = vm->tb_g0;
+  // continuity: the value now, under the old rate, is where the new rate starts
+  uint64 gnow = vm_guest_time(vm);
+  vm->tb_x0 = r_time() + vm->htimedelta;
+  vm->tb_g0 = gnow;
+  vm->timebase = hz;
+  // deadlines were set in the old units; they mean the same moment in the new
+  for (int i = 0; i < vm->nvcpu; i++)
+    ;                           // (vstimecmp is kept in host units: unchanged)
+  release(&vm->lock);
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);    // re-enter with the other hcounteren/henvcfg
+  printk("hyp: vm %d: timebase %u -> %u Hz (clock at %lu)\n", vm->id, old ? old : (uint32)HOST_TIMEBASE,
+         hz ? hz : (uint32)HOST_TIMEBASE, (unsigned long)gnow);
+  int r = vm_revise(vm, REV_TIMER);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->timebase = old;
+    vm->tb_x0 = ox0;
+    vm->tb_g0 = og0;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F14: how much of this host's memory a guest arriving here may be resident
+// in -- what is free above the host's own reserve, capped by `guestmem=MB' on
+// the command line (a host that keeps its guests small, or a test that wants
+// a definite number).
+uint64
+hyp_guest_room_bytes(void)
+{
+  struct meminfo mi;
+  kmem_info(&mi);
+  uint64 room = mi.free_pages > mi.reserve_pages ? (mi.free_pages - mi.reserve_pages) * PGSIZE : 0;
+  uint64 cap = plat_bootarg_num("guestmem") << 20;
+  if (cap && cap < room)
+    room = cap;
+  return room;
+}
+
+// F22: the set of SBI extensions is a fact of the machine -- a firmware that
+// lacks RFENCE or HSM is a different machine to boot on, and Linux decides at
+// boot which paths to take from exactly this set. The host can withhold any of
+// six (`nosbi=time', `nosbi=ipi', `nosbi=rfence', `nosbi=hsm', `nosbi=srst',
+// `nosbi=dbcn'); the machine's own set is carried with it, and a change is a
+// revision the guest re-probes for (REV_SBI).
+uint32
+sbi_hidden_default(void)
+{
+  uint32 h = 0;
+  if (plat_bootarg("nosbi=time"))   h |= SBIH_TIME;
+  if (plat_bootarg("nosbi=ipi"))    h |= SBIH_IPI;
+  if (plat_bootarg("nosbi=rfence")) h |= SBIH_RFENCE;
+  if (plat_bootarg("nosbi=hsm"))    h |= SBIH_HSM;
+  if (plat_bootarg("nosbi=srst"))   h |= SBIH_SRST;
+  if (plat_bootarg("nosbi=dbcn"))   h |= SBIH_DBCN;
+  return h;
+}
+
+int
+vm_revise_sbi(struct vm *vm, uint32 hidden)
+{
+  hidden &= SBIH_ALL;
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (hidden == vm->sbi_hidden)
+    return 0;
+  acquire(&vm->lock);
+  uint32 old = vm->sbi_hidden;
+  vm->sbi_hidden = hidden;
+  release(&vm->lock);
+  printk("hyp: vm %d: sbi extensions withheld 0x%x -> 0x%x\n", vm->id, old, hidden);
+  int r = vm_revise(vm, REV_SBI);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->sbi_hidden = old;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F23: whether an IMSIC guest's interrupts arrive through a hardware guest
+// interrupt file or through the software model is *not* a fact of the machine:
+// the guest sees the same IMSIC either way. It is a fact of the host, and it can
+// be changed under the guest at any time -- vimsic_exit() reads the file back
+// into the model on every exit and vimsic_enter() loads it into a file or not,
+// so the switch is a flag and a kick. What differs is the exits per interrupt.
+int
+vm_set_imsic_hw(struct vm *vm, int on)
+{
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -EINVAL;
+  if (vm->vic_kind != VIC_IMSIC)
+    return -ENOTSUP;
+  if (on && (plat.intc_kind != INTC_IMSIC || vimsic_geilen() == 0))
+    return -ENOTSUP;
+  acquire(&vm->lock);
+  int was = vm->imsic_hw;
+  vm->imsic_hw = on != 0;
+  release(&vm->lock);
+  if (was != vm->imsic_hw)
+    for (int i = 0; i < vm->nvcpu; i++)
+      vcpu_kick(&vm->vcpu[i]);     // leave and re-enter: the model or the file
+  printk("hyp: vm %d: imsic delivery %s -> %s\n", vm->id,
+         was ? "hardware file" : "software model", vm->imsic_hw ? "hardware file" : "software model");
+  return 0;
+}
+
+// F24: how the guest's memory is backed (2 MB blocks or 4 KB pages) is a fact of
+// the host too. Splitting everything is what a snapshot does before it can
+// write-protect a page; here it is done on request, so that the change can be
+// made under a running guest and shown to be invisible to it.
+int
+vm_split_all(struct vm *vm)
+{
+  if (vm == 0 || vm->state != VM_RUNNING)
+    return -EINVAL;
+  int n = 0;
+  for (int k = 0; k < vm->nchunks; k++) {
+    acquire(&vm->memlock);
+    int backed = vm->chunk && vm->chunk[k] != 0 && !gc_split(vm->chunk[k]);
+    release(&vm->memlock);
+    if (backed && vm_split(vm, G_RAM_BASE + (uint64)k * HCHUNK) == 0)
+      n++;
+  }
+  printk("hyp: vm %d: %d block(s) split to pages\n", vm->id, n);
+  return 0;
+}
+
+// F3: the number of the line a device raises is a fact of the machine, as its
+// address is. Two numberings exist: the default (uart 10, virtio 1..4, rtc 11)
+// and the alternative (`guestirq=alt': uart 7, virtio 11..14, rtc 15), which is
+// how a host that wires its devices differently is made. Every place a model
+// raises a line, registers itself, or is described in the tree goes through here.
+static int
+irq_map(int alt, int irq)
+{
+  if (!alt)
+    return irq;
+  switch (irq) {
+  case G_UART_IRQ:    return 7;
+  case G_VIRTIO_IRQ:  return 11;
+  case G_VNET_IRQ:    return 12;
+  case G_BALLOON_IRQ: return 13;
+  case G_CON_IRQ:     return 14;
+  case G_RTC_IRQ:     return 15;
+  }
+  return irq;
+}
+
+int
+vm_irq(struct vm *vm, int irq)
+{
+  return irq_map(vm->irq_alt, irq);
+}
+
+// Renumber a running guest's interrupt lines and tell it. What the host owns --
+// which lines the devices are holding asserted -- is carried across by number:
+// a line held as 1 (virtio) is held as 11 afterwards. Everything the guest
+// configured (enables, priorities) it rebuilds when it adopts the description
+// (machine.c: intc_init() after the numbering changed), exactly as for a change
+// of controller kind, and the model is rebuilt the same way.
+int
+vm_revise_irqmap(struct vm *vm, int alt)
+{
+  alt = alt != 0;
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (alt == vm->irq_alt)
+    return 0;
+  acquire(&vm->lock);
+  uint64 levels = 0;
+  if (vic_levels_snapshot(vm, &levels) < 0) {
+    release(&vm->lock);
+    return -EAGAIN;
+  }
+  int old = vm->irq_alt;
+  uint64 moved = 0;
+  for (int i = 0; i < vm->ndev; i++) {
+    struct vdev *d = &vm->dev[i];
+    if (d->irq0 < 0)
+      continue;
+    if (levels & (1ull << d->irq))
+      moved |= 1ull << irq_map(alt, d->irq0);
+    d->irq = irq_map(alt, d->irq0);
+  }
+  vm->irq_alt = alt;
+  // The same controller, the lines moved: drop what was held on the old
+  // numbers and hold it on the new ones, in the model as it stands. *Not*
+  // vic_levels_restore(): that rebuilds the model from nothing, and on an
+  // IMSIC host with a hardware guest file loaded on a running vcpu it zeroes
+  // the per-vcpu file bookkeeping (hwfile) underneath it -- the exit then
+  // reads nothing back and frees nothing, the guest's enables are lost with
+  // the file, and no interrupt is ever delivered again (m2a: the
+  // guest-revise-irqmap-imsic hang, reproduced on the laptop).
+  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+    if (levels & (1ull << irq))
+      vic_set_level(vm, irq, 0);
+  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+    if (moved & (1ull << irq))
+      vic_set_level(vm, irq, 1);
+  release(&vm->lock);
+  printk("hyp: vm %d: interrupt lines renumbered %s -> %s, %d line(s) held\n", vm->id,
+         old ? "alt" : "default", alt ? "alt" : "default", vic_held(moved));
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    for (int i = 0; i < vm->ndev; i++)
+      if (vm->dev[i].irq0 >= 0)
+        vm->dev[i].irq = irq_map(old, vm->dev[i].irq0);
+    vm->irq_alt = old;
+    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+      if (moved & (1ull << irq))
+        vic_set_level(vm, irq, 0);
+    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+      if (levels & (1ull << irq))
+        vic_set_level(vm, irq, 1);
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// Move a running guest's interrupt controller registers to another address (F2).
+//
+// The controller keeps its kind and all of its state; only the window the guest
+// reaches it through changes, exactly as a virtio device's does on the layout
+// axis. The models address their registers by offset from the window (vdev
+// read/write take `off'), so the move is the window's base and the description.
+// The guest, told, maps the new window and rebinds its driver (machine.c: it
+// compares the bases, not only the kind).
+int
+vm_revise_intc_addr(struct vm *vm, uint64 shift)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (shift != 0 && shift != G_INTC_ALT_SHIFT)
+    return -EINVAL;
+  if (shift == vm->intc_shift)
+    return 0;
+  acquire(&vm->lock);
+  uint64 old = vm->intc_shift;
+  for (int i = 0; i < vm->ndev; i++)
+    if (vm->dev[i].obs == OBS_INTC)
+      vm->dev[i].base = vm->dev[i].base - old + shift;
+  vm->intc_shift = shift;
+  release(&vm->lock);
+  printk("hyp: vm %d: interrupt controller registers +0x%lx -> +0x%lx\n", vm->id, old, shift);
+  int r = vm_revise(vm, REV_INTC);
+  if (r < 0) {
+    acquire(&vm->lock);
+    for (int i = 0; i < vm->ndev; i++)
+      if (vm->dev[i].obs == OBS_INTC)
+        vm->dev[i].base = vm->dev[i].base - shift + old;
+    vm->intc_shift = old;
     release(&vm->lock);
     return r;
   }
@@ -955,6 +1694,7 @@ vm_revise_vector(struct vm *vm, int on)
 
   acquire(&vm->lock);
   vm->vec_revoked = !on;
+  vm->vec_pending = 1;
   // Off when revoked, so the next vector instruction is an illegal-instruction
   // trap; Initial when granted, which is what a guest expects of a unit it has
   // not used yet.
@@ -971,6 +1711,7 @@ vm_revise_vector(struct vm *vm, int on)
   if (r < 0) {
     acquire(&vm->lock);
     vm->vec_revoked = !vm->vec_revoked;
+    vm->vec_pending = 0;
     release(&vm->lock);
     return r;
   }
@@ -1015,8 +1756,10 @@ vm_unshare(struct vm *vm, uint64 gpa)
         // write that brought us here is charged to the snapshot by
         // vmsnap_before_write; the ones after it need a fault of their own.
         *pte = PA2PTE(fresh) | GPTE_LEAF;
-        if (vm->snap.active)
+        if (vm->snap.active && !vm->snap.precopy)
           *pte &= ~(uint64)PTE_W;
+        else if (vm->snap.active)
+          vmsnap_before_write(vm, gpa);   // marked again here, see below
         old = frame;
         fresh = 0;
         r = 1;
@@ -1027,8 +1770,28 @@ vm_unshare(struct vm *vm, uint64 gpa)
       // because the snapshot wants to hear about every write to it, not
       // just the first. Leaving PTE_W set here is what made five pages of
       // a 48 MB migration change with nobody marking them.
+      //
+      // A pre-copy is different: it re-protects every page at the start of
+      // each round (vm_snap_protect, before the round's dirty set is taken),
+      // so one fault per page per round is all it needs to hear -- the mark
+      // that brought us here covers every later write until the next round.
+      // Leaving the page read-only made every store a trap for the rest of
+      // the round: a guest running `dd' under the copy took 3.8 million
+      // faults and 249 s to move 48 MB (fam8, snap-migrate-busy), and the
+      // destination gave up waiting. `nobody had marked' stays the check.
+      //
+      // The mark and the write-enable have to be one step. The caller marked
+      // before taking memlock; a round's `take' (dirty -> send, lock-free) and
+      // its re-protect (under memlock) can both run in between, and then the
+      // mark sits in the set being sent while the page is handed back writable
+      // *after* the re-protect made it read-only -- every later write of the
+      // round unrecorded (busy3: `2 page(s) nobody had marked'). Marking again
+      // here, under the lock the re-protect takes, puts the mark in the set
+      // that the re-protect follows, whichever order the three ran in.
       pg->flags &= ~(uint16)PG_KSM;
-      if (!vm->snap.active)
+      if (vm->snap.active && vm->snap.precopy)
+        vmsnap_before_write(vm, gpa);
+      if (!vm->snap.active || vm->snap.precopy)
         *pte |= PTE_W;
       r = 1;
     }
@@ -1117,6 +1880,35 @@ copy_step(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
   return -1;
 }
 
+// As vm_copyin, but a page that is not backed stays that way: -1 says so. The
+// pre-copy sweep uses this. vm_copyin's copy_step goes through vm_touch, which
+// *backs* an unbacked page -- writable, unprotected, unmarked -- and then
+// reports it "not backed" to the sweep, which records zeroes for it; the guest
+// writes it moments later without a fault (dd filling fresh tmpfs pages), and
+// the page reaches the far end as zeroes. Found as `0x805f9000 changed under
+// the copy and nobody had marked it (content)' (busy10c), by the verifying
+// round. Older than everything in this file's journal.
+int
+vm_peek(struct vm *vm, void *dst, uint64 gpa, uint64 n)
+{
+  while (n > 0) {
+    uint64 hpa, len;
+    acquire(&vm->memlock);
+    if (gpa2hpa_locked(vm, gpa, &hpa, &len) < 0) {
+      release(&vm->memlock);
+      return -1;
+    }
+    if (len > n)
+      len = n;
+    memmove(dst, (void *)hpa, len);
+    release(&vm->memlock);
+    dst = (char *)dst + len;
+    gpa += len;
+    n -= len;
+  }
+  return 0;
+}
+
 int
 vm_copyin(struct vm *vm, void *dst, uint64 gpa, uint64 n)
 {
@@ -1146,17 +1938,17 @@ vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n)
   // contents of the buffer it read into. Marking the pages dirty is all
   // that is needed and is safe from any context: this is called with
   // netlock held, where writing a page to a file would not be.
-  if (vm->snap.active && vm->snap.dirty && n > 0 &&
-      gpa >= G_RAM_BASE && gpa < G_RAM_BASE + vm->ram_size) {
-    uint64 last = gpa + n - 1;
-    if (last >= G_RAM_BASE + vm->ram_size)
-      last = G_RAM_BASE + vm->ram_size - 1;
-    for (uint64 p = gpa & ~(uint64)(PGSIZE - 1); p <= last; p += PGSIZE) {
-      int idx = (int)((p - G_RAM_BASE) / PGSIZE);
-      if (idx < vm->snap.npages)
-        vmsnap_mark(vm->snap.dirty, idx);
-    }
-  }
+  //
+  // And the mark has to come *after* the write. Marked before, it could be
+  // taken into a pre-copy round's send set and the page copied over, and
+  // only then the memmove land: content changed, mark consumed, nobody the
+  // wiser. That was `page 0x80139000 changed under the copy and nobody had
+  // marked it' (busy6a) -- the virtio-blk used ring, written by the disk
+  // thread. Marked after, the mark either follows the round's take (next
+  // round's set) or precedes it, in which case the copy, which follows the
+  // take, sees the write. Older than the one-fault-per-round change; found
+  // by the verifying last round.
+  uint64 gpa0 = gpa, n0 = n;
   while (n > 0) {
     uint64 hpa, len;
     if (copy_step(vm, gpa, &hpa, &len) < 0)
@@ -1168,6 +1960,17 @@ vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n)
     src = (char *)src + len;
     gpa += len;
     n -= len;
+  }
+  if (vm->snap.active && vm->snap.dirty && n0 > 0 &&
+      gpa0 >= G_RAM_BASE && gpa0 < G_RAM_BASE + vm->ram_size) {
+    uint64 last = gpa0 + n0 - 1;
+    if (last >= G_RAM_BASE + vm->ram_size)
+      last = G_RAM_BASE + vm->ram_size - 1;
+    for (uint64 p = gpa0 & ~(uint64)(PGSIZE - 1); p <= last; p += PGSIZE) {
+      int idx = (int)((p - G_RAM_BASE) / PGSIZE);
+      if (idx < vm->snap.npages)
+        vmsnap_mark(vm->snap.dirty, idx);
+    }
   }
   return 0;
 }
@@ -1533,7 +2336,7 @@ vcpu_reset(struct vcpu *v, struct vm *vm, int id)
   v->id = id;
   v->running_hart = -1;
   v->pc = vm->entry;
-  v->regs[10] = id;          // a0 = hartid
+  v->regs[10] = id + vm->hart_shift;   // a0 = hartid (F9: as this machine numbers them)
   v->regs[11] = vm->dtb_gpa; // a1 = device tree
   v->priv = 1;               // VS mode
   v->in_mmode = 1;           // running the guest's machine-mode boot code
@@ -1541,7 +2344,7 @@ vcpu_reset(struct vcpu *v, struct vm *vm, int id)
   v->scounteren = 7; // as firmware would: user access to cycle, time, instret
   v->last_hart = -1;
   // with VMF_HSM only vcpu 0 boots; the others wait for SBI hart_start.
-  v->hsm_state = ((vm->cfg.flags & VMF_HSM) && id != 0) ? HSM_STOPPED : HSM_STARTED;
+  v->hsm_state = (((vm->cfg.flags & VMF_HSM) && id != 0) || id >= vm->online) ? HSM_STOPPED : HSM_STARTED;   // F7/F8
 }
 
 // SBI HSM hart_start: give a stopped vcpu a fresh state and let it run.
@@ -1558,7 +2361,7 @@ vcpu_hsm_start(struct vcpu *v, uint64 addr, uint64 opaque)
   if (v->vstate)
     memset(v->vstate, 0, PGSIZE);
   v->pc = addr;
-  v->regs[10] = v->id;
+  v->regs[10] = v->id + v->vm->hart_shift;
   v->regs[11] = opaque;
   v->priv = 1;
   v->in_mmode = 0;
@@ -1683,15 +2486,15 @@ static int
 vm_create_flags(struct vmconfig *cfg, int noload)
 {
   if (!plat.has_h)
-    return -1;
+    return -ENOTSUP;
   int nvcpu = cfg->nvcpu;
   uint64 mem_bytes = (uint64)cfg->mem_mb * 1024 * 1024;
   if (nvcpu < 1 || nvcpu > NVCPU)
-    return -1;
+    return -EINVAL;
   if (mem_bytes < 8 * HCHUNK || (mem_bytes % HCHUNK) != 0 || mem_bytes > VM_MAXMEM)
-    return -1;
+    return -EINVAL;
   if (cfg->kernel[0] == 0 && !noload)
-    return -1;
+    return -EINVAL;
 
   // a slot: a VM object is allocated the first time its slot is used and
   // kept for reuse (struct vm is large: vcpus, interrupt controller
@@ -1707,7 +2510,7 @@ vm_create_flags(struct vmconfig *cfg, int noload)
       if (o && o->state != VM_FREE && o->owner == uid &&
           strncmp(o->cfg.name, cfg->name, VM_NAMELEN) == 0) {
         release(&vmslock);
-        return -1;
+        return -EEXIST;
       }
     }
   }
@@ -1741,9 +2544,10 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   }
   release(&vmslock);
   if (vm == 0)
-    return -1;
+    return -ENOSPC;
 
   int id = vm->id;
+  int err = -ENOMEM;        // why a `goto fail' failed; `vmm' shows it
   struct spinlock lk = vm->lock, mlk = vm->memlock;
   memset(vm, 0, sizeof(*vm));
   vm->lock = lk;
@@ -1756,6 +2560,9 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   // path both a fresh slot and a reused one go through
   vm->obs = 0;
   vm->obs_t0 = r_time();
+  vm->lazy_v = (cfg->flags & VMF_LAZYV) || plat_bootarg("lazyv=1");
+  if (vm->lazy_v && plat.has_v)
+    vm->vec_revoked = 1;          // hidden until asked for, by use
   initlock(&vm->portlock, "vmports");
   // a machine whose gateway is a gateway object is behind it, on that
   // object's private subnet rather than on the switch's own segment.
@@ -1821,8 +2628,10 @@ vm_create_flags(struct vmconfig *cfg, int noload)
               ((uint64)(id + 1) << HGATP_VMID_SHIFT) |
               ((uint64)vm->hgatp_root >> 12);
 
-  // the guest device tree sits in the last 64 KB of guest RAM.
+  // the guest device tree sits in the last 64 KB of guest RAM; revisions
+  // go to the two 64 KB slots below it (hyp.h: desc_gpa)
   vm->dtb_gpa = G_RAM_BASE + vm->ram_size - 0x10000;
+  vm->desc_gpa = vm->dtb_gpa;
 
   // the disk: a regular file in the host file system, or a whole block
   // device -- a disk, a partition, a loop device -- handed to the guest
@@ -1832,6 +2641,7 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   if (cfg->disk[0]) {
     struct inode *ip = namei(cfg->disk);
     if (ip == 0) {
+      err = -ENOENT;
       goto fail;
     }
     ilock(ip);
@@ -1841,12 +2651,14 @@ vm_create_flags(struct vmconfig *cfg, int noload)
     iunlock(ip);
     if (!ok) {
       iput(ip);
+      err = -EINVAL;
       goto fail;
     }
     if (isdev) {
       struct gendisk *d = blk_by_index(minor);
       if (d == 0 || d->nsectors == 0 || d->claimed || disk_in_use(vm, 0, d)) {
         iput(ip);
+        err = -EBUSY;
         goto fail;
       }
       d->claimed = 1;
@@ -1855,6 +2667,7 @@ vm_create_flags(struct vmconfig *cfg, int noload)
     } else {
       if (disk_in_use(vm, ip, 0)) {
         iput(ip);
+        err = -EBUSY;
         goto fail;
       }
       vm->disk_ip = ip;
@@ -1879,6 +2692,57 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   // block up by a megabyte, which is how a host of a different shape is made)
   vm->mmio_shift = (cfg->flags & VMF_MMIO_SET) ? cfg->mmio_shift
                  : plat_bootarg("guestmap=alt") ? G_MMIO_ALT_SHIFT : 0;
+  // and where its interrupt controller is (F2): the same rule
+  vm->intc_shift = (cfg->flags & VMF_INTC_SET) ? cfg->intc_shift
+                 : plat_bootarg("guestintc=alt") ? G_INTC_ALT_SHIFT : 0;
+  // and how its interrupt lines are numbered (F3): the same rule again
+  vm->irq_alt = (cfg->flags & VMF_IRQ_SET) ? (cfg->irq_alt != 0)
+              : plat_bootarg("guestirq=alt") ? 1 : 0;
+  // and which SBI extensions it is offered (F22): `nosbi=rfence' and friends
+  // on the host command line withhold one each
+  vm->sbi_hidden = (cfg->flags & VMF_SBI_SET) ? (cfg->sbi_hidden & SBIH_ALL) : sbi_hidden_default();
+  // how it sends IPIs (F4) and where its timer is (F5): `guestipi=sbi' and
+  // `guesttimer=sbi' on the host command line make hosts without a CLINT and
+  // without Sstc
+  vm->no_clint = (cfg->flags & VMF_IPI_SET) ? (cfg->no_clint != 0) : plat_bootarg("guestipi=sbi");
+  vm->no_sstc = (cfg->flags & VMF_TIMER_SET) ? (cfg->no_sstc != 0) : plat_bootarg("guesttimer=sbi");
+  // and the rate its clock is described as running at (F6): `guesttimebase=HZ'
+  vm->timebase = (cfg->flags & VMF_TIMEBASE_SET) ? cfg->timebase : (uint32)plat_bootarg_num("guesttimebase");
+  if (vm->timebase == HOST_TIMEBASE)
+    vm->timebase = 0;
+  // and how its harts are numbered (F9): `guesthart=4' makes a host whose
+  // guests' harts are 4..; ids stay below NVCPU so a guest can index by them
+  vm->hart_shift = (cfg->flags & VMF_HART_SET) ? cfg->hart_shift : (int)plat_bootarg_num("guesthart");
+  if (vm->hart_shift < 0 || vm->hart_shift + nvcpu > NVCPU)
+    vm->hart_shift = 0;
+  // and the identity of its NIC (F19): `guestmac=alt' is a host that hands out
+  // other addresses
+  vm->mac_alt = (cfg->flags & VMF_MAC_SET) ? (cfg->mac_alt != 0) : plat_bootarg("guestmac=alt");
+  // and whether it has an RTC (F16/F17): `guestrtc=off' is a host whose guests have none
+  vm->no_rtc = (cfg->flags & VMF_RTC_SET) ? (cfg->no_rtc != 0) : plat_bootarg("guestrtc=off");
+  // and what its console is (F18): a 16550, a virtio-console (-Q, as before),
+  // or the SBI debug console; `guestcon=virtio|sbi' is a host of that kind
+  vm->console_kind = (cfg->flags & VMF_CON_SET) ? cfg->console_kind
+                   : (cfg->flags & VMF_CONQUEUE) ? CON_VIRTIO
+                   : plat_bootarg("guestcon=virtio") ? CON_VIRTIO
+                   : plat_bootarg("guestcon=sbi") ? CON_SBI : CON_UART;
+  if (vm->console_kind < 0 || vm->console_kind > 2)
+    vm->console_kind = CON_UART;
+  // and how many of its harts are started (F7/F8): all, unless asked or the
+  // host caps them (`guestcpus=N'); the rest are described `disabled'
+  vm->online = (cfg->flags & VMF_CPUS_SET) ? cfg->online : nvcpu;
+  {
+    int cap = (int)plat_bootarg_num("guestcpus");
+    if (!(cfg->flags & VMF_CPUS_SET) && cap > 0 && cap < vm->online)
+      vm->online = cap;
+  }
+  if (vm->online < 1 || vm->online > nvcpu)
+    vm->online = nvcpu;
+  // F21: the cache-block size it is described with: this host's, unless asked
+  vm->cboz_block = (cfg->flags & VMF_CBOZ_SET) ? cfg->cboz_block : plat.cboz_block;
+  if (vm->cboz_block < 16 || vm->cboz_block > PGSIZE || (vm->cboz_block & (vm->cboz_block - 1)))
+    vm->cboz_block = plat.cboz_block;
+  vm->cboz_prev = vm->cboz_block;
   vm->ndev = 0;
   vuart_init(vm);
   vclint_init(vm);
@@ -1888,11 +2752,14 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   vvcon_init(vm);
   vballoon_init(vm);
   vrtc_init(vm);
+  vmachrev_init(vm);    // the anchor, for guests that cannot be told through SSIP
   if (vm->blk.bounce == 0)
     goto fail;
 
-  if (!noload && vm_load(vm) < 0)
+  if (!noload && vm_load(vm) < 0) {
+    err = -ENOENT;
     goto fail;
+  }
 
   for (int i = 0; i < nvcpu; i++) {
     if (plat.has_v && (vm->vcpu[i].vstate = kalloc()) == 0)
@@ -1915,7 +2782,7 @@ fail:
     vm_put_device(d);
   }
   vm->state = VM_FREE;
-  return -1;
+  return err;
 }
 
 // copy n bytes of file ip at offset foff into guest RAM at gpa.
@@ -1958,7 +2825,7 @@ static int
 hits_dtb(struct vm *vm, uint64 gpa, uint64 n)
 {
   uint64 dtb_end = G_RAM_BASE + vm->ram_size;
-  return gpa < dtb_end && gpa + n > vm->dtb_gpa;
+  return gpa < dtb_end && gpa + n > vm->dtb_gpa - 2 * VM_DTB_MAX;   // the boot blob and both revision slots
 }
 
 // load the guest kernel from the host file system into guest RAM: an
@@ -2217,6 +3084,12 @@ vcpu_enter(struct vcpu *v)
   uint64 hvip = 0;
 
   acquire(&vm->lock);
+  while (vm->vic_hold) {
+    // the controller model is being rebuilt: stay out until it is done
+    release(&vm->lock);
+    yield();
+    acquire(&vm->lock);
+  }
   v->running_hart = cpuid();
   if (v->ssip_req) {
     v->ssip_req = 0;
@@ -2224,6 +3097,11 @@ vcpu_enter(struct vcpu *v)
   }
   if (v->vssip)
     hvip |= HVIP_VSSIP;
+  // F5: without Sstc the timer interrupt is this hypervisor's to raise
+  // (and F6: a scaled clock has no hardware comparator to use)
+  if ((vm->no_sstc || vm_scaled_time(vm)) && v->vstimecmp != ~0UL &&
+      (long)(r_time() + vm->htimedelta - v->vstimecmp) >= 0)
+    hvip |= HVIP_VSTIP;
   hvip |= vic_vcpu_enter(v);
   release(&vm->lock);
 
@@ -2255,6 +3133,18 @@ vcpu_enter(struct vcpu *v)
   if (plat.intc_kind == INTC_IMSIC)
     csr_write(CSR_VSISELECT, v->vsiselect);
   csr_write(CSR_HVIP, hvip);
+  // F5: Sstc for this machine or not (STCE); A/D updating always. F6: a
+  // machine with another timebase may not read `time' itself (TM off).
+  // F21: cbo.zero in hardware only when the block described is the block the
+  // host has (and no revision between two sizes is pending); else it traps
+  int cboz_native = vm->cboz_block == plat.cboz_block &&
+                    (vm->cboz_prev == vm->cboz_block || vm->revise_acked == vm->revise_gen);
+  if (plat_bootarg("nocbozmodel"))
+    cboz_native = 1;    // the control: no software model, the hazard shows
+  csr_write(CSR_HENVCFG, HENVCFG_ADUE | HENVCFG_CBCFE | HENVCFG_CBIE | (cboz_native ? HENVCFG_CBZE : 0) |
+                         ((vm->no_sstc || vm_scaled_time(vm)) ? 0 : HENVCFG_STCE));
+  csr_write(CSR_HCOUNTEREN, vm_scaled_time(vm) ? 5 : 7);
+  csr_write(CSR_HTIMEDELTA, vm->htimedelta);
 
   if (hart_hgatp[hart] != vm->hgatp) {
     csr_write(CSR_HGATP, vm->hgatp);
@@ -2437,7 +3327,7 @@ vcpu_idle(struct vcpu *v)
     }
   }
   acquire(&vm->lock);
-  while (!(v->vssip || v->ssip_req || vic_seip(v) || r_time() >= v->vstimecmp ||
+  while (!(v->vssip || v->ssip_req || vic_seip(v) || r_time() + v->vm->htimedelta >= v->vstimecmp ||
            vm->state != VM_RUNNING || killed(v->p))) {
     v->idle = 1;
     v->wfi_sleeps++;
@@ -2472,8 +3362,11 @@ hyp_tick(void)
       continue;
     for (int j = 0; j < vm->nvcpu; j++) {
       struct vcpu *v = &vm->vcpu[j];
-      if (v->idle && now >= v->vstimecmp)
+      if (v->idle && now + vm->htimedelta >= v->vstimecmp)
         wakeup(v);
+      else if ((vm->no_sstc || vm_scaled_time(vm)) && !v->idle && v->running_hart >= 0 &&
+               v->vstimecmp != ~0UL && now + vm->htimedelta >= v->vstimecmp)
+        vcpu_kick(v);     // F5/F6: out, and back in with VSTIP raised
     }
   }
 }
@@ -2485,14 +3378,29 @@ hyp_next_deadline(uint64 dflt)
   if (!plat.has_h)
     return dflt;
   uint64 best = dflt;
+  uint64 now = r_time();
   for (int i = 0; i < NVM; i++) {
     struct vm *vm = vmtab[i];
     if (vm == 0 || vm->state != VM_RUNNING)
       continue;
     for (int j = 0; j < vm->nvcpu; j++) {
       struct vcpu *v = &vm->vcpu[j];
-      if (v->idle && v->hsm_state == HSM_STARTED && v->vstimecmp < best)
-        best = v->vstimecmp;
+      if (!(v->idle || vm->no_sstc || vm_scaled_time(vm)) || v->hsm_state != HSM_STARTED ||
+          v->vstimecmp == ~0UL)
+        continue;
+      // in host time: the guest's clock is the host's plus htimedelta
+      uint64 d = v->vstimecmp - vm->htimedelta;
+      // A deadline already passed is not a reason to set the timer: the tick
+      // that found it woke or kicked the vcpu, and VSTIP goes in on its
+      // entry. Re-arming for it set the host's timer 10 us out, again and
+      // again, until the guest's handler had written a new deadline -- and
+      // the guest, interrupted every 10 us, took seconds to get there (tb1:
+      // `sleep 1' = 2.9 s, then 4.6 s, on a 1 MHz machine; Linux on an
+      // SBI-timer host crawling through its boot).
+      if ((long)(d - now) <= 0)
+        continue;
+      if (d < best)
+        best = d;
     }
   }
   return best;

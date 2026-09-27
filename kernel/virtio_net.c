@@ -100,17 +100,22 @@ vq_alloc(struct vq *q)
 }
 
 // post one empty mbuf for the device to fill with a received frame.
-static void
+// returns 0 when it could not (no descriptor, or no memory for the mbuf).
+static int rx_posted;          // buffers the device holds; the ring is full at QSIZE
+uint64 net_rx_nobuf;           // times a buffer could not be posted (memory)
+
+static int
 rx_post(void)
 {
   struct vq *q = &nic.q[RXQ];
   int i = vq_alloc(q);
   if (i < 0)
-    return;
+    return 0;
   struct mbuf *m = mbufalloc(0);
   if (m == 0) {
     q->free[i] = 1;
-    return;
+    net_rx_nobuf++;
+    return 0;
   }
   q->bufs[i] = m;
   q->desc[i].addr = (uint64)m->buf;
@@ -120,6 +125,40 @@ rx_post(void)
   q->avail->ring[q->avail->idx % QSIZE] = i;
   io_fence();
   q->avail->idx++;
+  rx_posted++;
+  return 1;
+}
+
+// the ring back to full. A buffer that could not be posted -- kalloc had
+// nothing, as on a host taking in a guest -- used to be a buffer the ring
+// had lost for good: one frame's worth of receive capacity gone per failure,
+// and once all sixteen were gone every inbound frame was dropped at the
+// device, for ever (hunt3_7 crossing 97: the sender's last sections, its FIN
+// and ten retransmissions all vanished; the receiver sat ESTABLISHED with
+// nothing to read). Now the count is kept and the ring is refilled after
+// every interrupt and from the timer, so memory coming back brings the
+// receiver back. caller holds nic.lock.
+static void
+rx_refill(void)
+{
+  while (rx_posted < QSIZE)
+    if (!rx_post())
+      break;
+}
+
+// from net_timer(): a ring starved of buffers gets them back once memory does
+void
+virtio_net_refill(void)
+{
+  if (!nic.present)
+    return;
+  acquire(&nic.lock);
+  if (rx_posted < QSIZE) {
+    rx_refill();
+    io_fence();
+    *R(VIRTIO_MMIO_QUEUE_NOTIFY) = RXQ;
+  }
+  release(&nic.lock);
 }
 
 int
@@ -187,8 +226,7 @@ virtio_net_init(void)
   status |= VIRTIO_CONFIG_S_DRIVER_OK;
   *R(VIRTIO_MMIO_STATUS) = status;
 
-  for (int i = 0; i < QSIZE; i++)
-    rx_post();
+  rx_refill();
   *R(VIRTIO_MMIO_QUEUE_NOTIFY) = RXQ;
 
   memmove(netcfg.mac, nic.mac, ETHADDR_LEN);
@@ -252,8 +290,21 @@ virtio_net_intr(int idx)
   if (!nic.present || idx != nic.idx)
     return;
   acquire(&nic.lock);
-  *R(VIRTIO_MMIO_INTERRUPT_ACK) = *R(VIRTIO_MMIO_INTERRUPT_STATUS) & 0x3;
+  uint32 st = *R(VIRTIO_MMIO_INTERRUPT_STATUS);
+  *R(VIRTIO_MMIO_INTERRUPT_ACK) = st & 0x3;
   io_fence();
+  if (st & 2) {
+    // a configuration change (F19): the device's identity may have moved
+    uint8 mac[ETHADDR_LEN];
+    for (int i = 0; i < ETHADDR_LEN; i++)
+      mac[i] = *(volatile uint8 *)(nic.base + VIRTIO_MMIO_CONFIG + i);
+    if (memcmp(mac, nic.mac, ETHADDR_LEN) != 0) {
+      memmove(nic.mac, mac, ETHADDR_LEN);
+      net_mac_changed(mac);
+      char macs[18];
+      printk("virtio net: mac changed to %s\n", mac2str(nic.mac, macs));
+    }
+  }
 
   struct vq *q = &nic.q[RXQ];
   while (q->used_idx != q->used->idx) {
@@ -264,6 +315,7 @@ virtio_net_intr(int idx)
     struct mbuf *m = q->bufs[id];
     q->bufs[id] = 0;
     q->free[id] = 1;
+    rx_posted--;
     if (m && len > VNET_HDR_LEN) {
       m->head = m->buf + VNET_HDR_LEN;
       m->len = len - VNET_HDR_LEN;
@@ -276,6 +328,7 @@ virtio_net_intr(int idx)
     }
     rx_post();
   }
+  rx_refill();      // and whatever earlier failures left unposted
   io_fence();
   *R(VIRTIO_MMIO_QUEUE_NOTIFY) = RXQ;
 

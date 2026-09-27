@@ -28,6 +28,8 @@ static struct disk {
   uint64 base;     // mmio base, 0 if no disk in this slot
   int irq;
   uint64 capacity; // in 512-byte sectors
+  struct gendisk *gd;   // registered as, for a capacity that changes (F20)
+  char name[4];
 
   // a set (not a ring) of DMA descriptors, with which the
   // driver tells the device where to read and write individual
@@ -432,6 +434,8 @@ virtio_disk_register(void)
     struct gendisk *g = blk_register(name, &vblk_ops, &disks[i], capacity, 512);
     if (g == 0)
       continue;
+    disks[i].gd = g;
+    memmove(disks[i].name, name, 4);
     printk("blk: %s: %ld sectors (%ld MB)\n", name, capacity, capacity / 2048);
     blk_scan_partitions(g);
   }
@@ -452,9 +456,21 @@ virtio_disk_intr(int idx)
   // the "used" ring, in which case we may process the new
   // completion entries in this interrupt, and have nothing to do
   // in the next interrupt, which is harmless.
-  *R(d, VIRTIO_MMIO_INTERRUPT_ACK) = *R(d, VIRTIO_MMIO_INTERRUPT_STATUS) & 0x3;
+  uint32 st = *R(d, VIRTIO_MMIO_INTERRUPT_STATUS);
+  *R(d, VIRTIO_MMIO_INTERRUPT_ACK) = st & 0x3;
 
   io_fence();
+  if (st & 2) {
+    // a configuration change (F20): the disk behind the window is another
+    // size now -- a host whose image is larger. The block layer learns it;
+    // the file system on it is what it was (its size is its own).
+    uint64 cap = *R(d, VIRTIO_MMIO_CONFIG) | ((uint64)*R(d, VIRTIO_MMIO_CONFIG + 4) << 32);
+    if (cap != d->capacity) {
+      d->capacity = cap;
+      blk_resize(d->gd, cap, 0);
+      printk("blk: %s: %ld sectors (%ld MB) now\n", d->name, (long)cap, (long)cap / 2048);
+    }
+  }
 
   // the device increments d->used->idx when it
   // adds an entry to the used ring.

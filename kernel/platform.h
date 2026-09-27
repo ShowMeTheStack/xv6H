@@ -17,6 +17,8 @@ struct platform {
   uint64 ram_base;      // physical RAM start (0x80000000 on qemu virt)
   uint64 ram_size;      // from the device tree
   uint64 ram_end;       // ram_base + ram_size
+  uint64 resv_top;      // bytes at the top of RAM not to touch: the machine's description and its revision slots
+  uint64 resv_base, resv_size;   // as the tree says it (reserved-memory/xv6h-description)
   int mmu_max;          // widest paging mode the hardware offers: 39, 48 or 57 (device tree mmu-type)
   int mmu_levels;       // levels of every page table: 4 (Sv48) or 3 (Sv39)
   uint64 maxva;         // one past the highest virtual address: 1<<47 or 1<<38
@@ -31,11 +33,16 @@ struct platform {
   int imsic_guest_bits; // riscv,guest-index-bits (S-file stride = 4096 << bits)
   int imsic_nids;       // riscv,num-ids
 
-  uint64 clint_base;
+  uint64 clint_base;    // 0: no CLINT, IPIs go through SBI (F4)
+  int has_sstc;         // the timer is stimecmp (Sstc); else the SBI timer (F5)
+  int cboz_block;       // F21: bytes cbo.zero clears (riscv,cboz-block-size); 0 without Zicboz
+  int hartid[NCPU];     // F9: the hart id of logical cpu i (tp), from the tree's cpu nodes
+  int console_kind;     // F18: 0 the 16550, 1 a virtio-console, 2 the SBI debug console (chosen/stdout-path)
 
   uint64 rtc_base;      // goldfish RTC (0: none)
   int rtc_irq;
   uint64 timebase;      // ticks of the time counter per second
+  uint64 tb_t0, tb_ns0; // the monotonic clock's anchor at the last rate change (F6)
 
   uint64 uart_base;
   int uart_irq;
@@ -71,4 +78,7 @@ extern char fdt_copy[];
 
 void platform_init(uint64 fdt_pa);
 int plat_bootarg(const char *word);
+void platform_parse_into(struct platform *out, uint64 fdt_pa);   // a tree into a struct other than plat
+int plat_cpu_of_hart(uint64 hartid);        // F9: logical index of a hart id, or -1
+uint64 plat_bootarg_num(const char *key);   // the number after `key=', or 0
 int platform_virtio_by_irq(int irq);

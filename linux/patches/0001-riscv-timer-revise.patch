@@ -1,0 +1,73 @@
+--- a/drivers/clocksource/timer-riscv.c	2026-09-27 22:59:20
++++ b/drivers/clocksource/timer-riscv.c	2026-09-27 23:28:23
+@@ -154,6 +154,59 @@
+ 	return IRQ_HANDLED;
+ }
+ 
++/*
++ * xv6H: the machine's timer is a fact of its description and may be revised
++ * under a running guest -- Sstc taken away or given (the hypervisor then
++ * emulates stimecmp or not), or the counter's rate changed. Called by the
++ * machrev driver once the new description is read. Every cpu is re-armed
++ * through the new source with an event due at once, so the next interrupt
++ * comes the new way and the tick code reprograms from there. The clocksource
++ * and each clock event device take the new rate; sched_clock keeps the rate
++ * it was registered with (it cannot be re-registered), which is the one
++ * stated cost of F6 in Linux.
++ */
++static void riscv_timer_rearm_now(void *arg)
++{
++	struct clock_event_device *ce = this_cpu_ptr(&riscv_clock_event);
++	u32 hz = *(u32 *)arg;
++
++	if (hz)
++		clockevents_update_freq(ce, hz);
++	/*
++	 * The deadline this cpu had is re-armed through the new source. Only
++	 * a device that is armed (oneshot, with an event ahead) is touched:
++	 * a cpu whose tick is stopped (nohz idle) has nothing due, and an
++	 * event forced on it would arrive with no hrtimer expired -- the
++	 * tick code then reprograms for "now" again and again (lxp6: 40k
++	 * ecalls a second on the idle cpu).
++	 */
++	if (clockevent_state_oneshot(ce) && ce->next_event != KTIME_MAX)
++		clockevents_program_event(ce, ce->next_event, true);
++	else
++		riscv_clock_event_stop();
++}
++
++void riscv_timer_revise(bool sstc, u32 hz)
++{
++	bool had = static_branch_likely(&riscv_sstc_available);
++
++	if (sstc != had) {
++		if (sstc)
++			static_branch_enable(&riscv_sstc_available);
++		else
++			static_branch_disable(&riscv_sstc_available);
++		pr_info("riscv-timer: timer via %s\n", sstc ? "stimecmp" : "sbi");
++	}
++	if (hz && hz != riscv_timebase) {
++		pr_info("riscv-timer: timebase %lu -> %u Hz\n", riscv_timebase, hz);
++		riscv_timebase = hz;
++		__clocksource_update_freq_hz(&riscv_clocksource, hz);
++	} else
++		hz = 0;
++	on_each_cpu(riscv_timer_rearm_now, &hz, 1);
++}
++EXPORT_SYMBOL_GPL(riscv_timer_revise);
++
+ static int __init riscv_timer_init_common(void)
+ {
+ 	int error;
+--- a/arch/riscv/kernel/time.c	2026-09-27 22:59:20
++++ b/arch/riscv/kernel/time.c	2026-09-27 22:59:20
+@@ -14,7 +14,7 @@
+ #include <asm/timex.h>
+ #include <asm/paravirt.h>
+ 
+-unsigned long riscv_timebase __ro_after_init;
++unsigned long riscv_timebase;	/* xv6H: revisable (riscv_timer_revise) */
+ EXPORT_SYMBOL_GPL(riscv_timebase);
+ 
+ void __init time_init(void)

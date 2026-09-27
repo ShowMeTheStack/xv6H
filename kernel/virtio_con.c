@@ -38,8 +38,10 @@
 #define VIRTIO_MMIO_DRIVER_FEATURES_SEL 0x024
 #define VIRTIO_ID_CONSOLE 3
 #define VRING_AVAIL_F_NO_INTERRUPT 1
+#define RXQ 0
 #define TXQ 1
 #define CQSIZE 8         // descriptors; one is in flight at a time
+#define RXBUF 64         // bytes per receive buffer (F18: input, when it is the console)
 
 // The rings are static rather than kalloc'd, and that is the point: this
 // has to run before the first printk, because the lines a guest prints
@@ -51,9 +53,15 @@ static struct virtq_desc con_desc[CQSIZE] __attribute__((aligned(16)));
 static struct virtq_avail con_avail __attribute__((aligned(16)));
 static struct virtq_used con_used __attribute__((aligned(16)));
 static char con_buf[PGSIZE] __attribute__((aligned(16)));
+static struct virtq_desc rx_desc[CQSIZE] __attribute__((aligned(16)));
+static struct virtq_avail rx_avail __attribute__((aligned(16)));
+static struct virtq_used rx_used __attribute__((aligned(16)));
+static char rx_buf[CQSIZE][RXBUF] __attribute__((aligned(16)));
+static uint16 rx_used_idx;
 
 static struct {
   uint64 base;
+  int idx;         // the platform slot, for the interrupt dispatch
   int present;
   struct virtq_desc *desc;
   struct virtq_avail *avail;
@@ -113,6 +121,35 @@ virtio_con_init(void)
     if (!(*R(VIRTIO_MMIO_STATUS) & VIRTIO_CONFIG_S_FEATURES_OK))
       continue;
 
+    con.idx = i;
+    // F18: the receive queue, so that input comes this way too when this is
+    // the console: eight small buffers posted, an interrupt when one fills
+    *R(VIRTIO_MMIO_QUEUE_SEL) = RXQ;
+    if (*R(VIRTIO_MMIO_QUEUE_NUM_MAX) < CQSIZE)
+      continue;
+    memset(rx_desc, 0, sizeof(rx_desc));
+    memset(&rx_avail, 0, sizeof(rx_avail));
+    memset(&rx_used, 0, sizeof(rx_used));
+    rx_used_idx = 0;
+    for (int k = 0; k < CQSIZE; k++) {
+      rx_desc[k].addr = (uint64)rx_buf[k];
+      rx_desc[k].len = RXBUF;
+      rx_desc[k].flags = VRING_DESC_F_WRITE;
+      rx_desc[k].next = 0;
+      rx_avail.ring[k] = k;
+    }
+    *R(VIRTIO_MMIO_QUEUE_NUM) = CQSIZE;
+    *R(VIRTIO_MMIO_QUEUE_DESC_LOW) = (uint64)rx_desc;
+    *R(VIRTIO_MMIO_QUEUE_DESC_HIGH) = (uint64)rx_desc >> 32;
+    *R(VIRTIO_MMIO_DRIVER_DESC_LOW) = (uint64)&rx_avail;
+    *R(VIRTIO_MMIO_DRIVER_DESC_HIGH) = (uint64)&rx_avail >> 32;
+    *R(VIRTIO_MMIO_DEVICE_DESC_LOW) = (uint64)&rx_used;
+    *R(VIRTIO_MMIO_DEVICE_DESC_HIGH) = (uint64)&rx_used >> 32;
+    *R(VIRTIO_MMIO_QUEUE_READY) = 1;
+    __sync_synchronize();
+    rx_avail.idx = CQSIZE;
+    __sync_synchronize();
+
     *R(VIRTIO_MMIO_QUEUE_SEL) = TXQ;
     if (*R(VIRTIO_MMIO_QUEUE_NUM_MAX) < CQSIZE)
       continue;
@@ -138,9 +175,46 @@ virtio_con_init(void)
     status |= VIRTIO_CONFIG_S_DRIVER_OK;
     *R(VIRTIO_MMIO_STATUS) = status;
     con.present = 1;
+    *R(VIRTIO_MMIO_QUEUE_NOTIFY) = RXQ;   // the buffers are posted
     printk("virtio console: queue at 0x%lx, %d descriptors\n", con.base, CQSIZE);
     return;
   }
+  con.base = 0;
+}
+
+// F18: input arrived on the receive queue (or a transmit completed): each
+// byte goes to the console's line discipline and the buffer is posted again.
+void
+virtio_con_intr(int idx)
+{
+  if (!con.present || idx != con.idx)
+    return;
+  acquire(&con.lock);
+  *R(VIRTIO_MMIO_INTERRUPT_ACK) = *R(VIRTIO_MMIO_INTERRUPT_STATUS) & 0x3;
+  __sync_synchronize();
+  while (rx_used_idx != rx_used.idx) {
+    __sync_synchronize();
+    int id = rx_used.ring[rx_used_idx % CQSIZE].id;
+    uint32 len = rx_used.ring[rx_used_idx % CQSIZE].len;
+    rx_used_idx++;
+    if (id >= 0 && id < CQSIZE) {
+      for (uint32 k = 0; k < len && k < RXBUF; k++)
+        consoleintr(rx_buf[id][k]);
+      rx_avail.ring[rx_avail.idx % CQSIZE] = id;
+      __sync_synchronize();
+      rx_avail.idx++;
+    }
+  }
+  __sync_synchronize();
+  *R(VIRTIO_MMIO_QUEUE_NOTIFY) = RXQ;
+  release(&con.lock);
+}
+
+// F18/F17: the device left the machine (its node is gone from the tree)
+void
+virtio_con_detach(void)
+{
+  con.present = 0;
   con.base = 0;
 }
 

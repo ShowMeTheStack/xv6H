@@ -45,7 +45,7 @@ best_irq(struct vplic *p, int ctx)
 int
 vplic_seip(struct vcpu *v)
 {
-  return best_irq(&v->vm->plic, 2 * v->id + 1) != 0;
+  return best_irq(&v->vm->plic, 2 * (v->id + v->vm->hart_shift) + 1) != 0;   // F9: the guest's context numbers
 }
 
 // caller holds vm->lock.
@@ -172,5 +172,5 @@ void
 vplic_init(struct vm *vm)
 {
   memset(&vm->plic, 0, sizeof(vm->plic));
-  vm_add_dev(vm, "plic", -1, OBS_INTC, G_PLIC_BASE, G_PLIC_SIZE, vplic_read, vplic_write, 0);
+  vm_add_dev(vm, "plic", -1, OBS_INTC, G_PLIC_BASE + vm->intc_shift, G_PLIC_SIZE, vplic_read, vplic_write, 0);
 }

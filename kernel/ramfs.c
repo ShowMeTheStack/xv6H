@@ -76,10 +76,25 @@ struct ramfs_mount {
   uint next_ino;
   uint64 pages_used;
   uint64 pages_max; // 0 for no limit, which is what ramfs is
+  int half;         // no size= given: the limit is half the machine, whatever size the machine is now (F13/F14)
   int inuse;
 };
 
 static struct ramfs_mount mounts[RAMFS_MAX_MOUNTS];
+
+// the limit of a tmpfs. Given with size=, it is fixed; left to the default
+// it is half the machine -- the machine as it is now, since a revision can
+// change what it has (F13/F14). Linux freezes it at mount time; a machine
+// whose description is revisable should not.
+static uint64
+limit(struct ramfs_mount *m)
+{
+  if (m->half) {
+    uint64 h = kmem_total_pages() / 2;
+    return h ? h : 1;
+  }
+  return m->pages_max;
+}
 static const struct inode_ops ramfs_iops;
 static struct super *supers[RAMFS_MAX_MOUNTS];
 
@@ -133,7 +148,7 @@ node_page(struct ramfs_mount *m, struct ramfs_node *n, uint64 idx, int alloc)
   }
   p = l2[lo];
   if (p == 0 && alloc) {
-    if (m->pages_max && m->pages_used >= m->pages_max)
+    if (m->pages_max && m->pages_used >= limit(m))
       return 0;
     if ((p = kalloc()) == 0)
       return 0;
@@ -414,7 +429,7 @@ ramfs_setsize(struct inode *ip, uint64 len)
   acquiresleep(&m->lock);
   if ((n = node_find(m, ip->inum)) == 0) {
     r = -ENOENT;
-  } else if (m->pages_max && (len + PGSIZE - 1) / PGSIZE > m->pages_max) {
+  } else if (m->pages_max && (len + PGSIZE - 1) / PGSIZE > limit(m)) {
     r = -EFBIG; // a tmpfs with a size limit will not be grown past it
   } else {
     if (len < n->size) {
@@ -934,7 +949,7 @@ ramfs_sb_statfs(struct super *sb, uint64 *blocks, uint64 *bfree, uint64 *files, 
     nodes++;
   // a file system with no limit reports what it holds and says that
   // what is free is what the machine still has
-  *blocks = m->pages_max ? m->pages_max : m->pages_used + kmem_free_pages();
+  *blocks = m->pages_max ? limit(m) : m->pages_used + kmem_free_pages();
   *bfree = *blocks - m->pages_used;
   *files = nodes + *bfree;
   *ffree = *bfree;
@@ -1045,8 +1060,10 @@ ramfs_mount_common(const char *source, const char *opts, int limited)
   // half of what the machine has, which is what Linux does
   if (limited) {
     uint64 want = parse_size(opts);
-    if (want == 0)
-      want = (kmem_free_pages() * PGSIZE) / 2;
+    if (want == 0) {
+      want = (kmem_total_pages() * PGSIZE) / 2;
+      m->half = 1;
+    }
     m->pages_max = want / PGSIZE;
     if (m->pages_max == 0)
       m->pages_max = 1;

@@ -318,6 +318,9 @@ w_stimecmp(uint64 x)
 
 #define MENVCFG_STCE (1L << 63)
 #define MENVCFG_ADUE (1L << 61)
+#define MENVCFG_CBZE (1L << 7)   // cbo.zero below M
+#define MENVCFG_CBCFE (1L << 6)  // cbo.flush/clean
+#define MENVCFG_CBIE (3L << 4)   // cbo.inval
 
 static inline uint64
 r_menvcfg()

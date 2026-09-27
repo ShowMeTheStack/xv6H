@@ -52,7 +52,7 @@ static void
 raise_irq(struct vm *vm)
 {
   vm->vnet.intr_status |= 1;
-  vic_set_level(vm, G_VNET_IRQ, 1);
+  vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), 1);
 }
 
 // deliver a frame into the guest's receive queue. takes ownership.
@@ -63,6 +63,13 @@ vvnet_rx(struct vm *vm, struct mbuf *m)
   acquire(&vm->lock);
   struct vq_state *q = &n->q[0];
   if (!n->present || !q->ready || q->num == 0 || q->num > MAXQ || !(n->status & VIRTIO_CONFIG_S_DRIVER_OK))
+    goto drop;
+  // A machine that is not running receives nothing: a frame written into a
+  // paused guest's buffer during a migration's final round arrives at the
+  // far end stale or not at all (busy8a: `0x805f5000 changed under the copy
+  // and nobody had marked it'). vm_pause takes this lock, so once it has
+  // returned no delivery is in flight. A NIC on a stopped machine drops.
+  if (vm->state != VM_RUNNING)
     goto drop;
   uint16 avail_idx, head;
   if (rd16(vm, q->avail + 2, &avail_idx) < 0 || avail_idx == q->last_avail)
@@ -126,6 +133,21 @@ drop:
   n->rx_dropped++;
   release(&vm->lock);
   mbuffree(m);
+}
+
+// F19: the NIC's identity changed under the guest -- by an operator, or on
+// arrival at a host with another policy. The device says so the way virtio
+// says such things: a configuration-change interrupt; the driver re-reads
+// the config space. No description involved: this fact lives in the device.
+// caller holds vm->lock.
+void
+vvnet_mac_changed(struct vm *vm)
+{
+  struct vvnet *n = &vm->vnet;
+  if (!n->present)
+    return;
+  n->intr_status |= 2;
+  vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), 1);
 }
 
 // the guest notified the transmit queue: pull frames and switch them.
@@ -278,7 +300,7 @@ vvnet_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
     break;
   case VIRTIO_MMIO_INTERRUPT_ACK:
     n->intr_status &= ~val;
-    vic_set_level(vm, G_VNET_IRQ, n->intr_status != 0);
+    vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), n->intr_status != 0);
     break;
   case VIRTIO_MMIO_STATUS:
     n->status = val;
@@ -289,7 +311,7 @@ vvnet_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
         n->q[i].last_avail = 0;
       }
       n->intr_status = 0;
-      vic_set_level(vm, G_VNET_IRQ, 0);
+      vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), 0);
     }
     break;
   case VIRTIO_MMIO_QUEUE_DESC_LOW: if (q) q->desc = (q->desc & ~0xffffffffUL) | val; break;
@@ -314,7 +336,7 @@ vvnet_init(struct vm *vm)
   n->mac[0] = 0x52;
   n->mac[1] = 0x54;
   n->mac[2] = 0x00;
-  n->mac[3] = 0x78;
+  n->mac[3] = vm->mac_alt ? 0x79 : 0x78;   // F19: this host's policy
   n->mac[4] = 0x76;
   n->mac[5] = 0x10 + vm->id;
   vm_add_dev(vm, "virtio-net", G_VNET_IRQ, OBS_VIRTIO_NET, G_VNET_BASE + vm->mmio_shift, 0x1000, vvnet_read, vvnet_write, 0);

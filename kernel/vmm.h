@@ -47,6 +47,19 @@
 #define VMF_WANT_IMSIC 128
 #define VMF_WANT_MASK (VMF_WANT_PLIC | VMF_WANT_APLIC | VMF_WANT_IMSIC)
 #define VMF_MMIO_SET  256  // cfg.mmio_shift is a request, not the host's default
+#define VMF_LAZYV     512  // present no vector unit until the guest tries to use one
+#define VMF_INTC_SET 1024  // cfg.intc_shift is a request, not the host's default
+#define VMF_IRQ_SET  2048  // cfg.irq_alt is a request, not the host's default
+#define VMF_SBI_SET  4096  // cfg.sbi_hidden is a request, not the host's default
+#define VMF_IPI_SET  8192  // cfg.no_clint is a request, not the host's default
+#define VMF_TIMER_SET 16384 // cfg.no_sstc is a request, not the host's default
+#define VMF_TIMEBASE_SET 32768 // cfg.timebase is a request, not the host's default
+#define VMF_HART_SET 65536  // cfg.hart_shift is a request, not the host's default
+#define VMF_MAC_SET 131072  // cfg.mac_alt is a request, not the host's default
+#define VMF_RTC_SET 262144  // cfg.no_rtc is a request, not the host's default
+#define VMF_CON_SET 524288  // cfg.console_kind is a request, not the host's default
+#define VMF_CPUS_SET 1048576 // cfg.online is a request, not the host's default
+#define VMF_CBOZ_SET 2097152 // cfg.cboz_block is a request, not the host's own
 
 // A machine's switch port is closed: what arrives from outside is
 // delivered only when it belongs to a conversation the machine itself
@@ -73,6 +86,18 @@ struct vmconfig {
   int nvcpu;
   int flags;
   uint64 mmio_shift;       // virtio block offset from the default map (VMF_MMIO_SET)
+  uint64 intc_shift;       // interrupt controller offset from the default map (VMF_INTC_SET)
+  int irq_alt;             // interrupt lines numbered the alternative way (VMF_IRQ_SET)
+  uint32 sbi_hidden;       // SBI extensions withheld, SBIH_* (VMF_SBI_SET)
+  int no_clint;            // no CLINT: IPIs through SBI (VMF_IPI_SET)
+  int no_sstc;             // no Sstc: the SBI timer (VMF_TIMER_SET)
+  uint32 timebase;         // timebase-frequency presented, Hz (VMF_TIMEBASE_SET)
+  int hart_shift;          // hart ids presented as id+shift (VMF_HART_SET)
+  int mac_alt;             // the NIC's alternative identity (VMF_MAC_SET)
+  int no_rtc;              // no RTC device (VMF_RTC_SET)
+  int console_kind;        // 0 uart, 1 virtio-console, 2 SBI debug console (VMF_CON_SET)
+  int online;              // harts started, of nvcpu described (VMF_CPUS_SET)
+  int cboz_block;          // cache-block size described (VMF_CBOZ_SET)
   uint64 load_addr;        // VMF_RAW: guest-physical load address
   char bootargs[128];      // kernel command line (device tree /chosen/bootargs)
   int net;                 // 0: no address configuration, 1: dhcp, 2: static
@@ -137,6 +162,30 @@ struct vmentry {
 // guest (0) or give it back (1). The guest may refuse to lose it while a task
 // still holds vector state.
 #define VMCTL_REVISE_VEC 11
+// vm_ctl(id, VMCTL_REVISE_INTCMAP, shift): move a running guest's interrupt
+// controller registers to another address (F2) and tell it
+#define VMCTL_REVISE_INTCMAP 12
+// vm_ctl(id, VMCTL_REVISE_IRQMAP, alt): renumber a running guest's interrupt lines (F3)
+#define VMCTL_REVISE_IRQMAP 13
+// vm_ctl(id, VMCTL_IMSIC_HW, on): deliver a running IMSIC guest's interrupts
+// through a hardware guest interrupt file (1) or the software model (0). The
+// guest cannot tell (F23); what changes is the exits per interrupt.
+#define VMCTL_IMSIC_HW 14
+// vm_ctl(id, VMCTL_SPLIT, 0): back every 2 MB block of the guest's memory with
+// 4 KB pages instead (F24: memory backing, invisible to the guest)
+#define VMCTL_SPLIT 15
+// vm_ctl(id, VMCTL_REVISE_SBI, hidden): change the SBI extensions a running guest is offered (F22)
+#define VMCTL_REVISE_SBI 16
+#define VMCTL_REVISE_IPI 17     // arg: 1 = SBI IPIs (no CLINT), 0 = CLINT (F4)
+#define VMCTL_REVISE_TIMER 18   // arg: 1 = SBI timer (no Sstc), 0 = Sstc (F5)
+#define VMCTL_REVISE_TIMEBASE 19 // arg: Hz (F6)
+#define VMCTL_REVISE_HARTID 20   // arg: shift (F9)
+#define VMCTL_REVISE_MAC 21      // arg: 1 = alternative identity, 0 = default (F19)
+#define VMCTL_REVISE_RTC 22      // arg: 1 = an RTC, 0 = none (F16/F17)
+#define VMCTL_REVISE_CONSOLE 23  // arg: 0 uart, 1 virtio, 2 sbi (F18)
+#define VMCTL_GROW 24            // arg: MB, the machine's new size (F13)
+#define VMCTL_REVISE_CPUS 25     // arg: harts online (F7 up, F8 down)
+#define VMCTL_REVISE_CBOZ 26     // arg: cache-block size in bytes (F21)
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -160,6 +209,8 @@ struct vminfo {
   uint64 disk_sectors;
   uint64 exits, mmio, csr, wfi, injected;
   uint64 exit_throttles, nudges;  // the exit-rate throttle, and the sibling nudge
+  uint64 cboz_soft;               // F21: cbo.zero done in software, all machines
+  uint64 host_time, htimedelta, vstimecmp1;   // the clocks: guest time is host_time + htimedelta
   // which device the emulated accesses went to, which is what says what is
   // worth building next
   int ndev;

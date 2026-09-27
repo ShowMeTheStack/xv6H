@@ -448,7 +448,7 @@ fault_in(struct mm *mm, struct vma *v, uint64 va)
     if (n < PGSIZE)
       memset(mem + n, 0, PGSIZE - n);
   } else {
-    memset(mem, 0, PGSIZE);
+    page_zero(mem);   // F21: cbo.zero at the described cache-block size
     if (me)
       me->minflt++; // a zero page, no I/O
   }

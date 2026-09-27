@@ -20,6 +20,7 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "defs.h"
+#include "platform.h"
 #include "proc.h"
 #include "errno.h"
 #include "signal.h"
@@ -491,6 +492,56 @@ consoleintr(int c)
   }
 
   release(&cons.lock);
+}
+
+// F18: the console this machine has. Output from the 16550 driver's three
+// paths is diverted here when the console is something else: a virtio-console
+// (descriptors, one exit for a buffer) or the SBI debug console (one ecall for a
+// buffer). Returns 1 when it took the bytes.
+int
+console_divert(const char *s, int n)
+{
+  if (plat.console_kind == 1 && virtio_con_present()) {
+    virtio_con_write(s, n);
+    return 1;
+  }
+  if (plat.console_kind == 2) {
+    machine_sbi_dbcn_write(s, n);
+    return 1;
+  }
+  return 0;
+}
+
+// F18: input for the SBI debug console arrives by asking: the host's input
+// ring is read on every tick of hart 0. Cheap (one ecall a tick) and the way
+// a console without an interrupt line has always been driven.
+void
+console_poll_sbi(void)
+{
+  static char buf[64];
+  if (plat.console_kind != 2)
+    return;
+  int n = machine_sbi_dbcn_read(buf, sizeof(buf));
+  if (n > 0 && plat_bootarg("condbg"))
+    printk("console: sbi read %d byte(s), first 0x%x\n", n, buf[0]);
+  for (int i = 0; i < n; i++)
+    consoleintr(buf[i]);
+}
+
+// F18: the description now names another console. Output is synchronous on
+// every path, so there is nothing to flush; the 16550's interrupts are turned
+// off (or back on), a virtio-console that appeared is brought up, and the
+// change is announced through the console it made.
+void
+console_switch(int kind)
+{
+  static const char *names[] = {"uart", "virtio-console", "sbi"};
+  int old = plat.console_kind;
+  plat.console_kind = kind;
+  if (kind == 1 && !virtio_con_present())
+    virtio_con_init();
+  uart_set_console(kind == 0);
+  printk("machine: console via %s (was %s)\n", names[kind % 3], names[old % 3]);
 }
 
 void

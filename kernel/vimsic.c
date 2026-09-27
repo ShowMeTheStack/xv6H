@@ -420,9 +420,9 @@ static int
 vimsic_mmio_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
 {
   int is_s = (int)(uint64)d->priv;
-  int vcpu = off / 0x1000;
+  int vcpu = vm_vcpu_of_hart(vm, off / 0x1000);   // F9: files are per hart id
   int reg = off % 0x1000;
-  if (!is_s || size != 4)
+  if (!is_s || size != 4 || vcpu < 0)
     return 0; // machine-level files: accepted, ignored
   if (reg == IMSIC_SETEIPNUM_LE) {
     acquire(&vm->lock);
@@ -437,6 +437,6 @@ vimsic_init(struct vm *vm)
 {
   for (int i = 0; i < NVCPU; i++)
     memset(&vm->vcpu[i].imsic, 0, sizeof(struct vimsic));
-  vm_add_dev(vm, "imsic-m", -1, OBS_INTC, G_IMSIC_M, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)0);
-  vm_add_dev(vm, "imsic-s", -1, OBS_INTC, G_IMSIC_S, 0x1000L * vm->nvcpu, vimsic_mmio_read, vimsic_mmio_write, (void *)1);
+  vm_add_dev(vm, "imsic-m", -1, OBS_INTC, G_IMSIC_M + vm->intc_shift, 0x1000L * NVCPU,   /* F9: any hart id */ vimsic_mmio_read, vimsic_mmio_write, (void *)0);
+  vm_add_dev(vm, "imsic-s", -1, OBS_INTC, G_IMSIC_S + vm->intc_shift, 0x1000L * NVCPU,   /* F9: any hart id */ vimsic_mmio_read, vimsic_mmio_write, (void *)1);
 }

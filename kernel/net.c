@@ -1307,6 +1307,7 @@ net_timer(void)
   cgw_timer();
   if (!virtio_net_present())
     return;
+  virtio_net_refill();   // a receive ring starved of buffers comes back
   acquire(&netlock);
   if ((rootns.dhcp.state == 1 || rootns.dhcp.state == 2) &&
       ticks - rootns.dhcp.last_tx >= (uint)(2 * tick_hz)) {
@@ -1394,6 +1395,19 @@ static int
 lo_tx(struct netif *dev, struct mbuf *m)
 {
   return loopback_send(dev->ns, m);
+}
+
+// F19: the NIC's hardware address changed under us (a configuration change
+// from the device). The stack sends with it from now on; the address is what
+// the world reaches us by, so the next DHCP exchange and our neighbours' ARP
+// caches will learn it as traffic flows.
+void
+net_mac_changed(uint8 *mac)
+{
+  memmove(netcfg.mac, mac, ETHADDR_LEN);
+  struct netif *eth0 = netif_find(&rootns, "eth0");
+  if (eth0)
+    memmove(eth0->mac, mac, ETHADDR_LEN);
 }
 
 void

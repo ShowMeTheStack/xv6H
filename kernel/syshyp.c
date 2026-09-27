@@ -251,6 +251,40 @@ sys_vm_ctl(void)
     return vm_revise_intc(vm, (int)arg);
   case VMCTL_REVISE_VEC:
     return vm_revise_vector(vm, (int)arg);
+  case VMCTL_REVISE_INTCMAP:
+    return vm_revise_intc_addr(vm, arg);
+  case VMCTL_REVISE_IRQMAP:
+    return vm_revise_irqmap(vm, (int)arg);
+  case VMCTL_IMSIC_HW:
+    return vm_set_imsic_hw(vm, (int)arg);
+  case VMCTL_SPLIT:
+    return vm_split_all(vm);
+  case VMCTL_REVISE_SBI:
+    return vm_revise_sbi(vm, (uint32)arg);
+  case VMCTL_REVISE_IPI:
+    return vm_revise_ipi(vm, (int)arg);
+  case VMCTL_REVISE_TIMER:
+    return vm_revise_timer(vm, (int)arg);
+  case VMCTL_REVISE_TIMEBASE:
+    return vm_revise_timebase(vm, (uint32)arg);
+  case VMCTL_REVISE_HARTID:
+    return vm_revise_hartid(vm, (int)arg);
+  case VMCTL_REVISE_MAC:
+    return vm_revise_mac(vm, (int)arg);
+  case VMCTL_REVISE_RTC:
+    return vm_revise_rtc(vm, (int)arg);
+  case VMCTL_REVISE_CONSOLE:
+    return vm_revise_console(vm, (int)arg);
+  case VMCTL_REVISE_CPUS:
+    return vm_revise_cpus(vm, (int)arg);
+  case VMCTL_REVISE_CBOZ:
+    return vm_revise_cboz(vm, (int)arg);
+  case VMCTL_GROW: {
+    int r = vm_grow(vm, arg << 20);
+    if (r == 0 && vm->state == VM_RUNNING)
+      r = vm_revise(vm, REV_MEMORY) < 0 ? -EIO : 0;
+    return r;
+  }
   case VMCTL_BALLOON:
     return vballoon_request(vm, arg * 1024 * 1024);
   case VMCTL_WEIGHT:
@@ -362,6 +396,7 @@ sys_vm_info(void)
     info.revise_gen = vm->revise_gen;
     info.cfg = vm->cfg;
     info.entry = vm->entry;
+    info.cboz_soft = hyp_cboz_exits;
     info.disk_sectors = vm->blk.capacity;
     for (int i = 0; i < vm->nvcpu; i++) {
       struct vcpu *v = &vm->vcpu[i];
@@ -404,6 +439,8 @@ sys_vm_info(void)
     info.ra = v->regs[1];
     info.vsie = v->vsie;
     info.vstimecmp = v->vstimecmp;
+    info.host_time = r_time();
+    info.htimedelta = vm->htimedelta;
     info.scounteren = v->scounteren;
     info.senvcfg = v->senvcfg;
     info.hcounteren = csr_read(0x606);
@@ -420,6 +457,7 @@ sys_vm_info(void)
       info.exits1 = w->exits;
       info.idle1 = w->idle;
       info.hsm1 = w->hsm_state;
+      info.vstimecmp1 = w->vstimecmp;
       info.hart1 = w->running_hart;
       info.eie0_1 = w->imsic.eie[0];
       info.eip0_1 = w->imsic.eip[0];
@@ -511,6 +549,10 @@ sys_hwinfo(void)
   struct hwinfo hi;
   argaddr(0, &addr);
   memset(&hi, 0, sizeof(hi));
+  // a program asking whether there is a vector unit is the moment a machine
+  // described without one asks its host for it (lazy revelation, machine.c)
+  if (!plat.has_v && plat.is_guest)
+    machine_request(REV_VLEN);
   hi.misa = plat.misa;
   hi.ncpu = plat.ncpu;
   hi.has_h = plat.has_h;

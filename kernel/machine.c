@@ -35,11 +35,16 @@
 #define MACH_DESCRIBE 2
 #define MACH_ACK      3
 #define MACH_DTB_MAX  4
+#define MACH_REQUEST  5
+#define MACH_WHAT     6
 
 // what a revision can change, and what we report adopting (must match hyp.h)
 #define REV_DEVICES  (1u << 0)
 #define REV_INTC     (1u << 1)
 #define REV_VLEN     (1u << 2)
+#define REV_SBI      (1u << 3)
+#define REV_TIMER    (1u << 4)
+#define REV_MEMORY   (1u << 6)
 #define REV_NONE     0u
 
 struct sbiret {
@@ -51,12 +56,68 @@ struct sbiret {
 // firmware underneath this kernel at all (it boots with -bios none and is its
 // own machine mode), so this must never be called unless we are a guest.
 static struct sbiret
-sbi_call(uint64 ext, uint64 fid, uint64 a0)
+sbi_call3(uint64 ext, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
 {
   register uint64 r_a0 asm("a0") = a0;
   register uint64 r_a6 asm("a6") = fid;
   register uint64 r_a7 asm("a7") = ext;
-  register uint64 r_a1 asm("a1") = 0;
+  register uint64 r_a1 asm("a1") = a1;
+  register uint64 r_a2 asm("a2") = a2;
+
+  asm volatile("ecall"
+               : "+r"(r_a0), "+r"(r_a1)
+               : "r"(r_a2), "r"(r_a6), "r"(r_a7)
+               : "memory");
+  struct sbiret ret = {(long)r_a0, (long)r_a1};
+  return ret;
+}
+
+// F18: the SBI debug console, when the description names it as the console.
+// The kernel's addresses are physical addresses here (the direct map).
+//
+// Through a static buffer: the SBI takes a *physical* address, and this
+// kernel's statics are identity-mapped while a kernel stack is not -- the
+// shell's prompt came from consolewrite's stack buffer and the host answered
+// INVALID_ADDRESS to every byte of it (con_probe2).
+static struct spinlock dbcn_lock;
+static char dbcn_buf[256];
+static int dbcn_lock_ready;
+
+void
+machine_sbi_dbcn_write(const char *s, int n)
+{
+  extern volatile int panicking;
+  if (!dbcn_lock_ready) {
+    initlock(&dbcn_lock, "dbcn");
+    dbcn_lock_ready = 1;
+  }
+  while (n > 0) {
+    int k = n > (int)sizeof(dbcn_buf) ? (int)sizeof(dbcn_buf) : n;
+    if (panicking == 0)
+      acquire(&dbcn_lock);
+    memmove(dbcn_buf, s, k);
+    sbi_call3(0x4442434E, 0, k, (uint64)dbcn_buf, 0);
+    if (panicking == 0)
+      release(&dbcn_lock);
+    s += k;
+    n -= k;
+  }
+}
+
+int
+machine_sbi_dbcn_read(char *buf, int n)
+{
+  struct sbiret r = sbi_call3(0x4442434E, 1, n, (uint64)buf, 0);
+  return r.err == 0 ? (int)r.val : 0;
+}
+
+static struct sbiret
+sbi_call2(uint64 ext, uint64 fid, uint64 a0, uint64 a1)
+{
+  register uint64 r_a0 asm("a0") = a0;
+  register uint64 r_a6 asm("a6") = fid;
+  register uint64 r_a7 asm("a7") = ext;
+  register uint64 r_a1 asm("a1") = a1;
 
   asm volatile("ecall"
                : "+r"(r_a0), "+r"(r_a1)
@@ -64,6 +125,38 @@ sbi_call(uint64 ext, uint64 fid, uint64 a0)
                : "memory");
   struct sbiret ret = {(long)r_a0, (long)r_a1};
   return ret;
+}
+
+static struct sbiret
+sbi_call(uint64 ext, uint64 fid, uint64 a0)
+{
+  return sbi_call2(ext, fid, a0, 0);
+}
+
+// F5, F4: the firmware's timer and IPIs, for a machine described without Sstc
+// or without a CLINT. Both are the SBI's oldest services (TIME, IPI).
+void
+machine_sbi_set_timer(uint64 when)
+{
+  sbi_call(0x54494D45, 0, when);
+}
+
+void
+machine_sbi_ipi(int hart)
+{
+  sbi_call2(0x735049, 0, 1UL << hart, 0);
+}
+
+// F8: this hart leaves the machine. SBI HSM stop does not return; a hart
+// started again (F7) enters the kernel afresh at _entry.
+void
+machine_hart_park(void)
+{
+  intr_off();
+  printk("machine: hart %d parked\n", cpuid());
+  sbi_call(0x48534D, 1, 0);
+  for (;;)
+    asm volatile("wfi");
 }
 
 // ---- coordinating a revision across harts ----
@@ -84,6 +177,7 @@ static uint32 revision_global;    // generation whose global part is complete
 static uint32 revision_hart[NCPU];// generation each hart has applied locally
 static uint32 revision_seen;      // deprecated by the two above; kept for /sys
 static int revision_supported = -1;   // -1 unknown, 0 no, 1 yes
+static void sbi_reprobe(void);        // F22, below
 uint64 machine_revisions;         // how many we have been through (for /sys)
 
 // Does the thing underneath us speak the revision protocol? Asked once.
@@ -125,14 +219,24 @@ reread(uint64 dtb_gpa, struct platform *out)
   // below then saw "the device count changed" and "nothing moved", the drivers
   // stayed on the old windows, and the guest died on its first store to one
   // (vscause 7, vstval 0x10002050 -- the old virtio-net notify register).
-  memset(&plat, 0, sizeof(plat));
-  plat.is_guest = live.is_guest;    // not in the tree; known from boot
-  platform_init(dtb_gpa);           // fills `plat' from the new blob
-  struct platform fresh = plat;
-  plat = live;                      // and put the live one straight back
-  *out = fresh;
+  //
+  // And never into `plat' itself: the other harts keep running on the live
+  // description while this one reads the new one. It used to parse into
+  // `plat' with a save and a restore around it, and a hart that read the
+  // description in that window -- a tick, an IPI -- found a machine with
+  // nothing in it: with two harts, a hang on one arrival in two (tmr3/tmr4).
+  memset(out, 0, sizeof(*out));
+  out->is_guest = live.is_guest;    // not in the tree; known from boot
+  platform_parse_into(out, dtb_gpa);
+  struct platform fresh = *out;
 
   if (fresh.intc_kind != live.intc_kind)
+    changed |= REV_INTC;
+  // the same kind somewhere else is a change of the same class (F2): the
+  // driver is bound to registers at an address, and the address is in the
+  // page tables as well as in the description
+  else if (fresh.plic_base != live.plic_base || fresh.aplic_s_base != live.aplic_s_base ||
+           fresh.aplic_m_base != live.aplic_m_base || fresh.imsic_s_base != live.imsic_s_base)
     changed |= REV_INTC;
   // misa is not in the device tree: has_v is computed from it (platform.c), so
   // a vector unit that has come or gone is only visible by reading the CSR
@@ -144,11 +248,31 @@ reread(uint64 dtb_gpa, struct platform *out)
   if (out->has_v != live.has_v)
     changed |= REV_VLEN;
   if (fresh.nvirtio != live.nvirtio || fresh.ram_size != live.ram_size ||
-      fresh.ncpu != live.ncpu || fresh.rtc_base != live.rtc_base)
+      fresh.ncpu != live.ncpu || fresh.rtc_base != live.rtc_base ||
+      fresh.clint_base != live.clint_base)           // F4: the CLINT came or went
     changed |= REV_DEVICES;
+  for (int i = 0; i < fresh.ncpu && i < live.ncpu && i < NCPU; i++)
+    if (fresh.hartid[i] != live.hartid[i])           // F9: the harts were renumbered
+      changed |= REV_DEVICES;
+  if (fresh.console_kind != live.console_kind)       // F18
+    changed |= REV_DEVICES;
+  if (fresh.cboz_block != live.cboz_block)           // F21: the cache block cbo.zero clears
+    changed |= REV_DEVICES;
+  if (fresh.ram_size != live.ram_size)               // F13
+    changed |= REV_MEMORY;
+  if (fresh.has_sstc != live.has_sstc)               // F5
+    changed |= REV_TIMER;
+  if (fresh.timebase != live.timebase)               // F6
+    changed |= REV_TIMER;
   for (int i = 0; i < fresh.nvirtio && i < live.nvirtio; i++)
     if (fresh.virtio_base[i] != live.virtio_base[i])
       changed |= REV_DEVICES;   // a device moved: the layout axis
+  // F3: the same device on another line is a change of the same class
+  if (fresh.uart_irq != live.uart_irq || fresh.rtc_irq != live.rtc_irq)
+    changed |= REV_DEVICES;
+  for (int i = 0; i < fresh.nvirtio && i < live.nvirtio; i++)
+    if (fresh.virtio_irq[i] != live.virtio_irq[i])
+      changed |= REV_DEVICES;
   return changed;
 }
 
@@ -163,6 +287,11 @@ void
 machine_init(void)
 {
   initlock(&rev_lock, "machrev");
+  // only a guest has an SBI to probe: this kernel *is* the M-mode under a host
+  // (an ecall from here would land in its own mvec.S, and sbi1/inv4 hung every
+  // host at boot when this ran unconditionally)
+  if (plat.is_guest)
+    sbi_reprobe();
   // and say so, once, at boot: asking the protocol's version is how the host
   // learns that this guest can be told about a new description. Asked lazily --
   // on the first revision check, which was how it worked -- a guest that had
@@ -190,6 +319,75 @@ map_device(uint64 base, uint64 size, int wanted)
 // Called from the supervisor-software-interrupt path when no IPI reason was
 // pending -- see kernel/trap.c. Cheap when there is nothing to do: one ecall,
 // and only on a software interrupt nobody asked for.
+// F22: which SBI extensions the firmware under this kernel offers. Probed once
+// at boot and again when a revision says the set changed (REV_SBI) -- the tree
+// does not describe it, so the host says so through MACH fid 6. Exposed as
+// /sys/machine/sbi; consulted by whatever picks between an SBI service and a
+// device (the timer and the IPIs, when a machine is revised to lack Sstc or a
+// CLINT: M2).
+static const uint64 sbi_ext_ids[] = {0x54494D45, 0x735049, 0x52464E43, 0x48534D, 0x53525354, 0x4442434E};
+static const char *sbi_ext_names[] = {"time", "ipi", "rfence", "hsm", "srst", "dbcn"};
+static uint32 sbi_present;      // SBIH_* bits, present
+
+static void
+sbi_reprobe(void)
+{
+  uint32 p = 0;
+  for (int i = 0; i < 6; i++) {
+    struct sbiret r = sbi_call(0x10, 3, sbi_ext_ids[i]);   // base: probe_extension
+    if (r.err == 0 && r.val != 0)
+      p |= 1u << i;
+  }
+  sbi_present = p;
+}
+
+uint32
+machine_sbi_present(void)
+{
+  return sbi_present;
+}
+
+int
+machine_sbi_names(char *buf, int n)
+{
+  int k = 0;
+  for (int i = 0; i < 6; i++) {
+    if (!(sbi_present & (1u << i)))
+      continue;
+    int l = strlen(sbi_ext_names[i]);
+    if (k + l + 2 > n)
+      break;
+    if (k)
+      buf[k++] = ' ';
+    memmove(buf + k, sbi_ext_names[i], l);
+    k += l;
+  }
+  buf[k] = 0;
+  return k;
+}
+
+// Ask the host for a fact this machine was described without -- a vector unit
+// a lazily-revealed machine has not been shown. The host grants it as a
+// revision, which is taken here and now rather than on the next interrupt, so
+// the caller's answer (hwinfo) is the description as it is after the question.
+// A refusal is remembered so that no program's every hwinfo costs an ecall.
+int
+machine_request(uint32 what)
+{
+  static uint32 refused;
+  if (!supported() || (what & refused) == what)
+    return -1;
+  struct sbiret r = sbi_call(SBI_EXT_MACHINE, MACH_REQUEST, what);
+  if (r.err) {
+    refused |= what;
+    return -1;
+  }
+  push_off();                   // as the IPI path runs it: nothing delivered meanwhile
+  machine_revise_check();
+  pop_off();
+  return 0;
+}
+
 void
 machine_revise_check(void)
 {
@@ -211,6 +409,8 @@ machine_revise_check(void)
     // somebody else has already changed the description: this hart only has to
     // bring its own controller state up against it
     intc_inithart();
+    tick_reanchor();          // F6: at the rate the description now has
+    timer_rearm();            // F5: through whichever timer the description now has
     revision_hart[hart] = gen;
     return;
   }
@@ -227,11 +427,17 @@ machine_revise_check(void)
     // lost the race while fetching the description
     release(&rev_lock);
     intc_inithart();
+    tick_reanchor();          // F6: at the rate the description now has
+    timer_rearm();            // F5: through whichever timer the description now has
     revision_hart[hart] = gen;
     return;
   }
 
   uint32 changed = reread((uint64)d.val, &fresh);
+  // the part of a description that is not in the tree: what the host says
+  struct sbiret w = sbi_call(SBI_EXT_MACHINE, MACH_WHAT, 0);
+  if (w.err == 0 && (w.val & REV_SBI))
+    changed |= REV_SBI;
   revision_seen = gen;
   machine_revisions++;
 
@@ -284,6 +490,9 @@ machine_revise_check(void)
     plat.imsic_nids = fresh.imsic_nids;
     intc_init();
     intc_inithart();
+    printk("machine: interrupt controller %s at 0x%lx\n",
+           plat.intc_kind == INTC_PLIC ? "plic" : plat.intc_kind == INTC_APLIC ? "aplic" : "aplic-msi+imsic",
+           plat.intc_kind == INTC_PLIC ? plat.plic_base : plat.aplic_s_base);
     adopted |= REV_INTC;
   }
 
@@ -329,7 +538,174 @@ machine_revise_check(void)
     }
     for (int i = 0; i < nmoved; i++)
       printk("machine: virtio device moved 0x%lx -> 0x%lx\n", moved_from[i], moved_to[i]);
+    // F3: the lines. The dispatch (trap.c) and the drivers key on the numbers
+    // in `plat', so the numbers are data; what has to be *redone* is the
+    // controller's source configuration, which intc_init() rebuilds for the
+    // numbers it finds -- unless a new controller was just brought up above,
+    // which did that already against the fresh numbers.
+    int renumbered = fresh.uart_irq != plat.uart_irq || fresh.rtc_irq != plat.rtc_irq;
+    for (int i = 0; i < fresh.nvirtio && i < plat.nvirtio; i++)
+      if (fresh.virtio_irq[i] != plat.virtio_irq[i])
+        renumbered = 1;
+    if (renumbered) {
+      plat.uart_irq = fresh.uart_irq;
+      plat.rtc_irq = fresh.rtc_irq;
+      for (int i = 0; i < fresh.nvirtio && i < plat.nvirtio; i++)
+        plat.virtio_irq[i] = fresh.virtio_irq[i];
+      if (!(changed & REV_INTC)) {
+        intc_init();
+        intc_inithart();
+      }
+      printk("machine: interrupt lines renumbered: uart %d, virtio", plat.uart_irq);
+      for (int i = 0; i < plat.nvirtio; i++)
+        printk(" %d", plat.virtio_irq[i]);
+      printk("\n");
+    }
+    // F9: the harts were renumbered. Logical cpu i is still cpu i (tp); what
+    // changes is the hart id its per-hart controller registers are found
+    // under, so every hart rebinds them (intc_inithart here and in the
+    // per-hart path of every other hart as it takes the revision).
+    int renamed = 0;
+    for (int i = 0; i < fresh.ncpu && i < plat.ncpu && i < NCPU; i++)
+      if (fresh.hartid[i] != plat.hartid[i])
+        renamed = 1;
+    if (renamed) {
+      for (int i = 0; i < NCPU; i++)
+        plat.hartid[i] = fresh.hartid[i];
+      // the IMSIC's files are per hart *id*: the window mapped at boot covered
+      // the ids the machine had then (two files for two harts); with ids 4 and
+      // 5 the IPI to hart 5 is a store to a file 20 KB past it -- a guest page
+      // fault and a panic (hart_probe). Every file this machine could ever be
+      // given an id for is mapped, once, here.
+      if (plat.intc_kind == INTC_IMSIC && plat.imsic_s_base)
+        map_device(plat.imsic_s_base, 0x1000L * NCPU, 1);
+      if (!(changed & REV_INTC) && !renumbered) {
+        intc_init();
+        intc_inithart();
+      }
+      printk("machine: harts renumbered:");
+      for (int i = 0; i < plat.ncpu; i++)
+        printk(" %d", plat.hartid[i]);
+      printk("\n");
+    }
+    // F16: virtio devices that came (a virtio-console, F18), or went. The list
+    // is taken as the tree gives it; new windows are mapped and their lines
+    // enabled; a console device that went is let go of.
+    if (fresh.nvirtio != plat.nvirtio) {
+      for (int i = 0; i < fresh.nvirtio && i < PLAT_MAXVIRTIO; i++) {
+        int had = 0;
+        for (int j = 0; j < plat.nvirtio; j++)
+          if (plat.virtio_base[j] == fresh.virtio_base[i])
+            had = 1;
+        if (!had)
+          map_device(fresh.virtio_base[i], 0x1000, 1);
+      }
+      if (fresh.nvirtio < plat.nvirtio)
+        virtio_con_detach();       // the only device that leaves a running machine here
+      plat.nvirtio = fresh.nvirtio;
+      for (int i = 0; i < PLAT_MAXVIRTIO; i++) {
+        plat.virtio_base[i] = fresh.virtio_base[i];
+        plat.virtio_irq[i] = fresh.virtio_irq[i];
+      }
+      if (!(changed & REV_INTC)) {
+        intc_init();               // the new device's line, enabled
+        intc_inithart();
+      }
+      printk("machine: %d virtio device(s) now\n", plat.nvirtio);
+    }
+    // F18: the console is another kind now
+    if (fresh.console_kind != plat.console_kind)
+      console_switch(fresh.console_kind);
+    // F21: the cache block cbo.zero clears; the next page is zeroed at the new stride
+    if (fresh.cboz_block != plat.cboz_block) {
+      printk("machine: cache block %d -> %d bytes\n", plat.cboz_block, fresh.cboz_block);
+      plat.cboz_block = fresh.cboz_block;
+    }
+    // F7/F8: harts came or went. Up: the tables grow now, the harts arrive
+    // (started by the host after this acknowledgement) and boot themselves
+    // in. Down: the harts beyond the count drain and park themselves.
+    if (fresh.ncpu != plat.ncpu) {
+      int old = plat.ncpu;
+      for (int i = 0; i < NCPU; i++)
+        plat.hartid[i] = fresh.hartid[i];
+      plat.ncpu = fresh.ncpu;
+      if (fresh.ncpu > old) {
+        for (int i = old; i < fresh.ncpu && i < NCPU; i++)
+          cpus[i].offline = 0;
+        printk("machine: cpus %d -> %d\n", old, fresh.ncpu);
+      } else {
+        for (int i = fresh.ncpu; i < old && i < NCPU; i++) {
+          cpus[i].offline = 1;
+          sched_kick(i);
+        }
+        printk("machine: cpus %d -> %d (parking %d hart(s))\n", old, fresh.ncpu, old - fresh.ncpu);
+      }
+    }
+    // F16/F17: the RTC came or went
+    if (fresh.rtc_base != plat.rtc_base) {
+      if (fresh.rtc_base)
+        map_device(fresh.rtc_base, 0x1000, 1);
+      plat.rtc_base = fresh.rtc_base;
+      rtc_rebind();
+    }
+    // F4: the CLINT came or went. IPIs in flight are pending VSSIPs on their
+    // targets either way; only the way the next one is sent changes.
+    if (fresh.clint_base != plat.clint_base) {
+      extern uint64 clint_msip_base;
+      if (fresh.clint_base)
+        map_device(fresh.clint_base, 0x10000, 1);
+      plat.clint_base = fresh.clint_base;
+      clint_msip_base = fresh.clint_base;
+      printk("machine: ipis via %s\n", plat.clint_base ? "clint" : "sbi");
+    }
     adopted |= REV_DEVICES;
+  }
+
+  if (changed & REV_MEMORY) {
+    // F13: the machine has more memory. The new range gets a page database of
+    // its own and joins the free lists; nothing that exists moves.
+    if (fresh.ram_end > plat.ram_end) {
+      uint64 b = plat.ram_end, e = fresh.ram_end;
+      if (kalloc_grow(b, e) == 0) {
+        plat.ram_end = e;
+        plat.ram_size = fresh.ram_size;
+        printk("machine: memory %ld -> %ld MB (%ld MB added at 0x%lx)\n",
+               (long)((b - plat.ram_base) >> 20), (long)(plat.ram_size >> 20), (long)((e - b) >> 20), b);
+        adopted |= REV_MEMORY;
+      } else {
+        printk("machine: memory %ld -> %ld MB offered; could not take it\n",
+               (long)(plat.ram_size >> 20), (long)(fresh.ram_size >> 20));
+      }
+    }
+  }
+
+  if (changed & REV_TIMER) {
+    // F5: the timer moved between stimecmp and the SBI timer. What is armed
+    // stays armed as a value; it is re-armed through the other mechanism here
+    // and on every other hart as it takes the revision (below).
+    plat.has_sstc = fresh.has_sstc;
+    if (fresh.timebase != plat.timebase) {
+      // F6: the counter runs at another rate now. The tick interval is
+      // derived from it (tickinit); the wall clock and the scheduler read
+      // the rate each time they convert, and the count itself is continuous
+      // (the host scales the whole count, not a delta).
+      clock_reanchor();          // the ns so far stay; the rate from here is new
+      plat.timebase = fresh.timebase;
+      tickinit();
+      tick_reanchor();           // and the next tick is one new interval away
+      printk("machine: timebase %lu Hz\n", (unsigned long)plat.timebase);
+    }
+    timer_rearm();
+    printk("machine: timer via %s\n", plat.has_sstc ? "stimecmp" : "sbi");
+    adopted |= REV_TIMER;
+  }
+
+  if (changed & REV_SBI) {
+    char names[64];
+    sbi_reprobe();
+    machine_sbi_names(names, sizeof(names));
+    printk("machine: sbi extensions: %s\n", names);
+    adopted |= REV_SBI;
   }
 
   if (changed & REV_VLEN) {

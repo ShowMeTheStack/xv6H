@@ -74,12 +74,30 @@ int
 main(int argc, char *argv[])
 {
   struct hwinfo hi;
-  if (hwinfo(&hi) < 0 || !hi.has_v) {
+  int rounds = 1, secs = 0, force = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {   // hold the unit for SECS
+      secs = atoi(argv[++i]);
+      rounds = 0x7fffffff;
+    } else if (strcmp(argv[i], "-f") == 0) {
+      force = 1;                  // do not ask hwinfo: try the instructions anyway
+    } else {
+      rounds = atoi(argv[i]);
+    }
+  }
+  memset(&hi, 0, sizeof(hi));
+  if (!force && (hwinfo(&hi) < 0 || !hi.has_v)) {
     printf("vecbench: no vector extension on this hart\n");
     exit(0);
   }
-  int rounds = argc > 1 ? atoi(argv[1]) : 1;
+  if (force)
+    hi.vlenb = 16;                // reported, not asked for
+  int t0 = uptime();
   for (int r = 0; r < rounds; r++) {
+    if (secs && uptime() - t0 >= secs * 100) {     // TICK_HZ is 100
+      rounds = r;
+      break;
+    }
     for (int i = 0; i < N; i++) {
       x[i] = i * 3 + r;
       y[i] = 1000 - i;

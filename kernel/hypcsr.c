@@ -58,9 +58,17 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
   // which of these a guest asks for is what decides where it can still be
   // migrated to, so the asking is recorded (see OBS_* in hyp.h)
   switch (csr) {
+  case 0xc01:   // time: only trapped when this machine's clock is scaled (F6)
+    *val = vm_guest_time(v->vm);
+    return 0;
+  case 0x14d:   // stimecmp on a machine without Sstc (F5/F6): the same deadline,
+                // emulated, so the window between the host's change and the
+                // guest's adoption costs a trap and not a panic
+    *val = vm_guest_time_of(v->vm, v->vstimecmp);
+    return 0;
   case CSR_MHARTID:
     vm_observe(v->vm, OBS_MHARTID);
-    *val = v->id;
+    *val = v->id + v->vm->hart_shift;    // F9
     return 0;
   case CSR_MISA:
     vm_observe(v->vm, OBS_MISA);
@@ -100,6 +108,10 @@ static int
 mcsr_write(struct vcpu *v, int csr, uint64 val)
 {
   switch (csr) {
+  case 0x14d:   // stimecmp without Sstc (F5/F6): lands where an SBI set_timer would
+    v->vstimecmp = vm_host_time_of(v->vm, val);
+    timer_rearm();          // the host's timer to the guest's deadline (see hypsbi.c SBI_EXT_TIME)
+    return 0;
   case CSR_MSTATUS:
     v->m_mstatus = val;
     // the FS and VS fields are the real ones: reflect them in vsstatus.
@@ -176,6 +188,19 @@ emulate_mret(struct vcpu *v)
 
 // illegal instruction from the guest: a machine-mode CSR access, mret,
 // or a genuinely illegal instruction to hand back to the guest.
+// OP-V, or a vector load/store: LOAD-FP/STORE-FP with a width the scalar FP
+// instructions do not use (0, 5, 6, 7 are vector; 2, 3, 4 are flw/fld/flq).
+static int
+is_vector_inst(uint32 inst)
+{
+  uint32 op = inst & 0x7f, width = (inst >> 12) & 7;
+  if (op == 0x57)
+    return 1;
+  if ((op == 0x07 || op == 0x27) && (width == 0 || width >= 5))
+    return 1;
+  return 0;
+}
+
 int
 hyp_illegal(struct vcpu *v, uint32 inst)
 {
@@ -202,6 +227,20 @@ hyp_illegal(struct vcpu *v, uint32 inst)
       }
     }
   }
+  // A vector instruction from a guest whose unit is hidden: this is the one
+  // exact observation of use the host ever gets (Proposition 4 says sampling
+  // cannot give it; a trap on first use can). Grant the unit, tell the guest,
+  // and leave the pc where it is: the guest takes the revision on entry, adopts,
+  // returns to the instruction, which now runs -- or traps again as a plain
+  // illegal instruction into the guest if that task has no save area yet, which
+  // the guest answers by allocating one (trap.c).
+  if (is_vector_inst(inst) && v->vm->lazy_v && v->vm->vec_revoked && plat.has_v) {
+    vm_observe(v->vm, OBS_VECTOR_USED);
+    printk("hyp: vm %d: first vector instruction (0x%x): granting the unit\n",
+           v->vm->id, inst);
+    if (vm_revise_vector(v->vm, 1) == 0)
+      return 0;                     // pc unchanged: re-execute after adoption
+  }
   // not ours: the guest gets it as an illegal instruction exception.
   vcpu_inject(v, EXC_ILLEGAL, inst);
   return 0;
@@ -212,7 +251,27 @@ hyp_illegal(struct vcpu *v, uint32 inst)
 int
 hyp_virtinst(struct vcpu *v, uint32 inst)
 {
+  // F21: cbo.zero, trapped because the block the guest is described with is
+  // not the host's (henvcfg.CBZE off): clear the described block, in the
+  // guest's own address space (hsv.d, VS-level translation)
+  if ((inst & 0xfff07fff) == 0x0040200f) {
+    struct vm *vm = v->vm;
+    int n = vm->cboz_block;
+    if (vm->revise_acked != vm->revise_gen && vm->cboz_prev > n)
+      n = vm->cboz_prev;   // a revision between two sizes is pending: the larger
+    uint64 gva = v->regs[(inst >> 15) & 31] & ~((uint64)n - 1);
+    for (uint64 a = gva; a < gva + n; a += 8)
+      asm volatile(".insn r 0x73, 0x4, 0x37, x0, %0, %1" ::"r"(a), "r"(0UL) : "memory");   // hsv.d x0, (a)
+    __atomic_fetch_add(&hyp_cboz_exits, 1, __ATOMIC_RELAXED);
+    v->pc += 4;
+    return 0;
+  }
   if ((inst & 0x7f) == 0x73 && ((inst >> 12) & 3) != 0) {
+    int csr = inst >> 20;
+    // F6: `time' read by a machine whose clock is described at another rate
+    // (hcounteren.TM is off for it): answered at that rate, continuous
+    if ((csr == 0xc01 || csr == 0x14d) && csr_rmw(v, inst, mcsr_read, mcsr_write) == 0)
+      return 0;
     if (vic_csr(v, inst) == 0)
       return 0;
   }

@@ -1110,6 +1110,663 @@ def t_revise_intc(QEMU, intc, cpus, log):
         q.close()
 
 
+def t_revise_intc_addr(QEMU, intc, cpus, log):
+    """F2: the controller's *address* changed under a running guest, and back.
+
+    The kind stays a PLIC; the host moves the register window 256 MB up the map
+    (`vmm revise VM intcmap alt') and tells the guest, which maps the new window
+    and rebinds its driver. Checked as t_revise_intc checks: the guest goes on
+    working through the controller at its new address (its disk completes, so
+    interrupts arrive), it says from inside where its controller is, and it did
+    not reboot. Then the same the other way."""
+    q = boot_host(QEMU, "plic", cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("echo before-the-move > /keep\n")
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for want, addr in (("alt", "0x1c000000"), ("default", "0xc000000")):
+            m = q.mark()
+            q.send("vmm revise %d intcmap %s\n" % (vmid, want))
+            q.expect(r"interrupt controller map -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            sw = q.output_since(m)
+            assert re.search(r"interrupt controller registers \+0x[0-9a-f]+ -> \+0x[0-9a-f]+", sw), sw
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            # the guest said where its controller is now, from inside; the
+            # console backlog is replayed on attach
+            q.expect(r"machine: interrupt controller plic at %s" % addr, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("cat /keep\n")
+            q.expect(r"before-the-move", 60)
+            q.expect(r"\$ ", ATONCE)
+            mm = q.mark()
+            q.send("echo at-%s > /after; sync; cat /after\n" % want)
+            q.expect(r"at-%s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+            detach(q)
+            out = host_cmd(q, "vmm info %d" % vmid)
+            # the exits went to the window where the controller is now
+            assert ("plic@1c000000" if want == "alt" else "plic@c000000") in out, out
+        kill_vm(q, vmid)
+        print("    a guest followed its interrupt controller to a new address and back, without a reboot")
+    finally:
+        q.close()
+
+
+def t_revise_irqmap(QEMU, intc, cpus, log):
+    """F3: the interrupt lines renumbered under a running guest, and back.
+
+    `vmm revise VM irqmap alt' moves the uart from line 10 to 7 and the virtio
+    devices from 1..4 to 11..14; the host carries the lines the devices are
+    holding across by number and tells the guest, which takes the new numbers
+    into its platform description and rebuilds its controller's source
+    configuration. Checked by use: the disk completes (its interrupt arrives on
+    the new line), the console works (the uart's does), no reboot."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("echo before-the-renumbering > /keep\n")
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for want, uart, virtio in (("alt", 7, "11 12 13"), ("default", 10, "1 2 3")):
+            m = q.mark()
+            q.send("vmm revise %d irqmap %s\n" % (vmid, want))
+            q.expect(r"interrupt lines -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            sw = q.output_since(m)
+            assert re.search(r"interrupt lines renumbered \w+ -> %s, \d+ line\(s\) held" % want, sw), sw
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: interrupt lines renumbered: uart %d, virtio %s" % (uart, virtio), 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("cat /keep\n")
+            q.expect(r"before-the-renumbering", 60)
+            q.expect(r"\$ ", ATONCE)
+            mm = q.mark()
+            q.send("echo on-%s > /after; sync; cat /after\n" % want)
+            q.expect(r"on-%s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a guest had its interrupt lines renumbered and back, and kept running")
+    finally:
+        q.close()
+
+
+def _info(q, vmid):
+    """exits, observed set, revision generation and the by-device line of `vmm info'."""
+    out = host_cmd(q, "vmm info %d" % vmid)
+    m = re.search(r"exits (\d+):", out)
+    exits = int(m.group(1)) if m else -1
+    m = re.search(r"observed: ([^\n]*)", out)
+    obs = re.sub(r"@\d+ms|\(of \d+ ms alive\)", "", m.group(1)).strip() if m else ""   # the set, not the times
+    m = re.search(r"generation (\d+)", out)
+    gen = int(m.group(1)) if m else -1
+    return exits, obs, gen, out
+
+
+_churn_pass = [0]
+
+
+def _blk(q, vmid):
+    """csr exits and virtio-blk interrupts from `vmm info': the two numbers the
+    delivery path shows up in. MMIO exits are the device's traffic either way."""
+    out = host_cmd(q, "vmm info %d" % vmid)
+    m = re.search(r"csr (\d+),", out)
+    csr = int(m.group(1)) if m else -1
+    m = re.search(r"virtio-blk@[0-9a-f]+ \d+r/\d+w/(\d+)i", out)
+    irqs = int(m.group(1)) if m else -1
+    return csr, irqs
+
+
+def _churn(q, n=800):
+    """interrupts inside the attached guest: a sequential read of the disk in
+    4 KB blocks, one completion interrupt per block. Each call reads a part of
+    the disk no earlier call has, so the block cache serves none of it (inv5:
+    the second pass over the same blocks took 971 exits to the first's 14435)."""
+    skip = 2000 + _churn_pass[0] * n      # past what booting left in the cache (inv6, m2a)
+    _churn_pass[0] += 1
+    q.send("dd if=/dev/vda of=/dev/null bs=4096 count=%d skip=%d 2>/dev/null; echo CHURNED\n" % (n, skip))
+    q.expect(r"CHURNED", 180)
+    q.expect(r"\$ ", ATONCE)
+
+
+def t_invisible_imsic(QEMU, intc, cpus, log):
+    """F23: the same IMSIC delivered through a hardware guest interrupt file or
+    through the software model. The guest cannot tell -- no revision is asked,
+    its observed set does not change, it keeps running -- and the host can say
+    what the difference costs: the exits the same workload takes either way.
+    This is the tier-cost number seen from the invisible side."""
+    q = boot_host(QEMU, "imsic", cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "intc aplic-msi+imsic (hardware guest files)" in out, out
+        e0, obs0, gen0, _ = _info(q, vmid)
+        c0, i0 = _blk(q, vmid)
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 60)
+        _churn(q)
+        detach(q)
+        e1, obs1, gen1, _ = _info(q, vmid)
+        c1, i1 = _blk(q, vmid)
+        m = q.mark()
+        host_cmd(q, "vmm imsichw %d off" % vmid)
+        assert "imsic delivery hardware file -> software model" in q.output_since(m), q.output_since(m)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "(hardware guest files)" not in out, out
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 60)
+        _churn(q)
+        detach(q)
+        e2, obs2, gen2, out2 = _info(q, vmid)
+        c2, i2 = _blk(q, vmid)
+        host_cmd(q, "vmm imsichw %d on" % vmid)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "(hardware guest files)" in out, out
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 60)
+        _churn(q)
+        q.send("echo still-here\n"); q.expect(r"still-here", 60); q.expect(r"\$ ", ATONCE)
+        detach(q)
+        e3, obs3, gen3, _ = _info(q, vmid)
+        c3, i3 = _blk(q, vmid)
+        assert gen0 == gen1 == gen2 == gen3, (gen0, gen1, gen2, gen3)     # nothing was asked
+        assert "revision" not in q.buf.decode(errors="replace")[-20000:].replace("revision: guest", ""), q.buf[-3000:]
+        # and the switch itself showed the guest nothing new. The workload may:
+        # the guest's libc uses the vector unit for memmove, so `vector' can
+        # join the observed set while dd runs, switch or no switch (inv3).
+        grown = (set(obs3.split()) - set(obs1.split())) | (set(obs2.split()) - set(obs1.split()))
+        assert grown <= {"vector"}, (obs1, obs2, obs3)
+        hw, sw, hw2 = e1 - e0, e2 - e1, e3 - e2
+        # the delivery path shows up as CSR exits per interrupt: the model's
+        # claim and MSI traffic trap (vstopei, vsireg), the file's do not. MMIO
+        # exits are the disk's own traffic and the same either way (inv6).
+        def per(c, i):
+            return (c / i) if i > 0 else float("nan")
+        p1, p2, p3 = per(c1 - c0, i1 - i0), per(c2 - c1, i2 - i1), per(c3 - c2, i3 - i2)
+        print("    invisible: %d/%d/%d interrupts took %.2f/%.2f/%.2f csr exits each on file/model/file (%d/%d/%d exits in all)"
+              % (i1 - i0, i2 - i1, i3 - i2, p1, p2, p3, hw, sw, hw2))
+        assert i1 - i0 > 50 and i2 - i1 > 50 and i3 - i2 > 50, (i1 - i0, i2 - i1, i3 - i2)
+        assert p2 > p1 + 1 and p2 > p3 + 1, (p1, p2, p3)
+        kill_vm(q, vmid)
+    finally:
+        q.close()
+
+
+def t_invisible_backing(QEMU, intc, cpus, log):
+    """F24: how the guest's memory is backed -- 2 MB blocks or 4 KB pages, with
+    or without same-page merging -- is the host's business. Changed under a
+    running guest: no revision, same observed set, and the guest's data is what
+    it was (a checksum over a file it wrote before)."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("dd if=/dev/urandom of=/tmp/r bs=4096 count=512 2>/dev/null; cksum /tmp/r\n")
+        m = q.expect(r"(\d+) \d+ /tmp/r", 120)
+        sum0 = m.group(1)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        e0, obs0, gen0, out = _info(q, vmid)
+        assert re.search(r"memory: 0 chunks split to pages", out), out
+        host_cmd(q, "vmm split %d" % vmid)
+        _, _, gen1, out = _info(q, vmid)
+        m2 = re.search(r"memory: (\d+) chunks split to pages", out)
+        assert m2 and int(m2.group(1)) > 0, out
+        host_cmd(q, "vmm ksm on")
+        host_cmd(q, "sleep 2")
+        host_cmd(q, "vmm ksm off")
+        _, obs2, gen2, _ = _info(q, vmid)
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 60)
+        q.send("cksum /tmp/r\n")
+        m3 = q.expect(r"(\d+) \d+ /tmp/r", 120)
+        q.expect(r"\$ ", ATONCE)
+        assert m3.group(1) == sum0, (sum0, m3.group(1))
+        q.send("echo still-here\n"); q.expect(r"still-here", 60); q.expect(r"\$ ", ATONCE)
+        detach(q)
+        assert gen0 == gen1 == gen2, (gen0, gen1, gen2)
+        assert obs0 == obs2, (obs0, obs2)
+        print("    invisible: %s blocks split to pages and same-page merging on and off under the guest; checksum kept, nothing asked"
+              % m2.group(1))
+        kill_vm(q, vmid)
+    finally:
+        q.close()
+
+
+def t_revise_sbi(QEMU, intc, cpus, log):
+    """F22: the set of SBI extensions is a fact of the machine. The host withholds
+    two of them from a running guest (`vmm revise VM sbi hide srst,dbcn'); the
+    guest is told (REV_SBI, the one revision the tree cannot carry: MACH fid 6
+    says what changed), re-probes, and /sys/machine/sbi says what it now has.
+    Then they are given back."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("cat /sys/machine/sbi\n")
+        q.expect(r"time ipi rfence hsm srst dbcn", 30)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for hide, shown in (("srst,dbcn", "time ipi rfence hsm"), ("none", "time ipi rfence hsm srst dbcn"),
+                            ("rfence", "time ipi hsm srst dbcn")):
+            m = q.mark()
+            q.send("vmm revise %d sbi %s\n" % (vmid, hide))
+            q.expect(r"sbi extensions withheld 0x[0-9a-f]+: asked", 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: sbi extensions: %s" % shown, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("cat /sys/machine/sbi\n")
+            q.expect(r"%s\r?\n" % shown, 30)
+            q.expect(r"\$ ", ATONCE)
+            q.send("echo alive-%s\n" % hide.replace(",", "-"))
+            q.expect(r"alive-%s" % hide.replace(",", "-"), 60)
+            q.expect(r"\$ ", ATONCE)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a guest was told which SBI extensions it has, three times, and re-probed each time")
+    finally:
+        q.close()
+
+
+def t_revise_ipi(QEMU, intc, cpus, log):
+    """F4: how the guest sends IPIs -- a CLINT's msip or the SBI -- is a fact of
+    the machine. The CLINT is taken away from a running two-hart guest (its
+    node leaves the tree, the model leaves the machine) and given back; the
+    guest keeps scheduling across its harts, which is the check."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 2 -m 64")
+        detach(q)
+        for want, via in (("sbi", "sbi"), ("clint", "clint")):
+            m = q.mark()
+            q.send("vmm revise %d ipi %s\n" % (vmid, want))
+            q.expect(r"ipis -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: ipis via %s" % via, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            # work that crosses harts: pipes between processes on both
+            q.send("for i in 1 2 3 4 5 6; do (echo ipi-$i | cat | cat) & done; wait; echo IPIS-OK\n")
+            q.expect(r"IPIS-OK", 120)
+            q.expect(r"\$ ", ATONCE)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a two-hart guest lost its CLINT and sent its IPIs through SBI, then got it back")
+    finally:
+        q.close()
+
+
+def t_revise_timer(QEMU, intc, cpus, log):
+    """F5: where the guest's timer is -- Sstc's stimecmp or the SBI timer -- is a
+    fact of the machine. Sstc is taken away from a running guest (henvcfg.STCE
+    off, `sstc' out of the isa string); the guest re-arms through SBI and its
+    clock keeps time, which `sleep 1' shows; then it is given back."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        detach(q)
+        for want, via in (("sbi", "sbi"), ("sstc", "stimecmp")):
+            m = q.mark()
+            q.send("vmm revise %d timer %s\n" % (vmid, want))
+            q.expect(r"timer -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: timer via %s" % via, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            import time as _t
+            t0 = _t.time()
+            q.send("sleep 1; echo SLEPT\n")
+            q.expect(r"SLEPT", 60)
+            q.expect(r"\$ ", ATONCE)
+            dt = _t.time() - t0
+            assert 0.8 < dt < 6, dt           # the timer fires: not stuck, not spinning
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a guest lost Sstc and kept time through the SBI timer, then got it back")
+    finally:
+        q.close()
+
+
+def t_revise_timebase(QEMU, intc, cpus, log):
+    """F6: the timebase-frequency is a fact of the machine, with a stated cost.
+    A running guest is told its counter runs at 1 MHz instead of 10 MHz: the
+    host traps and scales its `time' reads and carries its SBI timer deadlines
+    in the other units; the guest recomputes its tick interval. `sleep 1' still
+    takes a second of wall time, which is the check -- a guest that believed
+    the old rate would sleep ten seconds or a tenth. Then back to 10 MHz."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        detach(q)
+        import time as _t
+        for hz, ok in (("1000000", "1000000"), ("10000000", "10000000")):
+            m = q.mark()
+            q.send("vmm revise %d timebase %s\n" % (vmid, hz))
+            q.expect(r"timebase -> %s Hz: asked" % hz, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            if hz == "1000000":
+                q.expect(r"machine: timebase 1000000 Hz", 60)
+            else:
+                q.expect(r"machine: timebase 10000000 Hz", 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            t0 = _t.time()
+            q.send("sleep 1; echo SLEPT\n")
+            q.expect(r"SLEPT", 60)
+            q.expect(r"\$ ", ATONCE)
+            dt = _t.time() - t0
+            assert 0.8 < dt < 4, dt
+            # and the guest's own clock agrees with the wall
+            q.send("cat /proc/uptime\n")
+            q.expect(r"\$ ", 30)
+            detach(q)
+            out = host_cmd(q, "vmm info %d" % vmid)
+            print("    timebase %s Hz: sleep 1 took %.2fs; %s" % (hz, dt, re.search(r"exits \d+:[^\n]*", out).group(0)))
+        kill_vm(q, vmid)
+        print("    a guest was told its clock runs at another rate, and kept time at both")
+    finally:
+        q.close()
+
+
+def t_revise_hartid(QEMU, intc, cpus, log):
+    """F9: how the harts are numbered is a fact of the machine. A running
+    two-hart guest, numbered 0 and 1, is told its harts are 4 and 5: mhartid,
+    the cpu nodes and every controller's per-hart registers move; the guest
+    keeps a logical index (tp) and rebinds its per-hart controller state to the
+    new numbers. Work that crosses harts still crosses them. Then back."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 2 -m 64")
+        q.send("cat /proc/cpuinfo | head -20\n")
+        q.expect(r"\$ ", 30)
+        detach(q)
+        for shift in ("4", "0"):
+            m = q.mark()
+            q.send("vmm revise %d hartid %s\n" % (vmid, shift))
+            q.expect(r"harts numbered from %s: asked" % shift, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: harts renumbered: %s" % ("4 5" if shift == "4" else "0 1"), 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("for i in 1 2 3 4 5 6; do (echo h-$i | cat | cat) & done; wait; echo HARTS-OK\n")
+            q.expect(r"HARTS-OK", 120)
+            q.expect(r"\$ ", ATONCE)
+            mm = q.mark()
+            q.send("echo on-%s > /after; sync; cat /after\n" % shift)
+            q.expect(r"on-%s" % shift, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a two-hart guest had its harts renumbered 4,5 and back, and kept scheduling across them")
+    finally:
+        q.close()
+
+
+def t_revise_mac(QEMU, intc, cpus, log):
+    """F19: the NIC's identity changed under a running guest, and back. Not a
+    revision: the device announces a configuration change and the driver
+    re-reads its address, as virtio provides. The guest's stack sends from
+    the new address; a ping to its gateway still answers."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("ifconfig eth0\n")
+        q.expect(r"52:54:00:78:76:10", 30)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for want, mac in (("alt", "52:54:00:79:76:10"), ("default", "52:54:00:78:76:10")):
+            m = q.mark()
+            host_cmd(q, "vmm revise %d mac %s" % (vmid, want))
+            assert "nic identity -> %s" % mac in q.output_since(m), q.output_since(m)
+            attach(q, str(vmid))
+            q.expect(r"virtio net: mac changed to %s" % mac, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("ifconfig eth0\n")
+            q.expect(mac, 30)
+            q.expect(r"\$ ", ATONCE)
+            # (the guest's default network policy blocks ICMP to its gateway, so
+            # the traffic check is the migration test's: a guest that arrived
+            # with a new address keeps its disk and console working over it)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a guest's NIC changed identity twice under it; it re-read the address and kept talking")
+    finally:
+        q.close()
+
+
+def t_revise_rtc(QEMU, intc, cpus, log):
+    """F16/F17: a device removed from a running guest and given back -- the RTC.
+    Without it the guest's wall clock runs on in software from the last
+    reading; with it back, it re-anchors to the device. `date +%s' stays
+    within a few seconds of the host's throughout, which is the check."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        def secs(out):
+            # `date' here prints a calendar line; the seconds of the day are enough
+            # for a comparison within a few seconds (both hosts are on the same day)
+            h, mi, s = re.search(r"(\d\d):(\d\d):(\d\d)", out).groups()
+            return int(h) * 3600 + int(mi) * 60 + int(s)
+        def gdate():
+            m = q.mark(); q.send("date\n"); q.expect(r"\$ ", 30)
+            return secs(q.output_since(m))
+        t0 = gdate()
+        detach(q)
+        for want, msg in (("off", r"rtc: gone; the wall clock continues from \d+ in software"),
+                          ("on", r"rtc: goldfish at 0x101000, epoch seconds \d+")):
+            m = q.mark()
+            q.send("vmm revise %d rtc %s\n" % (vmid, want))
+            q.expect(r"rtc %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert re.search(r"hyp: vm \d+: rtc (removed|added)", q.output_since(m)), q.output_since(m)
+            wait_adopted(q, m)
+            hnow = secs(host_cmd(q, "date"))
+            attach(q, str(vmid))
+            q.expect(msg, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("sleep 1\n")
+            q.expect(r"\$ ", 30)
+            gnow = gdate()
+            d = abs(gnow - hnow)
+            assert min(d, 86400 - d) <= 5, (want, gnow, hnow)
+            detach(q)
+        kill_vm(q, vmid)
+        print("    a guest lost its RTC (wall clock ran on in software) and got it back (re-anchored); within 5 s of the host both times")
+    finally:
+        q.close()
+
+
+def t_revise_console(QEMU, intc, cpus, log):
+    """F18: the console is a class change beside the interrupt controller: the
+    16550 the guest drives register by register, a virtio-console it feeds by
+    descriptor, the SBI debug console it calls into. A running guest is moved
+    through all three and back; each time it announces the change *through
+    the new console* and a command typed into it answers."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        detach(q)
+        for want, shown in (("sbi", "sbi"), ("virtio", "virtio-console"), ("uart", "uart")):
+            m = q.mark()
+            q.send("vmm revise %d console %s\n" % (vmid, want))
+            q.expect(r"console -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: console via %s" % shown, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("echo typed-into-%s\n" % want)
+            q.expect(r"typed-into-%s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            detach(q)
+            out = host_cmd(q, "vmm info %d" % vmid)
+            print("    console %s: %s" % (want, re.search(r"exits \d+:[^\n]*", out).group(0)))
+        kill_vm(q, vmid)
+        print("    a guest's console changed kind three times under it and answered through each")
+    finally:
+        q.close()
+
+
+def t_revise_ram(QEMU, intc, cpus, log):
+    """F13: a running guest is given more memory. The memory node grows, the
+    guest is told, and it adds the range to its allocator with a page database
+    of its own; a file too large for the old machine then fits."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 32")
+        q.send("grep MemTotal /proc/meminfo\n")
+        m = q.expect(r"MemTotal:\s+(\d+) kB", 30)
+        before = int(m.group(1))
+        q.expect(r"\$ ", ATONCE)
+        q.send("dd if=/dev/urandom of=/tmp/big bs=1M count=24 2>/dev/null; cksum /tmp/big; rm /tmp/big\n")
+        m = q.expect(r"(\d+) (\d+) /tmp/big", 240)
+        assert int(m.group(2)) < 25165824, "tmpfs took 24 MB in a 32 MB machine: %s" % m.group(0)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        m = q.mark()
+        q.send("vmm resize %d 64\n" % vmid)
+        q.expect(r"memory -> 64 MB: asked", 60)
+        q.expect(r"\$ ", ATONCE)
+        assert "memory 32 -> 64 MB" in q.output_since(m), q.output_since(m)
+        wait_adopted(q, m)
+        attach(q, str(vmid))
+        q.expect(r"machine: memory 32 -> 64 MB \(32 MB added at 0x82000000\)", 60)
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        q.send("grep MemTotal /proc/meminfo\n")
+        m = q.expect(r"MemTotal:\s+(\d+) kB", 30)
+        after = int(m.group(1))
+        q.expect(r"\$ ", ATONCE)
+        assert after >= before + 30000, (before, after)
+        # a file the old machine could not have held
+        # /tmp is a size-less tmpfs: its limit is half the machine, and it
+        # follows the machine (a 24 MB file did not fit in 32 MB; it does now)
+        q.send("dd if=/dev/urandom of=/tmp/big bs=1M count=24 2>/dev/null; cksum /tmp/big\n")
+        mm = q.expect(r"(\d+) 25165824 /tmp/big", 240)
+        q.expect(r"\$ ", ATONCE)
+        q.send("cksum /tmp/big\n")
+        m2 = q.expect(r"(\d+) 25165824 /tmp/big", 240)
+        q.expect(r"\$ ", ATONCE)
+        assert mm.group(1) == m2.group(1), (mm.group(1), m2.group(1))
+        detach(q)
+        kill_vm(q, vmid)
+        print("    a guest was given 32 MB more (MemTotal %d -> %d kB); a 24 MB file that its tmpfs refused before fits now, checksum stable" % (before, after))
+    finally:
+        q.close()
+
+
+def t_revise_cpus(QEMU, intc, cpus, log):
+    """F8/F7: harts taken away from a running guest and given back. A four-hart
+    guest is told it has two: the two beyond drain their queues onto the
+    others and stop through SBI HSM (the host sees them stopped); work still
+    crosses harts. Then it is told it has four again: the host starts the two
+    at the kernel's entry after the guest has extended its tables, and they
+    boot in (`hart N starting')."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 4 -m 64")
+        detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "4 vcpu" in out, out
+        def work():
+            q.send("for i in 1 2 3 4 5 6 7 8; do (echo w-$i | cat | cat) & done; wait; echo WORK-OK\n")
+            q.expect(r"WORK-OK", 120)
+            q.expect(r"\$ ", ATONCE)
+        q.send("vmm revise %d cpus 2\n" % vmid)
+        q.expect(r"hart\(s\) 2\.\.3 parked", 60)
+        q.expect(r"cpus -> 2: done", 60)
+        q.expect(r"\$ ", ATONCE)
+        attach(q, str(vmid))
+        q.expect(r"machine: cpus 4 -> 2 \(parking 2 hart\(s\)\)", 60)
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        work()
+        detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        q.send("vmm revise %d cpus 4\n" % vmid)
+        q.expect(r"hart\(s\) 2\.\.3 started", 60)
+        q.expect(r"cpus -> 4: done", 60)
+        q.expect(r"\$ ", ATONCE)
+        attach(q, str(vmid))
+        q.expect(r"machine: cpus 2 -> 4", 60)
+        # the two boot in whichever order the host's scheduler runs them
+        q.expect(r"hart [23] starting", 60)
+        q.expect(r"hart [23] starting", 60)
+        q.send("\n")
+        q.expect(r"\$ ", 60)
+        work()
+        detach(q)
+        kill_vm(q, vmid)
+        print("    a four-hart guest parked two of its harts on request and got them back; work crossed harts throughout")
+    finally:
+        q.close()
+
+
+def t_revise_cboz(QEMU, intc, cpus, log):
+    """F21: the cache-block size cbo.zero clears is a fact of the machine, and
+    the one whose wrong value does not fail loudly: a kernel zeroing pages at
+    a stride longer than the block leaves every other block as it was. The
+    host describes another size than its own (128 on a 64-byte host); until
+    the guest adopts, cbo.zero traps and is done in software at the larger of
+    the two; after, the guest strides 128 and the host clears 128 for it.
+    Fresh pages are zero throughout (zerocheck); then back to the host's own,
+    in hardware."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 1 -m 64")
+        q.send("zerocheck 512\n")
+        q.expect(r"zerocheck: 512 pages clean", 120)
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for want, frm in ((128, 64), (64, 128)):
+            m = q.mark()
+            q.send("vmm revise %d cboz %d\n" % (vmid, want))
+            q.expect(r"cache block %d -> %d bytes \((the host's, in hardware|not the host's, in software)\)" % (frm, want), 60)
+            q.expect(r"cache block -> %d bytes: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: cache block %d -> %d bytes" % (frm, want), 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            q.send("zerocheck 512\n")
+            q.expect(r"zerocheck: 512 pages clean", 120)
+            q.expect(r"\$ ", ATONCE)
+            detach(q)
+            out = host_cmd(q, "vmm info %d" % vmid)
+            mm = re.search(r"cbo.zero in software (\d+)", out)
+            if want == 128:
+                assert mm and int(mm.group(1)) > 0, out     # the 128-byte block is not this host's: software
+                soft = int(mm.group(1))
+        out = host_cmd(q, "vmm info %d" % vmid)
+        mm = re.search(r"cbo.zero in software (\d+)", out)
+        # back on the host's own block, cbo.zero is hardware again: the count stops moving
+        # (a few from the window before the adoption are allowed)
+        assert mm and int(mm.group(1)) - soft < 5000, (soft, out)
+        kill_vm(q, vmid)
+        print("    a guest was described a 128-byte cache block on a 64-byte host (%d cbo.zero done in software), zeroed pages right throughout, and got the host's own back" % soft)
+    finally:
+        q.close()
+
+
 def t_revise_vector(QEMU, intc, cpus, log):
     """the vector unit taken away from a running guest, and given back.
 
@@ -1243,6 +1900,24 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
     # own controllers because the point of them is a controller changing.
     t.append(("guest-revise-intc", lambda: t_revise_intc(QEMU, "imsic", cpus, log)))
     t.append(("guest-revise-vector", lambda: t_revise_vector(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-intc-addr", lambda: t_revise_intc_addr(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-irqmap", lambda: t_revise_irqmap(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-irqmap-imsic", lambda: t_revise_irqmap(QEMU, "imsic", cpus, log)))
+    t.append(("guest-revise-sbi", lambda: t_revise_sbi(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-ipi", lambda: t_revise_ipi(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-timer", lambda: t_revise_timer(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-timebase", lambda: t_revise_timebase(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-hartid", lambda: t_revise_hartid(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-hartid-imsic", lambda: t_revise_hartid(QEMU, "imsic", cpus, log)))
+    t.append(("guest-revise-mac", lambda: t_revise_mac(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-rtc", lambda: t_revise_rtc(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-console", lambda: t_revise_console(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-ram", lambda: t_revise_ram(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-cpus", lambda: t_revise_cpus(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-cboz", lambda: t_revise_cboz(QEMU, "plic", cpus, log)))
+    # F23/F24: the facts that are not facts of the machine
+    t.append(("guest-invisible-imsic", lambda: t_invisible_imsic(QEMU, "imsic", cpus, log)))
+    t.append(("guest-invisible-backing", lambda: t_invisible_backing(QEMU, "plic", cpus, log)))
     t.append(("guest-revguest", lambda: t_revguest(QEMU, "imsic", cpus, log)))
     for m in modes:
         t.append(("guest-fuzz-%s" % m, lambda m=m: t_fuzz(QEMU, m, cpus, log)))

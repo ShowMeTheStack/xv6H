@@ -42,6 +42,7 @@ static struct {
   uint64 epoch_ns;   // what the device said
   uint64 mono_ns;    // the monotonic reading when it said it
   int valid;
+  int soft;          // F17: the device is gone; the clock runs on from the last reading
 } rtc_off;
 
 void
@@ -59,20 +60,47 @@ rtcinit(void)
 int
 rtc_present(void)
 {
-  return plat.rtc_base != 0;
+  return plat.rtc_base != 0 || rtc_off.soft;   // a software clock is still a clock
+}
+
+// F16/F17: the RTC came or went (a revision of the devices). Gone: the wall
+// clock continues from the last reading, driven by the counter -- a software
+// clock, as a kernel keeps when its RTC is unreadable. Back: the device is
+// read again and the clock re-anchors to it.
+void
+rtc_rebind(void)
+{
+  acquire(&rtclock);
+  if (plat.rtc_base == 0) {
+    if (rtc_off.valid) {
+      rtc_off.soft = 1;
+      release(&rtclock);
+      printk("rtc: gone; the wall clock continues from %ld in software\n",
+             rtc_off.epoch_ns / 1000000000UL);
+      return;
+    }
+    release(&rtclock);
+    printk("rtc: gone; CLOCK_REALTIME unavailable\n");
+    return;
+  }
+  rtc_off.soft = 0;
+  rtc_off.valid = 0;
+  release(&rtclock);
+  uint64 ns = clock_realtime_ns();
+  printk("rtc: goldfish at 0x%lx, epoch seconds %ld\n", plat.rtc_base, ns / 1000000000UL);
 }
 
 // nanoseconds since the epoch, or 0 without an RTC.
 uint64
 clock_realtime_ns(void)
 {
-  if (plat.rtc_base == 0)
+  if (plat.rtc_base == 0 && !rtc_off.soft)
     return 0;
 
   uint64 mono = clock_monotonic_ns();
   acquire(&rtclock);
   if (rtc_off.valid && mono >= rtc_off.mono_ns &&
-      mono - rtc_off.mono_ns < RESYNC_NS) {
+      (rtc_off.soft || mono - rtc_off.mono_ns < RESYNC_NS)) {
     uint64 ns = rtc_off.epoch_ns + (mono - rtc_off.mono_ns);
     release(&rtclock);
     return ns;
@@ -93,8 +121,18 @@ clock_realtime_ns(void)
 uint64
 clock_monotonic_ns(void)
 {
-  uint64 t = r_time(), tb = plat.timebase ? plat.timebase : 10000000;
-  return (t / tb) * 1000000000UL + (t % tb) * 1000000000UL / tb;
+  // from the last rate change (F6): the counter's rate may have changed since
+  // boot, and what was counted at the old rate stays counted in ns
+  uint64 t = r_time() - plat.tb_t0, tb = plat.timebase ? plat.timebase : 10000000;
+  return plat.tb_ns0 + (t / tb) * 1000000000UL + (t % tb) * 1000000000UL / tb;
+}
+
+// F6: the rate is about to change; what has elapsed stays as it was
+void
+clock_reanchor(void)
+{
+  plat.tb_ns0 = clock_monotonic_ns();
+  plat.tb_t0 = r_time();
 }
 
 // ---- the system's random bytes ----

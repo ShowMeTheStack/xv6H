@@ -75,7 +75,7 @@ uartinit(void)
   WriteReg(FCR, FCR_FIFO_ENABLE | FCR_FIFO_CLEAR);
 
   // enable transmit and receive interrupts.
-  WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
+  WriteReg(IER, plat.console_kind == 0 ? (IER_TX_ENABLE | IER_RX_ENABLE) : 0);   // F18
 
   initsleeplock(&tx_lock, "uart");
   initlock(&tx_spin, "uart_tx");
@@ -87,12 +87,11 @@ uartinit(void)
 void
 uartwrite(char buf[], int n)
 {
-  // a guest with a console queue pays one exit for this whole buffer
-  // instead of two for each character of it (kernel/virtio_con.c).
-  if (virtio_con_present()) {
-    virtio_con_write(buf, n);
+  // a guest whose console is not the 16550 writes it elsewhere (F18): a
+  // virtio-console pays one exit for this whole buffer instead of two for
+  // each character of it (kernel/virtio_con.c); the SBI debug console one call
+  if (console_divert(buf, n))
     return;
-  }
   acquiresleep(&tx_lock);
 
   int i = 0;
@@ -122,10 +121,8 @@ uartputs_sync(const char *s, int n)
     for (;;)
       ;
   }
-  if (virtio_con_present()) {
-    virtio_con_write(s, n);
+  if (console_divert(s, n))
     return;
-  }
   if (panicking == 0)
     acquire(&tx_spin); // a panicking cpu must not wait for anyone
   for (int i = 0; i < n; i++) {
@@ -146,10 +143,10 @@ uartputc_sync(int c)
 {
   // the echo of a character typed at the console comes through here, and
   // a guest with a queue should not pay two exits for it either.
-  if (virtio_con_present()) {
+  {
     char ch = (char)c;
-    virtio_con_write(&ch, 1);
-    return;
+    if (console_divert(&ch, 1))
+      return;
   }
   if (panicking == 0)
     push_off();
@@ -184,10 +181,22 @@ uartgetc(void)
 // handle a uart interrupt, raised because input has
 // arrived, or the uart is ready for more output, or
 // both. called from devintr().
+// F18: the 16550's interrupts are wanted only while it is the console
+void
+uart_set_console(int on)
+{
+  WriteReg(IER, on ? (IER_TX_ENABLE | IER_RX_ENABLE) : 0);
+}
+
 void
 uartintr(void)
 {
   ReadReg(ISR); // acknowledge the interrupt
+  if (plat.console_kind != 0) {
+    // not the console (F18): its bytes are not ours to take. Whatever it
+    // holds stays in the host's input ring for the console that is.
+    return;
+  }
 
   if (ReadReg(LSR) & LSR_TX_IDLE) {
     // UART finished transmitting; wake up sending thread.

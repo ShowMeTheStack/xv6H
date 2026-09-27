@@ -34,7 +34,7 @@ plicinit(void)
 void
 plicinithart(void)
 {
-  int hart = cpuid();
+  int hart = plat.hartid[cpuid()];    // F9: the context is the hart's, by its id
 
   // set enable bits for this hart's S-mode for the uart and virtio disks.
   *(uint32 *)SENABLE(hart) = irqmask;
@@ -47,7 +47,7 @@ plicinithart(void)
 int
 plic_claim(void)
 {
-  int hart = cpuid();
+  int hart = plat.hartid[cpuid()];
   int irq = *(uint32 *)SCLAIM(hart);
   return irq;
 }
@@ -56,6 +56,6 @@ plic_claim(void)
 void
 plic_complete(int irq)
 {
-  int hart = cpuid();
+  int hart = plat.hartid[cpuid()];
   *(uint32 *)SCLAIM(hart) = irq;
 }

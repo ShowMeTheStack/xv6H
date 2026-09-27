@@ -30,6 +30,27 @@ if [ ! -d busybox-$BBVER ]; then
   tar xf busybox-$BBVER.tar.bz2
 fi
 
+# ---- the xv6H patches (linux/patches/*.patch): small, listed in PATCHES.md ----
+if [ -d $WORK/src/patches ]; then
+  # the files a patch touches come back pristine from the tarball first, so a
+  # patch that changed since the last build applies to the original, not to
+  # its own previous version
+  for p in $WORK/src/patches/*.patch; do
+    [ -f "$p" ] || continue
+    for f in $(grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||; s|\t.*||'); do
+      tar xf linux-$KVER.tar.xz linux-$KVER/$f 2>/dev/null || log "no pristine $f in the tarball"
+    done
+  done
+  for p in $WORK/src/patches/*.patch; do
+    [ -f "$p" ] || continue
+    if patch -d linux-$KVER -p1 -N --dry-run -s < "$p" >/dev/null 2>&1; then
+      log "applying $(basename $p)"
+      patch -d linux-$KVER -p1 -N -s < "$p"
+    else
+      log "$(basename $p): already applied (or does not apply)"
+    fi
+  done
+fi
 # ---- busybox (static) ----
 # Ubuntu's riscv64 toolchain and glibc target the RVA23 profile, whose
 # vector instructions the xv6H guest CPU (rv64gc) does not have. BusyBox
@@ -63,6 +84,12 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
   local root=$WORK/rootfs-$1
   rm -rf $root; mkdir -p $root
   cp -a bb-$1/_install/. $root/
+  mkdir -p $root/lib/modules
+  [ -f $OUT/machrev-$1.ko ] && cp $OUT/machrev-$1.ko $root/lib/modules/machrev.ko
+  # zerocheck: fresh pages are zero (F21's consumer, seen from userland)
+  if [ -f $WORK/src/zerocheck.c ]; then
+    ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/zerocheck $WORK/src/zerocheck.c || log "zerocheck did not build"
+  fi
   mkdir -p $root/proc $root/sys $root/dev $root/etc $root/mnt $root/tmp $root/root
   cat > $root/init <<'INIT'
 #!/bin/sh
@@ -75,6 +102,12 @@ exec </dev/console >/dev/console 2>&1
 # static); its name server is in /proc/net/pnp, in resolv.conf format.
 ln -sf /proc/net/pnp /etc/resolv.conf
 echo "xv6h-linux: init running on $(uname -m), $(nproc) cpu(s)"
+# the machine-description revision driver (machrev/): with it loaded this
+# guest speaks the revision protocol and the host treats it as participating
+# (machrev=off on the command line leaves it out: the legacy tier, same image)
+if [ -f /lib/modules/machrev.ko ] && ! grep -q machrev=off /proc/cmdline; then
+  insmod /lib/modules/machrev.ko
+fi
 echo "xv6h-linux: ready"
 exec /sbin/init
 INIT
@@ -96,7 +129,7 @@ make_initramfs hf $OUT/initramfs-hf.cpio.gz
 # ---- kernel ----
 build_kernel() { # $1 = name, $2 = initramfs, $3 = extra config fragment lines
   local d=obj-$1
-  if [ -f $OUT/Image-$1 ]; then return; fi
+  if [ -f $OUT/Image-$1 ] && [ -z "${REBUILD:-}" ]; then return; fi
   log "building kernel $1"
   mkdir -p $d
   cat > $d/fragment.config <<CFG
@@ -144,7 +177,14 @@ CONFIG_DRM=n
 CONFIG_SOUND=n
 CONFIG_INPUT=n
 CONFIG_HID_SUPPORT=n
-CONFIG_MODULES=n
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_MEMORY_HOTPLUG=y
+CONFIG_MEMORY_HOTREMOVE=y
+CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y
+CONFIG_HOTPLUG_CPU=y
+CONFIG_VIRTIO_BALLOON=y
+CONFIG_VIRTIO_CONSOLE=y
 CONFIG_DEBUG_INFO_NONE=y
 CONFIG_KASAN=n
 CONFIG_FTRACE=n
@@ -160,8 +200,22 @@ CFG
     make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS defconfig >/dev/null
     ./scripts/kconfig/merge_config.sh -O ../$d -m ../$d/.config ../$d/fragment.config >/dev/null
     make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig >/dev/null
-    make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image 2>&1 | grep -E "error|Error" || true
+    make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image modules 2>&1 | grep -E "error|Error" || true
   )
+  # the revision driver, against this kernel; then the initramfs again with
+  # it inside, and the image again around that (only the initramfs relinks)
+  if [ -d $WORK/src/machrev ]; then
+    log "building machrev.ko ($1)"
+    rm -rf $d/machrev; cp -r $WORK/src/machrev $d/machrev
+    ( cd linux-$KVER && make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS M=../$d/machrev modules 2>&1 | grep -E "error|warning" || true )
+    if [ -f $d/machrev/machrev.ko ]; then
+      cp $d/machrev/machrev.ko $OUT/machrev-$1.ko
+      make_initramfs $1 $2
+      ( cd linux-$KVER && make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image 2>&1 | grep -E "error|Error" || true )
+    else
+      log "machrev.ko ($1) did not build"
+    fi
+  fi
   cp $d/arch/riscv/boot/Image $OUT/Image-$1
   grep -E "^CONFIG_(FPU|RISCV_ISA_C|SMP|RISCV_APLIC|RISCV_IMSIC|SIFIVE_PLIC|VIRTIO_MMIO|RISCV_SBI_V01)=" $d/.config > $OUT/Image-$1.config
   log "kernel $1 done: $(du -h $OUT/Image-$1 | cut -f1)"

@@ -44,10 +44,13 @@ def axis_default(name, given, default):
     return AXIS.get(name, default)
 
 
+HOST_APPEND = ""   # --append: words for every host's command line
+
+
 class QEMU(object):
     def __init__(self, intc=None, cpus=None, mem=None, aia_guests=2, hyp=None, vec=None,
                  vlen=None, sv=None, log=None,
-                 extra_env=None, keep_fs=False, fsimg=None):
+                 extra_env=None, keep_fs=False, fsimg=None, cboz=None):
         intc = axis_default("intc", intc, "plic")
         cpus = int(axis_default("cpus", cpus, 3))
         mem = axis_default("mem", mem, "1G")
@@ -55,6 +58,7 @@ class QEMU(object):
         vec = int(axis_default("vec", vec, 1))
         vlen = int(axis_default("vlen", vlen, 128))
         sv = int(axis_default("sv", sv, 48))
+        cboz = int(axis_default("cboz", cboz, 64))
         # every run starts from a pristine copy of the host file system
         # (TEST_FSIMG names the copy, so that two runs can go in
         # parallel). keep_fs starts from the copy the last run left,
@@ -64,9 +68,13 @@ class QEMU(object):
         # file system with two kernels writing it.
         fsimg = fsimg or os.environ.get("TEST_FSIMG", "test-fs.img")
         env = dict(os.environ, INTC=intc, CPUS=str(cpus), MEM=mem, AIA_GUESTS=str(aia_guests),
-                   HYP=str(hyp), VEC=str(vec), VLEN=str(vlen), SV=str(sv), FSIMG=fsimg)
+                   HYP=str(hyp), VEC=str(vec), VLEN=str(vlen), SV=str(sv), FSIMG=fsimg,
+                   CBOZ=str(cboz))
         if extra_env:
             env.update(extra_env)
+        if HOST_APPEND:
+            # words for every host's command line (--append), on top of a test's own
+            env["APPEND"] = (env.get("APPEND", "") + " " + HOST_APPEND).strip()
         if not keep_fs or not os.path.exists(os.path.join(HERE, fsimg)):
             shutil.copyfile(os.path.join(HERE, "fs.img"), os.path.join(HERE, fsimg))
         cmd = subprocess.run(["make", "-s", "--no-print-directory", "qemucmd"], cwd=HERE,
@@ -1991,6 +1999,8 @@ def main():
     ap.add_argument("-c", "--cpus", type=int, default=3)
     ap.add_argument("-v", action="store_true", help="tee qemu output to stdout")
     ap.add_argument("-t", "--test", default=None, help="only tests whose name matches this (a pattern)")
+    ap.add_argument("--append", default="", metavar="WORDS",
+                    help="host command-line words for every emulated host (e.g. admeasure=1)")
     ap.add_argument("--list", action="store_true",
                     help="print the names of the tests this would run, and stop")
     ap.add_argument("--tier", default=None, choices=["quick", "full"],
@@ -2029,6 +2039,8 @@ def main():
     logname = os.environ.get("TEST_LOG", "test-hyp.log")
     log = sys.stdout if args.v else open(os.path.join(HERE, logname), "w")
 
+    global HOST_APPEND
+    HOST_APPEND = args.append
     if not (args.no_build or args.list):
         subprocess.run(["make", "-s"], cwd=HERE, check=True)
     import test_hyp_linux
@@ -2155,8 +2167,21 @@ def main():
         tests = [t for t in tests if re.fullmatch(quick, t[0])]
     if args.test:
         # a name, part of one, or a pattern: "-t 'pidns|sysfilter'" runs
-        # the two of them and nothing else
-        tests = [t for t in tests if re.search(args.test, t[0])]
+        # the two of them and nothing else. A comma-separated list is the
+        # same without shell metacharacters (tools/remote.sh passes the
+        # arguments through two shells), and an item that is exactly a
+        # test's name selects that test alone: "-t snap-migrate,hetero"
+        # is snap-migrate and snap-migrate-hetero, not the whole family.
+        names = set(t[0] for t in tests)
+        def wanted(name):
+            for pat in args.test.split(","):
+                if pat in names:
+                    if pat == name:
+                        return True
+                elif re.search(pat, name):
+                    return True
+            return False
+        tests = [t for t in tests if wanted(t[0])]
     if args.list:
         # what a queue runner needs to turn a suite into jobs
         for name, _ in tests:

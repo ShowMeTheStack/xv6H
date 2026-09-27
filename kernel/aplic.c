@@ -71,11 +71,12 @@ setup_source(int irq)
   // qemu's uart and virtio-mmio lines are level-triggered, active high.
   *R(s, APLIC_SOURCECFG(irq)) = APLIC_SM_LEVEL1;
   if (aplic_msi) {
-    // route to hart 0, supervisor file (guest index 0), identity = irq.
-    *R(s, APLIC_TARGET(irq)) = (0 << 18) | (0 << 12) | irq;
+    // route to the boot hart (logical cpu 0 -- by its hart *id*, F9),
+    // supervisor file (guest index 0), identity = irq.
+    *R(s, APLIC_TARGET(irq)) = ((uint32)plat.hartid[0] << 18) | (0 << 12) | irq;
   } else {
     // route to hart 0 with priority 1.
-    *R(s, APLIC_TARGET(irq)) = (0 << 18) | 1;
+    *R(s, APLIC_TARGET(irq)) = ((uint32)plat.hartid[0] << 18) | 1;   // direct mode: the boot hart, priority 1 (F9: by hart id)
   }
   *R(s, APLIC_SETIENUM) = irq;
 }
@@ -103,7 +104,7 @@ aplic_inithart(void)
 {
   if (aplic_msi)
     return; // IMSIC does per-hart delivery
-  int hart = cpuid();
+  int hart = plat.hartid[cpuid()];    // F9
   uint64 idc = plat.aplic_s_base + APLIC_IDC(hart);
   *R(idc, APLIC_IDC_ITHRESHOLD) = 0;
   *R(idc, APLIC_IDC_IDELIVERY) = 1;
@@ -114,7 +115,7 @@ aplic_inithart(void)
 int
 aplic_claim(void)
 {
-  int hart = cpuid();
+  int hart = plat.hartid[cpuid()];    // F9
   uint32 v = *R(plat.aplic_s_base + APLIC_IDC(hart), APLIC_IDC_CLAIMI);
   return v >> 16;
 }

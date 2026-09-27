@@ -50,7 +50,7 @@ vuart_irq_level(struct vm *vm)
 static void
 update(struct vm *vm)
 {
-  vic_set_level(vm, G_UART_IRQ, vuart_irq_level(vm));
+  vic_set_level(vm, vm_irq(vm, G_UART_IRQ), vuart_irq_level(vm));
 }
 
 // caller holds vm->lock. blocks (dropping the lock) while a host

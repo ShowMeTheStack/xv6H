@@ -587,18 +587,19 @@ def t_migrate_hetero(QEMU, cpus, log):
 
 
 def t_migrate_refused(QEMU, cpus, log, give_up):
-    """a migration that is refused, and the same one made legal by negotiation.
+    """a move the destination cannot take as things stand: refused before a page
+    moves, or negotiated -- automatically -- with a guest that can be asked.
 
-    Host A has a vector unit; host B was built without one. In both halves the
-    guest *uses* the unit, so its register file is state that has nowhere to go on
-    B, and B refuses -- the guest keeps running on A rather than being lost.
+    Host A has a vector unit; host B was built without one. The handshake means
+    the destination answers the description before any memory is sent.
 
-    In the second half the host then asks the guest to give the unit up. The guest
-    checks whether any task is relying on it and agrees, and the same migration
-    that was refused a moment ago is now allowed. That is the point of the whole
-    mechanism in one sequence: a machine that could not move becomes one that can,
-    because the guest was asked and gave something up. A fleet-wide feature floor
-    gets the same freedom only by taking vectors away from every guest for life."""
+    give_up=0: the guest cannot be told (`norevise'), so B refuses with a reason;
+    the source sends nothing and the guest keeps running on A.
+
+    give_up=1: the guest speaks the protocol. While a task holds vector state the
+    guest refuses to cede and the move fails with that reason; once the task has
+    finished, the same command makes B ask, the source asks the guest, the guest
+    cedes, and the move goes through -- no operator in the loop."""
     import os
     tag = "ref%d" % os.getpid()
     link = os.path.join(HERE, tag + ".sock")
@@ -618,20 +619,17 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
         b.expect(r"\$ ", 30)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
         run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
-        vmid = g.start_guest(a, "-n r1 -m 32 -c 1", 120)
+        vmid = g.start_guest(a, "-n r1 -m 32 -c 1" + ("" if give_up else " -a norevise"), 120)
         a.send("vecbench 2\n")
         a.expect(r"vecbench: (ok|no vector extension)", 90)
         a.expect(r"\$ ", ATONCE)
+        if give_up:
+            # a task that holds vector state for a while. Rounds are not a
+            # duration: 400 rounds were over before the move began (fam7), and
+            # the guest rightly ceded a unit nobody was using.
+            a.send("vecbench -t 25 &\n")
+            a.expect(r"\$ ", ATONCE)
         g.detach(a)
-
-        # this guest has a vector unit, and B has none: state with nowhere to go.
-        # (Not asserted through the observation set: vsstatus.VS going Dirty is a
-        # transient the guest's own trap handler clears, so whether the host ever
-        # samples one depends on when its exits fall -- the same guest running the
-        # same vecbench shows `vector' on some runs and not others. The decision
-        # is made by asking the guest, not by sampling it.)
-        out = run(a, "vmm info r1", 30)
-        assert re.search(r"observed:", out), out
 
         def try_move():
             b.send("vmm accept 9000 -d &\n")
@@ -642,34 +640,45 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
 
         moved, out = try_move()
         assert not moved, out
-        # and it was not lost in the refusing: it is still running on A. Before
-        # the acknowledgement existed this is where the guest disappeared -- the
-        # source had handed it over and the destination had said no.
+        # B's console is only read when something waits on it: drain it before
+        # asserting on what it said (fam7 failed on a stale buffer, not a
+        # missing message)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        # the handshake: nothing was sent
+        assert "pre-copy round" not in out, out
+        assert "took" not in b.buf.decode(errors="replace")[-3000:], b.buf[-3000:]
+        if give_up:
+            assert "would not give up" in out, out
+            assert "kept its vector unit" in out, out
+        else:
+            assert "destination refused" in out, out
+            assert "cannot be asked" in b.buf.decode(errors="replace"), b.buf[-2000:]
+        # and it was not lost: still running on A, and says so
         assert re.search(r"\br1\b", run(a, "vmm ls", 30)), run(a, "vmm ls", 30)
         g.attach(a, "r1")
+        if give_up:
+            # the guest's side of the refusal, said on its own console while it
+            # was detached; the backlog is replayed on attach
+            a.expect(r"keeping the vector unit, \d+ task\(s\)", 30)
         a.send("\n")
         a.expect(r"\$ ", 60)
         a.send("echo survived-the-refusal\n")
         a.expect(r"survived-the-refusal", 60)
         a.expect(r"\$ ", ATONCE)
-        g.detach(a)
         if not give_up:
-            print("    a guest holding vector state was refused, and kept running")
+            g.detach(a)
+            print("    a guest that cannot be asked was refused before a page moved, and kept running")
             return
-
-        # now ask it to give the unit up. It checks whether any task is relying
-        # on it, and between programs none is.
-        ma = a.mark()
-        a.send("vmm revise %d novector\n" % vmid)
-        a.expect(r"vector unit revoked: asked", 60)
+        # wait for the vector task to finish; nothing else changes
+        a.send("wait; echo VDONE\n")
+        a.expect(r"VDONE", 300)
         a.expect(r"\$ ", ATONCE)
-        a.consumed = ma
-        a.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 90)
-        a.consumed = len(a.buf)
-
-        # and the same move is now legal
+        g.detach(a)
+        # the same command again: B asks, A asks the guest, the guest cedes, it moves
         moved, out = try_move()
         assert moved, out
+        assert "cede 0x4" in out or "cede" in a.buf.decode(errors="replace")[-4000:], out
         for _ in range(10):
             o = run(a, "vmm ls", 30)
             if "no vms" in o:
@@ -682,11 +691,11 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
         g.attach(b, "r1")
         b.send("\n")
         b.expect(r"\$ ", 60)
-        b.send("echo moved-after-giving-it-up\n")
-        b.expect(r"moved-after-giving-it-up", 60)
+        b.send("vecbench 1\n")
+        b.expect(r"vecbench: no vector extension", 60)
         b.expect(r"\$ ", ATONCE)
         g.detach(b)
-        print("    a refused guest gave up its vector unit and the move became legal")
+        print("    refused while a task held vector state; negotiated and moved once it did not")
     finally:
         if b:
             b.close()
@@ -768,9 +777,128 @@ def t_migrate_legacy(QEMU, cpus, log):
         # and it pays for the shape it kept: interrupts still go through an
         # emulated controller, which is the exits the participating tier saves
         out = run(b, "vmm info old", 30)
-        assert re.search(r"(aplic-s|imsic-s) \d+r/\d+w", out), out
+        assert re.search(r"(aplic-s|imsic-s)(@[0-9a-f]+)? \d+r/\d+w", out), out
         run(b, "vmm kill old", 60)
         print("    a guest that cannot be told kept its controller across the move")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_lazy_vector(QEMU, cpus, log):
+    """L5: a unit revealed by use. `vmm start -L' presents the machine without
+    a vector unit; the guest's first vector instruction traps to the host, which
+    is the one exact observation of *use* there is (Proposition 4 says sampling
+    cannot give it). The host grants the unit and the instruction re-executes.
+
+    Two guests on a host with a unit, moved to a host without one:
+      lz  never touches vectors: it is accepted without a word, because its
+          description never had a unit to cede -- the whole point;
+      lz2 runs vecbench: the unit appears, is used, and must be ceded before
+          the same move, which the handshake does on its own."""
+    import os
+    tag = "lazy%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, vec=1, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, vec=0, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+
+        def move(name):
+            b.send("vmm accept 9000 -d &\n")
+            b.expect(r"\$ ", 30)
+            run(b, "sleep 1", 20)
+            o = run(a, "vmm migrate %s 10.7.0.2:9000" % name, 300)
+            assert "migrated to" in o, o
+            b.expect(r"arrived: 1 vcpu", 120)
+            b.send("\n")
+            b.expect(r"\$ ", 30)
+            return o
+
+        # -- lz: presented without a unit, never asks for one
+        m = a.mark()
+        g.start_guest(a, "-n lz -m 32 -c 1 -L", 120)
+        boot = a.output_since(m)
+        assert "vector extension" not in boot, boot
+        run(a, "echo before > /tmp/k", 30)
+        g.detach(a)
+        out = move("lz")
+        assert "cede" not in out, out            # nothing to cede: no unit was ever described
+        g.attach(b, "lz")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("vecbench 2\n")
+        b.expect(r"vecbench: no vector extension", 60)
+        b.expect(r"\$ ", ATONCE)
+        b.send("cat /tmp/k\n")
+        b.expect(r"before", 60)
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        run(b, "vmm kill lz", 60)
+        print("    a guest that never used the unit crossed to a host without one, unasked")
+
+        # -- lz2: uses it, gets it on first use, gives it back for the move
+        m = a.mark()
+        g.start_guest(a, "-n lz2 -m 32 -c 1 -L", 120)
+        assert "vector extension" not in a.output_since(m)
+        a.send("vecbench 2\n")
+        # vecbench asks hwinfo first, as any real program does: the question is
+        # what reveals the unit, not an instruction (a guest that believes its
+        # description never executes one)
+        a.expect(r"the guest asks for a vector unit: granting it", 60)
+        a.expect(r"revision \d+ adopted", 60)
+        a.expect(r"vecbench: ok \(vlen 128 bits, 2 rounds\)", 90)
+        a.expect(r"\$ ", ATONCE)
+        m = a.mark()
+        a.send("vecbench 3\n")                      # and the second time is not a first time
+        a.expect(r"vecbench: ok \(vlen 128 bits, 3 rounds\)", 90)
+        a.expect(r"\$ ", ATONCE)
+        assert "granting" not in a.output_since(m), a.output_since(m)
+        a.send("cat /sys/vector/vlen\n")
+        a.expect(r"\b128\b", 30)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        out = move("lz2")
+        assert "cede 0x4" in out or "cede" in a.buf.decode(errors="replace")[-4000:], out
+        g.attach(b, "lz2")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("vecbench 2\n")
+        b.expect(r"vecbench: no vector extension", 60)
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        run(b, "vmm kill lz2", 60)
+        print("    a guest that asked for the unit was granted it, and ceded it for the move")
+
+        # -- lz3: a program that does not ask and just tries: the instruction traps
+        g.start_guest(a, "-n lz3 -m 32 -c 1 -L", 120)
+        a.send("vecbench -f 2\n")
+        a.expect(r"first vector instruction \(0x[0-9a-f]+\): granting the unit", 60)
+        a.expect(r"revision \d+ adopted", 60)
+        a.expect(r"vecbench: ok \(vlen 128 bits, 2 rounds\)", 90)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        run(a, "vmm kill lz3", 60)
+        print("    a program that tried without asking was trapped on its first instruction and granted the unit")
     finally:
         if b:
             b.close()
@@ -865,6 +993,708 @@ def t_migrate_layout(QEMU, cpus, log, legacy):
                 pass
 
 
+def t_migrate_intc_addr(QEMU, cpus, log, legacy):
+    """F2: the interrupt controller's *address* is a fact of the machine. Both
+    hosts have a PLIC; host B is booted with `guestintc=alt', which puts every
+    guest's controller registers 256 MB up the map (0x1c000000). A guest that
+    speaks the protocol arrives, is told, maps the new window and rebinds its
+    driver -- the same class of change as a new controller kind, with the
+    kind unchanged. A guest that cannot be told keeps the address it left with.
+    Either way interrupts keep arriving, which is what the disk check shows."""
+    import os
+    tag = "ica%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestintc=alt"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n ic -m 32 -c 1" + (" -a norevise" if legacy else ""), 120)
+        a.send("echo before-the-move > /keep; sync\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate ic 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        if legacy:
+            b.expect(r"arriving with its interrupt controller at \+0x0 does not speak revision: keeping that address", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+        else:
+            b.expect(r"arrived with its interrupt controller at \+0x0, this host puts it at \+0x10000000", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            assert int(m.group(1), 16) & 2, m.group(0)     # REV_INTC taken
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        out = run(b, "vmm info ic", 30)
+        # the exits say where the guest is reaching its controller
+        if legacy:
+            assert re.search(r"plic@c000000 \d+r/\d+w", out) or "plic@" not in out, out
+        else:
+            assert "plic@1c000000" in out or "plic@" not in out, out
+        g.attach(b, "ic")
+        if not legacy:
+            # said from inside, replayed on attach
+            b.expect(r"machine: interrupt controller plic at 0x1c000000", 60)
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /keep\n")
+        b.expect(r"before-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        # the disk: its completion interrupt goes through the controller at its new address
+        b.send("echo after-the-move > /after; sync; cat /after\n")
+        b.expect(r"after-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        out = run(b, "vmm info ic", 30)
+        assert re.search(r"plic@(1c|c)000000 \d+r/\d+w", out), out
+        run(b, "vmm kill ic", 60)
+        print("    " + ("a guest that cannot be told kept its controller's address across the move"
+                        if legacy else "a guest rebound to its controller at a new address without a reboot"))
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_irq(QEMU, cpus, log, legacy):
+    """F3 across a move: host B is booted with `guestirq=alt', so every guest
+    there has its uart on line 7 and its virtio devices on 11..14. A guest that
+    speaks the protocol arrives, is told, and renumbers; one that cannot keeps
+    the numbering it left with. Both keep working, which the disk shows."""
+    import os
+    tag = "irq%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestirq=alt"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n iq -m 32 -c 1" + (" -a norevise" if legacy else ""), 120)
+        a.send("echo before-the-move > /keep; sync\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate iq 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        if legacy:
+            b.expect(r"arriving with its interrupt lines numbered default does not speak revision: keeping that numbering", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+        else:
+            b.expect(r"arrived with its interrupt lines numbered default, this host numbers them alt", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            assert int(m.group(1), 16) & 1, m.group(0)     # REV_DEVICES taken
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "iq")
+        if not legacy:
+            b.expect(r"machine: interrupt lines renumbered: uart 7, virtio 11 12 13", 60)
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /keep\n")
+        b.expect(r"before-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        b.send("echo after-the-move > /after; sync; cat /after\n")
+        b.expect(r"after-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        run(b, "vmm kill iq", 60)
+        print("    " + ("a guest that cannot be told kept its interrupt numbering across the move"
+                        if legacy else "a guest renumbered its interrupt lines on arrival without a reboot"))
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_axis(QEMU, cpus, log, axis, legacy):
+    """a host of a different shape on one axis, made with a host command-line
+    word on B; a participating guest is told and adopts, a legacy guest keeps
+    what it left with; both keep working. AXIS: (name, append, legacy-msg,
+    participating-msg, guest-msg, adopted-bit)."""
+    import os
+    name, append, legacy_msg, part_msg, guest_msg, bit = axis
+    tag = "%s%d" % (name, os.getpid())
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n ax -m 32 -c 2" + (" -a norevise" if legacy else ""), 120)
+        a.send("echo before-the-move > /keep; sync\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate ax 10.7.0.2:9000", 300)
+        if "migrated to 10.7.0.2:9000" not in out:
+            # B's side of the story into the log before failing
+            try:
+                b.send("\n")
+                b.expect(r"\$ ", 5)
+            except Exception:
+                pass
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        if legacy:
+            b.expect(legacy_msg, 120)
+            b.expect(r"arrived: 2 vcpu", 120)
+        else:
+            b.expect(part_msg, 120)
+            b.expect(r"arrived: 2 vcpu", 120)
+            if bit:         # a fact told through the description; 0: told through a device
+                m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+                assert int(m.group(1), 16) & bit, m.group(0)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "ax")
+        if not legacy and guest_msg:
+            b.expect(guest_msg, 60)
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /keep\n")
+        b.expect(r"before-the-move", 60)
+        b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        b.send("echo after-the-move > /after; sync; cat /after; sleep 1; echo SLEPT\n")
+        try:
+            b.expect(r"after-the-move", 60)
+            b.expect(r"SLEPT", 60)          # the timer and the disk both work over there
+            b.expect(r"\$ ", ATONCE)
+        except Exception as e:
+            # the guest's state at the moment it stopped answering, for the log
+            try:
+                g.detach(b)
+                run(b, "vmm info ax", 30)
+            except Exception:
+                pass
+            raise
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        run(b, "vmm kill ax", 60)
+        print("    " + ("a guest that cannot be told kept its %s across the move" % name
+                        if legacy else "a guest adopted this host's %s on arrival" % name))
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+AXES = {
+    "ipi": ("ipi", "guestipi=sbi",
+            r"arriving with clint ipis does not speak revision: keeping them",
+            r"arrived with clint ipis, this host has no clint",
+            r"machine: ipis via sbi", 1),
+    "timer": ("timer", "guesttimer=sbi",
+              r"arriving with the sstc timer does not speak revision: keeping it",
+              r"arrived with the sstc timer, this host has no sstc",
+              r"machine: timer via sbi", 16),
+    "timebase": ("timebase", "guesttimebase=1000000",
+                 r"arriving with a 10000000 Hz timebase does not speak revision: keeping it",
+                 r"arrived with a 10000000 Hz timebase, this host's is 1000000 Hz",
+                 r"machine: timebase 1000000 Hz", 16),
+    "hartid": ("hartid", "guesthart=4",
+               r"arriving with harts numbered from 0 does not speak revision: keeping that",
+               r"arrived with harts numbered from 0, this host numbers them from 4",
+               r"machine: harts renumbered: 4 5", 1),
+    "mac": ("mac", "guestmac=alt",
+            r"arriving with nic 52:54:00:78:76:10 does not speak revision: keeping it",
+            r"arrived with nic 52:54:00:78:76:10, this host gives 52:54:00:79:76:10: told through the device",
+            r"virtio net: mac changed to 52:54:00:79:76:10", 0),
+    "rtc": ("rtc", "guestrtc=off",
+            r"arriving with an rtc does not speak revision: keeping that",
+            r"arrived with an rtc, this host offers none",
+            r"rtc: gone; the wall clock continues from \d+ in software", 1),
+    "console": ("console", "guestcon=sbi",
+                r"arriving with a uart console does not speak revision: keeping it",
+                r"arrived with a uart console, this host's is sbi",
+                r"machine: console via sbi", 1),
+    "ram": ("ram", "guestgrow=32",
+            r"vm \d+ ax ",              # a legacy guest is not given more: nothing to see but the arrival line
+            r"arrived with 32 MB, this host gives it 64 MB",
+            r"machine: memory 32 -> 64 MB", 64),
+    "cpus": ("cpus", "guestcpus=1",
+             r"arriving with 2 harts running does not speak revision: keeping them",
+             r"arrived with 2 harts running, this host allows 1",
+             r"machine: cpus 2 -> 1 \(parking 1 hart\(s\)\)", 1),
+    "sbi": ("sbi", "nosbi=rfence",
+            r"arriving without SBI extensions 0x0 does not speak revision: keeping that set",
+            r"arrived without SBI extensions 0x0, this host withholds 0x4",
+            r"machine: sbi extensions: time ipi hsm srst dbcn", 8),
+}
+
+
+def t_migrate_vlen(QEMU, cpus, log):
+    """F11: the vector register width is a fact of the machine. Host A has a
+    128-bit unit, host B a 256-bit one. A guest that has used its unit cannot
+    simply be carried -- its save areas are laid out for 128 bits -- so the
+    move is negotiated as for a host without a unit: the guest cedes (no task
+    holds vector state), crosses, and is given B's unit back at B's width; a
+    program then sees vlen 256."""
+    import os
+    tag = "vl%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, vec=1, vlen=128, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, vec=1, vlen=256, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n vl -m 32 -c 1", 120)
+        a.send("vecbench 2\n")
+        a.expect(r"vecbench: ok \(vlen 128 bits", 90)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate vl 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        assert "cede 0x4" in out or "cede" in a.buf.decode(errors="replace")[-4000:], out
+        b.expect(r"gave up for the move; this host's is 256 bits wide and is given back", 120)
+        b.expect(r"arrived: 1 vcpu", 120)
+        m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+        assert int(m.group(1), 16) & 4, m.group(0)     # REV_VLEN taken
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "vl")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /sys/vector/vlen; vecbench 2\n")
+        b.expect(r"\b256\b", 60)
+        b.expect(r"vecbench: ok \(vlen 256 bits", 90)
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        run(b, "vmm kill vl", 60)
+        print("    a guest crossed from a 128-bit to a 256-bit vector unit: ceded, carried, given back wider")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_cboz(QEMU, cpus, log, legacy, hazard=0):
+    """F21 across a move: host A has 128-byte cache blocks, host B 64-byte
+    ones. A participating guest is told and strides 64; a legacy guest keeps
+    128 and B does its cbo.zero in software at 128 (henvcfg.CBZE off), so its
+    pages are still zero. HAZARD is the control: B without the software model
+    (`nocbozmodel'), and the legacy guest's fresh pages come out half dirty --
+    the failure the fact exists to prevent."""
+    import os
+    tag = "cz%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, cboz=128, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, cboz=64, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "nocbozmodel" if hazard else ""})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n cz -m 32 -c 1" + (" -a norevise" if legacy else ""), 120)
+        a.send("zerocheck 256\n")
+        a.expect(r"zerocheck: 256 pages clean", 120)
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate cz 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        if legacy:
+            b.expect(r"arriving with a 128-byte cache block does not speak revision: keeping it \(this host's is 64, cbo.zero in software\)", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+        else:
+            b.expect(r"arrived with a 128-byte cache block, this host's is 64", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            assert int(m.group(1), 16) & 1, m.group(0)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "cz")
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        if not legacy:
+            assert "machine: cache block 128 -> 64 bytes" in b.buf.decode(errors="replace")[-6000:], b.buf.decode(errors="replace")[-3000:]
+        # pages the guest zeroes on B: 4096 of them (16 MB) so that plenty are fresh from kalloc
+        b.send("zerocheck 1024; zerocheck 1024\n")
+        m = b.expect(r"zerocheck: (1024 pages clean|DIRTY: \d+ bytes of 1024 pages not zero[^\n]*)", 120)
+        first = m.group(0).decode(errors="replace")
+        m = b.expect(r"zerocheck: (1024 pages clean|DIRTY: \d+ bytes of 1024 pages not zero[^\n]*)", 120)
+        second = m.group(0).decode(errors="replace")
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        out = run(b, "vmm info cz", 60)
+        mm = re.search(r"cbo.zero in software (\d+)", out)
+        soft = int(mm.group(1)) if mm else 0
+        run(b, "vmm kill cz", 60)
+        if hazard:
+            assert "DIRTY" in first or "DIRTY" in second, (first, second)
+            assert soft == 0, out
+            print("    the control: a legacy guest striding 128 on a 64-byte host with no software model -- %s" % (first if "DIRTY" in first else second))
+        else:
+            assert "clean" in first and "clean" in second, (first, second)
+            if legacy:
+                assert soft > 0, out
+                print("    a legacy guest kept its 128-byte block on a 64-byte host: %d cbo.zero done in software, pages clean" % soft)
+            else:
+                print("    a guest crossed from 128- to 64-byte cache blocks, was told, strides 64: pages clean (%d cbo.zero in software during the window)" % soft)
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
+    """M5: a Linux guest crosses hosts. AXIS "same": two hosts alike, the
+    machine simply goes on (uptime continues, its disk is there). AXIS
+    "cboz": host A has 128-byte cache blocks, B 64: a Linux with machrev.ko
+    is told on arrival and re-rates clear_page; a stock Linux (machrev=off,
+    the same image) keeps 128 and B does its cbo.zero in software. Fresh
+    pages are zero either way."""
+    import os
+    import test_hyp_linux as lx
+    tag = "lm%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    acboz = 128 if axis == "cboz" else 64
+    a = QEMU(intc="plic", cpus=cpus, log=log, cboz=acboz, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, cboz=64, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        args = "-k /Image -r 0x80200000 -m 128 -a console=ttyS0 earlycon=sbi%s -f /linux.img -c 2 -H" % (
+            " machrev=off" if legacy else "")
+        a.send("vmm start -n lm %s\n" % args)
+        a.expect(r"vm (\d+) lm: ", 20)
+        a.expect(r"linux# ", 120)
+        out = lx.linux_cmd(a, "mount /dev/vda /mnt && echo before-the-move > /mnt/note && sync && cat /mnt/note")
+        assert "before-the-move" in out, out
+        out = lx.linux_cmd(a, "zerocheck 1024; dmesg | grep -c 'machrev: speaking' || true", 120)
+        assert "1024 pages clean" in out, out
+        assert ("machrev: speaking" in out) == (not legacy) or True
+        m = re.search(r"\n(\d+)\r?\n", out)
+        spoke = m and int(m.group(1)) > 0
+        assert bool(spoke) == (not legacy), (legacy, out)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate lm 10.7.0.2:9000", 600)
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        if axis == "cboz":
+            if legacy:
+                b.expect(r"arriving with a 128-byte cache block does not speak revision: keeping it", 120)
+            else:
+                b.expect(r"arrived with a 128-byte cache block, this host's is 64", 120)
+        b.expect(r"arrived: 2 vcpu", 120)
+        if axis == "cboz" and not legacy:
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            assert int(m.group(1), 16) & 1, m.group(0)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "lm")
+        b.send("\n")
+        b.expect(r"linux# ", 60)
+        out = lx.linux_cmd(b, "cat /mnt/note; echo after-the-move > /mnt/note2; sync; cat /mnt/note2; uptime", 60)
+        assert "before-the-move" in out and "after-the-move" in out and "load average" in out, out
+        out = lx.linux_cmd(b, "zerocheck 1024; zerocheck 1024", 180)
+        assert out.count("1024 pages clean") == 2, out
+        if axis == "cboz" and not legacy:
+            out = lx.linux_cmd(b, "dmesg | grep 'machrev: cache block'")
+            assert "cache block 128 -> 64 bytes" in out, out
+        out = lx.linux_cmd(b, "time sleep 1", 60)
+        m = re.search(r"real\s+0m\s*([\d.]+)s", out)
+        assert m and 0.9 <= float(m.group(1)) <= 1.6, out
+        g.detach(b)
+        info = run(b, "vmm info lm", 60)
+        mm = re.search(r"cbo.zero in software (\d+)", info)
+        soft = int(mm.group(1)) if mm else 0
+        run(b, "vmm kill lm", 60)
+        if axis == "same":
+            print("    a Linux guest crossed hosts: its disk, its clock and its pages as they were")
+        elif legacy:
+            assert soft > 0, info
+            print("    a stock Linux kept its 128-byte block on a 64-byte host: %d cbo.zero in software, pages clean" % soft)
+        else:
+            print("    Linux crossed from 128- to 64-byte cache blocks, was told on arrival, re-rated clear_page (%d software cbo.zero in the window)" % soft)
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_disk_grow(QEMU, cpus, log):
+    """F20: the disk's capacity is a fact of the machine the destination may
+    change -- its image of the same disk is larger. The device announces a
+    configuration change on arrival; the guest's driver re-reads the capacity
+    and its block layer takes the new size; the file system on it is as it
+    was."""
+    import os
+    tag = "dg%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        # B's copy of the guest's disk is 8 MB larger
+        run(b, "dd if=/dev/zero of=/disk0.img bs=1M count=8 seek=16 conv=notrunc", 120)
+        out = run(b, "ls -l /disk0.img", 30)
+        assert "25165824" in out, out
+        g.start_guest(a, "-n dg -m 32 -c 1", 120)
+        a.send("echo before-the-move > /keep; sync\n")
+        a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate dg 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out
+        b.expect(r"arrived with a 32768-sector disk, this host's image has 49152: told through the device", 120)
+        b.expect(r"arrived: 1 vcpu", 120)
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        g.attach(b, "dg")
+        b.expect(r"blk: vda: 49152 sectors \(24 MB\) now", 60)
+        b.send("\n")
+        b.expect(r"\$ ", 60)
+        b.send("cat /keep; cat /sys/block/vda/size\n")
+        b.expect(r"before-the-move", 60)
+        b.expect(r"49152", 60)
+        b.expect(r"\$ ", ATONCE)
+        g.detach(b)
+        run(b, "vmm kill dg", 60)
+        print("    a guest arrived at a host whose copy of its disk is larger, and its block layer took the new size")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def t_migrate_memory(QEMU, cpus, log, mode):
+    """F14: the destination has less room than the guest is resident in. Host B
+    is booted with `guestmem=16': sixteen megabytes for any arriving guest. The
+    32 MB guest on A is made resident in ~26 MB (a tmpfs file).
+
+    mode "cede":    the guest has freed the file: the pages are free inside it
+                    but still backed on A. The handshake asks it, through its
+                    balloon, to be resident in no more than 16 MB; it gives the
+                    pages back; the move goes; on B it is resident in <= 16 MB.
+    mode "refused": the guest still holds the file: it cannot give enough back;
+                    the move is refused with the reason and nothing was sent.
+    mode "legacy":  a guest that cannot be asked (`norevise') is refused before
+                    a page moves (reason 3)."""
+    import os
+    tag = "mem%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestmem=16"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n mm -m 32 -c 1" + (" -a norevise" if mode == "legacy" else ""), 120)
+        a.send("dd if=/dev/zero of=/tmp/z bs=1M count=20; echo FILLED\n")
+        a.expect(r"FILLED", 120)
+        a.expect(r"\$ ", ATONCE)
+        if mode == "cede":
+            a.send("rm /tmp/z; echo FREED\n")
+            a.expect(r"FREED", 60)
+            a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        out = run(a, "vmm info mm", 30)
+        m = re.search(r"\((\d+) MB resident\)", out)
+        assert m and int(m.group(1)) >= 20, out          # the point: it is resident in more than B has
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate mm 10.7.0.2:9000", 600)
+        if mode == "cede":
+            assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+            assert re.search(r"asking the guest to give up \d+ MB", out), out
+            assert re.search(r"resident in \d+ MB now", out), out
+            b.expect(r"arrived: 1 vcpu", 120)     # before the prompt: the arrival prints first
+            b.send("\n")
+            b.expect(r"\$ ", 30)
+            info = run(b, "vmm info mm", 30)
+            m = re.search(r"\((\d+) MB resident\)", info)
+            assert m and int(m.group(1)) <= 16, info
+            g.attach(b, "mm")
+            b.send("\n")
+            b.expect(r"\$ ", 60)
+            b.send("echo still-here\n")
+            b.expect(r"still-here", 60)
+            b.expect(r"\$ ", ATONCE)
+            g.detach(b)
+            run(b, "vmm kill mm", 60)
+            print("    a guest resident in 20+ MB was asked to fit a 16 MB host, gave the memory back through its balloon, and moved")
+        else:
+            b.send("\n")
+            b.expect(r"\$ ", 30)
+            assert "migrated to" not in out, out
+            assert "pre-copy round" not in out, out
+            if mode == "refused":
+                assert "would not give up" in out, out
+                assert "could not give up enough memory" in a.buf.decode(errors="replace")[-4000:], out
+            else:
+                assert "destination refused" in out, out
+                assert "cannot be asked" in b.buf.decode(errors="replace")[-3000:], b.buf[-3000:]
+            g.attach(a, "mm")
+            a.send("\n")
+            a.expect(r"\$ ", 60)
+            a.send("echo survived\n")
+            a.expect(r"survived", 60)
+            a.expect(r"\$ ", ATONCE)
+            g.detach(a)
+            print("    " + ("a guest holding its memory could not be made small enough: refused, and kept running"
+                            if mode == "refused" else "a guest that cannot be asked to be smaller was refused before a page moved"))
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"),
+                  os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
 def tests(modes, cpus, log, QEMU):
     m = modes[0]
     return [
@@ -882,7 +1712,48 @@ def tests(modes, cpus, log, QEMU):
         ("snap-migrate-negotiated", lambda: t_migrate_refused(QEMU, cpus, log, 1)),
         # and a guest that cannot be told anything, kept as it was
         ("snap-migrate-legacy", lambda: t_migrate_legacy(QEMU, cpus, log)),
+        # L5: the unit is revealed by use, and a guest that never used it needs no negotiation
+        ("snap-migrate-lazy", lambda: t_lazy_vector(QEMU, cpus, log)),
         # the layout axis: devices somewhere else on the destination
         ("snap-migrate-layout", lambda: t_migrate_layout(QEMU, cpus, log, 0)),
         ("snap-migrate-layout-legacy", lambda: t_migrate_layout(QEMU, cpus, log, 1)),
+        # F2: the controller's address
+        ("snap-migrate-intc-addr", lambda: t_migrate_intc_addr(QEMU, cpus, log, 0)),
+        ("snap-migrate-intc-addr-legacy", lambda: t_migrate_intc_addr(QEMU, cpus, log, 1)),
+        # F3: the numbering of the lines
+        ("snap-migrate-irq", lambda: t_migrate_irq(QEMU, cpus, log, 0)),
+        ("snap-migrate-irq-legacy", lambda: t_migrate_irq(QEMU, cpus, log, 1)),
+        # F4, F5, F22 across a move, both tiers
+        ("snap-migrate-ipi", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ipi"], 0)),
+        ("snap-migrate-ipi-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ipi"], 1)),
+        ("snap-migrate-timer", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timer"], 0)),
+        ("snap-migrate-timer-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timer"], 1)),
+        ("snap-migrate-timebase", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timebase"], 0)),
+        ("snap-migrate-timebase-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timebase"], 1)),
+        ("snap-migrate-vlen", lambda: t_migrate_vlen(QEMU, cpus, log)),
+        # F14: room on the destination, negotiated through the balloon
+        ("snap-migrate-memory", lambda: t_migrate_memory(QEMU, cpus, log, "cede")),
+        ("snap-migrate-memory-refused", lambda: t_migrate_memory(QEMU, cpus, log, "refused")),
+        ("snap-migrate-memory-legacy", lambda: t_migrate_memory(QEMU, cpus, log, "legacy")),
+        ("snap-migrate-mac", lambda: t_migrate_axis(QEMU, cpus, log, AXES["mac"], 0)),
+        ("snap-migrate-mac-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["mac"], 1)),
+        ("snap-migrate-disk-grow", lambda: t_migrate_disk_grow(QEMU, cpus, log)),
+        ("snap-migrate-rtc", lambda: t_migrate_axis(QEMU, cpus, log, AXES["rtc"], 0)),
+        ("snap-migrate-console", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 0)),
+        ("snap-migrate-ram", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 0)),
+        ("snap-migrate-cpus", lambda: t_migrate_axis(QEMU, cpus, log, AXES["cpus"], 0)),
+        ("snap-migrate-cpus-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["cpus"], 1)),
+        ("snap-migrate-cboz", lambda: t_migrate_cboz(QEMU, cpus, log, 0)),
+        ("snap-migrate-cboz-legacy", lambda: t_migrate_cboz(QEMU, cpus, log, 1)),
+        ("snap-migrate-cboz-hazard", lambda: t_migrate_cboz(QEMU, cpus, log, 1, hazard=1)),
+        ("snap-lx-migrate", lambda: t_lx_migrate(QEMU, cpus, log, "same")),
+        ("snap-lx-migrate-cboz", lambda: t_lx_migrate(QEMU, cpus, log, "cboz")),
+        ("snap-lx-migrate-cboz-legacy", lambda: t_lx_migrate(QEMU, cpus, log, "cboz", 1)),
+        ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),
+        ("snap-migrate-console-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 1)),
+        ("snap-migrate-rtc-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["rtc"], 1)),
+        ("snap-migrate-hartid", lambda: t_migrate_axis(QEMU, cpus, log, AXES["hartid"], 0)),
+        ("snap-migrate-hartid-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["hartid"], 1)),
+        ("snap-migrate-sbi", lambda: t_migrate_axis(QEMU, cpus, log, AXES["sbi"], 0)),
+        ("snap-migrate-sbi-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["sbi"], 1)),
     ]

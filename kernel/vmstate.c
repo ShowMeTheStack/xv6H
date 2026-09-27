@@ -82,6 +82,7 @@ struct vmstate_dev {
   uint32 blk_dfs, blk_ffs;
   uint64 dtb_gpa;
   uint64 entry;
+  uint64 desc_gpa;         // the slot the current description is in
 };
 
 // the configuration, and the shape of the machine the file describes.
@@ -112,6 +113,20 @@ struct vmstate_cfg {
   // continues across hosts.
   uint32 revise_gen;
   uint64 mmio_shift;      // where its virtio block sat (the layout axis)
+  uint64 intc_shift;      // and its interrupt controller's registers (F2)
+  uint32 irq_alt;         // and how its lines are numbered (F3)
+  uint32 sbi_hidden;      // and which SBI extensions it was described without (F22)
+  uint32 no_clint;        // F4: its IPIs go through SBI
+  uint32 no_sstc;         // F5: its timer is the SBI timer
+  uint32 timebase;        // F6: the rate its clock was described with (0: 10 MHz)
+  uint64 tb_x0, tb_g0;    // and the anchors of its continuous scaled clock
+  uint32 hart_shift;      // F9: how its harts were numbered
+  uint32 no_rtc;          // F16/F17: it had no RTC
+  uint32 console_kind;    // F18: the console it was described with
+  uint32 online;          // F7/F8: harts running
+  uint32 cboz_block;      // F21: the cache-block size it was described with
+  uint64 resident;        // F14: bytes of its RAM backed at the source, for the destination's legality
+  uint32 paging_mode;     // deepest vsatp mode in use (8 = Sv39, 9 = Sv48, 0 = bare)
   // bit 0: the guest has given the vector unit up (vm->vec_revoked). It matters
   // for legality and it is not the same question as `has it ever used one'. A
   // guest that used the unit and then *accepted* a revocation is holding no
@@ -128,6 +143,8 @@ struct vmstate_cfg {
   // deaf. That is the legacy tier: correct anywhere, paying emulation exits. A
   // guest that has asked is revised to the host's native controller instead.
 #define VMSTATE_F_CAPABLE 2u
+#define VMSTATE_F_LAZYV   4u   // the unit is hidden until used (and still hidden)
+#define VMSTATE_F_CEDED   8u   // the unit was given up for this move: the far end gives its own back
   uint32 flags2;
 };
 
@@ -407,10 +424,11 @@ save_dev(struct vm *vm, struct vmstate_dev *d)
   d->blk_ffs = vm->blk.driver_features_sel;
   d->dtb_gpa = vm->dtb_gpa;
   d->entry = vm->entry;
+  d->desc_gpa = vm->desc_gpa;
 }
 
 static void
-restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind)
+restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, int capable)
 {
   vm->uart = d->uart;
   vm->plic = d->plic;
@@ -441,15 +459,33 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind)
   // the network device keeps the hardware address this host gave it: the
   // switch knows the machine by that, and a saved one may be restored
   // beside the machine it was saved from.
-  uint8 mac[6];
-  memmove(mac, vm->vnet.mac, sizeof(mac));
+  // F19: the NIC's identity. The struct carries the address the guest left
+  // with; this host's vvnet_init chose one by its own policy (guestmac=alt,
+  // the slot). A guest that speaks the protocol gets this host's and is told
+  // through the device (a configuration change, as virtio tells such things);
+  // one that cannot be told keeps the address it had -- it may be in use.
+  uint8 hostmac[6];
+  memmove(hostmac, vm->vnet.mac, sizeof(hostmac));
   int present = vm->vnet.present;
   vm->vnet = d->vnet;
-  memmove(vm->vnet.mac, mac, sizeof(mac));
   vm->vnet.present = present;
+  if (memcmp(vm->vnet.mac, hostmac, 6) != 0) {
+    if (capable) {
+      printk("hyp: vm %d: arrived with nic 52:54:00:%x:76:%x, this host gives 52:54:00:%x:76:%x: "
+             "told through the device\n", vm->id, vm->vnet.mac[3], vm->vnet.mac[5], hostmac[3], hostmac[5]);
+      memmove(vm->vnet.mac, hostmac, 6);
+      acquire(&vm->lock);
+      vvnet_mac_changed(vm);
+      release(&vm->lock);
+    } else {
+      printk("hyp: a machine arriving with nic 52:54:00:%x:76:%x does not speak revision: keeping it\n",
+             vm->vnet.mac[3], vm->vnet.mac[5]);
+    }
+  }
   int bpresent = vm->balloon.present;
   vm->balloon = d->balloon;
   vm->balloon.present = bpresent;
+  vballoon_pin(vm);          // F14: what the guest gave up for the move, it keeps giving up
   for (int i = 0; i < NVCPU; i++)
     vm->clint_msip[i] = d->clint_msip[i];
   vm->rtc_latch = d->rtc_latch;
@@ -462,11 +498,24 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind)
   vm->blk.driver_features = d->blk_features;
   vm->blk.status = d->blk_status;
   vm->blk.intr_status = d->blk_intr_status;
+  // F20: the disk's capacity is this host's image's, computed at creation;
+  // if it is not what the guest left with, the device says so (a
+  // configuration change) and the driver re-reads it. Both tiers: the fact
+  // lives in the device, not in the description.
+  if (d->blk_capacity && vm->blk.capacity && vm->blk.capacity != d->blk_capacity) {
+    printk("hyp: vm %d: arrived with a %ld-sector disk, this host's image has %ld: told through the device\n",
+           vm->id, (long)d->blk_capacity, (long)vm->blk.capacity);
+    vm->blk.intr_status |= 2;
+    acquire(&vm->lock);
+    vic_set_level(vm, vm_irq(vm, G_VIRTIO_IRQ), 1);
+    release(&vm->lock);
+  }
   vm->blk.queue_sel = d->blk_queue_sel;
   vm->blk.device_features_sel = d->blk_dfs;
   vm->blk.driver_features_sel = d->blk_ffs;
   vm->dtb_gpa = d->dtb_gpa;
   vm->entry = d->entry;
+  vm->desc_gpa = d->desc_gpa ? d->desc_gpa : d->dtb_gpa;
 }
 
 // the memory: every backed page that is not all zeroes, named by its
@@ -535,7 +584,9 @@ save_mem(struct vm *vm, struct sink *s, uint64 *nbytes, uint32 *only,
       int pidx = k * HCHUNK_PAGES + i;
       if (!verify && only && !vmsnap_bit(only, pidx))
         continue;
-      if (vm_copyin(vm, page, gpa, PGSIZE) < 0) {
+      // a peek, not a copy: the sweep must not back what the guest has not
+      // touched (vm_peek says why)
+      if (vm_peek(vm, page, gpa, PGSIZE) < 0) {
         if (sums)
           sums[pidx] = 0;               // not backed: zeroes over there
         if (lr && lr->msums)
@@ -556,8 +607,12 @@ save_mem(struct vm *vm, struct sink *s, uint64 *nbytes, uint32 *only,
           uint32 mnow = pcs_masked(page);
           adonly = (mnow == lr->msums[pidx]);
         }
-        if (unmarked)
+        if (unmarked) {
           lr->nunmarked++;
+          if (lr->nunmarked <= 8)
+            printk("hyp: vm %d: page 0x%lx changed under the copy and nobody had marked it%s\n",
+                   vm->id, gpa, lr->msums ? (adonly ? " (A/D bits only)" : " (content)") : "");
+        }
         if (adonly)
           lr->nadonly++;
         if (unmarked && adonly)
@@ -770,6 +825,56 @@ vm_save_file(struct vm *vm, struct file *f)
 }
 
 // the sections, in order, into whatever the sink is
+// the handshake, defined with the acknowledgement below
+static int hs_put(struct file *f, char answer, uint32 arg);
+static int hs_get(struct file *f, char *answer, uint32 *arg);
+static int cede(struct vm *vm, uint32 mask);
+
+// the machine's shape, as the CFG section carries it
+static void
+fill_cfg(struct vm *vm, struct vmstate_cfg *c)
+{
+  memset(c, 0, sizeof(*c));
+  c->cfg = vm->cfg;
+  c->ram_size = vm->ram_size;
+  c->nvcpu = vm->nvcpu;
+  c->vic_kind = vm->vic_kind;
+  c->imsic_hw = vm->imsic_hw;
+  c->prefer_huge = vm->prefer_huge;
+  c->mem_limit = vm->mem_limit;
+  c->obs = vm->obs;
+  c->vlenb = (uint32)(vm->vec_revoked ? 0 : plat.vlenb);
+  c->revise_gen = vm->revise_gen;
+  c->mmio_shift = vm->mmio_shift;
+  c->intc_shift = vm->intc_shift;
+  c->irq_alt = vm->irq_alt;
+  c->sbi_hidden = vm->sbi_hidden;
+  c->no_clint = vm->no_clint;
+  c->no_sstc = vm->no_sstc;
+  c->timebase = vm->timebase;
+  c->tb_x0 = vm->tb_x0;
+  c->tb_g0 = vm->tb_g0;
+  c->hart_shift = vm->hart_shift;
+  c->no_rtc = vm->no_rtc;
+  c->console_kind = vm->console_kind;
+  c->online = vm->online;
+  c->cboz_block = vm->cboz_block;
+  c->resident = vm->resident;
+  // the paging depth the guest is using: a machine in Sv48 cannot land on a
+  // host whose G-stage is Sv39x4, and unlike the vector unit this is not
+  // something a guest can be asked to give up -- its address space is laid out
+  c->paging_mode = 0;
+  for (int i = 0; i < vm->nvcpu; i++) {
+    uint32 m = (uint32)(vm->vcpu[i].vsatp >> 60);
+    if (m > c->paging_mode)
+      c->paging_mode = m;
+  }
+  c->flags2 = (vm->vec_revoked ? VMSTATE_F_VEC_REVOKED : 0) |
+              (vm->revise_capable ? VMSTATE_F_CAPABLE : 0) |
+              (vm->lazy_v ? VMSTATE_F_LAZYV : 0) |
+              (vm->vec_ceded ? VMSTATE_F_CEDED : 0);
+}
+
 static int
 save_to(struct vm *vm, struct sink *s)
 {
@@ -794,22 +899,38 @@ save_to(struct vm *vm, struct sink *s)
   if ((r = put(s, &hdr, sizeof(hdr))) < 0)
     goto out;
 
-  memset(&w->cfg, 0, sizeof(w->cfg));
-  w->cfg.cfg = vm->cfg;
-  w->cfg.ram_size = vm->ram_size;
-  w->cfg.nvcpu = vm->nvcpu;
-  w->cfg.vic_kind = vm->vic_kind;
-  w->cfg.imsic_hw = vm->imsic_hw;
-  w->cfg.prefer_huge = vm->prefer_huge;
-  w->cfg.mem_limit = vm->mem_limit;
-  w->cfg.obs = vm->obs;
-  w->cfg.vlenb = (uint32)(vm->vec_revoked ? 0 : plat.vlenb);
-  w->cfg.revise_gen = vm->revise_gen;
-  w->cfg.mmio_shift = vm->mmio_shift;
-  w->cfg.flags2 = (vm->vec_revoked ? VMSTATE_F_VEC_REVOKED : 0) |
-                  (vm->revise_capable ? VMSTATE_F_CAPABLE : 0);
+  fill_cfg(vm, &w->cfg);
   if ((r = put_sec(s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
     goto out;
+  // over a connection the description is answered before a page moves
+  if (s->f) {
+    for (int tries = 0; ; tries++) {
+      char answer = 0; uint32 arg = 0;
+      if ((r = hs_get(s->f, &answer, &arg)) < 0)
+        goto out;
+      if (answer == MIG_HS_ACCEPT)
+        break;
+      if (answer == MIG_HS_REFUSE) {
+        printk("hyp: vm %d: the destination refused the machine (reason %d): "
+               "nothing was sent\n", vm->id, arg);
+        r = -ENOTSUP;
+        goto out;
+      }
+      if (answer != MIG_HS_NEGOTIATE || tries > 0) {
+        r = -EIO;
+        goto out;
+      }
+      // it will take the machine if the guest gives these up first
+      printk("hyp: vm %d: the destination asks the guest to cede 0x%x first\n", vm->id, arg);
+      if ((r = cede(vm, arg)) < 0) {
+        put_sec(s, "ABRT", 0, 0);
+        goto out;
+      }
+      fill_cfg(vm, &w->cfg);                 // the description, as it now is
+      if ((r = put_sec(s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
+        goto out;
+    }
+  }
 
   // and now, if this is a migration of a machine that is running, the
   // memory goes over while it keeps running (§9). A save to a file does
@@ -821,8 +942,18 @@ save_to(struct vm *vm, struct sink *s)
       // everything read-only again first, so that a write during the
       // sweep is a write this round knows about
       vm_snap_protect(vm, 0, pc.dirty, pc.npages);
-      if (round > 1)
+      if (round > 1) {
         precopy_take(&pc);
+        // and read-only again *after* the take. A page written between the
+        // protect above and the take faulted, was marked into the set the
+        // take has just moved to `send', and was made writable by the fault
+        // (vm_unshare: one fault per page per round). Writable, it would take
+        // every later write of this round unrecorded while its copy went
+        // over stale -- which is what `6 page(s) nobody had marked' was
+        // (busy2). Protected again here, its next write faults into the new
+        // set. Cheap: a pass over the PTEs.
+        vm_snap_protect(vm, 0, pc.dirty, pc.npages);
+      }
       // the first round is every page there is, so a page of zeroes can
       // be left out as in a plain save; from the second round on it
       // cannot (see save_mem).
@@ -853,7 +984,11 @@ save_to(struct vm *vm, struct sink *s)
     goto out;
 
   memset(&w->tm, 0, sizeof(w->tm));
-  w->tm.saved_time = hdr.saved_time;
+  // the moment the guest's clock stopped is *now*, not when the header went:
+  // a pre-copy ran between the two, and a destination that took the header's
+  // time set the guest's clock back by that much (hunt3: two-hart legacy
+  // guests waited on timers set during the pre-copy)
+  w->tm.saved_time = r_time();
   w->tm.htimedelta = vm->htimedelta;
   if ((r = put_sec(s, "TIME", &w->tm, sizeof(w->tm))) < 0)
     goto out;
@@ -1015,6 +1150,143 @@ now_ticks(void)
   uint t = ticks;
   release(&tickslock);
   return t;
+}
+
+// ---- the handshake ----
+//
+// The description goes first and the memory follows, and until now the memory
+// followed unconditionally: a destination that could not take the machine found
+// out after reading all of it, and the source found out after sending all of it.
+// Now the destination answers the CFG section before a page moves -- accept,
+// refuse with a reason, or negotiate: "I will take it if the guest first gives up
+// these facts". A refused move sends no memory; a negotiated one asks the guest,
+// re-sends the description, and only then streams.
+static int
+hs_put(struct file *f, char answer, uint32 arg)
+{
+  char buf[5] = {answer, arg & 0xff, (arg >> 8) & 0xff, (arg >> 16) & 0xff, (arg >> 24) & 0xff};
+  if (f == 0 || f->type != FD_SOCK || f->sock == 0)
+    return -EINVAL;
+  return sockwrite(f->sock, 0, (uint64)buf, 5) == 5 ? 0 : -EIO;
+}
+
+static int
+hs_get(struct file *f, char *answer, uint32 *arg)
+{
+  char buf[5];
+  int got = 0;
+
+  if (f == 0 || f->type != FD_SOCK || f->sock == 0)
+    return -EINVAL;
+  uint deadline = now_ticks() + ACK_TICKS;
+  while (got < 5) {
+    int ready = sockready(f->sock, 0);
+    if (ready < 0)
+      return -EIO;
+    if (ready == 0) {
+      if (killed(myproc()))
+        return -EINTR;
+      if (now_ticks() >= deadline)
+        return -ETIMEDOUT;
+      acquire(&tickslock);
+      sleep_prepare((void *)&ticks);
+      release(&tickslock);
+      sleep();
+      continue;
+    }
+    int n = sockread(f->sock, 0, (uint64)buf + got, 5 - got);
+    if (n <= 0)
+      return -EIO;
+    got += n;
+  }
+  *answer = buf[0];
+  *arg = (uint8)buf[1] | ((uint32)(uint8)buf[2] << 8) | ((uint32)(uint8)buf[3] << 16) | ((uint32)(uint8)buf[4] << 24);
+  return 0;
+}
+
+// the source, asked to make the guest cede something before the move. Returns 0
+// when the guest agreed, -EBUSY when it refused (a task relies on the feature),
+// or the revision's own error.
+static int
+cede(struct vm *vm, uint32 arg)
+{
+  uint32 mask = arg & 0xff;
+  if (mask & REV_MEM) {
+    // F14: be resident in no more than the destination has. The balloon is
+    // asked for the difference (on top of what it already holds) and the
+    // machine is watched until it is small enough -- or is not, within the
+    // time a guest that *can* give the memory back takes to do it.
+    uint64 target = (uint64)(arg >> 8) << 20;
+    uint64 now = vm->resident;
+    if (now > target) {
+      uint64 more = now - target;
+      uint64 before = (uint64)vm->balloon.target * PGSIZE;   // what it was asked to hold already
+      uint64 want = (uint64)vm->balloon.actual * PGSIZE + more;
+      printk("hyp: vm %d: asking the guest to give up %ld MB (resident %ld MB, the destination has %ld MB)\n",
+             vm->id, (long)(more >> 20), (long)(now >> 20), (long)(target >> 20));
+      if (vballoon_request(vm, want) < 0)
+        return -EBUSY;                 // no balloon: it cannot be asked
+      uint deadline = now_ticks() + 1500, nudge = now_ticks() + 50;
+      while (vm->resident > target) {
+        if (now_ticks() >= deadline) {
+          printk("hyp: vm %d: the guest could not give up enough memory (resident %ld MB): the move is refused\n",
+                 vm->id, (long)(vm->resident >> 20));
+          vballoon_request(vm, before);   // and is not left squeezed for nothing
+          return -EBUSY;
+        }
+        // The guest gives *free* pages, and a free page it never touched was
+        // never backed: giving it up frees nothing here. So when the guest
+        // has reached what it was asked and the machine is still too big, it
+        // is asked for the rest again (f14a: 6 MB asked, 4 MB of backing
+        // came back). It ends when the balloon holds what the host needs or
+        // the guest runs out of free pages, and then the clock above ends it.
+        if (now_ticks() >= nudge) {
+          nudge = now_ticks() + 50;
+          uint64 held = (uint64)vm->balloon.actual * PGSIZE, asked = (uint64)vm->balloon.target * PGSIZE;
+          if (held >= asked && vm->resident > target) {
+            want = held + (vm->resident - target);
+            if (want <= vm->ram_size)
+              vballoon_request(vm, want);
+          }
+        }
+        acquire(&tickslock);
+        sleep_prepare((void *)&ticks);
+        release(&tickslock);
+        sleep();
+      }
+      printk("hyp: vm %d: resident in %ld MB now\n", vm->id, (long)(vm->resident >> 20));
+    }
+  }
+  if (mask & REV_VLEN) {
+    int r = vm_revise_vector(vm, 0);
+    if (r < 0)
+      return r;
+    // wait for the guest's answer: it acks within milliseconds either way
+    uint deadline = now_ticks() + 500;
+    for (;;) {
+      acquire(&vm->lock);
+      int acked = vm->revise_acked == vm->revise_gen;
+      uint32 adopted = vm->revise_adopted;
+      release(&vm->lock);
+      if (acked) {
+        if (adopted & REV_VLEN) {
+          acquire(&vm->lock);
+          vm->vec_ceded = 1;        // for this move: the far end knows to give it back
+          release(&vm->lock);
+          break;
+        }
+        printk("hyp: vm %d: the guest kept its vector unit: the move is refused\n", vm->id);
+        return -EBUSY;
+      }
+      if (now_ticks() >= deadline)
+        return -ETIMEDOUT;
+      acquire(&tickslock);
+      sleep_prepare((void *)&ticks);
+      release(&tickslock);
+      sleep();
+    }
+  }
+  return 0;
 }
 
 int
@@ -1238,19 +1510,7 @@ vm_snapshot(struct vm *vm, char *path)
     goto resume;
 
   memset(&w->cfg, 0, sizeof(w->cfg));
-  w->cfg.cfg = vm->cfg;
-  w->cfg.ram_size = vm->ram_size;
-  w->cfg.nvcpu = vm->nvcpu;
-  w->cfg.vic_kind = vm->vic_kind;
-  w->cfg.imsic_hw = vm->imsic_hw;
-  w->cfg.prefer_huge = vm->prefer_huge;
-  w->cfg.mem_limit = vm->mem_limit;
-  w->cfg.obs = vm->obs;
-  w->cfg.vlenb = (uint32)(vm->vec_revoked ? 0 : plat.vlenb);
-  w->cfg.revise_gen = vm->revise_gen;
-  w->cfg.mmio_shift = vm->mmio_shift;
-  w->cfg.flags2 = (vm->vec_revoked ? VMSTATE_F_VEC_REVOKED : 0) |
-                  (vm->revise_capable ? VMSTATE_F_CAPABLE : 0);
+  fill_cfg(vm, &w->cfg);
   if ((r = put_sec(&s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
     goto resume;
   memset(&w->tm, 0, sizeof(w->tm));
@@ -1511,7 +1771,7 @@ vm_clone(struct vm *src, const char *name, const char *disk, int *idp)
       memmove(dst->vcpu[i].vstate, src->vcpu[i].vstate, PGSIZE);
   }
   save_dev(src, dev);
-  restore_dev(dst, dev, src->vic_kind);
+  restore_dev(dst, dev, src->vic_kind, 1);   // a clone is a new machine: it gets this slot's NIC identity, and is told
   dst->revise_gen = src->revise_gen;
   dst->revise_acked = src->revise_gen;
   dst->cons_out = src->cons_out;
@@ -1615,6 +1875,15 @@ restore_from(struct src *s, const char *name, int *idp)
   struct vm *vm = 0;
   int src_kind = -1;        // the controller the machine was bound to when it left
   uint64 src_shift = 0;     // and where its devices sat
+  uint64 src_ishift = 0;    // and its interrupt controller (F2)
+  int src_irq_alt = 0;      // and how its lines were numbered (F3)
+  uint32 src_sbi = 0;       // and which SBI extensions it lacked (F22)
+  int src_no_clint = 0, src_no_sstc = 0;   // F4, F5
+  uint32 src_timebase = 0;                 // F6
+  int src_hart_shift = 0;                  // F9
+  int src_no_rtc = 0;                      // F16/F17
+  int src_con = 0;                         // F18
+  int src_cboz = 0;                        // F21
   // a file too short to hold a header is not a saved machine, and saying
   // "invalid argument" is the answer; "input/output error" would be a
   // complaint about the disk, which is not what is wrong.
@@ -1684,11 +1953,67 @@ restore_from(struct src *s, const char *name, int *idp)
       // `vector' in its observation set on some runs and not others. The exact
       // answer lives in the guest, which knows which tasks hold state, so the
       // decision is a negotiation rather than an observation.
+      int refuse = 0;
+      uint32 must_cede = 0;
       if (!(w->cfg.flags2 & VMSTATE_F_VEC_REVOKED) && w->cfg.vlenb > 0 &&
-          (!plat.has_v || plat.vlenb < (uint64)w->cfg.vlenb)) {
-        printk("hyp: refusing a machine with a %d-byte vector unit: this host has "
-               "%s. Ask the guest to give it up first\n", w->cfg.vlenb,
-               plat.has_v ? "narrower ones" : "none");
+          (!plat.has_v || plat.vlenb != (uint64)w->cfg.vlenb)) {
+        // F11: a unit of another *width* is another unit -- a save area laid
+        // out for 128-bit registers is wrong for 256-bit ones -- so a guest
+        // holding state in it must give it up (as for no unit at all) and is
+        // given this host's on arrival. A guest that can be asked is asked; one
+        // that cannot is refused
+        if (w->cfg.flags2 & VMSTATE_F_CAPABLE)
+          must_cede |= REV_VLEN;
+        else
+          refuse = MIG_REFUSE_VECTOR;
+      }
+      if (w->cfg.paging_mode == 9 && plat.mmu_levels < 4) {
+        printk("hyp: refusing a machine in Sv48: this host's G-stage is Sv39x4\n");
+        refuse = MIG_REFUSE_PAGING;
+      }
+      // F14: room. A machine resident in more memory than this host has for
+      // it is asked, through its balloon, to be smaller before it comes --
+      // the one cede that has a *size*, carried in the answer's upper bits
+      // (MB); a guest that cannot be asked, or has no balloon, is refused.
+      {
+        uint64 room = hyp_guest_room_bytes();
+        // A host that keeps its guests small backs them a page at a time: with
+        // 2 MB blocks the pages that arrive pull whole blocks in behind them
+        // (f14e: 16 MB negotiated, 24 MB resident on arrival), and the room
+        // agreed on would mean nothing.
+        if (plat_bootarg_num("guestmem"))
+          w->cfg.cfg.flags |= VMF_NOHUGE;
+        if (!refuse && w->cfg.resident > room) {
+          uint32 room_mb = (uint32)(room >> 20);
+          if ((w->cfg.flags2 & VMSTATE_F_CAPABLE) && room_mb >= 4) {
+            must_cede |= REV_MEM | (room_mb << 8);
+            printk("hyp: a machine resident in %ld MB arrives at a host with %u MB for it: asking it to be smaller\n",
+                   (long)(w->cfg.resident >> 20), room_mb);
+          } else {
+            printk("hyp: refusing a machine resident in %ld MB: this host has %u MB for it and its guest "
+                   "cannot be asked\n", (long)(w->cfg.resident >> 20), room_mb);
+            refuse = MIG_REFUSE_MEMORY;
+          }
+        }
+      }
+      if (s->f) {
+        // over a connection: answer before a page moves
+        if (refuse) {
+          printk("hyp: refusing a machine with a %d-byte vector unit: this host has "
+                 "%s, and its guest cannot be asked to give it up\n", w->cfg.vlenb,
+                 plat.has_v ? "narrower ones" : "none");
+          hs_put(s->f, MIG_HS_REFUSE, refuse);
+          r = -ENOTSUP;
+          goto out;
+        }
+        if (must_cede) {
+          printk("hyp: asking the source to have its guest cede 0x%x before the move\n", must_cede);
+          hs_put(s->f, MIG_HS_NEGOTIATE, must_cede);
+          s->off = next;            // the next section is the CFG again, or an abort
+          continue;
+        }
+        hs_put(s->f, MIG_HS_ACCEPT, 0);
+      } else if (refuse) {
         r = -ENOTSUP;
         goto out;
       }
@@ -1704,6 +2029,16 @@ restore_from(struct src *s, const char *name, int *idp)
       // saves, which is the whole argument for speaking the protocol.
       int native = plat.intc_kind == INTC_PLIC ? VIC_PLIC
                  : plat.intc_kind == INTC_APLIC ? VIC_APLIC : VIC_IMSIC;
+      // The policy, measured (tiercost): revising to the host's native controller
+      // is worth it only when native is *cheaper* -- hardware guest interrupt
+      // files, where an interrupt costs no exit. On a host without them a
+      // software IMSIC and a PLIC cost the same, so `guestpolicy=cheapest' keeps
+      // whatever the guest arrived with and asks for no revision. The default
+      // stays `native', which is what the correctness tests exercise.
+      int target = native;
+      if (plat_bootarg("guestpolicy=cheapest") &&
+          !(plat.intc_kind == INTC_IMSIC && vimsic_geilen() > 0))
+        target = w->cfg.vic_kind;
       uint64 native_shift = plat_bootarg("guestmap=alt") ? G_MMIO_ALT_SHIFT : 0;
       w->cfg.cfg.flags &= ~(VMF_WANT_MASK | VMF_MMIO_SET);
       // the layout axis, same rule: a guest that cannot be told keeps the map
@@ -1715,12 +2050,133 @@ restore_from(struct src *s, const char *name, int *idp)
                "revision: keeping that map\n", w->cfg.mmio_shift);
       }
       src_shift = w->cfg.mmio_shift;
+      // F2, the same rule for the controller's address
+      uint64 native_ishift = plat_bootarg("guestintc=alt") ? G_INTC_ALT_SHIFT : 0;
+      w->cfg.cfg.flags &= ~VMF_INTC_SET;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.intc_shift != native_ishift) {
+        w->cfg.cfg.flags |= VMF_INTC_SET;
+        w->cfg.cfg.intc_shift = w->cfg.intc_shift;
+        printk("hyp: a machine arriving with its interrupt controller at +0x%lx does not "
+               "speak revision: keeping that address\n", w->cfg.intc_shift);
+      }
+      src_ishift = w->cfg.intc_shift;
+      // F3, the same rule for the numbering of the lines
+      int native_irq_alt = plat_bootarg("guestirq=alt") ? 1 : 0;
+      w->cfg.cfg.flags &= ~VMF_IRQ_SET;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (int)w->cfg.irq_alt != native_irq_alt) {
+        w->cfg.cfg.flags |= VMF_IRQ_SET;
+        w->cfg.cfg.irq_alt = w->cfg.irq_alt;
+        printk("hyp: a machine arriving with its interrupt lines numbered %s does not "
+               "speak revision: keeping that numbering\n", w->cfg.irq_alt ? "alt" : "default");
+      }
+      src_irq_alt = w->cfg.irq_alt;
+      // F22, the same rule for the SBI set
+      w->cfg.cfg.flags &= ~VMF_SBI_SET;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.sbi_hidden != sbi_hidden_default()) {
+        w->cfg.cfg.flags |= VMF_SBI_SET;
+        w->cfg.cfg.sbi_hidden = w->cfg.sbi_hidden;
+        printk("hyp: a machine arriving without SBI extensions 0x%x does not speak "
+               "revision: keeping that set\n", w->cfg.sbi_hidden);
+      }
+      src_sbi = w->cfg.sbi_hidden;
+      // F4 and F5, the same rule
+      w->cfg.cfg.flags &= ~(VMF_IPI_SET | VMF_TIMER_SET);
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (w->cfg.no_clint != 0) != plat_bootarg("guestipi=sbi")) {
+        w->cfg.cfg.flags |= VMF_IPI_SET;
+        w->cfg.cfg.no_clint = w->cfg.no_clint;
+        printk("hyp: a machine arriving with %s ipis does not speak revision: keeping them\n",
+               w->cfg.no_clint ? "sbi" : "clint");
+      }
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (w->cfg.no_sstc != 0) != plat_bootarg("guesttimer=sbi")) {
+        w->cfg.cfg.flags |= VMF_TIMER_SET;
+        w->cfg.cfg.no_sstc = w->cfg.no_sstc;
+        printk("hyp: a machine arriving with the %s timer does not speak revision: keeping it\n",
+               w->cfg.no_sstc ? "sbi" : "sstc");
+      }
+      src_no_clint = w->cfg.no_clint != 0;
+      src_no_sstc = w->cfg.no_sstc != 0;
+      // F6, the same rule
+      {
+        uint32 native_tb = (uint32)plat_bootarg_num("guesttimebase");
+        if (native_tb == HOST_TIMEBASE)
+          native_tb = 0;
+        w->cfg.cfg.flags &= ~VMF_TIMEBASE_SET;
+        if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.timebase != native_tb) {
+          w->cfg.cfg.flags |= VMF_TIMEBASE_SET;
+          w->cfg.cfg.timebase = w->cfg.timebase;
+          printk("hyp: a machine arriving with a %u Hz timebase does not speak revision: keeping it\n",
+                 w->cfg.timebase ? w->cfg.timebase : (uint32)HOST_TIMEBASE);
+        }
+        src_timebase = w->cfg.timebase;
+      }
+      // F9, the same rule
+      {
+        int native_hs = (int)plat_bootarg_num("guesthart");
+        w->cfg.cfg.flags &= ~VMF_HART_SET;
+        if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (int)w->cfg.hart_shift != native_hs) {
+          w->cfg.cfg.flags |= VMF_HART_SET;
+          w->cfg.cfg.hart_shift = w->cfg.hart_shift;
+          printk("hyp: a machine arriving with harts numbered from %u does not speak revision: keeping that\n",
+                 w->cfg.hart_shift);
+        }
+        src_hart_shift = w->cfg.hart_shift;
+      }
+      // F16/F17, the same rule
+      w->cfg.cfg.flags &= ~VMF_RTC_SET;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (w->cfg.no_rtc != 0) != (plat_bootarg("guestrtc=off") != 0)) {
+        w->cfg.cfg.flags |= VMF_RTC_SET;
+        w->cfg.cfg.no_rtc = w->cfg.no_rtc;
+        printk("hyp: a machine arriving %s an rtc does not speak revision: keeping that\n",
+               w->cfg.no_rtc ? "without" : "with");
+      }
+      src_no_rtc = w->cfg.no_rtc != 0;
+      // F18, the same rule
+      {
+        static const char *cnames[] = {"uart", "virtio", "sbi"};
+        int native_con = plat_bootarg("guestcon=virtio") ? CON_VIRTIO : plat_bootarg("guestcon=sbi") ? CON_SBI : CON_UART;
+        w->cfg.cfg.flags &= ~(VMF_CON_SET | VMF_CONQUEUE);
+        if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && (int)w->cfg.console_kind != native_con) {
+          w->cfg.cfg.flags |= VMF_CON_SET;
+          w->cfg.cfg.console_kind = w->cfg.console_kind;
+          printk("hyp: a machine arriving with a %s console does not speak revision: keeping it\n",
+                 cnames[w->cfg.console_kind % 3]);
+        }
+        src_con = w->cfg.console_kind;
+      }
+      // F21: the block size it left with. A guest that cannot be told keeps
+      // it -- and is served in software if this host's differs; one that
+      // can is described this host's on arrival and told (owed, below)
+      src_cboz = w->cfg.cboz_block;
+      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.cboz_block && (int)w->cfg.cboz_block != plat.cboz_block) {
+        w->cfg.cfg.flags |= VMF_CBOZ_SET;
+        w->cfg.cfg.cboz_block = w->cfg.cboz_block;
+        printk("hyp: a machine arriving with a %u-byte cache block does not speak revision: keeping it (this host's is %d, cbo.zero in software)\n",
+               w->cfg.cboz_block, plat.cboz_block);
+      }
+      // F7/F8, the same rule: a host's cap (`guestcpus=N') applies to a guest
+      // that can be told; one that cannot keeps its harts running
+      {
+        int cap = (int)plat_bootarg_num("guestcpus");
+        w->cfg.cfg.flags |= VMF_CPUS_SET;
+        w->cfg.cfg.online = w->cfg.online ? w->cfg.online : w->cfg.cfg.nvcpu;
+        if ((w->cfg.flags2 & VMSTATE_F_CAPABLE) && cap > 0 && cap < (int)w->cfg.cfg.online)
+          ;                                 // decided after the machine exists (owed)
+        else if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && cap > 0 && cap < (int)w->cfg.cfg.online)
+          printk("hyp: a machine arriving with %u harts running does not speak revision: keeping them\n",
+                 w->cfg.cfg.online);
+      }
       if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && src_kind != native) {
         w->cfg.cfg.flags |= src_kind == VIC_PLIC  ? VMF_WANT_PLIC
                           : src_kind == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
         printk("hyp: a machine arriving as %s does not speak revision: keeping "
                "%s on this %s host\n", vic_kindname(src_kind),
                vic_kindname(src_kind), vic_kindname(native));
+      } else if ((w->cfg.flags2 & VMSTATE_F_CAPABLE) && target != native) {
+        w->cfg.cfg.flags |= target == VIC_PLIC  ? VMF_WANT_PLIC
+                          : target == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
+        printk("hyp: a machine arriving as %s: this %s host has no cheaper "
+               "controller, keeping %s (guestpolicy=cheapest)\n",
+               vic_kindname(src_kind), vic_kindname(native), vic_kindname(target));
       }
       id = vm_create_blank(&w->cfg.cfg);
       if (id < 0) {
@@ -1740,6 +2196,9 @@ restore_from(struct src *s, const char *name, int *idp)
       // host has: the guest is running code that was told there is none.
       vm->vec_revoked = (w->cfg.flags2 & VMSTATE_F_VEC_REVOKED) ? 1 : 0;
       vm->revise_capable = (w->cfg.flags2 & VMSTATE_F_CAPABLE) ? 1 : 0;
+      vm->lazy_v = (w->cfg.flags2 & VMSTATE_F_LAZYV) ? 1 : 0;
+      vm->tb_x0 = w->cfg.tb_x0;
+      vm->tb_g0 = w->cfg.tb_g0;
     } else if (strncmp(sec.name, "TIME", sizeof(sec.name)) == 0) {
       if ((r = get(s, &w->tm, sizeof(w->tm))) < 0)
         goto out;
@@ -1778,7 +2237,7 @@ restore_from(struct src *s, const char *name, int *idp)
       }
       if ((r = get(s, dev, sizeof(*dev))) < 0)
         goto out;
-      restore_dev(vm, dev, src_kind);
+      restore_dev(vm, dev, src_kind, (w->cfg.flags2 & VMSTATE_F_CAPABLE) != 0);
     } else if (strncmp(sec.name, "CONSO", sizeof(sec.name)) == 0) {
       if (vm == 0 || sec.len != sizeof(vm->cons_out)) {
         r = -EINVAL;
@@ -1817,6 +2276,10 @@ restore_from(struct src *s, const char *name, int *idp)
           printk("vmstate: took %ld MB\n", (long)(got >> 20));
       }
       next = s->off;       // where the pages actually ended
+    } else if (strncmp(sec.name, "ABRT", sizeof(sec.name)) == 0) {
+      // the source's guest would not cede what this host needed
+      r = -EBUSY;
+      goto out;
     } else if (strncmp(sec.name, "END", sizeof(sec.name)) == 0) {
       // the sections are over. A file says in its header as well; a
       // connection has only this.
@@ -1845,6 +2308,94 @@ restore_from(struct src *s, const char *name, int *idp)
   uint32 owed = 0;
   if (src_kind >= 0 && src_kind != vm->vic_kind)
     owed |= REV_INTC | REV_DEVICES;
+  if (src_kind >= 0 && src_ishift != vm->intc_shift) {
+    owed |= REV_INTC;
+    printk("hyp: vm %d: arrived with its interrupt controller at +0x%lx, this host puts "
+           "it at +0x%lx\n", vm->id, src_ishift, vm->intc_shift);
+  }
+  if (src_kind >= 0 && src_no_clint != vm->no_clint) {
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived with %s ipis, this host has %s\n", vm->id,
+           src_no_clint ? "sbi" : "clint", vm->no_clint ? "no clint" : "a clint");
+  }
+  // F11: a unit ceded for the move is given back here, at this host's width;
+  // the guest's REV_VLEN grant path re-reads vlenb. Not for a lazily revealed
+  // unit, which the guest asks for when it wants it.
+  if (src_kind >= 0 && (w->cfg.flags2 & VMSTATE_F_CAPABLE) && (w->cfg.flags2 & VMSTATE_F_CEDED) &&
+      plat.has_v && !vm->lazy_v) {
+    acquire(&vm->lock);
+    vm->vec_revoked = 0;
+    vm->vec_ceded = 0;
+    for (int i = 0; i < vm->nvcpu; i++)
+      vm->vcpu[i].vsstatus = (vm->vcpu[i].vsstatus & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL;
+    release(&vm->lock);
+    owed |= REV_VLEN;
+    printk("hyp: vm %d: arrived without the vector unit it gave up for the move; this host's is "
+           "%ld bits wide and is given back\n", vm->id, plat.vlenb * 8);
+  }
+  // F13: `guestgrow=MB' on this host gives every arriving participating guest
+  // that much more memory; it is told and adds the range
+  {
+    uint64 grow = plat_bootarg_num("guestgrow") << 20;
+    if (src_kind >= 0 && (w->cfg.flags2 & VMSTATE_F_CAPABLE) && grow &&
+        vm_grow(vm, vm->ram_size + grow) == 0) {
+      owed |= REV_MEMORY;
+      printk("hyp: vm %d: arrived with %d MB, this host gives it %d MB\n", vm->id,
+             (int)((vm->ram_size - grow) >> 20), (int)(vm->ram_size >> 20));
+    }
+  }
+  // F21: another cache block here
+  if (src_kind >= 0 && src_cboz && src_cboz != vm->cboz_block) {
+    owed |= REV_DEVICES;
+    vm->cboz_prev = src_cboz;    // until it is told, cleared at the larger
+    printk("hyp: vm %d: arrived with a %d-byte cache block, this host's is %d\n", vm->id, src_cboz, vm->cboz_block);
+  }
+  // F7/F8: this host's cap on running harts
+  {
+    int cap = (int)plat_bootarg_num("guestcpus");
+    if (src_kind >= 0 && (w->cfg.flags2 & VMSTATE_F_CAPABLE) && cap > 0 && cap < vm->online) {
+      printk("hyp: vm %d: arrived with %d harts running, this host allows %d\n", vm->id, vm->online, cap);
+      vm->online = cap;
+      owed |= REV_DEVICES;
+    }
+  }
+  if (src_kind >= 0 && src_con != vm->console_kind) {
+    static const char *cnames[] = {"uart", "virtio", "sbi"};
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived with a %s console, this host's is %s\n", vm->id,
+           cnames[src_con % 3], cnames[vm->console_kind % 3]);
+  }
+  if (src_kind >= 0 && src_no_rtc != vm->no_rtc) {
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived %s an rtc, this host offers %s\n", vm->id,
+           src_no_rtc ? "without" : "with", vm->no_rtc ? "none" : "one");
+  }
+  if (src_kind >= 0 && src_hart_shift != vm->hart_shift) {
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived with harts numbered from %d, this host numbers them from %d\n",
+           vm->id, src_hart_shift, vm->hart_shift);
+  }
+  if (src_kind >= 0 && src_timebase != vm->timebase) {
+    owed |= REV_TIMER;
+    printk("hyp: vm %d: arrived with a %u Hz timebase, this host's is %u Hz\n", vm->id,
+           src_timebase ? src_timebase : (uint32)HOST_TIMEBASE,
+           vm->timebase ? vm->timebase : (uint32)HOST_TIMEBASE);
+  }
+  if (src_kind >= 0 && src_no_sstc != vm->no_sstc) {
+    owed |= REV_TIMER;
+    printk("hyp: vm %d: arrived with the %s timer, this host has %s\n", vm->id,
+           src_no_sstc ? "sbi" : "sstc", vm->no_sstc ? "no sstc" : "sstc");
+  }
+  if (src_kind >= 0 && src_sbi != vm->sbi_hidden) {
+    owed |= REV_SBI;
+    printk("hyp: vm %d: arrived without SBI extensions 0x%x, this host withholds 0x%x\n",
+           vm->id, src_sbi, vm->sbi_hidden);
+  }
+  if (src_kind >= 0 && src_irq_alt != vm->irq_alt) {
+    owed |= REV_DEVICES;
+    printk("hyp: vm %d: arrived with its interrupt lines numbered %s, this host numbers "
+           "them %s\n", vm->id, src_irq_alt ? "alt" : "default", vm->irq_alt ? "alt" : "default");
+  }
   if (src_kind >= 0 && src_shift != vm->mmio_shift) {
     owed |= REV_DEVICES;
     printk("hyp: vm %d: arrived with devices at +0x%lx, this host puts them at "

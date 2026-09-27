@@ -70,6 +70,7 @@ enum {
   S_HYP_VMS,
   S_VECTOR_PRESENT,
   S_VECTOR_VLEN,
+  S_MACHINE_SBI,
   // the settable ones: what is written here is applied at once
   S_W_HOSTNAME,
   S_W_CACHE_PCT,
@@ -292,6 +293,8 @@ rebuild(void)
   add("vector", S_DIR, 1, 0, 0);
   add("vector/present", S_VECTOR_PRESENT, 0, 0, 0);
   add("vector/vlen", S_VECTOR_VLEN, 0, 0, 0);
+  add("machine", S_DIR, 1, 0, 0);
+  add("machine/sbi", S_MACHINE_SBI, 0, 0, 0);     // the SBI extensions on offer (F22)
 
   // one directory per disk, as Linux's /sys/block is
   add("block", S_DIR, 1, 0, 0);
@@ -542,6 +545,13 @@ generate(struct gen *g, struct sysent *e)
     gn(g, plat.has_v ? plat.vlenb * 8 : 0);
     gs(g, "\n");
     break;
+  case S_MACHINE_SBI: {
+    char names[64];
+    machine_sbi_names(names, sizeof(names));
+    gs(g, names);
+    gs(g, "\n");
+    break;
+  }
   default:
     break;
   }
