@@ -114,6 +114,7 @@ struct file;
 int vm_save_file(struct vm *vm, struct file *f);
 int vm_restore_file(struct file *f, const char *name, int *idp);
 int vmstate_ack_put(struct file *f, int ok);
+int vmstate_commit_put(struct file *f);
 int vmstate_ack_get(struct file *f);
 // vmm clone BASE NEW [-f DISK]: the same machine again, sharing its pages
 int vm_clone(struct vm *src, const char *name, const char *disk, int *idp);

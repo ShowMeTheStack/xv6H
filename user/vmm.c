@@ -1136,6 +1136,8 @@ cmd_migrate(int argc, char *argv[])
 }
 
 // vmm accept PORT [-n NAME] [-d]: wait for a machine to arrive.
+static void on_commit_alarm(int sig);
+
 static int
 cmd_accept(int argc, char *argv[])
 {
@@ -1177,10 +1179,30 @@ cmd_accept(int argc, char *argv[])
     return 1;
   }
   int id = vm_accept(fd, name);
+  if (id < 0) {
+    close(fd);
+    close(ls);
+    fprintf(stderr, "vmm: taking the machine: %s\n", strerror(errno));
+    return 1;
+  }
+  // The sender's commit. The kernel has told the far end the machine is here
+  // (`Y'); the far end answers `C' once it has given the machine up, and only
+  // then may this copy run. A sender that gave up waiting -- its transport
+  // slow -- resumed its machine while this end went on and started its copy:
+  // one machine on two hosts (hunt3_15/16, on the wire). Now a copy nobody
+  // committed is thrown away. Five minutes covers a slow recovery; the
+  // sender's own wait is three.
+  char commit = 0;
+  signal(SIGALRM, on_commit_alarm);
+  alarm(300);
+  int got = read(fd, &commit, 1);
+  alarm(0);
   close(fd);
   close(ls);
-  if (id < 0) {
-    fprintf(stderr, "vmm: taking the machine: %s\n", strerror(errno));
+  if (got != 1 || commit != 'C') {
+    fprintf(stderr, "vmm: vm %d arrived but the source %s: discarded\n", id,
+            got == 1 ? "did not commit it" : got == 0 ? "hung up before committing" : "never committed (timed out)");
+    vm_destroy(id);
     return 1;
   }
   struct vminfo vi;
@@ -1726,6 +1748,12 @@ wait_freed(int id)
   }
   fprintf(stderr, "vmm: vm %d did not stop\n", id);
   exit(1);
+}
+
+static void
+on_commit_alarm(int sig)
+{
+  (void)sig;      // the read returns EINTR; the caller decides
 }
 
 static void

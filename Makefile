@@ -928,6 +928,11 @@ endif
 endif
 QEMUOPTS = -machine virt,$(AIAOPT) $(CPUOPT) -bios none -kernel $K/kernel -m $(MEM) -smp $(CPUS) -nographic
 QEMUOPTS += -global virtio-mmio.force-legacy=false
+# MONITOR=path: QEMU's monitor on a unix socket, for looking at a stuck host
+# from outside (tools/hunt3.py dumps every hart's registers at a stall)
+ifneq ($(strip $(MONITOR)),)
+QEMUOPTS += -monitor unix:$(MONITOR),server,nowait
+endif
 # paging mode of the host kernel: 48 (default, needs Sv48 hardware; direct-maps
 # up to 512 GiB) or 39 (three levels, RAM capped at 254 GiB). the word "sv39"
 # on the host's command line selects the latter.

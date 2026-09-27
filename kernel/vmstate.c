@@ -477,6 +477,7 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, int capabl
       acquire(&vm->lock);
       vvnet_mac_changed(vm);
       release(&vm->lock);
+      vm->mac_told = 1;      // and a revision to make its driver look (hyp.c vm_revise_mac)
     } else {
       printk("hyp: a machine arriving with nic 52:54:00:%x:76:%x does not speak revision: keeping it\n",
              vm->vnet.mac[3], vm->vnet.mac[5]);
@@ -1113,6 +1114,24 @@ out:
 // before giving anything up. 'Y' means the machine is safe over there. Anything
 // else, including the connection closing, means it is not, and the source keeps
 // running it.
+// the sender's last word: the machine is the far end's now. Without it the
+// far end must not run what it took: a sender that gave up waiting (its
+// transport slow) and resumed the source, while the receiver went on to
+// finish and start its copy, was a machine running on two hosts at once
+// (hunt3_15 crossing 1, hunt3_16 crossing 9, on the wire). The receiver waits
+// for this byte; the sender writes it only once it has the receiver's `Y'.
+int
+vmstate_commit_put(struct file *f)
+{
+  char c = 'C';
+
+  if (f == 0 || f->type != FD_SOCK || f->sock == 0)
+    return -EINVAL;
+  if (sockwrite(f->sock, 0, (uint64)&c, 1) != 1)
+    return -EIO;
+  return 0;
+}
+
 int
 vmstate_ack_put(struct file *f, int ok)
 {
@@ -1141,7 +1160,7 @@ vmstate_ack_put(struct file *f, int ok)
 // is here to prevent -- a machine kept here that the far end was about to accept.
 // Like FREE_TICKS in user/vmm.c: not a real wait, just long enough that reaching
 // it means something is genuinely wrong.
-#define ACK_TICKS 3000
+#define ACK_TICKS 18000   // 180 s: the far end's answer may be behind a slow recovery; giving up early split the machine in two (hunt3_15/16)
 
 static uint
 now_ticks(void)
@@ -2344,6 +2363,10 @@ restore_from(struct src *s, const char *name, int *idp)
              (int)((vm->ram_size - grow) >> 20), (int)(vm->ram_size >> 20));
     }
   }
+  if (vm->mac_told) {
+    owed |= REV_DEVICES;
+    vm->mac_told = 0;
+  }
   // F21: another cache block here
   if (src_kind >= 0 && src_cboz && src_cboz != vm->cboz_block) {
     owed |= REV_DEVICES;
@@ -2372,6 +2395,8 @@ restore_from(struct src *s, const char *name, int *idp)
   }
   if (src_kind >= 0 && src_hart_shift != vm->hart_shift) {
     owed |= REV_DEVICES;
+    vm->hart_alias_on = 1;          // the numbering it left with answers until it has taken this one
+    vm->hart_alias_shift = src_hart_shift;
     printk("hyp: vm %d: arrived with harts numbered from %d, this host numbers them from %d\n",
            vm->id, src_hart_shift, vm->hart_shift);
   }
@@ -2398,6 +2423,8 @@ restore_from(struct src *s, const char *name, int *idp)
   }
   if (src_kind >= 0 && src_shift != vm->mmio_shift) {
     owed |= REV_DEVICES;
+    vm->alias_on = 1;               // the old windows answer until it has taken the new map
+    vm->alias_shift = src_shift;
     printk("hyp: vm %d: arrived with devices at +0x%lx, this host puts them at "
            "+0x%lx\n", vm->id, src_shift, vm->mmio_shift);
   }

@@ -18,15 +18,51 @@ link = os.path.join(os.getcwd(), tag + ".sock")
 try: os.unlink(link)
 except OSError: pass
 LOGA = open("consoleA.log", "w"); LOGB = open("consoleB.log", "w")
-a = th.QEMU(intc="plic", cpus=3, log=LOGA, fsimg=tag+"-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+MONA = os.path.join(os.getcwd(), tag + "-a.mon"); MONB = os.path.join(os.getcwd(), tag + "-b.mon")
+
+def monitor(path, cmd):
+    """one QEMU monitor command over its unix socket; what it printed"""
+    import socket
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(5); s.connect(path)
+        s.recv(4096)
+        s.sendall((cmd + "\n").encode())
+        out = b""
+        while True:
+            try:
+                d = s.recv(65536)
+            except socket.timeout:
+                break
+            if not d: break
+            out += d
+            if out.rstrip().endswith(b"(qemu)"): break
+        s.close()
+        return out.decode(errors="replace")
+    except Exception as e:
+        return "(monitor %s: %s)" % (path, e)
+
+def dump_harts(tag_):
+    for who, path in (("A", MONA), ("B", MONB)):
+        out = monitor(path, "info registers -a")
+        pcs = re.findall(r"pc\s+([0-9a-f]+)", out)
+        print("---- %s host %s: harts' pc: %s" % (tag_, who, " ".join(pcs)))
+        for l in out.splitlines():
+            if re.search(r"^\s*(pc|ra|sp|scause|sepc|stval|mcause|mepc|mstatus|sstatus|hstatus|sip|sie)\s", l):
+                print("     " + l.strip()[:120])
+    sys.stdout.flush()
+
+a = th.QEMU(intc="plic", cpus=3, log=LOGA, fsimg=tag+"-a.img", extra_env={"LINK": link, "LINKSRV": "on", "MONITOR": MONA})
 b = None
 bad, n, lat = [], 0, []
 try:
     a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
-    b = th.QEMU(intc="plic", cpus=3, log=LOGB, fsimg=tag+"-b.img", extra_env={"LINK": link, "LINKSRV": "off"})
+    b = th.QEMU(intc="plic", cpus=3, log=LOGB, fsimg=tag+"-b.img", extra_env={"LINK": link, "LINKSRV": "off", "MONITOR": MONB})
     b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
     sn.run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
     sn.run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+    # the wire, both ends, headers only: what A sent and what B received when a crossing stalls
+    sn.run(a, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
+    sn.run(b, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
     g.start_guest(a, "-n ax -m 32 -c 2 -a norevise", 120)
     a.send("echo gen0 > /keep; sync\n"); a.expect(r"\$ ", 30)
     g.detach(a)
@@ -35,14 +71,22 @@ try:
         global n
         dst.send("vmm accept 9000 -d &\n"); dst.expect(r"\$ ", 30)
         sn.run(dst, "sleep 1", 20)
-        out = sn.run(src, "vmm migrate ax %s:9000" % dstip, 300)
+        try:
+            out = sn.run(src, "vmm migrate ax %s:9000" % dstip, 240)
+        except Exception as e:
+            bad.append("crossing %d: migrate hung: %s" % (i, str(e)[:100]))
+            print("---- crossing %d: the migration hung; both hosts from the monitor ----" % i)
+            dump_harts("stall"); time.sleep(2); dump_harts("2 s later")
+            return False
         if "migrated to" not in out:
             bad.append("crossing %d: migrate failed: %s" % (i, out.strip()[-160:]))
             # the wire, from both ends, as it is at the stall
             for who, h in (("src", src), ("dst", dst)):
                 try:
                     print("---- %s /proc/net/tcp at the stall (crossing %d) ----" % (who, i))
-                    print(sn.run(h, "cat /proc/net/tcp; vmm ls", 20))
+                    print(sn.run(h, "cat /proc/net/tcp; ifconfig; vmm ls", 20))
+                    print("---- %s: the last of the wire ----" % who)
+                    print(sn.run(h, "tcpdump -n -t -q -r /tmp/wire.pcap port 9000 | tail -40", 120))
                 except Exception as e:
                     print("  (%s did not answer: %s)" % (who, e))
             sys.stdout.flush()

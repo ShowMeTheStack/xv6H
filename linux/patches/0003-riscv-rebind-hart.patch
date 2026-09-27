@@ -1,0 +1,79 @@
+--- a/drivers/irqchip/irq-sifive-plic.c	2026-09-28 00:56:40
++++ b/drivers/irqchip/irq-sifive-plic.c	2026-09-28 01:04:31
+@@ -400,7 +400,40 @@
+ 	/* priority must be > threshold to trigger an interrupt */
+ 	writel(threshold, handler->hart_base + CONTEXT_THRESHOLD);
+ }
++
++/*
++ * xv6H: a hart's id is a fact of the machine's description and may be revised
++ * under the running guest (F9). This cpu's PLIC context is 2*hartid+1, so its
++ * enables and threshold live somewhere else now: copy the enables from the
++ * old context, point the handler at the new one, write them there, set the
++ * threshold. Any cpu may do this for any other; the registers are memory.
++ */
++int plic_rebind_hart(unsigned int cpu, unsigned long hartid)
++{
++	struct plic_handler *handler = per_cpu_ptr(&plic_handlers, cpu);
++	struct plic_priv *priv;
++	unsigned long flags;
++	int i, context_id = 2 * hartid + 1;
++	u32 words;
+ 
++	if (!handler->present || !handler->enable_save)
++		return -ENODEV;
++	priv = handler->priv;
++	words = DIV_ROUND_UP(priv->nr_irqs, 32);
++	raw_spin_lock_irqsave(&handler->enable_lock, flags);
++	for (i = 0; i < words; i++)
++		handler->enable_save[i] = readl(handler->enable_base + i * sizeof(u32));
++	handler->hart_base = priv->regs + CONTEXT_BASE + context_id * CONTEXT_SIZE;
++	handler->enable_base = priv->regs + CONTEXT_ENABLE_BASE + context_id * CONTEXT_ENABLE_SIZE;
++	for (i = 0; i < words; i++)
++		writel(handler->enable_save[i], handler->enable_base + i * sizeof(u32));
++	raw_spin_unlock_irqrestore(&handler->enable_lock, flags);
++	plic_set_threshold(handler, PLIC_ENABLE_THRESHOLD);
++	pr_info("riscv-plic: cpu%u now hart %lu (context %d)\n", cpu, hartid, context_id);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(plic_rebind_hart);
++
+ static int plic_dying_cpu(unsigned int cpu)
+ {
+ 	if (plic_parent_irq)
+--- a/arch/riscv/kernel/smp.c	2026-09-28 00:56:41
++++ b/arch/riscv/kernel/smp.c	2026-09-28 01:04:31
+@@ -40,10 +40,32 @@
+ 	IPI_MAX
+ };
+ 
+-unsigned long __cpuid_to_hartid_map[NR_CPUS] __ro_after_init = {
++unsigned long __cpuid_to_hartid_map[NR_CPUS] = {	/* xv6H: revisable (riscv_rebind_hart) */
+ 	[0 ... NR_CPUS-1] = INVALID_HARTID
+ };
++
++/*
++ * xv6H: the machine's description renumbered its harts (F9). The map every
++ * hart mask is built from (IPIs, remote fences, HSM start/stop) takes the new
++ * number, and the interrupt controller's per-cpu context follows it.
++ */
++int plic_rebind_hart(unsigned int cpu, unsigned long hartid);
++
++int riscv_rebind_hart(unsigned int cpu, unsigned long hartid)
++{
++	unsigned long old;
+ 
++	if (cpu >= NR_CPUS)
++		return -EINVAL;
++	old = cpuid_to_hartid_map(cpu);
++	if (old == hartid)
++		return 0;
++	cpuid_to_hartid_map(cpu) = hartid;
++	pr_info("smp: cpu%u: hart %lu -> %lu\n", cpu, old, hartid);
++	return plic_rebind_hart(cpu, hartid);
++}
++EXPORT_SYMBOL_GPL(riscv_rebind_hart);
++
+ void __init smp_setup_processor_id(void)
+ {
+ 	cpuid_to_hartid_map(0) = boot_cpu_hartid;

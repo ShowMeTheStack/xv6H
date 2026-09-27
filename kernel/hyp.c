@@ -1057,6 +1057,8 @@ vm_revise_hartid(struct vm *vm, int shift)
   acquire(&vm->lock);
   int old = vm->hart_shift;
   vm->hart_shift = shift;
+  vm->hart_alias_on = 1;          // the old numbers answer until the guest has the new ones
+  vm->hart_alias_shift = old;
   release(&vm->lock);
   printk("hyp: vm %d: harts renumbered %d.. -> %d..\n", vm->id, old, shift);
   int r = vm_revise(vm, REV_DEVICES);
@@ -1338,6 +1340,11 @@ vm_revise_mac(struct vm *vm, int alt)
   vvnet_mac_changed(vm);
   release(&vm->lock);
   printk("hyp: vm %d: nic identity -> 52:54:00:%x:76:%x\n", vm->id, vm->vnet.mac[3], vm->vnet.mac[5]);
+  // told through the device; a guest that speaks revision is nudged to look
+  // as well (Linux's driver reads the address at probe only: machrev.ko
+  // re-reads it on a revision; an xv6 guest finds nothing changed and says so)
+  if (vm->revise_capable)
+    vm_revise(vm, REV_DEVICES);
   return 0;
 }
 
@@ -1560,6 +1567,13 @@ irq_map(int alt, int irq)
 int
 vm_irq(struct vm *vm, int irq)
 {
+  // F3 for a guest that boots its own harts (Linux): the console's line stays
+  // where it was. Linux's serial core has no way to move a port's interrupt
+  // under a running console, and a console whose line has moved is a machine
+  // nobody can talk to (lxmig2: irq axis, no prompt for 480 s). The virtio
+  // and RTC lines follow (machrev.ko); this one is the second anchor.
+  if (irq == G_UART_IRQ && (vm->cfg.flags & VMF_HSM))
+    return irq;
   return irq_map(vm->irq_alt, irq);
 }
 

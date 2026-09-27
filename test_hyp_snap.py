@@ -629,6 +629,11 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
             # the guest rightly ceded a unit nobody was using.
             a.send("vecbench -t 25 &\n")
             a.expect(r"\$ ", ATONCE)
+            # and a moment for it to touch a vector register: a move asked before
+            # its first instruction found nobody holding state and was granted
+            # (m7x: 1 of the first 20 runs)
+            a.send("sleep 1\n")
+            a.expect(r"\$ ", 30)
         g.detach(a)
 
         def try_move():
@@ -1531,6 +1536,129 @@ def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
                 pass
 
 
+LX_AXES = {
+    # name: (B's boot word, host message on arrival, machrev line in dmesg, guest check command, expected in its output)
+    "cpus": ("guestcpus=1", r"arrived with 2 harts running, this host allows 1",
+             "machrev: cpus 2 -> 1 (0 up, 1 down)", "nproc", r"\n1\r?\n"),
+    "timer": ("guesttimer=sbi", r"arrived with the sstc timer, this host has no sstc",
+              "machrev: timer via sbi", "cat /proc/interrupts | grep -c riscv-timer", r"\n1\r?\n"),
+    "timebase": ("guesttimebase=1000000", r"arrived with a 10000000 Hz timebase, this host's is 1000000 Hz",
+                 "riscv-timer: timebase 10000000 -> 1000000 Hz", "time sleep 1", r"real\s+0m\s*(0\.9|1\.[0-5])"),
+    "rtc": ("guestrtc=off", r"arrived with an rtc, this host offers none",
+            "machrev: rtc gone", "ls /sys/class/rtc | wc -l", r"\n0\r?\n"),
+    "sbi": ("nosbi=rfence", r"arrived without SBI extensions 0x0, this host withholds 0x4",
+            "machrev: sbi extensions re-probed: remote fences by IPI", "dmesg | grep -c rfence_v02_call", r"\n[0-9]\r?\n"),   # a few fences fail in the window before the re-probe
+    "ram": ("guestgrow=128", r"arrived with 128 MB, this host gives it 256 MB",
+            "machrev: memory 128 -> 256 MB", "grep MemTotal /proc/meminfo", r"MemTotal:\s+(2[0-9]{5}|1[89][0-9]{4}) kB"),
+    # the device map and the line numbering: the disk moves with them, and is still a disk
+    "layout": ("guestmap=alt", r"arrived with devices at \+0x0, this host puts them at \+0x100000",
+               "machrev: virtio device at 0x10001000 -> 0x10101000 line 1: moved",
+               "mount /dev/vda /mnt && cat /mnt/marker && echo x > /mnt/after-move && sync && cat /mnt/after-move", r"marker-on-virtio-disk[\s\S]*\nx\r?\n"),
+    "irq": ("guestirq=alt", r"arrived with its interrupt lines numbered default, this host numbers them alt",
+            "machrev: virtio device at 0x10001000 -> 0x10001000 line 11: moved",
+            "mount /dev/vda /mnt && cat /mnt/marker && echo x > /mnt/after-move && sync && cat /mnt/after-move", r"marker-on-virtio-disk[\s\S]*\nx\r?\n"),
+}
+LX_AXES["mac"] = ("guestmac=alt", r"arrived with nic 52:54:00:78:76:10, this host gives 52:54:00:79:76:10: told through the device",
+                  "machrev: nic identity -> 52:54:00:79:76:10", "cat /sys/class/net/eth0/address", r"52:54:00:79:76:10")
+LX_AXES["hartid"] = ("guesthart=4", r"arrived with harts numbered from 0, this host numbers them from 4",
+                     "machrev: cpu 1: hart 1 -> 5", "grep hart /proc/cpuinfo | grep -v isa; ls /sys/class/rtc; mount /dev/vda /mnt && cat /mnt/marker",
+                     r"hart\s*:\s*4[\s\S]*hart\s*:\s*5[\s\S]*marker-on-virtio-disk")
+LX_DISK = ("layout", "irq", "hartid")     # axes whose guest has its disk (the thing that moves)
+
+
+def t_lx_migrate_axis(QEMU, cpus, log, name):
+    """M5 across a move, one fact at a time: host B differs from A on one axis
+    (a boot word); a Linux with machrev.ko is told on arrival and takes it;
+    the guest's own view (nproc, /proc/interrupts, sysfs, meminfo) agrees."""
+    import os
+    import test_hyp_linux as lx
+    append, host_msg, dmesg_msg, check, want = LX_AXES[name]
+    tag = "la%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        mb = 128 if name == "ram" else 256
+        disk = "/linux.img" if name in LX_DISK else "none"
+        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi -f %s -c 2 -H\n" % (mb, disk))
+        a.expect(r"vm (\d+) la: ", 20)
+        a.expect(r"linux# ", 120)
+        out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
+        assert re.search(r"\n1\r?\n", out), out
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n")
+        b.expect(r"\$ ", 30)
+        run(b, "sleep 1", 20)
+        out = run(a, "vmm migrate la 10.7.0.2:9000", 600)
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        b.expect(host_msg, 120)
+        b.expect(r"arrived: 2 vcpu", 120)
+        try:
+            b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
+        except Exception:
+            # not taken: the host's view, then the guest's own words, for the log
+            try:
+                b.send("\n")
+                b.expect(r"\$ ", 30)
+                run(b, "vmm info la", 30)
+                g.attach(b, "la")
+                b.send("\n")
+                b.expect(r"linux# ", 30)
+                lx.linux_cmd(b, "dmesg | tail -25; cat /proc/interrupts", 60)
+                g.detach(b)
+            except Exception:
+                pass
+            raise
+        b.send("\n")
+        b.expect(r"\$ ", 30)
+        run(b, "vmm info la", 30)          # the host's view before anyone attaches, for the log
+        g.attach(b, "la")
+        try:
+            b.send("\n")
+            b.expect(r"linux# ", 60)
+            out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer' | tail -12", 60)
+            assert dmesg_msg in out, out
+            out = lx.linux_cmd(b, check, 120)
+            assert re.search(want, out), (check, out)
+            out = lx.linux_cmd(b, "time sleep 1", 60)
+            m = re.search(r"real\s+0m\s*([\d.]+)s", out)
+            assert m and 0.9 <= float(m.group(1)) <= 1.6, out
+        except Exception:
+            # the guest's state as the host sees it, twice, for the log
+            try:
+                g.detach(b)
+                for _ in range(2):
+                    run(b, "vmm info la", 30)
+                    run(b, "sleep 2", 20)
+            except Exception:
+                pass
+            raise
+        g.detach(b)
+        run(b, "vmm kill la", 60)
+        print("    Linux crossed to a host with another %s, was told on arrival and took it" % name)
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"), os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
 def t_migrate_disk_grow(QEMU, cpus, log):
     """F20: the disk's capacity is a fact of the machine the destination may
     change -- its image of the same disk is larger. The device announces a
@@ -1749,6 +1877,16 @@ def tests(modes, cpus, log, QEMU):
         ("snap-lx-migrate", lambda: t_lx_migrate(QEMU, cpus, log, "same")),
         ("snap-lx-migrate-cboz", lambda: t_lx_migrate(QEMU, cpus, log, "cboz")),
         ("snap-lx-migrate-cboz-legacy", lambda: t_lx_migrate(QEMU, cpus, log, "cboz", 1)),
+        ("snap-lx-migrate-cpus", lambda: t_lx_migrate_axis(QEMU, cpus, log, "cpus")),
+        ("snap-lx-migrate-timer", lambda: t_lx_migrate_axis(QEMU, cpus, log, "timer")),
+        ("snap-lx-migrate-timebase", lambda: t_lx_migrate_axis(QEMU, cpus, log, "timebase")),
+        ("snap-lx-migrate-rtc", lambda: t_lx_migrate_axis(QEMU, cpus, log, "rtc")),
+        ("snap-lx-migrate-sbi", lambda: t_lx_migrate_axis(QEMU, cpus, log, "sbi")),
+        ("snap-lx-migrate-ram", lambda: t_lx_migrate_axis(QEMU, cpus, log, "ram")),
+        ("snap-lx-migrate-layout", lambda: t_lx_migrate_axis(QEMU, cpus, log, "layout")),
+        ("snap-lx-migrate-irq", lambda: t_lx_migrate_axis(QEMU, cpus, log, "irq")),
+        ("snap-lx-migrate-mac", lambda: t_lx_migrate_axis(QEMU, cpus, log, "mac")),
+        ("snap-lx-migrate-hartid", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid")),
         ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),
         ("snap-migrate-console-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 1)),
         ("snap-migrate-rtc-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["rtc"], 1)),

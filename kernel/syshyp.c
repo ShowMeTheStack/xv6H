@@ -168,6 +168,14 @@ sys_vm_migrate(void)
       vm_resume(vm);        // it was stopped for the last round; it stays ours
     return r;
   }
+  // the far end has it and says so; commit -- it runs the machine only on
+  // this word, so a sender that never gets here has left nothing running
+  // over there
+  if ((r = vmstate_commit_put(f)) < 0) {
+    if (was_running)
+      vm_resume(vm);
+    return r;
+  }
   // it is over there now. What is here must stop being a machine before
   // the other end starts it, which is why this is not a copy.
   vm_destroy(vm);

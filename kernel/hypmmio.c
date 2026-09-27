@@ -147,6 +147,17 @@ find_dev(struct vm *vm, uint64 gpa)
     if (gpa >= d->base && gpa < d->base + d->size)
       return d;
   }
+  // F15: the old device map, honoured until the guest has taken the new one
+  // (hyp.h alias_shift). The virtio windows are the ones that move.
+  if (vm->alias_on && vm->revise_acked != vm->revise_gen &&
+      gpa >= G_VIRTIO_BASE + vm->alias_shift && gpa < G_CON_BASE + 0x1000 + vm->alias_shift) {
+    uint64 moved = gpa - vm->alias_shift + vm->mmio_shift;
+    for (int i = 0; i < vm->ndev; i++) {
+      struct vdev *d = &vm->dev[i];
+      if (moved >= d->base && moved < d->base + d->size)
+        return d;
+    }
+  }
   return 0;
 }
 
@@ -173,6 +184,8 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
     return 0;
   }
 
+  if (gpa < d->base || gpa >= d->base + d->size)
+    gpa = gpa - vm->alias_shift + vm->mmio_shift;   // reached through the old map (F15 alias)
   uint64 off = gpa - d->base;
   int rc;
   // which device a guest's exits go to is the thing that says what to

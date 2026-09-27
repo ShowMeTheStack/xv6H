@@ -1,0 +1,100 @@
+--- a/drivers/virtio/virtio_mmio.c	2026-09-28 00:18:28
++++ b/drivers/virtio/virtio_mmio.c	2026-09-28 00:50:41
+@@ -88,6 +88,7 @@
+ 
+ 	void __iomem *base;
+ 	unsigned long version;
++	int irq;		/* xv6H: the line, which a revision may move (virtio_mmio_relocate) */
+ 
+ 	/* a list of queues so we can dispatch IRQs */
+ 	spinlock_t lock;
+@@ -359,14 +360,14 @@
+ 	list_for_each_entry_safe(vq, n, &vdev->vqs, list)
+ 		vm_del_vq(vq);
+ 
+-	free_irq(platform_get_irq(vm_dev->pdev, 0), vm_dev);
++	free_irq(vm_dev->irq, vm_dev);
+ }
+ 
+ static void vm_synchronize_cbs(struct virtio_device *vdev)
+ {
+ 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+ 
+-	synchronize_irq(platform_get_irq(vm_dev->pdev, 0));
++	synchronize_irq(vm_dev->irq);
+ }
+ 
+ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned int index,
+@@ -493,7 +494,7 @@
+ 		       struct irq_affinity *desc)
+ {
+ 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+-	int irq = platform_get_irq(vm_dev->pdev, 0);
++	int irq = vm_dev->irq;
+ 	int i, err, queue_idx = 0;
+ 
+ 	if (irq < 0)
+@@ -630,6 +631,7 @@
+ 	INIT_LIST_HEAD(&vm_dev->virtqueues);
+ 	spin_lock_init(&vm_dev->lock);
+ 
++	vm_dev->irq = platform_get_irq(pdev, 0);
+ 	vm_dev->base = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(vm_dev->base)) {
+ 		rc = PTR_ERR(vm_dev->base);
+@@ -693,9 +695,55 @@
+ 
+ free_vm_dev:
+ 	kfree(vm_dev);
++	return rc;
++}
++
++/*
++ * xv6H: the device's register window and its interrupt line are facts of the
++ * machine's description, and the hypervisor may revise them under the running
++ * guest (a machine that arrives on a host with another device map). The
++ * device and its queues are the host's and stay as they are; this driver only
++ * has to look somewhere else. Called by the machrev driver once it has read
++ * the new description; the old window is still answered by the host until the
++ * revision is acknowledged, so a driver touching it meanwhile is not hurt.
++ */
++int virtio_mmio_relocate(struct platform_device *pdev, resource_size_t base, int virq)
++{
++	struct virtio_mmio_device *vm_dev = platform_get_drvdata(pdev);
++	void __iomem *nb, *ob;
++	int old_irq, rc = 0;
++
++	if (!vm_dev)
++		return -ENODEV;
++	nb = ioremap(base, 0x1000);
++	if (!nb)
++		return -ENOMEM;
++	old_irq = vm_dev->irq;
++	if (old_irq > 0 && !list_empty(&vm_dev->virtqueues)) {
++		free_irq(old_irq, vm_dev);
++		rc = request_irq(virq, vm_interrupt, IRQF_SHARED, dev_name(&vm_dev->vdev.dev), vm_dev);
++		if (rc)
++			dev_err(&pdev->dev, "relocate: irq %d: %d\n", virq, rc);
++	}
++	vm_dev->irq = virq;
++	ob = vm_dev->base;
++	vm_dev->base = nb;
++	dev_info(&pdev->dev, "relocated to %pa, irq %d\n", &base, virq);
++	(void)ob;	/* the devm mapping of the boot window stays until the device goes */
+ 	return rc;
+ }
++EXPORT_SYMBOL_GPL(virtio_mmio_relocate);
+ 
++/* xv6H: the virtio device behind a virtio-mmio platform device (machrev reads
++ * a moved device's configuration -- its MAC -- through it) */
++struct virtio_device *virtio_mmio_vdev(struct platform_device *pdev)
++{
++	struct virtio_mmio_device *vm_dev = platform_get_drvdata(pdev);
++
++	return vm_dev ? &vm_dev->vdev : NULL;
++}
++EXPORT_SYMBOL_GPL(virtio_mmio_vdev);
++
+ static void virtio_mmio_remove(struct platform_device *pdev)
+ {
+ 	struct virtio_mmio_device *vm_dev = platform_get_drvdata(pdev);

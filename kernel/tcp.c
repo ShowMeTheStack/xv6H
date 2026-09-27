@@ -499,6 +499,8 @@ tcp_ack(struct tcpcb *t, uint32 ack)
         if (t->ssthresh < 2 * t->mss)
           t->ssthresh = 2 * t->mss;
         t->cwnd = t->ssthresh + 3 * t->mss;
+        t->recover = t->snd_nxt;
+        t->in_recovery = 1;
         tcp_retransmit(t);
       }
     }
@@ -512,6 +514,17 @@ tcp_ack(struct tcpcb *t, uint32 ack)
   uint32 data_acked = MIN(acked, tring_len(&t->snd));
   t->snd.r += data_acked;
   t->snd_una = ack;
+  // NewReno (RFC 6582): an ack that moves snd_una but not past what was in
+  // flight when the loss was found is a partial ack -- the next segment is
+  // gone too. Retransmit it now, not after three more duplicates: a burst
+  // that lost several frames (41 per side per hunt3 run) used to recover one
+  // segment per round trip, and a 30-second wait on the far end ran out.
+  if (t->in_recovery) {
+    if (SEQ_LT(ack, t->recover))
+      tcp_retransmit(t);
+    else
+      t->in_recovery = 0;
+  }
   if (t->rtt_seq && SEQ_LEQ(t->rtt_seq, ack))
     rtt_sample(t);
   if (t->cwnd < t->ssthresh)

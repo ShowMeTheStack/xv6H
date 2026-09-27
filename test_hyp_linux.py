@@ -38,7 +38,8 @@ def linux_cmd(q, cmd, timeout=30):
     _lx_seq[0] += 1
     mark = q.mark()
     tag = "_ok%d_" % _lx_seq[0]
-    q.send(cmd + "; echo " + tag + "\n")
+    # a command that ends in `&' takes the marker after a space (`&;' is a syntax error)
+    q.send(cmd + (" echo " if cmd.rstrip().endswith("&") else "; echo ") + tag + "\n")
     q.expect(r"\n" + tag + r"\r?\n", timeout)
     q.expect(r"linux# ", 10)
     return q.output_since(mark)
@@ -458,6 +459,69 @@ def t_lx_revise_sbi(QEMU, intc, cpus, log):
         q.close()
 
 
+def t_lx_revise_mac(QEMU, intc, cpus, log):
+    """F19 in Linux (no patch): the NIC's identity changes under the guest; the
+    device says so (config change); the driver keeps its old address, the
+    machrev driver re-reads the device's and sets the stack's to follow."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_linux(q)
+        out = linux_cmd(q, "cat /sys/class/net/eth0/address")
+        assert "52:54:00:78:76:10" in out, out
+        detach(q)
+        for alt, mac in (("alt", "52:54:00:79:76:10"), ("default", "52:54:00:78:76:10")):
+            out = host_cmd(q, "vmm revise %d mac %s" % (vmid, alt), 60)
+            assert "nic identity" in out or "asked" in out, out
+            attach(q, str(vmid))
+            q.send("\n")
+            q.expect(r"linux# ", 30)
+            out = linux_cmd(q, "sleep 1; cat /sys/class/net/eth0/address; dmesg | grep 'machrev: nic' | tail -1")
+            assert mac in out and "machrev: nic identity" in out, out
+            detach(q)
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"linux# ", 30)
+        poweroff(q)
+        print("    Linux's NIC changed identity twice; the stack's address followed the device")
+    finally:
+        q.close()
+
+
+def t_lx_revise_console(QEMU, intc, cpus, log):
+    """F18 in Linux (no patch): the machine is given a virtio-console; the
+    driver makes the platform device, virtio-console binds, /dev/hvc0 appears
+    and writes through it reach the same console; taken away, it goes."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_linux(q)
+        out = linux_cmd(q, "ls /dev/ | grep -c hvc")
+        hvc0 = int(re.search(r"\n(\d+)\r?\n", out).group(1))
+        detach(q)
+        out = host_cmd(q, "vmm revise %d console virtio" % vmid, 60)
+        assert "asked" in out, out
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "sleep 1; dmesg | grep 'machrev: virtio device' | tail -2; ls /dev/ | grep -c hvc")
+        assert "appeared: registered" in out, out
+        hvc1 = int(re.search(r"\n(\d+)\r?\n", out).group(1))
+        assert hvc1 == hvc0 + 1, (hvc0, hvc1, out)
+        out = linux_cmd(q, "echo through-the-new-console > /dev/hvc%d; sleep 1" % hvc0, 30)
+        assert "through-the-new-console" in out, out
+        detach(q)
+        out = host_cmd(q, "vmm revise %d console uart" % vmid, 60)
+        assert "asked" in out, out
+        attach(q, str(vmid))
+        q.send("\n")
+        q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "sleep 1; dmesg | grep 'machrev: virtio device' | tail -1; ls /dev/ | grep -c hvc")
+        assert "went" in out, out
+        poweroff(q)
+        print("    Linux was given a virtio-console (hvc%d appeared, a line written through it arrived) and lost it again" % hvc0)
+    finally:
+        q.close()
+
+
 def tests(modes, cpus, log, QEMU):
     t = []
     for m in modes:
@@ -474,4 +538,6 @@ def tests(modes, cpus, log, QEMU):
     t.append(("lx-revise-timebase", lambda: t_lx_revise_timebase(QEMU, "plic", cpus, log)))
     t.append(("lx-revise-rtc", lambda: t_lx_revise_rtc(QEMU, "plic", cpus, log)))
     t.append(("lx-revise-sbi", lambda: t_lx_revise_sbi(QEMU, "plic", cpus, log)))
+    t.append(("lx-revise-mac", lambda: t_lx_revise_mac(QEMU, "plic", cpus, log)))
+    t.append(("lx-revise-console", lambda: t_lx_revise_console(QEMU, "plic", cpus, log)))
     return t

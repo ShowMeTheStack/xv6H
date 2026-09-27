@@ -26,12 +26,26 @@
 #include <linux/string.h>
 #include <linux/delay.h>
 #include <linux/irqdomain.h>
+#include <linux/irq.h>
 #include <linux/ioport.h>
+#include <linux/netdevice.h>
+#include <linux/if_arp.h>
+#include <linux/etherdevice.h>
+#include <linux/rtnetlink.h>
+#include <linux/virtio.h>
+#include <linux/virtio_config.h>
+#include <linux/virtio_ids.h>
+#include <linux/virtio_net.h>
 #include <asm/sbi.h>
 #include <asm/cacheflush.h>
 
 /* linux/patches/0001-riscv-timer-revise.patch */
 extern void riscv_timer_revise(bool sstc, u32 hz);
+/* linux/patches/0002-virtio-mmio-relocate.patch */
+extern int virtio_mmio_relocate(struct platform_device *pdev, resource_size_t base, int virq);
+extern struct virtio_device *virtio_mmio_vdev(struct platform_device *pdev);
+/* linux/patches/0003-riscv-rebind-hart.patch */
+extern int riscv_rebind_hart(unsigned int cpu, unsigned long hartid);
 
 #define SBI_EXT_MACH 0x4D414348
 #define MACH_VERSION 0
@@ -199,11 +213,11 @@ static void rtc_gone(void)
 	}
 }
 
-static void rtc_back(u64 base, u32 hwirq)
+/* a wired line of the machine, as a Linux irq, mapped on the live tree's controller */
+static int map_line(u32 hwirq)
 {
 	struct device_node *ic;
 	struct irq_fwspec fwspec = { };
-	struct resource res[2];
 	int virq;
 
 	ic = of_find_compatible_node(NULL, NULL, "riscv,plic0");
@@ -211,16 +225,47 @@ static void rtc_back(u64 base, u32 hwirq)
 		ic = of_find_compatible_node(NULL, NULL, "sifive,plic-1.0.0");
 	if (!ic)
 		ic = of_find_compatible_node(NULL, NULL, "riscv,aplic");
-	if (!ic) {
-		pr_info("machrev: rtc back, but no interrupt controller node to map its line on\n");
-		return;
-	}
+	if (!ic)
+		return -ENODEV;
 	fwspec.fwnode = of_node_to_fwnode(ic);
 	fwspec.param[0] = hwirq;
 	fwspec.param[1] = IRQ_TYPE_LEVEL_HIGH;
 	fwspec.param_count = of_device_is_compatible(ic, "riscv,aplic") ? 2 : 1;
 	virq = irq_create_fwspec_mapping(&fwspec);
 	of_node_put(ic);
+	return virq > 0 ? virq : -ENODEV;
+}
+
+/* F3/F15: a virtio device's window or line moved; the driver follows (patch 0002) */
+static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq)
+{
+	char name[32];
+	struct device *dev;
+	int virq, rc;
+
+	snprintf(name, sizeof(name), "%llx.virtio_mmio", old_base);
+	dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+	if (!dev) {
+		pr_info("machrev: no platform device %s to move\n", name);
+		return -ENODEV;
+	}
+	virq = map_line(new_irq);
+	rc = virq < 0 ? virq : virtio_mmio_relocate(to_platform_device(dev), new_base, virq);
+	put_device(dev);
+	pr_info("machrev: virtio device at 0x%llx -> 0x%llx line %u: %s\n", old_base, new_base, new_irq,
+		rc ? "not moved" : "moved");
+	return rc;
+}
+
+static void rtc_back(u64 base, u32 hwirq)
+{
+	struct resource res[2];
+	int virq = map_line(hwirq);
+
+	if (virq < 0) {
+		pr_info("machrev: rtc back, but no interrupt controller node to map its line on\n");
+		return;
+	}
 	memset(res, 0, sizeof(res));
 	res[0] = DEFINE_RES_MEM(base, 0x1000);
 	res[1] = DEFINE_RES_IRQ(virq);
@@ -231,6 +276,122 @@ static void rtc_back(u64 base, u32 hwirq)
 		return;
 	}
 	pr_info("machrev: rtc back at 0x%llx line %u (irq %d): goldfish_rtc registered\n", base, hwirq, virq);
+}
+
+/*
+ * F19: the NIC's identity. The host tells it through the device -- a
+ * configuration change, the MAC re-read -- which Linux's virtio-net driver
+ * takes at probe only. So on every revision the network device's configured
+ * MAC is compared with what the device now says, and the stack's address is
+ * set to follow (the same call `ip link set address' makes).
+ */
+static int nic_follow(const struct facts *f)
+{
+	int i, changed = 0;
+
+	for (i = 0; i < f->nvirtio; i++) {
+		char name[32];
+		struct device *dev;
+		struct virtio_device *vdev;
+		struct net_device *nd;
+		u8 mac[ETH_ALEN];
+
+		snprintf(name, sizeof(name), "%llx.virtio_mmio", f->virtio_base[i]);
+		dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+		if (!dev)
+			continue;
+		vdev = virtio_mmio_vdev(to_platform_device(dev));
+		put_device(dev);
+		if (!vdev || vdev->id.device != VIRTIO_ID_NET || !virtio_has_feature(vdev, VIRTIO_NET_F_MAC))
+			continue;
+		virtio_cread_bytes(vdev, offsetof(struct virtio_net_config, mac), mac, ETH_ALEN);
+		nd = dev_get_by_name(&init_net, "eth0");
+		if (!nd)
+			continue;
+		if (!ether_addr_equal(nd->dev_addr, mac)) {
+			struct sockaddr sa;
+
+			sa.sa_family = ARPHRD_ETHER;
+			memcpy(sa.sa_data, mac, ETH_ALEN);
+			rtnl_lock();
+			dev_set_mac_address(nd, &sa, NULL);
+			rtnl_unlock();
+			pr_info("machrev: nic identity -> %pM (the device said so)\n", mac);
+			changed = 1;
+		}
+		dev_put(nd);
+	}
+	return changed;
+}
+
+/*
+ * F18 (and any device that comes or goes): a virtio-mmio node in the new
+ * tree that was not in the old one is a device the machine now has -- a
+ * virtio-console, say. Linux made its platform devices from the boot tree;
+ * this makes the new one by hand (its window and line as the tree says), and
+ * the virtio-mmio driver probes it, and the class driver behind that. One
+ * that went is unregistered. The kernel's own console stays where it was
+ * booted (`console='), which is Linux's rule, not ours: what changes is
+ * which consoles the machine has.
+ */
+static struct platform_device *machrev_vdev[MAX_VIRTIO];
+static int machrev_nvdev;
+
+static void virtio_appeared(u64 base, u32 hwirq)
+{
+	struct resource res[2];
+	struct platform_device *pdev;
+	int virq = map_line(hwirq);
+
+	if (virq < 0 || machrev_nvdev >= MAX_VIRTIO) {
+		pr_info("machrev: a virtio device at 0x%llx appeared, and could not be made\n", base);
+		return;
+	}
+	memset(res, 0, sizeof(res));
+	res[0] = DEFINE_RES_MEM(base, 0x200);
+	res[1] = DEFINE_RES_IRQ(virq);
+	pdev = platform_device_register_resndata(NULL, "virtio-mmio", -1, res, 2, NULL, 0);
+	if (IS_ERR(pdev)) {
+		pr_info("machrev: a virtio device at 0x%llx appeared; registering it failed: %ld\n", base, PTR_ERR(pdev));
+		return;
+	}
+	machrev_vdev[machrev_nvdev++] = pdev;
+	pr_info("machrev: virtio device at 0x%llx line %u appeared: registered\n", base, hwirq);
+}
+
+static void virtio_went(u64 base)
+{
+	char name[32];
+	struct device *dev;
+	int i;
+
+	for (i = 0; i < machrev_nvdev; i++) {
+		struct resource *r = platform_get_resource(machrev_vdev[i], IORESOURCE_MEM, 0);
+
+		if (r && r->start == base) {
+			platform_device_unregister(machrev_vdev[i]);
+			machrev_vdev[i] = machrev_vdev[--machrev_nvdev];
+			pr_info("machrev: virtio device at 0x%llx went: unregistered\n", base);
+			return;
+		}
+	}
+	snprintf(name, sizeof(name), "%llx.virtio_mmio", base);
+	dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+	if (dev) {
+		platform_device_unregister(to_platform_device(dev));
+		put_device(dev);
+		pr_info("machrev: virtio device at 0x%llx went: the boot tree's unregistered\n", base);
+	}
+}
+
+static bool has_virtio(const struct facts *f, u64 base)
+{
+	int i;
+
+	for (i = 0; i < f->nvirtio; i++)
+		if (f->virtio_base[i] == base)
+			return true;
+	return false;
 }
 
 /* what this kernel can take, taken; what it cannot, said */
@@ -294,25 +455,56 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 		pr_info("machrev: timer via %s at %u Hz\n", new->sstc ? "stimecmp" : "sbi", new->timebase);
 		adopted |= REV_TIMER;
 	}
+	/* F18 and friends: virtio devices that came or went */
+	for (i = 0; i < new->nvirtio; i++)
+		if (!has_virtio(old, new->virtio_base[i])) {
+			virtio_appeared(new->virtio_base[i], new->virtio_irq[i]);
+			adopted |= REV_DEVICES;
+		}
+	for (i = 0; i < old->nvirtio; i++)
+		if (!has_virtio(new, old->virtio_base[i])) {
+			virtio_went(old->virtio_base[i]);
+			adopted |= REV_DEVICES;
+		}
+
+	/* F19: told through the device; looked at on every revision */
+	if (nic_follow(new))
+		adopted |= REV_DEVICES;
+
 	/* what a stock kernel keeps in a place this module cannot reach */
+	/* F9: the harts were renumbered. cpu i was hart old[i]; it is hart new[i] now. */
 	for (i = 0; i < new->ncpu && i < old->ncpu; i++)
 		if (new->hartid[i] != old->hartid[i]) {
-			pr_info("machrev: harts renumbered: not taken by this kernel\n");
-			break;
+			int cpu = cpu_of_hart(old->hartid[i]);
+
+			if (cpu < 0)
+				continue;
+			if (riscv_rebind_hart(cpu, new->hartid[i]) == 0)
+				adopted |= REV_DEVICES;
+			pr_info("machrev: cpu %d: hart %u -> %u\n", cpu, old->hartid[i], new->hartid[i]);
 		}
-	for (i = 0; i < new->nvirtio && i < old->nvirtio; i++)
-		if (new->virtio_base[i] != old->virtio_base[i] || new->virtio_irq[i] != old->virtio_irq[i]) {
-			pr_info("machrev: a virtio device moved (0x%llx irq %u -> 0x%llx irq %u): not taken by this kernel\n",
-				old->virtio_base[i], old->virtio_irq[i], new->virtio_base[i], new->virtio_irq[i]);
-			break;
-		}
+	/* the RTC first: on a renumbering, the line it leaves may be the one a virtio device moves to (lxirq) */
 	if (new->rtc != old->rtc) {
 		if (new->rtc)
 			rtc_back(new->rtc_base, new->rtc_irq);
 		else
 			rtc_gone();
 		adopted |= REV_DEVICES;
+	} else if (new->rtc && (new->rtc_irq != old->rtc_irq || new->rtc_base != old->rtc_base)) {
+		/* F3/F15: the same clock on another line or at another address */
+		rtc_gone();
+		rtc_back(new->rtc_base, new->rtc_irq);
+		adopted |= REV_DEVICES;
 	}
+	for (i = 0; i < new->nvirtio && i < old->nvirtio; i++)
+		if (new->virtio_base[i] != old->virtio_base[i] || new->virtio_irq[i] != old->virtio_irq[i]) {
+			/* a device that came or went is not a move (handled below) */
+			if (new->virtio_base[i] != old->virtio_base[i] &&
+			    (!has_virtio(old, new->virtio_base[i]) || !has_virtio(new, old->virtio_base[i])))
+				continue;
+			if (virtio_moved(old->virtio_base[i], new->virtio_base[i], new->virtio_irq[i]) == 0)
+				adopted |= REV_DEVICES;
+		}
 	if ((what & REV_INTC) && new->intc && old->intc && strcmp(new->intc, old->intc))
 		pr_info("machrev: interrupt controller %s -> %s: Linux keeps its own (legacy tier)\n", old->intc, new->intc);
 	/* F22: the SBI extension set. Linux keeps one decision from its boot-time

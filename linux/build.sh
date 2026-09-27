@@ -200,7 +200,8 @@ CFG
     make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS defconfig >/dev/null
     ./scripts/kconfig/merge_config.sh -O ../$d -m ../$d/.config ../$d/fragment.config >/dev/null
     make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS olddefconfig >/dev/null
-    make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image modules 2>&1 | grep -E "error|Error" || true
+    make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image modules 2>&1 | grep -E "error|Error" -A3 || true
+    [ -f ../$d/arch/riscv/boot/Image ] && [ ../$d/arch/riscv/boot/Image -nt ../$d/.config ] || { log "KERNEL $1 DID NOT BUILD"; exit 1; }
   )
   # the revision driver, against this kernel; then the initramfs again with
   # it inside, and the image again around that (only the initramfs relinks)
@@ -211,7 +212,8 @@ CFG
     if [ -f $d/machrev/machrev.ko ]; then
       cp $d/machrev/machrev.ko $OUT/machrev-$1.ko
       make_initramfs $1 $2
-      ( cd linux-$KVER && make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image 2>&1 | grep -E "error|Error" || true )
+      ( cd linux-$KVER && make -s O=../$d ARCH=riscv CROSS_COMPILE=$CROSS -j$J Image 2>&1 | grep -E "error|Error" -A3 || true )
+      [ $d/arch/riscv/boot/Image -nt $d/machrev/machrev.ko ] || { log "KERNEL $1 DID NOT RELINK WITH THE MODULE"; exit 1; }
     else
       log "machrev.ko ($1) did not build"
     fi

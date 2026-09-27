@@ -35,7 +35,7 @@ struct virtio_net_hdr {
 
 #define RXQ 0
 #define TXQ 1
-#define QSIZE 16 // descriptors per queue (power of two, <= NUM_MAX)
+#define QSIZE 64 // descriptors per queue (power of two, <= NUM_MAX; 16 dropped 41 frames a side per migration run)
 
 struct vq {
   struct virtq_desc *desc;

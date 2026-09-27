@@ -12,8 +12,8 @@
 // rings need a deeper receive queue and real out-of-order recovery (SACK) to go
 // with them; that is a change to make on purpose, with a TCP throughput test,
 // not a constant to bump.
-#define TRING_PAGES 4
-#define TCP_SNDBUF (2 * 4096)
+#define TRING_PAGES 16   // 64 KB rings: a migration is a stream, and 8 KB in flight per round trip was its ceiling
+#define TCP_SNDBUF (TRING_PAGES * 4096)
 #define TCP_RCVBUF (TRING_PAGES * 4096)
 #define TCP_BACKLOG 4
 // Segments kept while there is a hole in front of them. Throwing away
@@ -21,7 +21,7 @@
 // losses: the sender has to send the whole window again, one segment per
 // round trip, because each retransmission only fills the first gap. Four
 // is a window's worth for this stack's eight-kilobyte send ring.
-#define TCP_OOO 4
+#define TCP_OOO 32   // segments held past a hole; with 4, every lost frame in a burst cost a round trip
 
 enum tcpstate {
   TCPS_CLOSED = 0, TCPS_LISTEN, TCPS_SYN_SENT, TCPS_SYN_RCVD, TCPS_ESTABLISHED,
@@ -50,6 +50,8 @@ struct tcpcb {
   uint32 cwnd, ssthresh;
   uint16 mss;
   int dupacks;
+  uint32 recover;      // NewReno: snd_nxt when fast retransmit began; acks below it are partial
+  int in_recovery;
   int fin_queued;    // FIN to send after the data
   int fin_sent;      // FIN has been (re)transmitted at least once
   // tcp_output is inside this connection already. A segment sent to an

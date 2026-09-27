@@ -542,6 +542,15 @@ struct vm {
   uint64 mmio_shift;
   uint64 intc_shift;       // F2: where its interrupt controller's registers sit (+shift)
   int irq_alt;             // F3: its interrupt lines numbered the alternative way (guestirq=alt)
+  // F15 on arrival: where the devices sat on the host it came from. Until the
+  // guest has taken the new description its drivers may still touch the old
+  // windows (Linux does, from another cpu, before its driver has moved them),
+  // so those addresses are answered too while the revision is pending.
+  int alias_on;
+  uint64 alias_shift;
+  int mac_told;            // F19: the NIC's identity changed on arrival; a guest with a driver is nudged to look (REV_DEVICES)
+  int hart_alias_on;       // F9: the previous numbering still answers while the revision is pending (vm_vcpu_of_hart)
+  int hart_alias_shift;
   uint32 sbi_hidden;       // F22: SBI extensions this machine is not offered (SBIH_*)
   int hart_shift;          // F9: the guest's harts are numbered id+shift (mhartid, cpus reg, a0 at boot)
   int mac_alt;             // F19: the NIC's identity (mac[3] 0x79 instead of 0x78), this host's policy
@@ -724,7 +733,19 @@ void vvnet_mac_changed(struct vm *vm);            // vvnet.c: tell the guest thr
 // F9: a guest addresses its harts by hart id; the models index vcpus. -1: no such hart.
 static inline int vm_vcpu_of_hart(struct vm *vm, long hart) {
   long i = hart - vm->hart_shift;
-  return (i >= 0 && i < vm->nvcpu) ? (int)i : -1;
+  if (i >= 0 && i < vm->nvcpu)
+    return (int)i;
+  // The old numbering, honoured until the guest has taken the new one. Until
+  // then the guest's IPI masks, and the interrupt-controller context its
+  // anchor line is enabled in, still carry the old numbers -- a Linux guest
+  // renumbered on arrival never heard of the revision, because the line
+  // announcing it was enabled in a context that had just moved (lxf9).
+  if (vm->hart_alias_on && vm->revise_acked != vm->revise_gen) {
+    i = hart - vm->hart_alias_shift;
+    if (i >= 0 && i < vm->nvcpu)
+      return (int)i;
+  }
+  return -1;
 }
 uint64 vm_guest_time(struct vm *vm);              // hyp.c: `time' as this machine sees it
 uint64 vm_host_time_of(struct vm *vm, uint64 gt); // hyp.c: and back
