@@ -27,6 +27,9 @@ FACTS = [
 if kind == "xv6":
     FACTS = [("F1 intc", "plic", "imsic"), ("F2 intc-addr", "intcmap alt", "intcmap default"),
              ("F3 irqmap", "irqmap alt", "irqmap default"), ("F4 ipi", "ipi sbi", "ipi clint")] + FACTS
+if len(sys.argv) > 3:       # only these facts (a word of the name), e.g. cpus,rtc
+    only = sys.argv[3].split(",")
+    FACTS = [f for f in FACTS if any(w in f[0] for w in only)]
 LOG = open("console.log", "w")
 # an IMSIC host offers all three controllers (F1 there and back); the others are the same on any
 q = th.QEMU(intc="imsic" if kind == "xv6" else "plic", cpus=3, log=LOG)

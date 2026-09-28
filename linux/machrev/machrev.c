@@ -165,8 +165,48 @@ static void read_facts(struct device_node *root, struct facts *f)
 	}
 }
 
-/* the logical cpu that is hart `hart', from the live tree (cpu numbering is Linux's own) */
+/*
+ * the logical cpu that is hart `hart' (cpu numbering is Linux's own). The
+ * map is the module's: the live tree's cpu nodes keep the reg they booted
+ * with, so after a renumbering a lookup by the tree finds the old numbers
+ * only -- a renumbering *back* to them was then "no cpu of this kernel" and
+ * silently not applied, and every SBI call the kernel made afterwards named
+ * harts the machine no longer had (lxsbi: -EINVAL on each, IPIs lost, the
+ * SBI-set revision four seconds).
+ */
+static u32 hart_of_cpu[NR_CPUS];
+static bool hart_map_ready;
+
+static void hart_map_init(void)
+{
+	int cpu;
+
+	if (hart_map_ready)
+		return;
+	for_each_possible_cpu(cpu) {
+		struct device_node *n = of_get_cpu_node(cpu, NULL);
+		u32 hid = ~0u;
+
+		if (!n || of_property_read_u32(n, "reg", &hid))
+			hid = ~0u;
+		hart_of_cpu[cpu] = hid;
+		of_node_put(n);
+	}
+	hart_map_ready = true;
+}
+
 static int cpu_of_hart(u32 hart)
+{
+	int cpu;
+
+	hart_map_init();
+	for_each_possible_cpu(cpu)
+		if (hart_of_cpu[cpu] == hart)
+			return cpu;
+	return -1;
+}
+
+static int __maybe_unused cpu_of_hart_by_tree(u32 hart)	/* the boot tree's view, kept for reference */
 {
 	int cpu;
 
@@ -481,8 +521,10 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 
 			if (cpu < 0)
 				continue;
-			if (riscv_rebind_hart(cpu, new->hartid[i]) == 0)
+			if (riscv_rebind_hart(cpu, new->hartid[i]) == 0) {
+				hart_of_cpu[cpu] = new->hartid[i];
 				adopted |= REV_DEVICES;
+			}
 			pr_info("machrev: cpu %d: hart %u -> %u\n", cpu, old->hartid[i], new->hartid[i]);
 		}
 	/* the RTC first: on a renumbering, the line it leaves may be the one a virtio device moves to (lxirq) */
