@@ -110,6 +110,9 @@ mcsr_write(struct vcpu *v, int csr, uint64 val)
   switch (csr) {
   case 0x14d:   // stimecmp without Sstc (F5/F6): lands where an SBI set_timer would
     v->vstimecmp = vm_host_time_of(v->vm, val);
+    if (plat_bootarg("tracetimer"))
+      printk("hyp: vm %d vcpu %d: stimecmp <- 0x%lx (host 0x%lx, now 0x%lx, tb %u)\n", v->vm->id, v->id,
+             val, v->vstimecmp, r_time() + v->vm->htimedelta, v->vm->timebase);
     timer_rearm();          // the host's timer to the guest's deadline (see hypsbi.c SBI_EXT_TIME)
     return 0;
   case CSR_MSTATUS:
@@ -248,6 +251,35 @@ hyp_illegal(struct vcpu *v, uint32 inst)
 
 // virtual instruction exception: an instruction that would be legal in
 // HS mode but not in VS mode (wfi is handled by the caller).
+
+// store eight zero bytes at guest virtual address a through the guest's own
+// translation (hsv.d). The store may fault: the guest's page table may not
+// map a (VS-stage -- the guest's fault, to be handed to it), or the guest RAM
+// behind it may not be backed yet (G-stage -- ours to back, as for the
+// guest's own first touch). Either was a host panic until a Linux guest that
+// had crossed with a 128-byte belief zeroed a page nobody had touched since
+// the move. kerneltrap resumes at the label with the cause; 0 is success.
+static uint64
+hsv_zero8(uint64 a, uint64 *tval, uint64 *htval)
+{
+  struct cpu *c;
+  uint64 cause;
+  push_off();                  // the fixup is this hart's: stay on it
+  c = mycpu();
+  c->fixup_cause = 0;
+  asm volatile("la t0, 1f\n\t"
+               "sd t0, %0\n\t"
+               ".insn r 0x73, 0x4, 0x37, x0, %1, x0\n\t"   // hsv.d x0, (a)
+               "1:\n\t"
+               "sd zero, %0\n\t"
+               : "+m"(c->fixup) : "r"(a) : "t0", "memory");
+  cause = c->fixup_cause;
+  *tval = c->fixup_tval;
+  *htval = c->fixup_htval;
+  pop_off();
+  return cause;
+}
+
 int
 hyp_virtinst(struct vcpu *v, uint32 inst)
 {
@@ -259,9 +291,23 @@ hyp_virtinst(struct vcpu *v, uint32 inst)
     int n = vm->cboz_block;
     if (vm->revise_acked != vm->revise_gen && vm->cboz_prev > n)
       n = vm->cboz_prev;   // a revision between two sizes is pending: the larger
-    uint64 gva = v->regs[(inst >> 15) & 31] & ~((uint64)n - 1);
-    for (uint64 a = gva; a < gva + n; a += 8)
-      asm volatile(".insn r 0x73, 0x4, 0x37, x0, %0, %1" ::"r"(a), "r"(0UL) : "memory");   // hsv.d x0, (a)
+    uint64 va = v->regs[(inst >> 15) & 31];
+    uint64 gva = va & ~((uint64)n - 1);
+    for (uint64 a = gva; a < gva + n; a += 8) {
+      uint64 cause, tval, htval;
+      int backed = 0;
+      while ((cause = hsv_zero8(a, &tval, &htval)) != 0) {
+        if ((cause == EXC_LOAD_GPF || cause == EXC_STORE_GPF) && !backed++ &&
+            vm_touch(vm, (htval << 2) | (tval & 3)) == 0)
+          continue;            // guest RAM, backed on first touch: once more
+        // the guest's own translation refused it (its page fault, at its
+        // address), or the address is not RAM at all (an access fault)
+        if (cause == EXC_LOAD_GPF || cause == EXC_STORE_GPF)
+          cause = EXC_STORE_ACCESS;
+        vcpu_inject(v, cause, va);
+        return 0;
+      }
+    }
     __atomic_fetch_add(&hyp_cboz_exits, 1, __ATOMIC_RELAXED);
     v->pc += 4;
     return 0;

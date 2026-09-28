@@ -1477,7 +1477,7 @@ def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
         out = lx.linux_cmd(a, "mount /dev/vda /mnt && echo before-the-move > /mnt/note && sync && cat /mnt/note")
         assert "before-the-move" in out, out
         out = lx.linux_cmd(a, "zerocheck 1024; dmesg | grep -c 'machrev: speaking' || true", 120)
-        assert "1024 pages clean" in out, out
+        assert re.search(r"1024 pages[\s\S]{0,200}?clean", out), out
         assert ("machrev: speaking" in out) == (not legacy) or True
         m = re.search(r"\n(\d+)\r?\n", out)
         spoke = m and int(m.group(1)) > 0
@@ -1505,7 +1505,7 @@ def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
         out = lx.linux_cmd(b, "cat /mnt/note; echo after-the-move > /mnt/note2; sync; cat /mnt/note2; uptime", 60)
         assert "before-the-move" in out and "after-the-move" in out and "load average" in out, out
         out = lx.linux_cmd(b, "zerocheck 1024; zerocheck 1024", 180)
-        assert out.count("1024 pages clean") == 2, out
+        assert len(re.findall(r"1024 pages[\s\S]{0,200}?clean", out)) == 2, out
         if axis == "cboz" and not legacy:
             out = lx.linux_cmd(b, "dmesg | grep 'machrev: cache block'")
             assert "cache block 128 -> 64 bytes" in out, out
@@ -1566,13 +1566,29 @@ LX_AXES["hartid"] = ("guesthart=4", r"arrived with harts numbered from 0, this h
 LX_DISK = ("layout", "irq", "hartid")     # axes whose guest has its disk (the thing that moves)
 
 
-def t_lx_migrate_axis(QEMU, cpus, log, name):
+LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axis
+    "hartid": r"arriving with harts numbered from 0 does not speak revision: keeping that",
+    "layout": r"arriving with its devices at \+0x0 does not speak revision: keeping that map",
+    "irq": r"arriving with its interrupt lines numbered default does not speak revision: keeping that numbering",
+    "intc": r"does not speak revision: keeping plic on this imsic host",
+}
+
+
+def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
     """M5 across a move, one fact at a time: host B differs from A on one axis
     (a boot word); a Linux with machrev.ko is told on arrival and takes it;
-    the guest's own view (nproc, /proc/interrupts, sysfs, meminfo) agrees."""
+    the guest's own view (nproc, /proc/interrupts, sysfs, meminfo) agrees.
+    LEGACY: the same image with machrev=off -- the host keeps the guest's
+    description and serves it with its models; the disk still works."""
     import os
     import test_hyp_linux as lx
-    append, host_msg, dmesg_msg, check, want = LX_AXES[name]
+    if name == "intc":       # legacy only: F1 for Linux is the software model
+        assert legacy
+        append, host_msg, dmesg_msg, check, want = "", None, None, None, None
+    else:
+        append, host_msg, dmesg_msg, check, want = LX_AXES[name]
+    if legacy:
+        host_msg = LX_LEGACY_MSG[name]
     tag = "la%d" % os.getpid()
     link = os.path.join(HERE, tag + ".sock")
     try:
@@ -1584,19 +1600,20 @@ def t_lx_migrate_axis(QEMU, cpus, log, name):
     try:
         a.expect(r"init: starting sh", 90)
         a.expect(r"\$ ", 30)
-        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+        b = QEMU(intc="imsic" if name == "intc" else "plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
                  extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
         b.expect(r"init: starting sh", 90)
         b.expect(r"\$ ", 30)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
         run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
         mb = 128 if name == "ram" else 256
-        disk = "/linux.img" if name in LX_DISK else "none"
-        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi -f %s -c 2 -H\n" % (mb, disk))
+        disk = "/linux.img" if (name in LX_DISK or legacy) else "none"   # the legacy check is the disk
+        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi%s -f %s -c 2 -H\n" % (
+            mb, " machrev=off" if legacy else "", disk))
         a.expect(r"vm (\d+) la: ", 20)
         a.expect(r"linux# ", 120)
         out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
-        assert re.search(r"\n1\r?\n", out), out
+        assert re.search(r"\n%d\r?\n" % (0 if legacy else 1), out), out
         g.detach(a)
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
@@ -1606,7 +1623,11 @@ def t_lx_migrate_axis(QEMU, cpus, log, name):
         b.expect(host_msg, 120)
         b.expect(r"arrived: 2 vcpu", 120)
         try:
+            if legacy:
+                raise StopIteration      # nothing is asked of a guest that cannot be told
             b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
+        except StopIteration:
+            pass
         except Exception:
             # not taken: the host's view, then the guest's own words, for the log
             try:
@@ -1628,10 +1649,15 @@ def t_lx_migrate_axis(QEMU, cpus, log, name):
         try:
             b.send("\n")
             b.expect(r"linux# ", 60)
-            out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer' | tail -12", 60)
-            assert dmesg_msg in out, out
-            out = lx.linux_cmd(b, check, 120)
-            assert re.search(want, out), (check, out)
+            if not legacy:
+                out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer' | tail -12", 60)
+                assert dmesg_msg in out, out
+                out = lx.linux_cmd(b, check, 120)
+                assert re.search(want, out), (check, out)
+            else:
+                # served by the models: the disk it left with is the disk it has
+                out = lx.linux_cmd(b, "mount /dev/vda /mnt && cat /mnt/marker && echo x > /mnt/after && sync && cat /mnt/after", 120)
+                assert re.search(r"marker-on-virtio-disk[\s\S]*\nx\r?\n", out), out
             out = lx.linux_cmd(b, "time sleep 1", 60)
             m = re.search(r"real\s+0m\s*([\d.]+)s", out)
             assert m and 0.9 <= float(m.group(1)) <= 1.6, out
@@ -1647,7 +1673,8 @@ def t_lx_migrate_axis(QEMU, cpus, log, name):
             raise
         g.detach(b)
         run(b, "vmm kill la", 60)
-        print("    Linux crossed to a host with another %s, was told on arrival and took it" % name)
+        print("    a stock Linux (no module) crossed to a host with another %s: kept its description, served by the models" % name
+              if legacy else "    Linux crossed to a host with another %s, was told on arrival and took it" % name)
     finally:
         if b:
             b.close()
@@ -1887,6 +1914,10 @@ def tests(modes, cpus, log, QEMU):
         ("snap-lx-migrate-irq", lambda: t_lx_migrate_axis(QEMU, cpus, log, "irq")),
         ("snap-lx-migrate-mac", lambda: t_lx_migrate_axis(QEMU, cpus, log, "mac")),
         ("snap-lx-migrate-hartid", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid")),
+        ("snap-lx-migrate-hartid-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid", 1)),
+        ("snap-lx-migrate-layout-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "layout", 1)),
+        ("snap-lx-migrate-irq-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "irq", 1)),
+        ("snap-lx-migrate-intc-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc", 1)),
         ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),
         ("snap-migrate-console-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 1)),
         ("snap-migrate-rtc-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["rtc"], 1)),

@@ -1,6 +1,6 @@
 --- a/drivers/clocksource/timer-riscv.c	2026-09-27 22:59:20
 +++ b/drivers/clocksource/timer-riscv.c	2026-09-28 00:02:12
-@@ -152,8 +152,68 @@
+@@ -152,8 +152,72 @@
  	evdev->event_handler(evdev);
  
  	return IRQ_HANDLED;
@@ -40,8 +40,12 @@
 +			ns = ce->min_delta_ns;
 +		clc = ((unsigned long long)ns * ce->mult) >> ce->shift;
 +		riscv_clock_next_event((unsigned long)clc, ce);
++		pr_info("riscv-timer: cpu%d re-armed: hz %u next %lld now %lld clc %llu\n",
++			smp_processor_id(), hz, (long long)ktime_to_ns(ce->next_event), (long long)ktime_to_ns(ktime_get()), clc);
 +	} else
 +		riscv_clock_event_stop();
++		pr_info("riscv-timer: cpu%d stopped: hz %u state %d next %lld\n", smp_processor_id(), hz,
++			clockevent_state_oneshot(ce), (long long)ktime_to_ns(ce->next_event));
  }
  
 +void riscv_timer_revise(bool sstc, u32 hz);

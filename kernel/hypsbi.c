@@ -352,6 +352,9 @@ hyp_ecall(struct vcpu *v)
   case SBI_EXT_TIME:
     if (fid == 0) {
       v->vstimecmp = vm_host_time_of(vm, a0); // in host units; loaded into the hart on the next entry (F6 scales)
+      if (plat_bootarg("tracetimer"))
+        printk("hyp: vm %d vcpu %d: set_timer 0x%lx (host 0x%lx, now 0x%lx, tb %u)\n", vm->id, v->id,
+               a0, v->vstimecmp, r_time() + vm->htimedelta, vm->timebase);
       // and the host's timer to it: a guest without Sstc gets its VSTIP from
       // this hypervisor, at the deadline -- not at the next host tick, which
       // is up to ten milliseconds later and made a Linux boot with its

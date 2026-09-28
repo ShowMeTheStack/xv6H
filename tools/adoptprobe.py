@@ -25,10 +25,11 @@ FACTS = [
     ("F22 sbi", "sbi rfence", "sbi none"),
 ]
 if kind == "xv6":
-    FACTS = [("F1 intc", "aplic", "plic"), ("F2 intc-addr", "intcmap alt", "intcmap default"),
+    FACTS = [("F1 intc", "plic", "imsic"), ("F2 intc-addr", "intcmap alt", "intcmap default"),
              ("F3 irqmap", "irqmap alt", "irqmap default"), ("F4 ipi", "ipi sbi", "ipi clint")] + FACTS
 LOG = open("console.log", "w")
-q = th.QEMU(intc="plic", cpus=3, log=LOG)
+# an IMSIC host offers all three controllers (F1 there and back); the others are the same on any
+q = th.QEMU(intc="imsic" if kind == "xv6" else "plic", cpus=3, log=LOG)
 res = {}
 def host(cmd, t=60):
     m = q.mark(); q.send(cmd + "\n"); q.expect(r"\$ ", t); return q.output_since(m)
@@ -47,12 +48,17 @@ try:
             for words in (there, back):
                 m = q.mark()
                 q.send("vmm revise %d %s\n" % (vmid, words))
+                # the host's `adopted' line and the shell's next prompt come in
+                # either order (the guest adopts in milliseconds; the prompt is
+                # printed when the command returns): wait for the line, then
+                # resync on a fresh prompt -- waiting for the prompt first ate
+                # the line half the time and cost 40 s per miss
                 try:
-                    q.expect(r"\$ ", 60)
-                    mm = q.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\) after (\d+) us", 90)
-                    lat.append(int(mm.group(2)) / 1000.0); masks.add(mm.group(1))
+                    mm = q.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\) after (\d+) us", 40)
+                    lat.append(int(mm.group(2)) / 1000.0); masks.add(mm.group(1).decode() if isinstance(mm.group(1), bytes) else mm.group(1))
                 except Exception as e:
                     lat.append(float("nan")); masks.add("timeout")
+                q.send("\n"); q.expect(r"\$ ", 60)
                 # the cpus revision parks harts: let them settle
                 if words.startswith("cpus"):
                     host("sleep 3", 20)

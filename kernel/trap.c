@@ -254,6 +254,19 @@ kerneltrap()
   if (intr_get() != 0)
     panic("kerneltrap: interrupts enabled");
 
+  if ((scause & (1L << 63)) == 0 && mycpu()->fixup) {
+    // a guest-memory access made on a guest's behalf faulted: the guest's
+    // translation refused it, or the RAM behind it is not backed yet. Not
+    // ours to panic over -- resume the caller with the cause (hyp_virtinst)
+    struct cpu *c = mycpu();
+    c->fixup_cause = scause;
+    c->fixup_tval = r_stval();
+    asm volatile("csrr %0, 0x643" : "=r"(c->fixup_htval));   // htval
+    w_sepc(c->fixup);
+    c->fixup = 0;
+    return;
+  }
+
   if ((which_dev = devintr()) == 0) {
     // interrupt or trap from an unknown source
     printk("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(),

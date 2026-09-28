@@ -56,3 +56,4 @@ user/syscallnames.h
 /qlogs/
 *-fs.img
 bench/campaign/
+.DS_Store

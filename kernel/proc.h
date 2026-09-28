@@ -32,6 +32,9 @@ struct cpu {
   int resched;            // something with less virtual time is waiting
   int tick;               // a whole timer tick passed at the last interrupt
   int offline;            // F8: this hart is to drain its run queue and park
+  // a guest-memory access the hypervisor makes on a guest's behalf (hsv.d in
+  // the cbo.zero model) may fault: kerneltrap resumes at fixup with the cause
+  uint64 fixup, fixup_cause, fixup_tval, fixup_htval;
 };
 
 extern struct cpu cpus[NCPU];
