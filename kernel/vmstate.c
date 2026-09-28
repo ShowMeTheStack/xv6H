@@ -2418,8 +2418,36 @@ restore_from(struct src *s, const char *name, int *idp)
   }
   if (src_kind >= 0 && src_irq_alt != vm->irq_alt) {
     owed |= REV_DEVICES;
+    // The controller model arrived with the lines the source's devices were
+    // holding, numbered the source's way; this host's devices sit on other
+    // numbers. A level left on a number nobody here owns is never dropped:
+    // the guest, still on the old numbering, takes the interrupt, finds
+    // nothing at the device, acknowledges, and takes it again -- 265 000
+    // times in twenty seconds on the balloon's line (hunt4b crossing 13),
+    // with the anchor's threaded handler starved behind the storm and the
+    // arrival never acknowledged. That was the one Linux arrival in twenty
+    // (m7lx irq.10, 865 s) and very likely the first version's one in 814.
+    // Move the held levels to this host's numbers, as vm_revise_irqmap does.
+    acquire(&vm->lock);
+    uint64 levels = vm->vic_kind == VIC_PLIC ? vm->plic.level : vm->aplic.level;
+    uint64 moved = 0;
+    for (int i = 0; i < vm->ndev; i++) {
+      struct vdev *dd = &vm->dev[i];
+      if (dd->irq0 < 0)
+        continue;
+      if (levels & (1ull << irq_map(src_irq_alt, dd->irq0)))
+        moved |= 1ull << irq_map(vm->irq_alt, dd->irq0);
+    }
+    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+      if (levels & (1ull << irq))
+        vic_set_level(vm, irq, 0);
+    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+      if (moved & (1ull << irq))
+        vic_set_level(vm, irq, 1);
+    release(&vm->lock);
     printk("hyp: vm %d: arrived with its interrupt lines numbered %s, this host numbers "
-           "them %s\n", vm->id, src_irq_alt ? "alt" : "default", vm->irq_alt ? "alt" : "default");
+           "them %s (%d held line(s) moved)\n", vm->id, src_irq_alt ? "alt" : "default",
+           vm->irq_alt ? "alt" : "default", vic_held(moved));
   }
   if (src_kind >= 0 && src_shift != vm->mmio_shift) {
     owed |= REV_DEVICES;

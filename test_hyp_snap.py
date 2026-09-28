@@ -627,11 +627,11 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
             # a task that holds vector state for a while. Rounds are not a
             # duration: 400 rounds were over before the move began (fam7), and
             # the guest rightly ceded a unit nobody was using.
-            a.send("vecbench -t 25 &\n")
+            # vhold touches the registers every 10 ms for the whole time, so the
+            # ask finds state held whenever it comes (vecbench's rounds were over
+            # before the move began twice in twenty: 18/20 in m7x)
+            a.send("vhold 25 &\n")
             a.expect(r"\$ ", ATONCE)
-            # and a moment for it to touch a vector register: a move asked before
-            # its first instruction found nobody holding state and was granted
-            # (m7x: 1 of the first 20 runs)
             a.send("sleep 1\n")
             a.expect(r"\$ ", 30)
         g.detach(a)
@@ -1558,12 +1558,18 @@ LX_AXES = {
             "machrev: virtio device at 0x10001000 -> 0x10001000 line 11: moved",
             "mount /dev/vda /mnt && cat /mnt/marker && echo x > /mnt/after-move && sync && cat /mnt/after-move", r"marker-on-virtio-disk[\s\S]*\nx\r?\n"),
 }
+LX_AXES["ipi"] = ("guestipi=sbi", r"arrived with clint ipis, this host has no clint",
+                  "machrev: revision",
+                  "(i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & wait; grep -c 'IPI1' /proc/interrupts; echo PAR-OK", r"PAR-OK")
+LX_AXES["disk"] = ("", r"arrived with a 32768-sector disk, this host's image has 49152: told through the device",
+                   "new size: 49152",
+                   "cat /sys/block/vda/size", r"\n49152\r?\n")
 LX_AXES["mac"] = ("guestmac=alt", r"arrived with nic 52:54:00:78:76:10, this host gives 52:54:00:79:76:10: told through the device",
                   "machrev: nic identity -> 52:54:00:79:76:10", "cat /sys/class/net/eth0/address", r"52:54:00:79:76:10")
 LX_AXES["hartid"] = ("guesthart=4", r"arrived with harts numbered from 0, this host numbers them from 4",
                      "machrev: cpu 1: hart 1 -> 5", "grep hart /proc/cpuinfo | grep -v isa; ls /sys/class/rtc; mount /dev/vda /mnt && cat /mnt/marker",
                      r"hart\s*:\s*4[\s\S]*hart\s*:\s*5[\s\S]*marker-on-virtio-disk")
-LX_DISK = ("layout", "irq", "hartid")     # axes whose guest has its disk (the thing that moves)
+LX_DISK = ("layout", "irq", "hartid", "disk")     # axes whose guest has its disk (the thing that moves)
 
 
 LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axis
@@ -1604,6 +1610,8 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
                  extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
         b.expect(r"init: starting sh", 90)
         b.expect(r"\$ ", 30)
+        if name == "disk":     # B's copy of the guest's disk is 8 MB larger (F20)
+            run(b, "dd if=/dev/zero of=/linux.img bs=1M count=8 seek=16 conv=notrunc", 120)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
         run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
         mb = 128 if name == "ram" else 256
@@ -1623,8 +1631,8 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
         b.expect(host_msg, 120)
         b.expect(r"arrived: 2 vcpu", 120)
         try:
-            if legacy:
-                raise StopIteration      # nothing is asked of a guest that cannot be told
+            if legacy or name == "disk":
+                raise StopIteration      # nothing is asked of a guest that cannot be told; F20 is carried by the device, no revision
             b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
         except StopIteration:
             pass
@@ -1650,7 +1658,7 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
             b.send("\n")
             b.expect(r"linux# ", 60)
             if not legacy:
-                out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer' | tail -12", 60)
+                out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer|new size' | tail -12", 60)
                 assert dmesg_msg in out, out
                 out = lx.linux_cmd(b, check, 120)
                 assert re.search(want, out), (check, out)
@@ -1918,6 +1926,8 @@ def tests(modes, cpus, log, QEMU):
         ("snap-lx-migrate-layout-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "layout", 1)),
         ("snap-lx-migrate-irq-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "irq", 1)),
         ("snap-lx-migrate-intc-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc", 1)),
+        ("snap-lx-migrate-ipi", lambda: t_lx_migrate_axis(QEMU, cpus, log, "ipi")),
+        ("snap-lx-migrate-disk", lambda: t_lx_migrate_axis(QEMU, cpus, log, "disk")),
         ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),
         ("snap-migrate-console-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 1)),
         ("snap-migrate-rtc-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["rtc"], 1)),

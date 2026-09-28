@@ -1,6 +1,6 @@
 --- a/drivers/clocksource/timer-riscv.c	2026-09-27 22:59:20
 +++ b/drivers/clocksource/timer-riscv.c	2026-09-28 00:02:12
-@@ -152,8 +152,77 @@
+@@ -152,8 +152,79 @@
  	evdev->event_handler(evdev);
  
  	return IRQ_HANDLED;
@@ -69,6 +69,8 @@
 +		pr_info("riscv-timer: timebase %lu -> %u Hz\n", riscv_timebase, hz);
 +		riscv_timebase = hz;
 +		__clocksource_update_freq_hz(&riscv_clocksource, hz);
++		timekeeping_rerate();	/* the timekeeper copied the old mult at setup (kernel/time/timekeeping.c) */
++		sched_clock_revise(hz);	/* the scheduler's clock too (kernel/time/sched_clock.c) */
 +	} else
 +		hz = 0;
 +	on_each_cpu(riscv_timer_rearm_now, &hz, 1);
@@ -89,3 +91,115 @@
  EXPORT_SYMBOL_GPL(riscv_timebase);
  
  void __init time_init(void)
+--- a/kernel/time/sched_clock.c
++++ b/kernel/time/sched_clock.c
+@@ -234,6 +234,53 @@
+ 	pr_debug("Registered %pS as sched_clock source\n", read);
+ }
+ 
++/*
++ * xv6H: the counters rate is a fact of the machines description and may
++ * be revised under a running kernel (the hypervisor scales the counter it
++ * shows the guest, continuously). sched_clock_register() is __init and
++ * refuses a lower rate; this re-rates the registered clock in place, with
++ * the epoch carried over so that sched_clock() never goes backwards. Called
++ * by riscv_timer_revise() after the clocksource has been re-rated.
++ */
++void sched_clock_revise(unsigned long rate)
++{
++	u64 wrap, cyc, ns;
++	u32 new_mult, new_shift;
++	unsigned long flags;
++	struct clock_read_data rd;
++
++	if (!rate || rate == cd.rate)
++		return;
++
++	local_irq_save(flags);
++
++	clocks_calc_mult_shift(&new_mult, &new_shift, rate, NSEC_PER_SEC, 3600);
++
++	rd = cd.read_data[0];
++	cyc = cd.actual_read_sched_clock();
++	ns = rd.epoch_ns + cyc_to_ns((cyc - rd.epoch_cyc) & rd.sched_clock_mask, rd.mult, rd.shift);
++
++	rd.mult = new_mult;
++	rd.shift = new_shift;
++	rd.epoch_cyc = cyc;
++	rd.epoch_ns = ns;
++	cd.rate = rate;
++
++	wrap = clocks_calc_max_nsecs(new_mult, new_shift, 0, rd.sched_clock_mask, NULL);
++	cd.wrap_kt = ns_to_ktime(wrap);
++
++	update_clock_read_data(&rd);
++
++	if (sched_clock_timer.function != NULL)
++		hrtimer_start(&sched_clock_timer, cd.wrap_kt, HRTIMER_MODE_REL_HARD);
++
++	local_irq_restore(flags);
++
++	pr_info("sched_clock: re-rated to %lu Hz, epoch %llu ns at cyc %llu, mult %u shift %u (was mult %u shift %u)\n",
++		rate, ns, cyc, new_mult, new_shift, cd.read_data[0].mult, cd.read_data[0].shift);
++}
++EXPORT_SYMBOL_GPL(sched_clock_revise);
++
+ void __init generic_sched_clock_init(void)
+ {
+ 	/*
+--- a/include/linux/sched_clock.h
++++ b/include/linux/sched_clock.h
+@@ -40,6 +40,7 @@
+ 
+ extern void sched_clock_register(u64 (*read)(void), int bits,
+ 				 unsigned long rate);
++extern void sched_clock_revise(unsigned long rate);	/* xv6H: F6 */
+ #else
+ static inline void generic_sched_clock_init(void) { }
+ 
+@@ -47,6 +48,10 @@
+ 					unsigned long rate)
+ {
+ }
++
++static inline void sched_clock_revise(unsigned long rate)
++{
++}
+ #endif
+ 
+ #endif
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1539,6 +1539,22 @@
+ 	return tk->tkr_mono.clock == clock ? 0 : -1;
+ }
+ 
++/*
++ * xv6H: the running clocksource's rate is a fact of the machine's
++ * description and may be revised under the kernel (F6). Updating the
++ * clocksource's mult/shift alone does not reach the timekeeper, which
++ * copied them at setup; re-base it on the same clocksource exactly as a
++ * clocksource change would, with the elapsed time carried forward.
++ */
++void timekeeping_rerate(void)
++{
++	struct timekeeper *tk = &tk_core.timekeeper;
++
++	stop_machine(change_clocksource, tk->tkr_mono.clock, NULL);
++	tick_clock_notify();
++}
++EXPORT_SYMBOL_GPL(timekeeping_rerate);
++
+ /**
+  * ktime_get_raw_ts64 - Returns the raw monotonic time in a timespec
+  * @ts:		pointer to the timespec64 to be set
+--- a/include/linux/clocksource.h
++++ b/include/linux/clocksource.h
+@@ -276,6 +276,7 @@
+ #endif
+ 
+ extern int timekeeping_notify(struct clocksource *clock);
++extern void timekeeping_rerate(void);	/* xv6H: F6 */
+ 
+ extern u64 clocksource_mmio_readl_up(struct clocksource *);
+ extern u64 clocksource_mmio_readl_down(struct clocksource *);

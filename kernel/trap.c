@@ -404,6 +404,7 @@ clockintr()
 
   // let the hypervisor wake guests whose virtual timers expired.
   hyp_tick();
+  printk_flush_held();     // a held host line after a tenth of a second of the guest's silence
   if (me == 0)
     console_poll_sbi();    // F18: an SBI console has no line; it is asked
 

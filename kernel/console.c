@@ -20,6 +20,10 @@
 #include "memlayout.h"
 #include "riscv.h"
 #include "defs.h"
+extern volatile int cons_last_nl;
+extern volatile uint cons_last_write;
+extern uint ticks;
+void printk_flush_held(void);
 #include "platform.h"
 #include "proc.h"
 #include "errno.h"
@@ -257,6 +261,11 @@ consolewrite(int user_src, uint64 src, int n)
       uartwrite(buf, nn);
     }
     i += nn;
+    // console ownership (printk.c): where the guest's line stands
+    cons_last_nl = (buf[nn - 1] == '\n');
+    cons_last_write = ticks;
+    if (cons_last_nl)
+      printk_flush_held();
   }
 
   return i;

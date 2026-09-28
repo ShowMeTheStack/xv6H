@@ -335,10 +335,11 @@ sys_vm_cons(void)
     return vm_cons_write(vm, 1, buf, n);
   case VMCONS_DETACH:
     acquire(&vm->lock);
-    vm->cons_attached = 0;
+    cons_set_attached(vm, 0);
     vm->cons_detach_req = 1;
     wakeup(&vm->cons_out);
     release(&vm->lock);
+    printk_flush_held();
     return 0;
   }
   return -1;
@@ -402,6 +403,9 @@ sys_vm_info(void)
     info.imsic_hw = vm->imsic_hw;
     info.revise_capable = vm->revise_capable;
     info.revise_gen = vm->revise_gen;
+    info.revise_repeats = vm->revise_repeats;
+    info.corun_busy = vm->corun_busy;
+    info.corun_both = vm->corun_both;
     info.cfg = vm->cfg;
     info.entry = vm->entry;
     info.cboz_soft = hyp_cboz_exits;

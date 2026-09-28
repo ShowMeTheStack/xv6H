@@ -1584,9 +1584,12 @@ info(int id)
   printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB (%d MB resident), intc %s%s\n", id, vi.cfg.name,
          states[vi.state % 5], vi.nvcpu, vi.mem_mb, vi.resident_mb, intcs[vi.intc % 3],
          vi.imsic_hw ? " (hardware guest files)" : "");
-  printf("  revision: %s, generation %d\n",
+  printf("  revision: %s, generation %d, announcement repeated %d time(s)\n",
          vi.revise_capable ? "guest speaks the protocol" : "guest does not speak it",
-         vi.revise_gen);
+         vi.revise_gen, vi.revise_repeats);
+  if (vi.corun_busy)
+    printf("  co-run: both vcpus on harts in %ld%% of the %ld ticks with two busy\n",
+           vi.corun_both * 100 / vi.corun_busy, vi.corun_busy);
   printf("  memory: %d chunks split to pages, %d table pages%s%s",
          vi.split_chunks, vi.table_pages,
          (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "",

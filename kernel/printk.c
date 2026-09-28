@@ -25,6 +25,91 @@ static struct {
   int n;
 } pr;
 
+// Console ownership. While a terminal is attached to a machine (`vmm
+// attach') the console is the guest's: a host line written in the middle
+// of the guest's output landed inside it ("real 0hyp: vm 0: ... m 1.01s",
+// m7lq2 layout.10) and the reader on the other end could not tell whose
+// line it was reading. The host's lines are held in a ring while anybody
+// is attached and written out, each on a line of its own, when the last
+// terminal detaches (or by the next printk after that). They still go to
+// /dev/kmsg at once, so nothing is lost to klogd.
+#define HOLD_LINES 64
+#define HOLD_LEN   200
+static struct {
+  char line[HOLD_LINES][HOLD_LEN];
+  int len[HOLD_LINES];
+  int r, w, dropped;
+} hold;
+volatile int cons_owned;   // terminals attached to machines (vuart.c, syshyp.c)
+volatile int cons_last_nl = 1;      // the console's last byte was a newline (console.c)
+volatile uint cons_last_write;      // ticks at the console's last write (console.c)
+extern uint ticks;
+
+static void
+hold_line(char *s, int n)
+{
+  if (hold.w - hold.r >= HOLD_LINES) {
+    hold.r++;
+    hold.dropped++;
+  }
+  int i = hold.w % HOLD_LINES;
+  if (n > HOLD_LEN)
+    n = HOLD_LEN;
+  memmove(hold.line[i], s, n);
+  hold.len[i] = n;
+  hold.w++;
+}
+
+// pr.lock held. Write out what was held, each line whole.
+static void
+hold_flush(void)
+{
+  if (hold.w == hold.r)
+    return;
+  while (hold.r < hold.w) {
+    int i = hold.r % HOLD_LINES;
+    consputs(hold.line[i], hold.len[i]);
+    hold.r++;
+  }
+  if (hold.dropped) {
+    // a small decimal by hand: printk itself cannot be used from here
+    char m[72]; int n = 0, d = hold.dropped, k = 0; char dig[12];
+    const char *a = "(", *z = " host lines dropped while a console was attached)\n";
+    while (*a) m[n++] = *a++;
+    do { dig[k++] = '0' + d % 10; d /= 10; } while (d);
+    while (k) m[n++] = dig[--k];
+    while (*z) m[n++] = *z++;
+    consputs(m, n);
+    hold.dropped = 0;
+  }
+}
+
+// A held line waits for the end of the guest's current line, or a tenth of a
+// second of the guest's silence (the tick calls this), or the detach: bounded,
+// so that whoever is waiting for a host line while attached still sees it,
+// and whole, so that it never lands inside a line of the guest's.
+static int
+hold_due(void)
+{
+  return hold.w != hold.r &&
+         (cons_owned == 0 || cons_last_nl || (uint)(ticks - cons_last_write) >= 10);
+}
+
+void
+printk_flush_held(void)
+{
+  if (panicking || !hold_due())
+    return;
+  acquire(&pr.lock);
+  if (hold_due()) {
+    if (!cons_last_nl)
+      consputs("\n", 1);
+    hold_flush();
+    cons_last_nl = 1;
+  }
+  release(&pr.lock);
+}
+
 // append to the message; while panicking (no lock, other cpus may be
 // in the middle of their own message) write straight through.
 static void
@@ -45,7 +130,14 @@ static void
 pflush(void)
 {
   if (pr.n > 0) {
-    consputs(pr.buf, pr.n);
+    if (cons_owned > 0 && !panicking && !cons_last_nl && (uint)(ticks - cons_last_write) < 10)
+      hold_line(pr.buf, pr.n);       // the guest is in the middle of a line
+    else {
+      if (hold.w != hold.r)
+        hold_flush();
+      consputs(pr.buf, pr.n);
+      cons_last_nl = 1;
+    }
     // and into the ring /dev/kmsg reads, so that what the kernel said
     // is still there for klogd and for whoever asks later
     kmsg_note(pr.buf, pr.n);

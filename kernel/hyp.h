@@ -582,6 +582,11 @@ struct vm {
   uint64 revise_asked;    // host tick when the notification went out
   uint32 revise_what;     // what the last revision said had changed (REV_*), for MACH fid 6
   uint64 revise_done;     // host tick when the ack came back
+  uint64 revise_repeat_at; // L1: when the announcement was last repeated
+  uint32 revise_repeats;   // how many times it had to be (a lost announcement, explained)
+  uint32 revise_described; // the generation the guest last asked describe() for
+  int revise_wd_printed;   // the watchdog's line, once per generation
+  uint64 corun_busy, corun_both; // L6: ticks with >=2 vcpus busy; of those, >=2 on a hart together
 
   // what this guest has observed about its machine (OBS_*), and the host tick
   // at which each fact was first observed. See vm_observe().
@@ -668,6 +673,10 @@ void vm_halt(struct vm *vm);
 int vm_seip(struct vcpu *v);
 void hyp_stats(uint64 *out, int n);
 int vm_gripe(uint64 *count);  // should this complaint about a guest be printed?
+int irq_map(int alt, int irq);   // a line number under the alternative numbering (F3)
+void cons_set_attached(struct vm *vm, int on);   // vuart.c: console ownership
+void printk_flush_held(void);                    // printk.c: let held host lines out
+extern volatile int cons_owned;
 
 // hypcsr.c
 int hyp_illegal(struct vcpu *v, uint32 inst);

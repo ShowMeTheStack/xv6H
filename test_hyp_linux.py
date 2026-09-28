@@ -42,7 +42,8 @@ def linux_cmd(q, cmd, timeout=30):
     q.send(cmd + (" echo " if cmd.rstrip().endswith("&") else "; echo ") + tag + "\n")
     q.expect(r"\n" + tag + r"\r?\n", timeout)
     q.expect(r"linux# ", 10)
-    return q.output_since(mark)
+    # a host line that landed inside the guest's output is not the guest's answer
+    return re.sub(r"^hyp: [^\n]*\n?", "", q.output_since(mark), flags=re.M)
 
 
 def have_https(q):
@@ -331,10 +332,18 @@ def t_lx_revise_cpus(QEMU, intc, cpus, log):
 
 
 def _lx_sleep_secs(q):
-    out = linux_cmd(q, "time sleep 1", 60)
+    """`sleep 1' timed from the HOST's wall clock (time.time() around the
+    command), less the same command's overhead without the sleep. The
+    guest's own `time' output cannot be the judge: a timekeeper running ten
+    times slow reports a ten-second sleep as one second (lxtb3: sleep 2 took
+    20 s of wall time at 1 MHz while the guest said 2.00)."""
+    t0 = time.time(); linux_cmd(q, "true", 60); base = time.time() - t0
+    t0 = time.time(); out = linux_cmd(q, "time sleep 1", 60); wall = time.time() - t0 - base
     m = re.search(r"real\s+0m\s*([\d.]+)s", out)
     assert m, out
-    return float(m.group(1))
+    guest = float(m.group(1))
+    assert abs(guest - wall) < 0.5, ("the guest's clock disagrees with the wall", guest, wall)
+    return wall
 
 
 def t_lx_revise_timer(QEMU, intc, cpus, log):
@@ -388,8 +397,13 @@ def t_lx_revise_timebase(QEMU, intc, cpus, log):
         out = linux_cmd(q, "date +%s; sleep 2; date +%s")
         secs = [int(x) for x in re.findall(r"^(\d{9,})\r?$", out, re.M)]
         assert len(secs) == 2 and 1 <= secs[1] - secs[0] <= 3, out
+        # L4: the scheduler's clock (what dmesg stamps with) re-rates too: two
+        # marks two seconds apart are two seconds apart in dmesg
+        out = linux_cmd(q, "echo tb-a > /dev/kmsg; sleep 2; echo tb-b > /dev/kmsg; dmesg | grep -E 'tb-[ab]$'", 30)
+        ts = sorted(set(float(x) for x in re.findall(r"^\[\s*(\d+\.\d+)\] tb-[ab]", out, re.M)))   # kmsg shows each mark twice
+        assert len(ts) == 2 and 1.7 <= ts[1] - ts[0] <= 2.4, (ts, out)
         poweroff(q)
-        print("    Linux took a 1 MHz timebase in place of 10 MHz: sleep 1 = %.2fs, the clock advanced %d s in 2" % (t, secs[1] - secs[0]))
+        print("    Linux took a 1 MHz timebase in place of 10 MHz: sleep 1 = %.2fs, the clock advanced %d s in 2, sched_clock %.2f s in 2" % (t, secs[1] - secs[0], ts[1] - ts[0]))
     finally:
         q.close()
 
@@ -547,4 +561,155 @@ def tests(modes, cpus, log, QEMU):
     t.append(("lx-revise-sbi", lambda: t_lx_revise_sbi(QEMU, "plic", cpus, log)))
     t.append(("lx-revise-mac", lambda: t_lx_revise_mac(QEMU, "plic", cpus, log)))
     t.append(("lx-revise-console", lambda: t_lx_revise_console(QEMU, "plic", cpus, log)))
+    t.append(("lx-invisible-imsic", lambda: t_lx_invisible_imsic(QEMU, "imsic", cpus, log)))
+    t.append(("lx-invisible-backing", lambda: t_lx_invisible_backing(QEMU, "plic", cpus, log)))
+    t.append(("lx-revise-ram-down", lambda: t_lx_revise_ram_down(QEMU, "plic", cpus, log)))
+    t.append(("lx-revise-while-paused", lambda: t_lx_revise_while_paused(QEMU, "plic", cpus, log)))
     return t
+
+
+# ---- L31: the cells the table marked "stock" or "---" for Linux, as tests ----
+
+def _lx_info(q, vmid):
+    out = host_cmd(q, "vmm info %d" % vmid)
+    m = re.search(r"generation (\d+)", out)
+    gen = int(m.group(1)) if m else -1
+    m = re.search(r"exits (\d+):", out)
+    exits = int(m.group(1)) if m else -1
+    m = re.search(r"\((\d+) MB resident\)", out)
+    res = int(m.group(1)) if m else -1
+    return gen, exits, res, out
+
+
+def t_lx_invisible_imsic(QEMU, intc, cpus, log):
+    """F23 for Linux: the guest's IMSIC is served by a hardware interrupt file,
+    then by the software model, then by hardware again -- under a running
+    Linux that is never asked and cannot tell (same generation, its disk and
+    NIC interrupts keep flowing through each)."""
+    q = boot_host(QEMU, "imsic", cpus, log)
+    try:
+        vmid = start_linux(q, "-f /linux.img -c 2 -H")
+        out = linux_cmd(q, "mount /dev/vda /mnt && cat /mnt/marker")
+        assert "marker-on-virtio-disk" in out, out
+        detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "(hardware guest files)" in out, out
+        gen0, e0, _, _ = _lx_info(q, vmid)
+        counts = []
+        for step, cmd in (("hw", None), ("sw", "vmm imsichw %d off" % vmid), ("hw2", "vmm imsichw %d on" % vmid)):
+            if cmd:
+                host_cmd(q, cmd)
+            attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+            out = linux_cmd(q, "dd if=/dev/vda of=/dev/null bs=1M count=8 2>&1 | tail -1; grep -c . /proc/interrupts", 120)
+            assert re.search(r"8388608 bytes", out) or re.search(r"copied", out), out
+            detach(q)
+            counts.append(_lx_info(q, vmid)[1])
+        gen3 = _lx_info(q, vmid)[0]
+        assert gen0 == gen3, (gen0, gen3)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        assert "(hardware guest files)" in out, out
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+        poweroff(q)
+        print("    Linux's interrupt file went hardware -> software -> hardware under it: nothing asked (generation %d), exits per pass %s"
+              % (gen0, [b - a for a, b in zip([e0] + counts, counts)]))
+    finally:
+        q.close()
+
+
+def t_lx_invisible_backing(QEMU, intc, cpus, log):
+    """F24 for Linux: the pages behind the guest's RAM are split and merged
+    (KSM) under it; a checksum it computed before is the checksum after; no
+    revision."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_linux(q, "-f none -c 2 -H")
+        out = linux_cmd(q, "dd if=/dev/urandom of=/tmp/r bs=4096 count=2048 2>/dev/null; cksum /tmp/r", 120)
+        m = re.search(r"(\d+) \d+ /tmp/r", out)
+        assert m, out
+        sum0 = m.group(1)
+        detach(q)
+        gen0, _, _, out = _lx_info(q, vmid)
+        assert re.search(r"memory: 0 chunks split to pages", out), out
+        host_cmd(q, "vmm split %d" % vmid)
+        _, _, _, out = _lx_info(q, vmid)
+        m2 = re.search(r"memory: (\d+) chunks split to pages", out)
+        assert m2 and int(m2.group(1)) > 0, out
+        host_cmd(q, "vmm ksm on"); host_cmd(q, "sleep 3"); host_cmd(q, "vmm ksm off")
+        gen1 = _lx_info(q, vmid)[0]
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "cksum /tmp/r", 120)
+        m3 = re.search(r"(\d+) \d+ /tmp/r", out)
+        assert m3 and m3.group(1) == sum0, (sum0, out)
+        assert gen0 == gen1, (gen0, gen1)
+        poweroff(q)
+        print("    Linux's memory was split to pages (%s chunks) and merged under it; checksum kept, nothing asked" % m2.group(1))
+    finally:
+        q.close()
+
+
+def t_lx_revise_ram_down(QEMU, intc, cpus, log):
+    """F14 for Linux, live: the host asks for memory back through the balloon;
+    the stock driver gives what it can; the guest's resident set falls and
+    the guest keeps working; then the balloon is let go."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_linux(q, "-f none -c 2 -H")
+        out = linux_cmd(q, "grep MemFree /proc/meminfo")
+        free0 = int(re.search(r"MemFree:\s+(\d+) kB", out).group(1))
+        detach(q)
+        _, _, res0, _ = _lx_info(q, vmid)
+        q.send("vmm balloon %d 64\n" % vmid)
+        q.expect(r"asked for 64 MB back", 30); q.expect(r"\$ ", 10)
+        given = 0
+        for _ in range(60):
+            time.sleep(1)
+            _, _, res1, txt = _lx_info(q, vmid)
+            mm = re.search(r"balloon: \d+ MB asked for, (\d+) MB given back", txt)
+            now = int(mm.group(1)) if mm else 0
+            if now > 0 and now == given:
+                break
+            given = now
+        assert given >= 48, (given, res0, res1)
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "grep MemFree /proc/meminfo")
+        free1 = int(re.search(r"MemFree:\s+(\d+) kB", out).group(1))
+        assert free0 - free1 >= 40 * 1024, (free0, free1)
+        out = linux_cmd(q, "zerocheck 4096", 120)   # 16 MB: still usable
+        assert "4096 pages clean" in out, out
+        detach(q)
+        host_cmd(q, "vmm balloon %d 0" % vmid)
+        host_cmd(q, "sleep 3")
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "grep MemFree /proc/meminfo")
+        free2 = int(re.search(r"MemFree:\s+(\d+) kB", out).group(1))
+        assert free2 > free1 + 30 * 1024, (free1, free2)
+        poweroff(q)
+        print("    Linux gave %d MB back through its balloon (MemFree %d -> %d -> %d kB) and got it again" % (given, free0, free1, free2))
+    finally:
+        q.close()
+
+
+def t_lx_revise_while_paused(QEMU, intc, cpus, log):
+    """A revision asked of a paused guest is taken when it resumes: the
+    announcement waits (at-least-once), the adoption comes after `vmm resume'."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_linux(q, "-f none -c 2 -H")
+        detach(q)
+        host_cmd(q, "vmm pause %d" % vmid)
+        m = q.mark()
+        out = host_cmd(q, "vmm revise %d mac alt" % vmid, 60)
+        assert "asked" in out, out
+        host_cmd(q, "sleep 4")
+        assert "adopted" not in q.output_since(m), q.output_since(m)   # paused: nothing runs
+        q.send("vmm resume %d\n" % vmid)     # the adoption lands before the next prompt
+        q.expect(r"revision \d+ adopted \(0x[0-9a-f]+\) after (\d+) us", 60)
+        q.expect(r"\$ ", 30)
+        _, _, _, out = _lx_info(q, vmid)
+        attach(q, str(vmid)); q.send("\n"); q.expect(r"linux# ", 30)
+        out = linux_cmd(q, "cat /sys/class/net/eth0/address")
+        assert "52:54:00:79:76:10" in out, out
+        poweroff(q)
+        print("    a revision asked of a paused Linux was taken on resume")
+    finally:
+        q.close()

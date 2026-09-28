@@ -96,6 +96,7 @@ int             pipewrite(struct pipe*, uint64, int, int);
 
 // printk.c
 int             printk(char*, ...) __attribute__ ((format (printf, 1, 2)));
+void            printk_flush_held(void);
 void            panic(char*) __attribute__((noreturn));
 void            backtrace(void);
 

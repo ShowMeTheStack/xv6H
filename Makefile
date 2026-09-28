@@ -423,6 +423,7 @@ UPROGS=\
 	$U/_cp\
 	$U/_fpbench\
 	$U/_vecbench\
+	$U/_vhold\
 	$U/_mandel\
 	$U/_ifconfig\
 	$U/_ping\

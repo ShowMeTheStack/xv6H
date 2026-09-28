@@ -197,6 +197,8 @@ struct vmentry {
 struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
   int revise_capable, revise_gen;  // speaks the revision protocol; generation
+  uint32 revise_repeats;           // L1: announcements repeated (a lost one, counted)
+  uint64 corun_busy, corun_both;   // L6: ticks with two vcpus busy; of those, both on harts
   int resident_mb;        // guest RAM actually backed by host memory
   int split_chunks;       // 2 MB chunks backed a page at a time
   int table_pages;        // G-stage page table pages below the root

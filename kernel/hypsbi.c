@@ -166,6 +166,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // register, which the caller reads as sbiret.val after a second call --
     // simpler to hand back the address here and the length on fid 4.
     r.val = vm->desc_gpa;   // the current slot (hyp.h)
+    vm->revise_described = vm->revise_gen;   // L1: the watchdog's evidence
     break;
   case 3:
     acquire(&vm->lock);

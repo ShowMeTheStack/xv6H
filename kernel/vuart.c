@@ -176,13 +176,24 @@ vuart_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
   return 0;
 }
 
+// the console is the guest's while a terminal is attached: the host's own
+// printk lines are held meanwhile (printk.c, cons_owned). vm->lock held.
+void
+cons_set_attached(struct vm *vm, int on)
+{
+  if (vm->cons_attached == on)
+    return;
+  vm->cons_attached = on;
+  __atomic_fetch_add(&cons_owned, on ? 1 : -1, __ATOMIC_SEQ_CST);
+}
+
 void
 vuart_init(struct vm *vm)
 {
   memset(&vm->uart, 0, sizeof(vm->uart));
   vm->cons_out.r = vm->cons_out.w = 0;
   vm->cons_in.r = vm->cons_in.w = 0;
-  vm->cons_attached = 0;
+  cons_set_attached(vm, 0);
   vm_add_dev(vm, "uart", G_UART_IRQ, OBS_UART, G_UART_BASE, 0x100, vuart_read, vuart_write, 0);
 }
 
@@ -255,16 +266,18 @@ vm_cons_read(struct vm *vm, int user, uint64 dst, int n)
   acquire(&vm->lock);
   if (vm->cons_detach_req) {
     vm->cons_detach_req = 0;
-    vm->cons_attached = 0;
+    cons_set_attached(vm, 0);
     release(&vm->lock);
+    printk_flush_held();
     return -1;
   }
-  vm->cons_attached = 1;
+  cons_set_attached(vm, 1);
   while (cring_empty(&vm->cons_out)) {
     if (killed(myproc()) || vm->state == VM_FREE || vm->cons_detach_req) {
       vm->cons_detach_req = 0;
-      vm->cons_attached = 0;
+      cons_set_attached(vm, 0);
       release(&vm->lock);
+      printk_flush_held();
       return -1;
     }
     sleep_prepare(&vm->cons_out);

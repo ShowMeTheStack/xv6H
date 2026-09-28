@@ -710,8 +710,13 @@ pick_cpu(struct proc *p, int how)
         break;
       }
   }
+  // ... except for a vcpu. A vcpu woken by its sibling's IPI is not the
+  // partner of a task about to block: the sibling goes on running, and the
+  // two of them on one hart is the machine's parallelism halved until the
+  // next tick's balance (linux-disk-smp: two loops at 1.7-1.8x one, 11 of 80
+  // quiet runs). A vcpu takes its home hart or the least loaded one.
   if (how == SCHED_WAKE && here != home && ((mask >> here) & 1) &&
-      rqs[here].nr_running <= 1)
+      rqs[here].nr_running <= 1 && p->vcpu == 0)
     return here;
 
   uint64 hl = rqs[home].load;

@@ -850,6 +850,8 @@ vm_revise(struct vm *vm, uint32 what)
   vm->revise_what = what;
   vm->revise_adopted = 0;
   vm->revise_asked = r_time();
+  vm->revise_repeat_at = vm->revise_asked;
+  vm->revise_wd_printed = 0;
   vm->revise_done = 0;
   // every vcpu, not just the first. A guest with several harts has per-hart
   // controller state, and each hart has to bring its own up against the new
@@ -1096,7 +1098,7 @@ now_ticks_hyp(void)
 int
 vm_revise_cpus(struct vm *vm, int online)
 {
-  if (vm == 0 || vm->state != VM_RUNNING)
+  if (vm == 0 || vm->state != VM_RUNNING)   // the host waits for the guest to park its harts: not while paused
     return -EINVAL;
   if (online < 1 || online > vm->nvcpu)
     return -EINVAL;
@@ -1334,7 +1336,7 @@ int
 vm_revise_mac(struct vm *vm, int alt)
 {
   alt = alt != 0;
-  if (vm == 0 || vm->state != VM_RUNNING)
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
     return -EINVAL;
   if (alt == vm->mac_alt)
     return 0;
@@ -1552,7 +1554,7 @@ vm_split_all(struct vm *vm)
 // and the alternative (`guestirq=alt': uart 7, virtio 11..14, rtc 15), which is
 // how a host that wires its devices differently is made. Every place a model
 // raises a line, registers itself, or is described in the tree goes through here.
-static int
+int
 irq_map(int alt, int irq)
 {
   if (!alt)
@@ -3378,6 +3380,7 @@ hyp_tick(void)
     struct vm *vm = vmtab[i];
     if (vm == 0 || vm->state != VM_RUNNING)
       continue;
+    int busy = 0, on = 0;
     for (int j = 0; j < vm->nvcpu; j++) {
       struct vcpu *v = &vm->vcpu[j];
       if (v->idle && now + vm->htimedelta >= v->vstimecmp)
@@ -3385,6 +3388,53 @@ hyp_tick(void)
       else if ((vm->no_sstc || vm_scaled_time(vm)) && !v->idle && v->running_hart >= 0 &&
                v->vstimecmp != ~0UL && now + vm->htimedelta >= v->vstimecmp)
         vcpu_kick(v);     // F5/F6: out, and back in with VSTIP raised
+      if (!v->idle && v->hsm_state == HSM_STARTED)
+        busy++;
+      if (v->running_hart >= 0)
+        on++;
+    }
+    // L6: how often a machine's busy vcpus are actually on harts together
+    if (busy >= 2) {
+      vm->corun_busy++;
+      if (on >= 2)
+        vm->corun_both++;
+    }
+    // L1: an announcement is at-least-once. The SSIP that carries it can be
+    // consumed by the guest's IPI handler in the same trap as a real IPI, and
+    // a guest asked on arrival may be asked before its first instruction has
+    // run; a repeat is harmless (the guest compares generations) and cheap
+    // (one bit per vcpu every two seconds while unacknowledged). Two arrivals
+    // in ~6000 never acknowledged and left no evidence; the repeat is either
+    // the fix or, counted, the evidence.
+    // ... and only while the guest has not started on it: a guest that has
+    // read describe() is inside its own handler, and a second SSIP there is
+    // a re-entry into its lock (m8x: snap-migrate-vlen stuck at the acquire,
+    // "described yes, repeated 10 times").
+    if (vm->revise_capable && vm->revise_acked != vm->revise_gen &&
+        vm->revise_described != vm->revise_gen &&
+        now - vm->revise_asked > 2 * HOST_TIMEBASE &&
+        now - vm->revise_repeat_at > 2 * HOST_TIMEBASE) {
+      acquire(&vm->lock);
+      vm->revise_repeat_at = now;
+      vm->revise_repeats++;
+      for (int j = 0; j < vm->nvcpu; j++)
+        vm->vcpu[j].ssip_req = 1;
+      vmachrev_notify(vm);
+      release(&vm->lock);
+      for (int j = 0; j < vm->nvcpu; j++)
+        vcpu_kick(&vm->vcpu[j]);
+      if (now - vm->revise_asked > 20 * HOST_TIMEBASE && !vm->revise_wd_printed) {
+        vm->revise_wd_printed = 1;
+        printk("hyp: vm %d: revision %d not acknowledged for 20 s (described %s, repeated %d times; lines %s, held 0x%lx)\n",
+               vm->id, vm->revise_gen, vm->revise_described == vm->revise_gen ? "yes" : "no",
+               vm->revise_repeats, vm->irq_alt ? "alt" : "default",
+               (unsigned long)(vm->vic_kind == VIC_PLIC ? vm->plic.level : vm->aplic.level));
+        for (int j = 0; j < vm->nvcpu; j++) {
+          struct vcpu *v = &vm->vcpu[j];
+          printk("hyp: vm %d:   vcpu %d pc 0x%lx idle %d hart %d ssip_req %d vssip %d hsm %d\n",
+                 vm->id, j, v->pc, v->idle, v->running_hart, v->ssip_req, v->vssip, v->hsm_state);
+        }
+      }
     }
   }
 }
