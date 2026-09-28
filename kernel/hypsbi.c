@@ -171,6 +171,11 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     acquire(&vm->lock);
     vm->revise_acked = vm->revise_gen;
     vm->cboz_prev = vm->cboz_block;   // F21: the old stride is gone
+    if (vm->con_going) {              // F18: the guest has let the virtio-console go; now the model may
+      vm->con_going = 0;
+      vm->con.present = 0;
+      vm_del_dev(vm, "virtio-con");
+    }
     vm->revise_adopted = (uint32)a0;
     vm->revise_done = r_time();
     if (vm->vec_pending) {

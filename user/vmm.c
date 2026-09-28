@@ -1388,6 +1388,7 @@ start(int argc, char *argv[])
       setstr(cfg.name, VM_NAMELEN, v);
       i++;
     } else if (strcmp(a, "-k") == 0 && v) {
+      cfg.flags |= VMF_FOREIGN;   // its own kernel: the host's Linux rules apply (vmm.h)
       setstr(cfg.kernel, VM_PATHLEN, v);
       i++;
     } else if (strcmp(a, "-f") == 0 && v) {

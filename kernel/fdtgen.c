@@ -200,7 +200,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_u32(&w, "xv6h,vmid", vm->id);
 
   node_begin(&w, "chosen");
-  if ((vm->cfg.flags & VMF_HSM) && vm->online < vm->nvcpu) {
+  if (VM_FOREIGN(vm) && vm->online < vm->nvcpu) {
     // F7/F8 for a guest that boots its own harts: the ones beyond the count
     // stay offline until its driver is told otherwise
     char ba[160];
@@ -275,7 +275,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     // good, so for a guest that boots its own harts (VMF_HSM) every hart is
     // `okay', the parked ones carry a mark, and maxcpus= in bootargs keeps
     // them offline; the driver (machrev.ko) brings them up and down.
-    if (vm->cfg.flags & VMF_HSM) {
+    if VM_FOREIGN(vm) {
       prop_str(&w, "status", "okay");
       if (i >= vm->online)
         prop_empty(&w, "xv6h,parked");
@@ -533,7 +533,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     node_end(&w);
   }
 
-  if (vm->con.present) {
+  if (vm->con.present && !vm->con_going) {   // F18: a console on its way out is not described
     // the console as a queue. The guest prefers it to the 16550 when it
     // is here and falls back to the 16550 when it is not, so this node
     // appearing is what makes a guest stop paying two exits a character.

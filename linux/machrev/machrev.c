@@ -455,17 +455,19 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 		pr_info("machrev: timer via %s at %u Hz\n", new->sstc ? "stimecmp" : "sbi", new->timebase);
 		adopted |= REV_TIMER;
 	}
-	/* F18 and friends: virtio devices that came or went */
-	for (i = 0; i < new->nvirtio; i++)
-		if (!has_virtio(old, new->virtio_base[i])) {
-			virtio_appeared(new->virtio_base[i], new->virtio_irq[i]);
-			adopted |= REV_DEVICES;
-		}
-	for (i = 0; i < old->nvirtio; i++)
-		if (!has_virtio(new, old->virtio_base[i])) {
-			virtio_went(old->virtio_base[i]);
-			adopted |= REV_DEVICES;
-		}
+	/* F18 and friends: virtio devices that came or went (see above) */
+	if (new->nvirtio != old->nvirtio) {
+		for (i = 0; i < new->nvirtio; i++)
+			if (!has_virtio(old, new->virtio_base[i])) {
+				virtio_appeared(new->virtio_base[i], new->virtio_irq[i]);
+				adopted |= REV_DEVICES;
+			}
+		for (i = 0; i < old->nvirtio; i++)
+			if (!has_virtio(new, old->virtio_base[i])) {
+				virtio_went(old->virtio_base[i]);
+				adopted |= REV_DEVICES;
+			}
+	}
 
 	/* F19: told through the device; looked at on every revision */
 	if (nic_follow(new))
@@ -496,15 +498,20 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 		rtc_back(new->rtc_base, new->rtc_irq);
 		adopted |= REV_DEVICES;
 	}
-	for (i = 0; i < new->nvirtio && i < old->nvirtio; i++)
-		if (new->virtio_base[i] != old->virtio_base[i] || new->virtio_irq[i] != old->virtio_irq[i]) {
-			/* a device that came or went is not a move (handled below) */
-			if (new->virtio_base[i] != old->virtio_base[i] &&
-			    (!has_virtio(old, new->virtio_base[i]) || !has_virtio(new, old->virtio_base[i])))
-				continue;
-			if (virtio_moved(old->virtio_base[i], new->virtio_base[i], new->virtio_irq[i]) == 0)
-				adopted |= REV_DEVICES;
-		}
+	/*
+	 * The same number of devices, in the tree's order: differences are moves
+	 * (F3/F15 -- a new map moves every window, so no new address is in the
+	 * old set; treating that as "all went, all appeared" unregistered the
+	 * disk under the running system: m7lx layout 0/20). A different number:
+	 * devices came or went (F18), matched by address below.
+	 */
+	if (new->nvirtio == old->nvirtio) {
+		for (i = 0; i < new->nvirtio; i++)
+			if (new->virtio_base[i] != old->virtio_base[i] || new->virtio_irq[i] != old->virtio_irq[i]) {
+				if (virtio_moved(old->virtio_base[i], new->virtio_base[i], new->virtio_irq[i]) == 0)
+					adopted |= REV_DEVICES;
+			}
+	}
 	if ((what & REV_INTC) && new->intc && old->intc && strcmp(new->intc, old->intc))
 		pr_info("machrev: interrupt controller %s -> %s: Linux keeps its own (legacy tier)\n", old->intc, new->intc);
 	/* F22: the SBI extension set. Linux keeps one decision from its boot-time

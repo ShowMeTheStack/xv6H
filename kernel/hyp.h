@@ -549,6 +549,7 @@ struct vm {
   int alias_on;
   uint64 alias_shift;
   int mac_told;            // F19: the NIC's identity changed on arrival; a guest with a driver is nudged to look (REV_DEVICES)
+  int con_going;           // F18: the virtio-console left the description; its model answers until the guest has taken that
   int hart_alias_on;       // F9: the previous numbering still answers while the revision is pending (vm_vcpu_of_hart)
   int hart_alias_shift;
   uint32 sbi_hidden;       // F22: SBI extensions this machine is not offered (SBIH_*)

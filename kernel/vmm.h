@@ -60,6 +60,9 @@
 #define VMF_CON_SET 524288  // cfg.console_kind is a request, not the host's default
 #define VMF_CPUS_SET 1048576 // cfg.online is a request, not the host's default
 #define VMF_CBOZ_SET 2097152 // cfg.cboz_block is a request, not the host's own
+#define VMF_FOREIGN 4194304  // a kernel of its own (-k): a guest whose console and hart bring-up are not xv6's
+// the rules a foreign guest (Linux) needs: its console cannot move, its harts are its own to start
+#define VM_FOREIGN(vm) ((vm)->cfg.flags & (VMF_FOREIGN | VMF_HSM))
 
 // A machine's switch port is closed: what arrives from outside is
 // delivered only when it belongs to a conversation the machine itself

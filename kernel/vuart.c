@@ -306,7 +306,13 @@ vm_cons_write(struct vm *vm, int user, uint64 src, int n)
     // and if the guest is reading its console through the queue rather
     // than the 16550, hand it over there too. Both devices draw from the
     // same ring, so whichever the guest drives is the one that sees it.
-    vvcon_rx(vm);
+    // Not for a guest that boots its own harts (Linux): its login shell is
+    // on the 16550 for good (console= is boot-time), while its hvc driver
+    // posts buffers on the queue the moment the device appears -- and took
+    // every keystroke (lxp9: no prompt after `console virtio'). For it the
+    // 16550 is the console anchor; the queue is an extra tty.
+    if (!VM_FOREIGN(vm))
+      vvcon_rx(vm);
     done += k;
   }
   return n;

@@ -53,16 +53,19 @@ def dump_harts(tag_):
 
 a = th.QEMU(intc="plic", cpus=3, log=LOGA, fsimg=tag+"-a.img", extra_env={"LINK": link, "LINKSRV": "on", "MONITOR": MONA})
 b = None
-bad, n, lat = [], 0, []
+bad, n, lat, retries = [], 0, [], []
 try:
     a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
     b = th.QEMU(intc="plic", cpus=3, log=LOGB, fsimg=tag+"-b.img", extra_env={"LINK": link, "LINKSRV": "off", "MONITOR": MONB})
     b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
     sn.run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
     sn.run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
-    # the wire, both ends, headers only: what A sent and what B received when a crossing stalls
-    sn.run(a, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
-    sn.run(b, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
+    # the wire, both ends, headers only: what A sent and what B received when a
+    # crossing stalls. Not on a long run: the capture grows without bound and
+    # reading it back takes longer than the harness waits (hunt3_1000).
+    if CYCLES <= 60:
+        sn.run(a, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
+        sn.run(b, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
     g.start_guest(a, "-n ax -m 32 -c 2 -a norevise", 120)
     a.send("echo gen0 > /keep; sync\n"); a.expect(r"\$ ", 30)
     g.detach(a)
@@ -79,14 +82,30 @@ try:
             dump_harts("stall"); time.sleep(2); dump_harts("2 s later")
             return False
         if "migrated to" not in out:
+            # A failure the protocol handled -- the source kept its machine, the
+            # destination will discard an uncommitted copy -- is a retry, counted
+            # (retries[]); anything else stops the run.
+            where = sn.run(src, "vmm ls", 30)
+            if "running" in where and ("Input/output error" in out or "did not answer" in out):
+                retries.append("crossing %d: %s" % (i, out.strip().splitlines()[-1][:100]))
+                print("  crossing %d: clean failure, retrying: %s" % (i, out.strip().splitlines()[-1][:100])); sys.stdout.flush()
+                try:
+                    sn.run(dst, "sleep 2", 10)
+                    lst = sn.run(dst, "vmm ls", 30)
+                    if "ax" in lst:
+                        sn.run(dst, "vmm kill ax", 60)
+                except Exception:
+                    pass
+                return cross(src, dst, dstip, i) if len(retries) < 20 else False
             bad.append("crossing %d: migrate failed: %s" % (i, out.strip()[-160:]))
             # the wire, from both ends, as it is at the stall
             for who, h in (("src", src), ("dst", dst)):
                 try:
                     print("---- %s /proc/net/tcp at the stall (crossing %d) ----" % (who, i))
                     print(sn.run(h, "cat /proc/net/tcp; ifconfig; vmm ls", 20))
-                    print("---- %s: the last of the wire ----" % who)
-                    print(sn.run(h, "tcpdump -n -t -q -r /tmp/wire.pcap port 9000 | tail -40", 120))
+                    if CYCLES <= 60:
+                        print("---- %s: the last of the wire ----" % who)
+                        print(sn.run(h, "tcpdump -n -t -q -r /tmp/wire.pcap port 9000 | tail -40", 120))
                 except Exception as e:
                     print("  (%s did not answer: %s)" % (who, e))
             sys.stdout.flush()
@@ -119,8 +138,10 @@ try:
         if i % 5 == 4:
             print("  %d crossings ok, sleep-1 round trip median %.2f s" % (n, sorted(lat)[len(lat)//2])); sys.stdout.flush()
 finally:
-    print("crossings ok: %d; problems: %d" % (n, len(bad)))
+    print("crossings ok: %d; problems: %d; clean failures retried: %d" % (n, len(bad), len(retries)))
     for x in bad: print("  " + x)
+    for x in retries: print("  retried " + x)
+    if lat: print("sleep-1 round trip: n=%d median %.2f s max %.2f s" % (len(lat), sorted(lat)[len(lat)//2], max(lat)))
     try:
         if b: b.close()
         a.close()

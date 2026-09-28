@@ -320,6 +320,12 @@ tcp_output(struct tcpcb *t)
     uint32 inflight = t->snd_nxt - t->snd_una;
     if (inflight >= wnd)
       break;
+    // and not into a full transmit ring: what the ring cannot take is
+    // dropped and counted as sent, and comes back only by retransmission
+    // timeout. Room is left for acknowledgements. The retransmission timer
+    // (armed below) resends what stays unsent here.
+    if (virtio_net_tx_room() <= 4)
+      break;
     uint32 len = MIN(unsent_end - t->snd_nxt, wnd - inflight);
     if (len > t->mss)
       len = t->mss;

@@ -1127,7 +1127,7 @@ vm_revise_cpus(struct vm *vm, int online)
     release(&tickslock);
     sleep();
   }
-  if (online > old && (vm->cfg.flags & VMF_HSM)) {
+  if (online > old && VM_FOREIGN(vm)) {
     // a guest that boots its harts itself (Linux: cpu_up -> SBI HSM start at
     // its own secondary entry) starts them; the host starting them at the
     // kernel's entry would boot a second kernel
@@ -1144,7 +1144,7 @@ vm_revise_cpus(struct vm *vm, int online)
   } else {
     // the guest parks them; seen here as HSM-stopped. A Linux guest takes a
     // second or two per hart (cpu_down: migrate its work, quiesce, HSM stop)
-    deadline = now_ticks_hyp() + ((vm->cfg.flags & VMF_HSM) ? 3000 : 500);
+    deadline = now_ticks_hyp() + (VM_FOREIGN(vm) ? 3000 : 500);
     int left;
     do {
       left = 0;
@@ -1258,10 +1258,13 @@ vm_revise_console(struct vm *vm, int kind)
   vm->console_kind = kind;
   if (kind == CON_VIRTIO && !vm->con.present) {
     vm->con.present = 1;
+    vm->con_going = 0;
     vvcon_add(vm);
   } else if (kind != CON_VIRTIO && vm->con.present) {
-    vm->con.present = 0;
-    vm_del_dev(vm, "virtio-con");
+    // the device leaves the description now and the machine at the ack: a
+    // guest's driver tears down against a device that still answers (Linux's
+    // virtio-console remove path read a window that was gone: fx7)
+    vm->con_going = 1;
   }
   release(&vm->lock);
   static const char *names[] = {"uart", "virtio", "sbi"};
@@ -1270,6 +1273,7 @@ vm_revise_console(struct vm *vm, int kind)
   if (r < 0) {
     acquire(&vm->lock);
     vm->console_kind = old;
+    vm->con_going = 0;
     if (old == CON_VIRTIO && !vm->con.present) {
       vm->con.present = 1;
       vvcon_add(vm);
@@ -1572,7 +1576,7 @@ vm_irq(struct vm *vm, int irq)
   // under a running console, and a console whose line has moved is a machine
   // nobody can talk to (lxmig2: irq axis, no prompt for 480 s). The virtio
   // and RTC lines follow (machrev.ko); this one is the second anchor.
-  if (irq == G_UART_IRQ && (vm->cfg.flags & VMF_HSM))
+  if (irq == G_UART_IRQ && VM_FOREIGN(vm))
     return irq;
   return irq_map(vm->irq_alt, irq);
 }

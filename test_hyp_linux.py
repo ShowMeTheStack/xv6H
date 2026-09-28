@@ -4,7 +4,7 @@
 # linux/fetch.sh); test-hyp.py rebuilds fs.img with them when present.
 #
 import os, re, time
-from test_hyp_guest import boot_host, start_guest, detach, attach, vm_ls, kill_vm, host_stats
+from test_hyp_guest import boot_host, start_guest, detach, attach, vm_ls, kill_vm, host_stats, wait_adopted
 
 LINUX_ARGS = "-k /Image -r 0x80200000 -m 256 -a console=ttyS0 earlycon=sbi"
 
@@ -497,24 +497,31 @@ def t_lx_revise_console(QEMU, intc, cpus, log):
         out = linux_cmd(q, "ls /dev/ | grep -c hvc")
         hvc0 = int(re.search(r"\n(\d+)\r?\n", out).group(1))
         detach(q)
-        out = host_cmd(q, "vmm revise %d console virtio" % vmid, 60)
-        assert "asked" in out, out
+        m = q.mark()
+        q.send("vmm revise %d console virtio\n" % vmid)
+        q.expect(r"console -> virtio: asked", 60)
+        q.expect(r"\$ ", 30)
+        wait_adopted(q, m)                 # the driver has made the device before anyone attaches
         attach(q, str(vmid))
         q.send("\n")
-        q.expect(r"linux# ", 30)
+        q.expect(r"linux# ", 60)
         out = linux_cmd(q, "sleep 1; dmesg | grep 'machrev: virtio device' | tail -2; ls /dev/ | grep -c hvc")
         assert "appeared: registered" in out, out
+        # the hvc tty driver registers eight minors at once: what matters is that there were none and now there are
         hvc1 = int(re.search(r"\n(\d+)\r?\n", out).group(1))
-        assert hvc1 == hvc0 + 1, (hvc0, hvc1, out)
+        assert hvc1 > hvc0, (hvc0, hvc1, out)
         out = linux_cmd(q, "echo through-the-new-console > /dev/hvc%d; sleep 1" % hvc0, 30)
         assert "through-the-new-console" in out, out
         detach(q)
-        out = host_cmd(q, "vmm revise %d console uart" % vmid, 60)
-        assert "asked" in out, out
+        m = q.mark()
+        q.send("vmm revise %d console uart\n" % vmid)
+        q.expect(r"console -> uart: asked", 60)
+        q.expect(r"\$ ", 30)
+        wait_adopted(q, m)
         attach(q, str(vmid))
         q.send("\n")
-        q.expect(r"linux# ", 30)
-        out = linux_cmd(q, "sleep 1; dmesg | grep 'machrev: virtio device' | tail -1; ls /dev/ | grep -c hvc")
+        q.expect(r"linux# ", 60)
+        out = linux_cmd(q, "sleep 1; dmesg | grep 'machrev: virtio device' | tail -1")
         assert "went" in out, out
         poweroff(q)
         print("    Linux was given a virtio-console (hvc%d appeared, a line written through it arrived) and lost it again" % hvc0)

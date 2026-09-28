@@ -201,6 +201,7 @@ void            sched_offline_drain(int);
 uint64          kmem_total_pages(void);
 void            page_zero(void *);
 void            virtio_net_refill(void);
+int             virtio_net_tx_room(void);
 void            machine_hart_park(void);
 void            net_mac_changed(uint8 *);
 void            rtc_rebind(void);

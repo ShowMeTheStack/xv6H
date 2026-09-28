@@ -35,7 +35,7 @@ struct virtio_net_hdr {
 
 #define RXQ 0
 #define TXQ 1
-#define QSIZE 64 // descriptors per queue (power of two, <= NUM_MAX; 16 dropped 41 frames a side per migration run)
+#define QSIZE 256 // descriptors per queue (power of two, <= NUM_MAX): the device's maximum. 16 dropped 41 frames a side per migration run, 64 still ~30 a crossing at the transmit ring
 
 struct vq {
   struct virtq_desc *desc;
@@ -233,6 +233,34 @@ virtio_net_init(void)
   char macs[18];
   printk("virtio net: mac %s\n", mac2str(nic.mac, macs));
   return 0;
+}
+
+// how many frames the transmit ring can take right now. TCP asks before it
+// sends a burst: a segment handed to a full ring was dropped and counted as
+// sent, and every such drop was a retransmission timeout later (hunt3_1000:
+// 5,221 transmit drops in 178 crossings, and one connection reset).
+int
+virtio_net_tx_room(void)
+{
+  if (!nic.present)
+    return 1 << 20;
+  acquire(&nic.lock);
+  struct vq *q = &nic.q[TXQ];
+  while (q->used_idx != q->used->idx) {
+    io_fence();
+    int id = q->used->ring[q->used_idx % QSIZE].id;
+    if (q->bufs[id]) {
+      mbuffree(q->bufs[id]);
+      q->bufs[id] = 0;
+    }
+    q->free[id] = 1;
+    q->used_idx++;
+  }
+  int room = 0;
+  for (int i = 0; i < QSIZE; i++)
+    room += q->free[i] ? 1 : 0;
+  release(&nic.lock);
+  return room;
 }
 
 // transmit an ethernet frame. takes ownership of m. may be called from
