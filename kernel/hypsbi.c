@@ -167,10 +167,14 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // simpler to hand back the address here and the length on fid 4.
     r.val = vm->desc_gpa;   // the current slot (hyp.h)
     vm->revise_described = vm->revise_gen;   // L1: the watchdog's evidence
+    if (vm->irq_alias_on && vm->revise_acked != vm->revise_gen)
+      vm->irq_quiet = 1;    // a renumbering is being taken: device lines held until the ack (vic.c)
     break;
   case 3:
     acquire(&vm->lock);
     vm->revise_acked = vm->revise_gen;
+    vm_del_ghosts(vm);            // the old controller's window has answered its last
+    vm_irq_alias_end(vm);         // F3: what the devices hold moves to the new numbers
     vm->cboz_prev = vm->cboz_block;   // F21: the old stride is gone
     if (vm->con_going) {              // F18: the guest has let the virtio-console go; now the model may
       vm->con_going = 0;
@@ -186,14 +190,19 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       // using it (busy2: the guest arrived and executed nothing but faults).
       vm->vec_pending = 0;
       if (!(a0 & REV_VLEN)) {
-        vm->vec_revoked = !vm->vec_revoked;
-        for (int i = 0; i < vm->nvcpu; i++) {
-          vm->vcpu[i].vsstatus &= ~SSTATUS_VS_MASK;
-          if (!vm->vec_revoked)
-            vm->vcpu[i].vsstatus |= SSTATUS_VS_INITIAL;
-        }
+        vm->vec_revoked = !vm->vec_revoked;     // the description goes back to what the guest holds; VS untouched
         printk("hyp: vm %d: the guest declined: its vector unit stays %s\n", vm->id,
                vm->vec_revoked ? "absent" : "present");
+      } else if (vm->vec_revoked) {
+        // ceded: from here the unit is gone -- VS Off on every vcpu, so a vector
+        // instruction traps (illegal) instead of touching registers the
+        // description no longer has; a vcpu on a hart takes it at its exit
+        for (int i = 0; i < vm->nvcpu; i++) {
+          if (vm->vcpu[i].running_hart >= 0)
+            vm->vcpu[i].vs_force = 1;
+          else
+            vm->vcpu[i].vsstatus &= ~SSTATUS_VS_MASK;
+        }
       }
     }
     release(&vm->lock);
@@ -214,10 +223,31 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // executes a vector instruction, so the first-use trap (hypcsr.c) alone
     // would never fire for a well-behaved program; the question is the
     // observation. Granted iff this host has a unit and it was only hidden.
+    // a request is a revision of the machine, which is not free: one every
+    // tenth of a second per machine, and the rest are refused (L21: a guest
+    // asking by the thousand is a guest asking the host to spend its time)
+    if (r_time() - vm->request_at < HOST_TIMEBASE / 10) {
+      vm->requests_refused++;
+      r.err = SBI_ERR_FAILED;
+      break;
+    }
+    vm->request_at = r_time();
+    if ((a0 & REV_VLEN) && !vm->vec_revoked && plat.has_v) {
+      // already granted -- the guest's first vector instruction trapped here
+      // and the unit was given on the spot (hypcsr.c), and the guest's own
+      // handler asks a moment later, before its revision thread has taken the
+      // grant (lxvs4: "refused (-2)", SIGILL, on a unit that was on its way).
+      // The request is idempotent: yes, it is yours; the revision is coming.
+      r.val = REV_VLEN;
+      break;
+    }
     if ((a0 & REV_VLEN) && vm->lazy_v && vm->vec_revoked && plat.has_v) {
       vm_observe(vm, OBS_VECTOR_USED);
       printk("hyp: vm %d: the guest asks for a vector unit: granting it\n", vm->id);
-      if (vm_revise_vector(vm, 1) == 0)
+      vm->revise_hold++;
+      int rv = vm_revise_vector(vm, 1);
+      vm->revise_hold--;
+      if (rv == 0)
         r.val = REV_VLEN;
       else
         r.err = SBI_ERR_FAILED;

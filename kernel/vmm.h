@@ -49,6 +49,8 @@
 #define VMF_MMIO_SET  256  // cfg.mmio_shift is a request, not the host's default
 #define VMF_LAZYV     512  // present no vector unit until the guest tries to use one
 #define VMF_INTC_SET 1024  // cfg.intc_shift is a request, not the host's default
+#define VMF_VICSHIM  (1 << 23)  // describe the interrupt controller as xv6h,vic (Linux patch 0005: F1/F2 taken live)
+#define VM_VICSHIM(vm) (((vm)->cfg.flags & VMF_VICSHIM) != 0)   // read from the cfg, which crosses with the machine (an arrival is built from it)
 #define VMF_IRQ_SET  2048  // cfg.irq_alt is a request, not the host's default
 #define VMF_SBI_SET  4096  // cfg.sbi_hidden is a request, not the host's default
 #define VMF_IPI_SET  8192  // cfg.no_clint is a request, not the host's default
@@ -189,6 +191,7 @@ struct vmentry {
 #define VMCTL_GROW 24            // arg: MB, the machine's new size (F13)
 #define VMCTL_REVISE_CPUS 25     // arg: harts online (F7 up, F8 down)
 #define VMCTL_REVISE_CBOZ 26     // arg: cache-block size in bytes (F21)
+#define VMCTL_REVISE_MAP 27      // arg: the device windows' shift, 0 or 0x100000 (F15, live)
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -198,7 +201,10 @@ struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
   int revise_capable, revise_gen;  // speaks the revision protocol; generation
   uint32 revise_repeats;           // L1: announcements repeated (a lost one, counted)
+  uint32 irq_quiet_held;           // F3: device interrupts held in the quiet window and raised on the new numbers at the ack
+  uint32 aplic_ie, aplic_idel0, aplic_idel1, aplic_tgt10; uint64 aplic_en, aplic_pend, aplic_lvl;   // the APLIC model, for a guest that is not answering
   uint64 corun_busy, corun_both;   // L6: ticks with two vcpus busy; of those, both on harts
+  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // L20
   int resident_mb;        // guest RAM actually backed by host memory
   int split_chunks;       // 2 MB chunks backed a page at a time
   int table_pages;        // G-stage page table pages below the root

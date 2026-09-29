@@ -333,6 +333,10 @@ sbi_round(uint64 r)
   long fid = (long)(next() & 0xff);
   if ((r & 7) == 0)
     ext = 0x10;             // the base extension, with a random function
+  else if ((r & 7) == 1) {  // the revision protocol (L21): every fid, random masks,
+    ext = 0x4D414348;       // requests by the thousand, acks for nothing
+    fid = (long)(next() & 7);
+  }
   sbi(ext, fid, (long)next(), (long)next());
 }
 

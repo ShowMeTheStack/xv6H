@@ -1,0 +1,217 @@
+--- a/drivers/irqchip/irq-sifive-plic.c	2026-09-28 00:56:40
++++ b/drivers/irqchip/irq-sifive-plic.c	2026-09-28 01:04:31
+@@ -400,7 +400,40 @@
+ 	/* priority must be > threshold to trigger an interrupt */
+ 	writel(threshold, handler->hart_base + CONTEXT_THRESHOLD);
+ }
++
++/*
++ * xv6H: a hart's id is a fact of the machine's description and may be revised
++ * under the running guest (F9). This cpu's PLIC context is 2*hartid+1, so its
++ * enables and threshold live somewhere else now: copy the enables from the
++ * old context, point the handler at the new one, write them there, set the
++ * threshold. Any cpu may do this for any other; the registers are memory.
++ */
++int plic_rebind_hart(unsigned int cpu, unsigned long hartid)
++{
++	struct plic_handler *handler = per_cpu_ptr(&plic_handlers, cpu);
++	struct plic_priv *priv;
++	unsigned long flags;
++	int i, context_id = 2 * hartid + 1;
++	u32 words;
+ 
++	if (!handler->present || !handler->enable_save)
++		return -ENODEV;
++	priv = handler->priv;
++	words = DIV_ROUND_UP(priv->nr_irqs, 32);
++	raw_spin_lock_irqsave(&handler->enable_lock, flags);
++	for (i = 0; i < words; i++)
++		handler->enable_save[i] = readl(handler->enable_base + i * sizeof(u32));
++	handler->hart_base = priv->regs + CONTEXT_BASE + context_id * CONTEXT_SIZE;
++	handler->enable_base = priv->regs + CONTEXT_ENABLE_BASE + context_id * CONTEXT_ENABLE_SIZE;
++	for (i = 0; i < words; i++)
++		writel(handler->enable_save[i], handler->enable_base + i * sizeof(u32));
++	raw_spin_unlock_irqrestore(&handler->enable_lock, flags);
++	plic_set_threshold(handler, PLIC_ENABLE_THRESHOLD);
++	pr_info("riscv-plic: cpu%u now hart %lu (context %d)\n", cpu, hartid, context_id);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(plic_rebind_hart);
++
+ static int plic_dying_cpu(unsigned int cpu)
+ {
+ 	if (plic_parent_irq)
+
+--- a/arch/riscv/kernel/smp.c
++++ b/arch/riscv/kernel/smp.c
+@@ -51,11 +51,44 @@
+ 	[IPI_KGDB_ROUNDUP]	= "KGDB roundup interrupts",
+ };
+ 
+-unsigned long __cpuid_to_hartid_map[NR_CPUS] __ro_after_init = {
++unsigned long __cpuid_to_hartid_map[NR_CPUS] = {	/* xv6H: revisable (riscv_rebind_hart) */
+ 	[0 ... NR_CPUS-1] = INVALID_HARTID
+ };
+ EXPORT_SYMBOL_GPL(__cpuid_to_hartid_map);
+ 
++/*
++ * xv6H: the machine's description renumbered its harts (F9). The map every
++ * hart mask is built from (IPIs, remote fences, HSM start/stop) takes the new
++ * number, and the interrupt controller's per-cpu context follows it.
++ */
++int plic_rebind_hart(unsigned int cpu, unsigned long hartid);
++int imsic_rebind_hart(unsigned int cpu, unsigned long hartid);
++
++int riscv_rebind_hart(unsigned int cpu, unsigned long hartid)
++{
++	unsigned long old;
++	int rc = 0, rc2;
++	if (cpu >= NR_CPUS)
++		return -EINVAL;
++	old = cpuid_to_hartid_map(cpu);
++	if (old == hartid)
++		return 0;
++	cpuid_to_hartid_map(cpu) = hartid;
++	pr_info("smp: cpu%u: hart %lu -> %lu\n", cpu, old, hartid);
++#ifdef CONFIG_RISCV_IMSIC
++	rc = imsic_rebind_hart(cpu, hartid);	/* its interrupt file and the MSI targets naming it */
++#endif
++	rc2 = plic_rebind_hart(cpu, hartid);
++	/* a controller this machine does not have is not a failure of the renumbering
++	 * (the IMSIC machine's second renumbering was skipped on the PLIC's -ENODEV) */
++	if (rc == -ENODEV)
++		rc = 0;
++	if (rc2 == -ENODEV)
++		rc2 = 0;
++	return rc ? rc : rc2;
++}
++EXPORT_SYMBOL_GPL(riscv_rebind_hart);
++
+ void __init smp_setup_processor_id(void)
+ {
+ 	cpuid_to_hartid_map(0) = boot_cpu_hartid;
+--- a/include/linux/irqchip/riscv-imsic.h
++++ b/include/linux/irqchip/riscv-imsic.h
+@@ -93,4 +93,6 @@
+ static inline struct fwnode_handle *imsic_acpi_get_fwnode(struct device *dev) { return NULL; }
+ #endif
+ 
++int imsic_rebind_hart(unsigned int cpu, unsigned long hartid);	/* xv6H: F9 */
++
+ #endif
+
+--- a/drivers/irqchip/irq-riscv-imsic-state.c
++++ b/drivers/irqchip/irq-riscv-imsic-state.c
+@@ -11,6 +11,8 @@
+ #include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/module.h>
++#include <linux/msi.h>
++#include "irq-riscv-aplic-main.h"
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+ #include <linux/of_irq.h>
+@@ -216,6 +218,63 @@
+ 	raw_spin_unlock_irqrestore(&lpriv->lock, flags);
+ }
+ 
++/*
++ * xv6H: the machine's description renumbered its harts (F9). This cpu's
++ * interrupt file is the page of the hart it is now called, and every MSI
++ * message that named the old page -- the APLIC's targets for wired lines --
++ * is composed and written again against the new one. The file's own state
++ * (enables, pending) belongs to the vcpu and moves with the hart number on
++ * the hypervisor's side; nothing here is lost.
++ */
++int imsic_rebind_hart(unsigned int cpu, unsigned long hartid)
++{
++	struct imsic_local_config *local;
++	struct imsic_local_priv *lpriv;
++	phys_addr_t pa;
++	void __iomem *va;
++	unsigned int i;
++
++	if (!imsic)
++		return -ENODEV;
++	local = per_cpu_ptr(imsic->global.local, cpu);
++	pa = imsic->global.base_addr +
++	     ((phys_addr_t)hartid << (imsic->global.guest_index_bits + IMSIC_MMIO_PAGE_SHIFT));
++	if (pa == local->msi_pa)
++		return 0;
++	va = ioremap(pa, IMSIC_MMIO_PAGE_SZ);
++	if (!va)
++		return -ENOMEM;
++	local->msi_pa = pa;
++	local->msi_va = va;
++	/* the hart index field has to hold the new number: an APLIC that parsed
++	 * hart-index-bits 1 for harts 0,1 cannot address hart 4's file (it warned
++	 * and masked the index to 0, and the machine's interrupts went to a hart
++	 * that no longer existed) */
++	if (fls((unsigned int)hartid) > imsic->global.hart_index_bits)
++		imsic->global.hart_index_bits = fls((unsigned int)hartid);
++
++	lpriv = per_cpu_ptr(imsic->lpriv, cpu);
++	for (i = 1; i <= imsic->global.nr_ids; i++) {
++		struct imsic_vector *vec = &lpriv->vectors[i];
++		struct irq_data *d;
++		struct msi_msg msg;
++
++		if (!vec->irq || vec->irq == UINT_MAX)
++			continue;
++		d = irq_get_irq_data(vec->irq);
++		if (!d)
++			continue;
++#ifdef CONFIG_RISCV_APLIC_MSI
++		aplic_msi_hart_index_bits(d, imsic->global.hart_index_bits);
++#endif
++		if (d->chip && d->chip->irq_write_msi_msg && irq_chip_compose_msi_msg(d, &msg) == 0)
++			d->chip->irq_write_msi_msg(d, &msg);
++	}
++	pr_info("riscv-imsic: cpu%u now hart %lu: interrupt file at %pa\n", cpu, hartid, &pa);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(imsic_rebind_hart);
++
+ void imsic_local_delivery(bool enable)
+ {
+ 	if (enable) {
+
+--- a/drivers/irqchip/irq-riscv-aplic-msi.c
++++ b/drivers/irqchip/irq-riscv-aplic-msi.c
+@@ -128,6 +128,25 @@
+ 	writel(val, target);
+ }
+ 
++/*
++ * xv6H: the machine renumbered its harts (a revisable fact of the machine);
++ * the hart index field of this APLIC's MSI addresses must be wide enough for
++ * the new numbers. Called by imsic_rebind_hart for each vector it rewrites.
++ */
++void aplic_msi_hart_index_bits(struct irq_data *d, u32 bits)
++{
++	struct aplic_priv *priv;
++
++	if (!d->chip || d->chip->irq_write_msi_msg != aplic_msi_write_msg)
++		return;
++	priv = irq_data_get_irq_chip_data(d);
++	if (priv && priv->msicfg.lhxw < bits && bits <= APLIC_xMSICFGADDRH_LHXW_MASK) {
++		pr_info("riscv-aplic: %s: hart index bits %u -> %u\n", dev_name(priv->dev), priv->msicfg.lhxw, bits);
++		priv->msicfg.lhxw = bits;
++	}
++}
++EXPORT_SYMBOL_GPL(aplic_msi_hart_index_bits);
++
+ static void aplic_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+ {
+ 	arg->desc = desc;
+
+--- a/drivers/irqchip/irq-riscv-aplic-main.h
++++ b/drivers/irqchip/irq-riscv-aplic-main.h
+@@ -43,6 +43,7 @@
+ int aplic_direct_setup(struct device *dev, void __iomem *regs);
+ #ifdef CONFIG_RISCV_APLIC_MSI
+ int aplic_msi_setup(struct device *dev, void __iomem *regs);
++void aplic_msi_hart_index_bits(struct irq_data *d, u32 bits);
+ #else
+ static inline int aplic_msi_setup(struct device *dev, void __iomem *regs)
+ {

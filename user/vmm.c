@@ -49,7 +49,7 @@ usage(void)
              "                 [-w weight] [--cpu-max pct] [-p HPORT[:GPORT][/udp]]\n"
              "       vmm ls | attach VM | kill VM|--all | restart VM | pause VM | resume VM\n"
              "       vmm ps VM | info VM | stats | balloon VM MB | ksm on|off\n"
-             "       vmm revise VM [plic|aplic|imsic|vector|novector|intcmap alt|default|irqmap alt|default]\n"
+             "       vmm revise VM [plic|aplic|imsic|vector|novector|lazyvector|intcmap alt|default|irqmap alt|default]\n"
              "                     [sbi LIST|none|ipi sbi|clint|timer sbi|sstc|timebase HZ|hartid SHIFT|mac alt|default|rtc on|off]\n"
              "                     [console uart|virtio|sbi|cpus N|cboz BYTES]\n"
              "       vmm resize VM MB\n"
@@ -1517,6 +1517,8 @@ start(int argc, char *argv[])
       cfg.flags |= VMF_WANT_APLIC;     // the software APLIC, whatever the host has
     } else if (strcmp(a, "-I") == 0) {
       cfg.flags |= VMF_WANT_IMSIC;     // and the software IMSIC
+    } else if (strcmp(a, "-V") == 0) {
+      cfg.flags |= VMF_VICSHIM;        // the controller described as one xv6h,vic node (a Linux with patch 0005 follows F1/F2 live)
     } else if (strcmp(a, "-L") == 0) {
       cfg.flags |= VMF_LAZYV;          // no vector unit until the guest uses one
     } else if (strcmp(a, "-M") == 0 && i + 1 < argc) {
@@ -1584,12 +1586,21 @@ info(int id)
   printf("vm %d: name '%s' state %s, %d vcpu(s), %d MB (%d MB resident), intc %s%s\n", id, vi.cfg.name,
          states[vi.state % 5], vi.nvcpu, vi.mem_mb, vi.resident_mb, intcs[vi.intc % 3],
          vi.imsic_hw ? " (hardware guest files)" : "");
+  if (vi.irq_quiet_held)
+    printf("  quiet window: %d device interrupt(s) held while a renumbering was taken, raised at the ack\n", vi.irq_quiet_held);
+  if (vi.aplic_en || vi.aplic_ie || vi.aplic_idel0)
+    printf("  aplic: ie %d en 0x%lx pend 0x%lx lvl 0x%lx idelivery %d/%d target[10] 0x%x\n", vi.aplic_ie != 0,
+           vi.aplic_en, vi.aplic_pend, vi.aplic_lvl, vi.aplic_idel0, vi.aplic_idel1, vi.aplic_tgt10);
   printf("  revision: %s, generation %d, announcement repeated %d time(s)\n",
          vi.revise_capable ? "guest speaks the protocol" : "guest does not speak it",
          vi.revise_gen, vi.revise_repeats);
   if (vi.corun_busy)
     printf("  co-run: both vcpus on harts in %ld%% of the %ld ticks with two busy\n",
            vi.corun_both * 100 / vi.corun_busy, vi.corun_busy);
+  if (vi.lookup_direct || vi.lookup_alias)
+    printf("  device lookups: %ld direct (%ld cycles each), %ld through the old map (%ld cycles each)\n",
+           vi.lookup_direct, vi.lookup_direct ? vi.lookup_direct_cyc / vi.lookup_direct : 0,
+           vi.lookup_alias, vi.lookup_alias ? vi.lookup_alias_cyc / vi.lookup_alias : 0);
   printf("  memory: %d chunks split to pages, %d table pages%s%s",
          vi.split_chunks, vi.table_pages,
          (vi.cfg.flags & VMF_NOHUGE) ? ", 4 KB pages only" : "",
@@ -2028,6 +2039,16 @@ main(int argc, char *argv[])
     printf("vm %d: interrupt lines -> %s: %s\n", id, argv[4],
            rv == 0 ? "asked" : rv == -EAGAIN ? "inside an interrupt handler, try again" : strerror(-rv));
     exit(rv == 0 ? 0 : 1);
+  } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "map") == 0) {
+    // `vmm revise VM map alt|default': move the device windows a megabyte up the map (F15, live)
+    int id = must_lookup(argv[2]);
+    uint64 shift = strcmp(argv[4], "alt") == 0 ? 0x100000UL
+                 : strcmp(argv[4], "default") == 0 ? 0 : (uint64)-1;
+    if (shift == (uint64)-1)
+      usage();
+    int rv = vm_ctl(id, VMCTL_REVISE_MAP, shift);
+    printf("vm %d: device map -> %s: %s\n", id, argv[4], rv == 0 ? "asked" : strerror(-rv));
+    exit(rv == 0 ? 0 : 1);
   } else if (argc == 5 && strcmp(cmd, "revise") == 0 && strcmp(argv[3], "intcmap") == 0) {
     // `vmm revise VM intcmap alt|default': move the controller's registers (F2)
     int id = must_lookup(argv[2]);
@@ -2043,10 +2064,13 @@ main(int argc, char *argv[])
     // give a running guest a different kind of interrupt controller
     int id = must_lookup(argv[2]);
     // `vmm revise VM vector' / `novector' take the unit away or give it back
-    if (strcmp(argv[3], "vector") == 0 || strcmp(argv[3], "novector") == 0) {
-      int on = strcmp(argv[3], "vector") == 0;
+    if (strcmp(argv[3], "vector") == 0 || strcmp(argv[3], "novector") == 0 ||
+        strcmp(argv[3], "lazyvector") == 0) {
+      // `lazyvector': taken away now, and given back the moment a task in the
+      // guest asks for it (F12 for a guest that booted with the unit)
+      int on = strcmp(argv[3], "vector") == 0 ? 1 : strcmp(argv[3], "lazyvector") == 0 ? 2 : 0;
       int rv = vm_ctl(id, VMCTL_REVISE_VEC, on);
-      printf("vm %d: vector unit %s: %s\n", id, on ? "granted" : "revoked",
+      printf("vm %d: vector unit %s: %s\n", id, on == 1 ? "granted" : on == 2 ? "revoked until asked for" : "revoked",
              rv == 0 ? "asked" : strerror(-rv));
       exit(rv == 0 ? 0 : 1);
     }

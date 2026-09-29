@@ -1441,6 +1441,129 @@ def t_migrate_cboz(QEMU, cpus, log, legacy, hazard=0):
                 pass
 
 
+LX_START = "-k /Image -r 0x80200000 -m 128 -a console=ttyS0 earlycon=sbi -f /linux.img -c 2 -H"
+
+
+def t_lx_migrate_vector(QEMU, cpus, log, lazy):
+    """L9: the negotiated tier on a production kernel. Host A has a vector
+    unit, host B was built without one; the Linux guest carries patch 0004 and
+    machrev.
+    lazy=0 (snap-lx-migrate-negotiated): a task holds vector state, so the
+    guest refuses to cede and the move is refused with that reason before a
+    page moves; once the task has exited the same command makes B ask, A ask
+    the guest, the guest cede, and the move goes through. On B a program that
+    tries the unit asks for it, B has none, illegal instruction.
+    lazy=1 (snap-lx-migrate-lazy): the unit is taken with `lazyvector' while
+    nobody holds state; the machine crosses to B without being asked (nothing
+    to cede); a program on B asks and is refused; the machine crosses back to
+    A, the same program asks and is granted."""
+    import os
+    import test_hyp_linux as lx
+    tag = "lxv%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, vec=1, fsimg=tag + "-a.img",
+             extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90)
+        a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, vec=0, fsimg=tag + "-b.img",
+                 extra_env={"LINK": link, "LINKSRV": "off"})
+        b.expect(r"init: starting sh", 90)
+        b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
+        run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        a.send("vmm start -n lv %s\n" % LX_START)
+        a.expect(r"vm (\d+) lv: ", 20)
+        a.expect(r"linux# ", 120)
+        out = lx.linux_cmd(a, "vecuser probe; vecuser use 2", 60)
+        if "vecuser: ok" not in out:
+            assert "no vector unit" in out, out
+            g.detach(a)
+            print("    no vector unit on host A: nothing to negotiate")
+            return
+        if not lazy:
+            lx.linux_cmd(a, "vecuser hold 40 &", 10)
+            lx.linux_cmd(a, "sleep 1", 20)
+        g.detach(a)
+
+        def try_move(src, dst, name):
+            dst.send("vmm accept 9000 -d &\n")
+            dst.expect(r"\$ ", 30)
+            run(dst, "sleep 1", 20)
+            o = run(src, "vmm migrate %s 10.7.0.2:9000" % name if dst is b else "vmm migrate %s 10.7.0.1:9000" % name, 600)
+            return "migrated to" in o, o
+
+        if not lazy:
+            moved, out = try_move(a, b, "lv")
+            assert not moved, out
+            b.send("\n"); b.expect(r"\$ ", 30)
+            assert "pre-copy round" not in out, out
+            assert "would not give up" in out and "kept its vector unit" in out, out
+            g.attach(a, "lv"); a.send("\n"); a.expect(r"linux# ", 60)
+            out = lx.linux_cmd(a, "dmesg | grep 'keeping the vector unit' | tail -1", 60)
+            assert "keeping the vector unit, 1 task(s)" in out, out
+            out = lx.linux_cmd(a, "wait; echo VDONE", 120)
+            assert "released" in out and "VDONE" in out, out
+            g.detach(a)
+            moved, out = try_move(a, b, "lv")
+            assert moved, out
+            assert "cede" in out or "cede" in a.buf.decode(errors="replace")[-4000:], out
+            b.expect(r"arrived: 2 vcpu", 120)
+            b.send("\n"); b.expect(r"\$ ", 30)
+            g.attach(b, "lv"); b.send("\n"); b.expect(r"linux# ", 60)
+            out = lx.linux_cmd(b, "dmesg | grep 'machrev: vector' | tail -1; vecuser probe; vecuser use 1; dmesg | grep 'asked the host' | tail -1", 90)
+            assert "vector unit withdrawn" in out and "vecuser: no vector unit" in out and "vecuser: SIGILL" in out, out
+            assert "refused" in out, out
+            g.detach(b)
+            run(b, "vmm kill lv", 60)
+            print("    Linux refused to cede while a task held vector state; ceded and crossed once it did not; on the unit-less host a program asked and was refused")
+            return
+
+        # lazy: taken while nobody holds state, crosses unasked, asks on B (refused) and on A again (granted)
+        vmid_out = run(a, "vmm ls", 30)
+        m = re.search(r"\b(\d+)\s+lv\b", vmid_out) or re.search(r"vm (\d+)", vmid_out)
+        mk = a.mark()
+        out = run(a, "vmm revise lv lazyvector" if not m else "vmm revise %s lazyvector" % m.group(1), 60)
+        assert "asked" in out, out
+        a.consumed = mk                       # the ack may have landed before the prompt
+        a.expect(r"revision \d+ adopted \(0x([0-9a-f]*4)\)", 60)
+        a.consumed = len(a.buf)
+        a.send("\n"); a.expect(r"\$ ", 30)
+        moved, out = try_move(a, b, "lv")
+        assert moved, out
+        assert "cede" not in out, out              # nothing to cede: the description has no unit
+        b.expect(r"arrived: 2 vcpu", 120)
+        b.send("\n"); b.expect(r"\$ ", 30)
+        g.attach(b, "lv"); b.send("\n"); b.expect(r"linux# ", 60)
+        out = lx.linux_cmd(b, "vecuser use 1; dmesg | grep 'asked the host' | tail -1", 90)
+        assert "vecuser: SIGILL" in out and "refused" in out, out
+        g.detach(b)
+        moved, out = try_move(b, a, "lv")
+        assert moved, out
+        a.expect(r"arrived: 2 vcpu", 120)
+        a.send("\n"); a.expect(r"\$ ", 30)
+        g.attach(a, "lv"); a.send("\n"); a.expect(r"linux# ", 60)
+        out = lx.linux_cmd(a, "vecuser use 2; dmesg | grep -E 'machrev: (asked|vector)' | tail -2", 90)
+        assert "vecuser: ok" in out and "vector unit back" in out, out
+        g.detach(a)
+        run(a, "vmm kill lv", 60)
+        print("    Linux's unit taken lazily; it crossed to a unit-less host unasked, a program's ask was refused there and granted back on the host that has one")
+    finally:
+        if b:
+            b.close()
+        a.close()
+        for f in (link, os.path.join(HERE, tag + "-a.img"), os.path.join(HERE, tag + "-b.img")):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
 def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
     """M5: a Linux guest crosses hosts. AXIS "same": two hosts alike, the
     machine simply goes on (uptime continues, its disk is there). AXIS
@@ -1569,7 +1692,13 @@ LX_AXES["mac"] = ("guestmac=alt", r"arrived with nic 52:54:00:78:76:10, this hos
 LX_AXES["hartid"] = ("guesthart=4", r"arrived with harts numbered from 0, this host numbers them from 4",
                      "machrev: cpu 1: hart 1 -> 5", "grep hart /proc/cpuinfo | grep -v isa; ls /sys/class/rtc; mount /dev/vda /mnt && cat /mnt/marker",
                      r"hart\s*:\s*4[\s\S]*hart\s*:\s*5[\s\S]*marker-on-virtio-disk")
-LX_DISK = ("layout", "irq", "hartid", "disk")     # axes whose guest has its disk (the thing that moves)
+LX_AXES["intc"] = ("", r"arrived as plic, this host gives imsic",
+                   "machrev: interrupt controller plic at", "mount /dev/vda /mnt && cat /mnt/marker; dmesg | grep xv6h-vic | tail -1",
+                   r"marker-on-virtio-disk[\s\S]*xv6h-vic: plic -> imsic")
+LX_AXES["intc-addr"] = ("guestintc=alt", r"arrived with its interrupt controller at \+0x0, this host puts",
+                        "machrev: interrupt controller plic at 0x", "mount /dev/vda /mnt && cat /mnt/marker; dmesg | grep 'machrev: interrupt controller' | tail -1",
+                        r"marker-on-virtio-disk[\s\S]*rebound")
+LX_DISK = ("layout", "irq", "hartid", "disk", "intc", "intc-addr")     # axes whose guest has its disk (the thing that moves)
 
 
 LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axis
@@ -1580,7 +1709,7 @@ LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axi
 }
 
 
-def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
+def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
     """M5 across a move, one fact at a time: host B differs from A on one axis
     (a boot word); a Linux with machrev.ko is told on arrival and takes it;
     the guest's own view (nproc, /proc/interrupts, sysfs, meminfo) agrees.
@@ -1588,8 +1717,7 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
     description and serves it with its models; the disk still works."""
     import os
     import test_hyp_linux as lx
-    if name == "intc":       # legacy only: F1 for Linux is the software model
-        assert legacy
+    if name == "intc" and legacy:   # the legacy control: F1 served by the software model
         append, host_msg, dmesg_msg, check, want = "", None, None, None, None
     else:
         append, host_msg, dmesg_msg, check, want = LX_AXES[name]
@@ -1601,12 +1729,12 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
         os.unlink(link)
     except OSError:
         pass
-    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+    a = QEMU(intc=host_intc, cpus=cpus, log=log, fsimg=tag + "-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
     b = None
     try:
         a.expect(r"init: starting sh", 90)
         a.expect(r"\$ ", 30)
-        b = QEMU(intc="imsic" if name == "intc" else "plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
+        b = QEMU(intc="imsic" if name == "intc" else host_intc, cpus=cpus, log=log, fsimg=tag + "-b.img",
                  extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
         b.expect(r"init: starting sh", 90)
         b.expect(r"\$ ", 30)
@@ -1616,8 +1744,9 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0):
         run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
         mb = 128 if name == "ram" else 256
         disk = "/linux.img" if (name in LX_DISK or legacy) else "none"   # the legacy check is the disk
-        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi%s -f %s -c 2 -H\n" % (
-            mb, " machrev=off" if legacy else "", disk))
+        # the participating controller axis needs the description-bound controller (patch 0005, `-V')
+        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi%s -f %s -c 2 -H%s\n" % (
+            mb, " machrev=off" if legacy else "", disk, " -V" if (name in ("intc", "intc-addr") and not legacy) else ""))
         a.expect(r"vm (\d+) la: ", 20)
         a.expect(r"linux# ", 120)
         out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
@@ -1877,6 +2006,9 @@ def tests(modes, cpus, log, QEMU):
         ("snap-migrate-legacy", lambda: t_migrate_legacy(QEMU, cpus, log)),
         # L5: the unit is revealed by use, and a guest that never used it needs no negotiation
         ("snap-migrate-lazy", lambda: t_lazy_vector(QEMU, cpus, log)),
+        # L9: the same two, with Linux (patch 0004 + machrev) as the guest
+        ("snap-lx-migrate-negotiated", lambda: t_lx_migrate_vector(QEMU, cpus, log, 0)),
+        ("snap-lx-migrate-lazy", lambda: t_lx_migrate_vector(QEMU, cpus, log, 1)),
         # the layout axis: devices somewhere else on the destination
         ("snap-migrate-layout", lambda: t_migrate_layout(QEMU, cpus, log, 0)),
         ("snap-migrate-layout-legacy", lambda: t_migrate_layout(QEMU, cpus, log, 1)),
@@ -1925,8 +2057,11 @@ def tests(modes, cpus, log, QEMU):
         ("snap-lx-migrate-hartid-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid", 1)),
         ("snap-lx-migrate-layout-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "layout", 1)),
         ("snap-lx-migrate-irq-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "irq", 1)),
+        ("snap-lx-migrate-intc", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc", 0)),
+        ("snap-lx-migrate-intc-addr", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc-addr", 0)),
         ("snap-lx-migrate-intc-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc", 1)),
         ("snap-lx-migrate-ipi", lambda: t_lx_migrate_axis(QEMU, cpus, log, "ipi")),
+        ("snap-lx-migrate-hartid-imsic", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid", 0, "imsic")),
         ("snap-lx-migrate-disk", lambda: t_lx_migrate_axis(QEMU, cpus, log, "disk")),
         ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),
         ("snap-migrate-console-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["console"], 1)),

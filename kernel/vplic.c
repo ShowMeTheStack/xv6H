@@ -51,7 +51,7 @@ vplic_seip(struct vcpu *v)
   // and the context it had under the previous numbering, while the revision
   // is pending: its enables are still there, and so is the line that tells
   // it about the renumbering (hyp.h vm_vcpu_of_hart)
-  if (vm->hart_alias_on && vm->revise_acked != vm->revise_gen)
+  if (vm->hart_alias_on && vm_revising(vm))
     return best_irq(&vm->plic, 2 * (v->id + vm->hart_alias_shift) + 1) != 0;
   return 0;
 }

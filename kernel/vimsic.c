@@ -121,7 +121,6 @@ vimsic_seip(struct vcpu *v)
 // vstopi only if hvictl names it (IID 9 with a priority), which is what
 // an AIA-aware guest reads to find the interrupt. keep hvip and hvictl
 // together. runs on the vcpu's own hart.
-#define HVICTL_VSEIP ((9L << 16) | (1L << 8) | 1)
 
 static void
 soft_vseip(int on)

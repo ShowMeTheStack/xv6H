@@ -8,8 +8,11 @@
 #
 set -euo pipefail
 WORK=${WORK:-$HOME/xv6h-linux}
-OUT=$WORK/out
 KVER=${KVER:-6.12.41}
+# a second kernel version builds beside the first: TAG=-618 KVER=6.18.54 puts its
+# objects in obj-hf-618 and its artifacts in out-618 (L5: the patches proven on two LTS kernels)
+TAG=${TAG:-}
+OUT=$WORK/out$TAG
 BBVER=${BBVER:-1.37.0}
 CROSS=riscv64-linux-gnu-
 J=$(nproc)
@@ -37,17 +40,28 @@ if [ -d $WORK/src/patches ]; then
   # its own previous version
   for p in $WORK/src/patches/*.patch; do
     [ -f "$p" ] || continue
+    [ -f "$WORK/src/patches/$KVER/$(basename $p)" ] && p="$WORK/src/patches/$KVER/$(basename $p)"
     for f in $(grep -E '^\+\+\+ b/' "$p" | sed 's|^+++ b/||; s|\t.*||'); do
-      tar xf linux-$KVER.tar.xz linux-$KVER/$f 2>/dev/null || log "no pristine $f in the tarball"
+      # a file the patch creates has no pristine copy: it must not be there before the patch runs
+      tar xf linux-$KVER.tar.xz linux-$KVER/$f 2>/dev/null || rm -f linux-$KVER/$f
     done
   done
   for p in $WORK/src/patches/*.patch; do
     [ -f "$p" ] || continue
+    # a kernel version may need its own rendering of a patch (linux/patches/$KVER/):
+    # the same change against that version's source, listed in PATCHES.md
+    [ -f "$WORK/src/patches/$KVER/$(basename $p)" ] && p="$WORK/src/patches/$KVER/$(basename $p)"
     if patch -d linux-$KVER -p1 -N --dry-run -s < "$p" >/dev/null 2>&1; then
       log "applying $(basename $p)"
       patch -d linux-$KVER -p1 -N -s < "$p"
+    elif patch -d linux-$KVER -p1 -R --dry-run -s < "$p" >/dev/null 2>&1; then
+      log "$(basename $p): already applied"
     else
-      log "$(basename $p): already applied (or does not apply)"
+      # a patch that does not apply must stop the build: the kernel would go
+      # out without it, and the module against it would not build -- and the
+      # image would then carry the previous module (lxbuild10/11: a malformed
+      # hunk shipped two stale kernels before anyone noticed)
+      log "$(basename $p) DOES NOT APPLY"; patch -d linux-$KVER -p1 -N --dry-run < "$p" 2>&1 | tail -5; exit 1
     fi
   done
 fi
@@ -90,6 +104,11 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
   if [ -f $WORK/src/zerocheck.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/zerocheck $WORK/src/zerocheck.c || log "zerocheck did not build"
   fi
+  # vecuser: the vector unit from a program's side (F10-F12's consumer). musl,
+  # scalar: the GNU toolchain's glibc (RVA23) uses V in memset before main
+  if [ -f $WORK/src/vecuser.c ]; then
+    ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecuser $WORK/src/vecuser.c || log "vecuser did not build"
+  fi
   mkdir -p $root/proc $root/sys $root/dev $root/etc $root/mnt $root/tmp $root/root
   cat > $root/init <<'INIT'
 #!/bin/sh
@@ -128,7 +147,7 @@ make_initramfs hf $OUT/initramfs-hf.cpio.gz
 
 # ---- kernel ----
 build_kernel() { # $1 = name, $2 = initramfs, $3 = extra config fragment lines
-  local d=obj-$1
+  local d=obj-$1$TAG
   if [ -f $OUT/Image-$1 ] && [ -z "${REBUILD:-}" ]; then return; fi
   log "building kernel $1"
   mkdir -p $d

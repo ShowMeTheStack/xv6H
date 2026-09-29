@@ -712,7 +712,13 @@ machine_revise_check(void)
     if (fresh.has_v) {
       plat.has_v = 1;
       plat.misa = fresh.misa;
+      // vlenb is readable only with the unit enabled; the host no longer
+      // turns VS on for a guest (defect 15: Linux read that as live state), so
+      // this kernel does, for the read (vreg2: kerneltrap on csrr vlenb)
+      uint64 ss = r_sstatus();
+      w_sstatus((ss & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL);
       plat.vlenb = r_vlenb();
+      w_sstatus(ss);
       adopted |= REV_VLEN;
     } else {
       // Which tasks are actually *relying* on the unit? Not the ones with a

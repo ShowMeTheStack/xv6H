@@ -463,8 +463,11 @@ def t_parallel(QEMU, intc, cpus, log, nguests=3, vcpus=2):
             ids.append(vmid)
         print("    %d guests running usertests concurrently" % nguests)
         for i, vmid in enumerate(ids):
-            attach(q, "g%d" % i)
+            # the mark before the attach: the guest's backlog is replayed on
+            # attach, and a verdict already in it was matched by the expect
+            # and missing from `out' (m8x: 14 of 60 guest-parallel jobs)
             m = q.mark()
+            attach(q, "g%d" % i)
             q.expect(r"ALL TESTS PASSED|FAILED|panic", 1500)
             out = q.output_since(m)
             assert "ALL TESTS PASSED" in out, "vm %d: %s" % (vmid, out[-2000:])
@@ -1904,6 +1907,7 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
     t.append(("guest-revise-intc", lambda: t_revise_intc(QEMU, "imsic", cpus, log)))
     t.append(("guest-revise-vector", lambda: t_revise_vector(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-intc-addr", lambda: t_revise_intc_addr(QEMU, "plic", cpus, log)))
+    t.append(("guest-revise-map", lambda: t_revise_map(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-irqmap", lambda: t_revise_irqmap(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-irqmap-imsic", lambda: t_revise_irqmap(QEMU, "imsic", cpus, log)))
     t.append(("guest-revise-sbi", lambda: t_revise_sbi(QEMU, "plic", cpus, log)))
@@ -1928,3 +1932,40 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
     t.append(("guest-smp-on-1-hart-plic", lambda: t_guest_usertests(QEMU, "plic", 1, log, 2)))
     t.append(("guest-parallel-on-4-harts-imsic", lambda: t_parallel(QEMU, "imsic", 4, log, 3, 2)))
     return t
+
+
+def t_revise_map(QEMU, intc, cpus, log):
+    """F15, live: the device windows of a running guest move a megabyte up the
+    map (`vmm revise VM map alt') and back; the guest is told, maps the new
+    windows and repoints its drivers; its disk keeps completing through them
+    and it did not reboot."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 2 -m 64")
+        q.send("echo before-the-move > /keep; sync\n")
+        q.expect(r"\$ ", ATONCE)
+        detach(q)
+        for want, base in (("alt", "0x10101000"), ("default", "0x10001000")):
+            m = q.mark()
+            q.send("vmm revise %d map %s\n" % (vmid, want))
+            q.expect(r"device map -> %s: asked" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert re.search(r"device windows \+0x[0-9a-f]+ -> \+0x[0-9a-f]+", q.output_since(m)), q.output_since(m)
+            wait_adopted(q, m)
+            attach(q, str(vmid))
+            q.expect(r"machine: virtio device moved 0x[0-9a-f]+ -> %s" % base, 60)
+            q.send("\n")
+            q.expect(r"\$ ", 60)
+            mm = q.mark()
+            q.send("cat /keep; echo after-%s > /after; sync; cat /after\n" % want)
+            q.expect(r"before-the-move", 60)
+            q.expect(r"after-%s" % want, 60)
+            q.expect(r"\$ ", ATONCE)
+            assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+            detach(q)
+        out = host_cmd(q, "vmm info %d" % vmid)
+        mm = re.search(r"device lookups: (\d+) direct \((\d+) cycles each\), (\d+) through the old map \((\d+) cycles each\)", out)
+        print("    a running guest followed its devices a megabyte up the map and back; lookups: %s" % (mm.group(0) if mm else out[-200:]))
+        kill_vm(q, vmid)
+    finally:
+        q.close()

@@ -1277,7 +1277,9 @@ cede(struct vm *vm, uint32 arg)
     }
   }
   if (mask & REV_VLEN) {
+    vm->revise_hold++;
     int r = vm_revise_vector(vm, 0);
+    vm->revise_hold--;
     if (r < 0)
       return r;
     // wait for the guest's answer: it acks within milliseconds either way
@@ -2058,6 +2060,17 @@ restore_from(struct src *s, const char *name, int *idp)
       if (plat_bootarg("guestpolicy=cheapest") &&
           !(plat.intc_kind == INTC_IMSIC && vimsic_geilen() > 0))
         target = w->cfg.vic_kind;
+      // Speaking the protocol is not the same as being able to take F1/F2. A
+      // foreign guest (Linux) takes them only with the description-bound
+      // controller (patch 0005, described with `-V'); on the stock drivers it
+      // is bound to the controller it booted with, and a capable Linux crossing
+      // controller kinds would have been given this host's and gone deaf. So:
+      // its own guest always; a foreign one only with the shim.
+      int takes_intc = (w->cfg.flags2 & VMSTATE_F_CAPABLE) &&
+                       (!(w->cfg.cfg.flags & (VMF_FOREIGN | VMF_HSM)) || (w->cfg.cfg.flags & VMF_VICSHIM));
+      if ((w->cfg.flags2 & VMSTATE_F_CAPABLE) && !takes_intc && (src_kind != native || w->cfg.intc_shift != (plat_bootarg("guestintc=alt") ? G_INTC_ALT_SHIFT : 0)))
+        printk("hyp: a Linux arriving as %s at +0x%lx keeps both: its drivers are bound to that controller (no description-bound controller)\n",
+               vic_kindname(src_kind), w->cfg.intc_shift);
       uint64 native_shift = plat_bootarg("guestmap=alt") ? G_MMIO_ALT_SHIFT : 0;
       w->cfg.cfg.flags &= ~(VMF_WANT_MASK | VMF_MMIO_SET);
       // the layout axis, same rule: a guest that cannot be told keeps the map
@@ -2072,11 +2085,12 @@ restore_from(struct src *s, const char *name, int *idp)
       // F2, the same rule for the controller's address
       uint64 native_ishift = plat_bootarg("guestintc=alt") ? G_INTC_ALT_SHIFT : 0;
       w->cfg.cfg.flags &= ~VMF_INTC_SET;
-      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.intc_shift != native_ishift) {
+      if (!takes_intc && w->cfg.intc_shift != native_ishift) {
         w->cfg.cfg.flags |= VMF_INTC_SET;
         w->cfg.cfg.intc_shift = w->cfg.intc_shift;
-        printk("hyp: a machine arriving with its interrupt controller at +0x%lx does not "
-               "speak revision: keeping that address\n", w->cfg.intc_shift);
+        if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE))
+          printk("hyp: a machine arriving with its interrupt controller at +0x%lx does not "
+                 "speak revision: keeping that address\n", w->cfg.intc_shift);
       }
       src_ishift = w->cfg.intc_shift;
       // F3, the same rule for the numbering of the lines
@@ -2184,13 +2198,14 @@ restore_from(struct src *s, const char *name, int *idp)
           printk("hyp: a machine arriving with %u harts running does not speak revision: keeping them\n",
                  w->cfg.cfg.online);
       }
-      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && src_kind != native) {
+      if (!takes_intc && src_kind != native) {
         w->cfg.cfg.flags |= src_kind == VIC_PLIC  ? VMF_WANT_PLIC
                           : src_kind == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
-        printk("hyp: a machine arriving as %s does not speak revision: keeping "
-               "%s on this %s host\n", vic_kindname(src_kind),
-               vic_kindname(src_kind), vic_kindname(native));
-      } else if ((w->cfg.flags2 & VMSTATE_F_CAPABLE) && target != native) {
+        if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE))
+          printk("hyp: a machine arriving as %s does not speak revision: keeping "
+                 "%s on this %s host\n", vic_kindname(src_kind),
+                 vic_kindname(src_kind), vic_kindname(native));
+      } else if (takes_intc && target != native) {
         w->cfg.cfg.flags |= target == VIC_PLIC  ? VMF_WANT_PLIC
                           : target == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
         printk("hyp: a machine arriving as %s: this %s host has no cheaper "
@@ -2346,7 +2361,7 @@ restore_from(struct src *s, const char *name, int *idp)
     vm->vec_revoked = 0;
     vm->vec_ceded = 0;
     for (int i = 0; i < vm->nvcpu; i++)
-      vm->vcpu[i].vsstatus = (vm->vcpu[i].vsstatus & ~SSTATUS_VS_MASK) | SSTATUS_VS_INITIAL;
+      vm->vcpu[i].vsstatus &= ~SSTATUS_VS_MASK;   // Off: the guest turns VS on when a task first uses the unit (Initial written here told Linux a task had live state and no save area)
     release(&vm->lock);
     owed |= REV_VLEN;
     printk("hyp: vm %d: arrived without the vector unit it gave up for the move; this host's is "
@@ -2419,35 +2434,27 @@ restore_from(struct src *s, const char *name, int *idp)
   if (src_kind >= 0 && src_irq_alt != vm->irq_alt) {
     owed |= REV_DEVICES;
     // The controller model arrived with the lines the source's devices were
-    // holding, numbered the source's way; this host's devices sit on other
-    // numbers. A level left on a number nobody here owns is never dropped:
-    // the guest, still on the old numbering, takes the interrupt, finds
-    // nothing at the device, acknowledges, and takes it again -- 265 000
-    // times in twenty seconds on the balloon's line (hunt4b crossing 13),
-    // with the anchor's threaded handler starved behind the storm and the
-    // arrival never acknowledged. That was the one Linux arrival in twenty
-    // (m7lx irq.10, 865 s) and very likely the first version's one in 814.
-    // Move the held levels to this host's numbers, as vm_revise_irqmap does.
+    // holding, numbered the source's way -- the way the guest still knows
+    // them. Until the guest has taken this host's numbering the devices go
+    // on raising on the old numbers (vm_irq's alias); at the acknowledgement
+    // what they hold moves (vm_irq_alias_end). Raising on the new numbers at
+    // once put a device's interrupt on a line the guest had given to another
+    // device: its handler found nothing, returned, was brought again -- an
+    // exit storm with the module's threaded handler starved behind it and the
+    // arrival never acknowledged (hunt4b crossing 13, hunt4d crossing 384;
+    // m7lx irq.10, 865 s; on the same evidence the first version's 1 in 814).
     acquire(&vm->lock);
-    uint64 levels = vm->vic_kind == VIC_PLIC ? vm->plic.level : vm->aplic.level;
-    uint64 moved = 0;
+    vm->irq_alias_on = 1;
+    vm->irq_alias_alt = src_irq_alt;
     for (int i = 0; i < vm->ndev; i++) {
       struct vdev *dd = &vm->dev[i];
-      if (dd->irq0 < 0)
-        continue;
-      if (levels & (1ull << irq_map(src_irq_alt, dd->irq0)))
-        moved |= 1ull << irq_map(vm->irq_alt, dd->irq0);
+      if (dd->irq0 >= 0 && !(dd->irq0 == G_UART_IRQ && VM_FOREIGN(vm)))
+        dd->irq = irq_map(src_irq_alt, dd->irq0);
     }
-    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
-      if (levels & (1ull << irq))
-        vic_set_level(vm, irq, 0);
-    for (int irq = 1; irq < VPLIC_NIRQ; irq++)
-      if (moved & (1ull << irq))
-        vic_set_level(vm, irq, 1);
     release(&vm->lock);
     printk("hyp: vm %d: arrived with its interrupt lines numbered %s, this host numbers "
-           "them %s (%d held line(s) moved)\n", vm->id, src_irq_alt ? "alt" : "default",
-           vm->irq_alt ? "alt" : "default", vic_held(moved));
+           "them %s (the old numbers answer until the ack)\n", vm->id, src_irq_alt ? "alt" : "default",
+           vm->irq_alt ? "alt" : "default");
   }
   if (src_kind >= 0 && src_shift != vm->mmio_shift) {
     owed |= REV_DEVICES;

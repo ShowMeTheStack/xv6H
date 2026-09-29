@@ -139,23 +139,140 @@ vm_del_dev(struct vm *vm, const char *name)
   }
 }
 
-static struct vdev *
-find_dev(struct vm *vm, uint64 gpa)
+// The outgoing controller's window, kept until the acknowledgement. A guest
+// stopped in the middle of an interrupt handler and moved to a host of
+// another controller kind completes the interrupt on the controller it was
+// bound to, which is gone: hunt2c crossing 570, an xv6 guest at
+// aplic_complete() storing to 0xd002000 on a PLIC host, a store access fault,
+// a panic, and the arrival never acknowledged -- Theorem 1's excluded case,
+// met at a migration stop rather than a live exchange, and on the same
+// evidence the first version's one arrival in 814. The old names keep
+// answering: a ghost reads as zero and takes writes without effect, and the
+// interrupt the guest was completing is re-delivered through the new
+// controller when it re-enables the line, which a level-triggered handler
+// takes without harm.
+static int
+ghost_read(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 *val)
+{
+  *val = 0;
+  return 0;
+}
+
+static int
+ghost_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
+{
+  return 0;
+}
+
+void
+vm_ghost_dev(struct vm *vm, const char *name)
 {
   for (int i = 0; i < vm->ndev; i++) {
     struct vdev *d = &vm->dev[i];
-    if (gpa >= d->base && gpa < d->base + d->size)
+    if (d->name == 0 || strncmp(d->name, name, 12) != 0)
+      continue;
+    d->ghost = 1;
+    d->read = ghost_read;
+    d->write = ghost_write;
+    d->irq = d->irq0 = -1;
+  }
+}
+
+void
+vm_del_ghosts(struct vm *vm)
+{
+  for (int i = 0; i < vm->ndev; i++) {
+    if (!vm->dev[i].ghost)
+      continue;
+    for (int j = i; j + 1 < vm->ndev; j++)
+      vm->dev[j] = vm->dev[j + 1];
+    vm->ndev--;
+    memset(&vm->dev[vm->ndev], 0, sizeof(vm->dev[0]));
+    i--;
+  }
+}
+
+static struct vdev *find_dev_(struct vm *vm, uint64 gpa, int *aliased, uint64 *tgpa);
+
+// L20: the alias invariant's cost is a second lookup on a miss; count both
+// kinds and their cycles so `vmm info' can say what it is
+static struct vdev *
+find_dev(struct vm *vm, uint64 gpa, uint64 *tgpa)
+{
+  // One map, not half of two. A revision moves the windows on another hart
+  // while this one looks a device up without the lock (every MMIO exit comes
+  // through here); a lookup that saw a base moved and a shift not yet moved
+  // found no window, or the wrong register (alias1000 under two kernel builds:
+  // 13 wrong reads in 1 250 revisions, 4 of them "load to unmapped gpa" on a
+  // window that was there). So the lookup, and the translation of an aliased
+  // address, are one snapshot: retried while the map is being moved or has
+  // moved under them (hyp.h map_seq).
+  int aliased = 0;
+  uint64 c0 = r_cycle();
+  struct vdev *d;
+  uint32 seq;
+  do {
+    while ((seq = vm->map_seq) & 1)
+      ;
+    __sync_synchronize();
+    aliased = 0;
+    *tgpa = gpa;
+    d = find_dev_(vm, gpa, &aliased, tgpa);
+    __sync_synchronize();
+  } while (seq != vm->map_seq);
+  uint64 dc = r_cycle() - c0;
+  if (aliased) {
+    vm->lookup_alias++;
+    vm->lookup_alias_cyc += dc;
+  } else {
+    vm->lookup_direct++;
+    vm->lookup_direct_cyc += dc;
+  }
+  return d;
+}
+
+static struct vdev *
+find_dev_(struct vm *vm, uint64 gpa, int *aliased, uint64 *tgpa)
+{
+  // the live models first; a ghost only where nothing live answers (the
+  // PLIC and the APLIC's M domain share 0x0c000000)
+  for (int i = 0; i < vm->ndev; i++) {
+    struct vdev *d = &vm->dev[i];
+    if (!d->ghost && gpa >= d->base && gpa < d->base + d->size)
+      return d;
+  }
+  for (int i = 0; i < vm->ndev; i++) {
+    struct vdev *d = &vm->dev[i];
+    if (d->ghost && gpa >= d->base && gpa < d->base + d->size)
       return d;
   }
   // F15: the old device map, honoured until the guest has taken the new one
   // (hyp.h alias_shift). The virtio windows are the ones that move.
-  if (vm->alias_on && vm->revise_acked != vm->revise_gen &&
+  int pending = vm_revising(vm);
+  // F2: the controller's old window, the same way
+  if (vm->intc_alias_on && pending && vm->intc_alias_shift != vm->intc_shift) {
+    for (int i = 0; i < vm->ndev; i++) {
+      struct vdev *d = &vm->dev[i];
+      if (d->obs != OBS_INTC || d->ghost)
+        continue;
+      uint64 ob = d->base - vm->intc_shift + vm->intc_alias_shift;
+      if (gpa >= ob && gpa < ob + d->size) {
+        *aliased = 1;
+        *tgpa = gpa - vm->intc_alias_shift + vm->intc_shift;
+        return d;
+      }
+    }
+  }
+  if (vm->alias_on && pending &&
       gpa >= G_VIRTIO_BASE + vm->alias_shift && gpa < G_CON_BASE + 0x1000 + vm->alias_shift) {
     uint64 moved = gpa - vm->alias_shift + vm->mmio_shift;
     for (int i = 0; i < vm->ndev; i++) {
       struct vdev *d = &vm->dev[i];
-      if (moved >= d->base && moved < d->base + d->size)
+      if (moved >= d->base && moved < d->base + d->size) {
+        *aliased = 1;
+        *tgpa = moved;
         return d;
+      }
     }
   }
   return 0;
@@ -175,7 +292,8 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
     return 0;
   }
 
-  struct vdev *d = find_dev(vm, gpa);
+  uint64 tgpa;
+  struct vdev *d = find_dev(vm, gpa, &tgpa);
   if (d == 0) {
     if (vm_gripe(&vm->g_fault))
       printk("hyp: vm %d vcpu %d: %s to unmapped gpa 0x%lx at pc 0x%lx (%ld times)\n",
@@ -184,8 +302,7 @@ hyp_mmio(struct vcpu *v, uint64 gpa, int is_store, uint32 inst)
     return 0;
   }
 
-  if (gpa < d->base || gpa >= d->base + d->size)
-    gpa = gpa - vm->alias_shift + vm->mmio_shift;   // reached through the old map (F15 alias)
+  gpa = tgpa;                     // reached through an old map (the F15 or the F2 alias): translated in the same snapshot
   uint64 off = gpa - d->base;
   int rc;
   // which device a guest's exits go to is the thing that says what to

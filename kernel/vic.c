@@ -103,11 +103,14 @@ vic_levels_restore(struct vm *vm, uint64 levels)
   // the outgoing controller's device models first, or they alias the incoming
   // ones (PLIC and APLIC-M both live at 0x0c000000) and the guest goes on
   // talking to the one it is leaving
-  vm_del_dev(vm, "plic");
-  vm_del_dev(vm, "aplic-m");
-  vm_del_dev(vm, "aplic-s");
-  vm_del_dev(vm, "imsic-m");
-  vm_del_dev(vm, "imsic-s");
+  // ... kept as ghosts until the guest has acknowledged (hypmmio.c): a
+  // stale ghost from an exchange the guest never acknowledged goes first
+  vm_del_ghosts(vm);
+  vm_ghost_dev(vm, "plic");
+  vm_ghost_dev(vm, "aplic-m");
+  vm_ghost_dev(vm, "aplic-s");
+  vm_ghost_dev(vm, "imsic-m");
+  vm_ghost_dev(vm, "imsic-s");
   vic_init(vm);
   for (int irq = 1; irq < VPLIC_NIRQ; irq++)
     if (levels & (1ull << irq))
@@ -126,6 +129,26 @@ vic_set_level(struct vm *vm, int irq, int level)
   // an interrupt costs the guest four exits to take.
   if (level && irq >= 0 && irq < VPLIC_NIRQ)
     vm->irq_raised[irq]++;
+  // The quiet window (F3). While the guest is taking a renumbering -- it has
+  // read the description and not yet acknowledged -- the two sides disagree on
+  // the numbers: the host still raises on the old ones, the guest is moving
+  // its handlers to the new ones, one device at a time. Where a device's old
+  // number is another device's new one, an interrupt raised then runs the
+  // wrong handler, which finds nothing, and the line is raised again: a storm
+  // (hunt4g crossing 11: 1.65 M exits, CPU 0 stalled, the RTC never
+  // re-registered, the ack never sent). Invariant 4 cannot serve both values
+  // of a line; so it serves neither: the level is held here and raised on the
+  // new number at the ack (vm_irq_alias_end). The anchor's own line and a
+  // foreign guest's pinned console line are not renumbered and go through.
+  if (vm->irq_quiet && irq > 0 && irq < VPLIC_NIRQ && irq != G_MACHREV_IRQ &&
+      !(irq == G_UART_IRQ && VM_FOREIGN(vm))) {
+    if (level) {
+      vm->quiet_set |= 1ull << irq;
+      vm->irq_quiet_held++;
+      return;
+    }
+    vm->quiet_set &= ~(1ull << irq);
+  }
   switch (vm->vic_kind) {
   case VIC_PLIC:
     vplic_set_level(vm, irq, level);

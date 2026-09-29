@@ -1,0 +1,168 @@
+xv6H patch 0004: the vector unit as a revisable fact (F10 withdrawn, F11 another
+width, F12 asked for on first use). riscv_v_revise(present) cedes the unit when no
+task holds vector state and refuses with the count while one does; withdrawn, no
+task may start on it (first-use trap, prctl, hwprobe, the kernel's own user-copy
+fast path), and a task that tries asks the machine through riscv_v_request_hook
+(the machrev driver) before it gets its illegal instruction. Given back, the
+save-area size follows the width the hart reports. has_vector() itself is patched
+into the text at boot and is not touched: a unit absent at boot stays absent.
+
+--- a/arch/riscv/kernel/vector.c
++++ b/arch/riscv/kernel/vector.c
+@@ -29,6 +29,76 @@
+ unsigned long riscv_v_vsize __read_mostly;
+ EXPORT_SYMBOL_GPL(riscv_v_vsize);
+ 
++/*
++ * xv6H: the vector unit is a revisable fact of the machine. A unit present at
++ * boot may be withdrawn -- the hypervisor asks, and this kernel cedes it when
++ * no task holds vector state, refuses while one does -- and given back, with
++ * this or another width. has_vector() is patched into the text at boot and
++ * cannot follow; this flag does, at every point where a task or the kernel
++ * would begin to use the unit. A task that meets the withdrawn unit asks the
++ * machine for it through the hook (the machrev driver), and gets it back or
++ * an illegal instruction.
++ */
++bool riscv_v_withdrawn;
++EXPORT_SYMBOL_GPL(riscv_v_withdrawn);
++int (*riscv_v_request_hook)(void);
++EXPORT_SYMBOL_GPL(riscv_v_request_hook);
++#ifdef CONFIG_RISCV_ISA_V_UCOPY_THRESHOLD
++extern size_t riscv_v_usercopy_threshold;	/* arch/riscv/lib/riscv_v_helpers.c */
++#endif
++
++int riscv_v_revise(bool present)
++{
++	struct task_struct *g, *t;
++	int held = 0;
++
++	if (!has_vector())
++		return -ENODEV;
++	if (!present) {
++		if (READ_ONCE(riscv_v_withdrawn))
++			return 0;
++		/* the flag first, so no task allocates state behind the walk */
++		WRITE_ONCE(riscv_v_withdrawn, true);
++		read_lock(&tasklist_lock);
++		for_each_process_thread(g, t)
++			if (t->thread.vstate.datap)
++				held++;
++		read_unlock(&tasklist_lock);
++		if (held) {
++			WRITE_ONCE(riscv_v_withdrawn, false);
++			return held;	/* the register file is state: not ours to give away */
++		}
++#ifdef CONFIG_RISCV_ISA_V_UCOPY_THRESHOLD
++		riscv_v_usercopy_threshold = SIZE_MAX;	/* the kernel's own use stops too */
++#endif
++		pr_info("riscv: vector unit withdrawn (no task held state)\n");
++		return 0;
++	}
++	/* back, with the width this hart reports now (F11): the save area is sized to it */
++	{
++		unsigned long vsize;
++
++		riscv_v_enable();
++		vsize = csr_read(CSR_VLENB) * 32;
++		riscv_v_disable();
++		if (vsize != riscv_v_vsize) {
++			struct kmem_cache *c = kmem_cache_create_usercopy("riscv_vector_ctx", vsize, 16,
++									  SLAB_PANIC, 0, vsize, NULL);
++			pr_info("riscv: vector unit back with vlenb %lu (was %lu): save areas re-sized\n",
++				vsize / 32, riscv_v_vsize / 32);
++			riscv_v_user_cachep = c;	/* the old cache holds no object: nobody had state */
++			riscv_v_vsize = vsize;
++		} else
++			pr_info("riscv: vector unit back, vlenb %lu\n", vsize / 32);
++	}
++#ifdef CONFIG_RISCV_ISA_V_UCOPY_THRESHOLD
++	riscv_v_usercopy_threshold = CONFIG_RISCV_ISA_V_UCOPY_THRESHOLD;
++#endif
++	WRITE_ONCE(riscv_v_withdrawn, false);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(riscv_v_revise);
++
+ int riscv_v_setup_vsize(void)
+ {
+ 	unsigned long this_vsize;
+@@ -164,6 +234,8 @@
+ 
+ bool riscv_v_vstate_ctrl_user_allowed(void)
+ {
++	if (READ_ONCE(riscv_v_withdrawn))	/* xv6H: no task may start on a unit the machine took back */
++		return false;
+ 	return riscv_v_ctrl_get_cur(current) == PR_RISCV_V_VSTATE_CTRL_ON;
+ }
+ EXPORT_SYMBOL_GPL(riscv_v_vstate_ctrl_user_allowed);
+@@ -176,6 +248,18 @@
+ 	if (!has_vector())
+ 		return false;
+ 
++	/*
++	 * xv6H: the unit is withdrawn. A task that wants it asks the machine for
++	 * it back (F12: a unit revealed by use); the hook returns once the
++	 * revision that brings it back has been taken, or with the refusal.
++	 */
++	if (READ_ONCE(riscv_v_withdrawn)) {
++		int (*ask)(void) = READ_ONCE(riscv_v_request_hook);
++
++		if (!ask || ask() != 0)
++			return false;	/* refused, or nobody to ask: an illegal instruction */
++	}
++
+ 	/* Do not handle if V is not supported, or disabled */
+ 	if (!riscv_v_vstate_ctrl_user_allowed())
+ 		return false;
+@@ -264,6 +348,8 @@
+ 
+ 		break;
+ 	case PR_RISCV_V_VSTATE_CTRL_ON:
++		if (READ_ONCE(riscv_v_withdrawn))	/* xv6H */
++			return -EBUSY;
+ 		break;
+ 	case PR_RISCV_V_VSTATE_CTRL_DEFAULT:
+ 		cur = riscv_v_ctrl_get_cur(current);
+--- a/arch/riscv/include/asm/vector.h
++++ b/arch/riscv/include/asm/vector.h
+@@ -20,6 +20,9 @@
+ #include <asm/asm.h>
+ 
+ extern unsigned long riscv_v_vsize;
++extern bool riscv_v_withdrawn;			/* xv6H: the unit is a revisable fact (patch 0004) */
++extern int (*riscv_v_request_hook)(void);
++int riscv_v_revise(bool present);
+ int riscv_v_setup_vsize(void);
+ bool riscv_v_first_use_handler(struct pt_regs *regs);
+ void kernel_vector_begin(void);
+@@ -271,6 +274,8 @@
+ static inline bool riscv_v_first_use_handler(struct pt_regs *regs) { return false; }
+ static inline bool riscv_v_vstate_query(struct pt_regs *regs) { return false; }
+ static inline bool riscv_v_vstate_ctrl_user_allowed(void) { return false; }
++static inline int riscv_v_revise(bool present) { return -ENODEV; }
++#define riscv_v_withdrawn (false)
+ #define riscv_v_vsize (0)
+ #define riscv_v_vstate_discard(regs)		do {} while (0)
+ #define riscv_v_vstate_save(vstate, regs)	do {} while (0)
+--- a/arch/riscv/kernel/sys_hwprobe.c
++++ b/arch/riscv/kernel/sys_hwprobe.c
+@@ -71,8 +71,8 @@
+ 	if (riscv_isa_extension_available(NULL, c))
+ 		pair->value |= RISCV_HWPROBE_IMA_C;
+ 
+-	if (has_vector() && riscv_isa_extension_available(NULL, v))
+-		pair->value |= RISCV_HWPROBE_IMA_V;
++	if (has_vector() && riscv_isa_extension_available(NULL, v) && !READ_ONCE(riscv_v_withdrawn))
++		pair->value |= RISCV_HWPROBE_IMA_V;	/* xv6H: not while the machine has it back */
+ 
+ 	/*
+ 	 * Loop through and record extensions that 1) anyone has, and 2) anyone
+@@ -123,7 +123,7 @@
+ 		 * All the following extensions must depend on the kernel
+ 		 * support of V.
+ 		 */
+-		if (has_vector()) {
++		if (has_vector() && !READ_ONCE(riscv_v_withdrawn)) {
+ 			EXT_KEY(ZVBB);
+ 			EXT_KEY(ZVBC);
+ 			EXT_KEY(ZVE32F);

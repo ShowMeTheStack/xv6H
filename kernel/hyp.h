@@ -22,6 +22,7 @@
 #define CSR_HGATP      0x680
 #define CSR_HGEIP      0xe12
 #define CSR_HVICTL     0x609
+#define HVICTL_VSEIP   ((9L << 16) | (1L << 8) | 1)   // name the external interrupt in vstopi: IID 9, IPRIOM, priority 1 (vimsic.c, hyp.c entry)
 #define CSR_VSSTATUS   0x200
 #define CSR_VSIE       0x204
 #define CSR_VSTVEC     0x205
@@ -161,6 +162,7 @@ struct vdev {
   int irq0;              // the same in the default numbering (F3: vm_irq(vm, irq0) == irq)
   uint32 obs;            // the observation a first access to it implies
   uint64 loads, stores;  // and how many of each
+  int ghost;             // the outgoing controller's window, answering (nothing) until the ack (Invariant 4, F1)
 };
 #define VM_MAXDEV 16
 
@@ -379,6 +381,7 @@ struct vcpu {
   struct vm *vm;
   int id;
   struct proc *p;         // host process running this vcpu (0 if none)
+  int vs_force;          // F10: a VS-field change for a vcpu that was running when it was made (applied at its exit)
   volatile int running_hart; // hart currently executing the guest, or -1
   volatile int idle;      // sleeping in wfi
   int priv;               // 1 = VS, 0 = VU (for entry)
@@ -587,6 +590,14 @@ struct vm {
   uint32 revise_described; // the generation the guest last asked describe() for
   int revise_wd_printed;   // the watchdog's line, once per generation
   uint64 corun_busy, corun_both; // L6: ticks with >=2 vcpus busy; of those, >=2 on a hart together
+  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // L20: device lookups and their cost
+  uint64 request_at, requests_refused;  // L21: fid 5 rate limit
+  int irq_alias_on, irq_alias_alt;      // F3 alias: devices raise on the numbering the guest still has, until the ack
+  int irq_quiet; uint64 quiet_set; uint64 irq_quiet_held;
+  volatile uint32 map_seq;              // odd while the device map is being moved (hypmmio.c find_dev retries: a lookup must see one map, not half of two)      // the quiet window: from describe() to ack() a renumbering machine's device
+                                        // lines are held here (by their old number) and raised on the new ones at the ack
+  volatile int revise_hold;             // a revision is being made: its facts are set, its generation not yet bumped (syshyp.c vmctl)
+  int intc_alias_on; uint64 intc_alias_shift;   // F2 alias: the controller's old window answers until the ack
 
   // what this guest has observed about its machine (OBS_*), and the host tick
   // at which each fact was first observed. See vm_observe().
@@ -674,7 +685,21 @@ int vm_seip(struct vcpu *v);
 void hyp_stats(uint64 *out, int n);
 int vm_gripe(uint64 *count);  // should this complaint about a guest be printed?
 int irq_map(int alt, int irq);   // a line number under the alternative numbering (F3)
+int vm_revise_map(struct vm *vm, uint64 shift);   // F15, live (hyp.c)
+void vm_irq_alias_end(struct vm *vm);
+int vm_irq_described(struct vm *vm, int irq);   // the number in the description (fdtgen), not the one raised on
+// Is a revision pending -- asked and not yet acknowledged, or being made this
+// moment? Every model that serves an old fact alongside a new one (the device
+// windows, the controller window, the interrupt numbering, the hart numbers,
+// the cache block) asks this, never the generation alone: the facts change
+// before the generation is bumped, and in that gap a check of the generation
+// said "nothing pending" while the guest still had the old fact (alias1: 38
+// wrong reads through the old map; alias2/3: 8 half-zeroed pages in 2 253,
+// cbo.zero run in hardware at 64 bytes against a guest striding 128).
+static inline int vm_revising(struct vm *vm) { return vm->revise_hold || vm->revise_acked != vm->revise_gen; }              // F3: the ack (hyp.c), vm->lock held
 void cons_set_attached(struct vm *vm, int on);   // vuart.c: console ownership
+void vm_ghost_dev(struct vm *vm, const char *name);   // hypmmio.c: keep a model's window, as a ghost
+void vm_del_ghosts(struct vm *vm);                    // hypmmio.c: the ack came
 void printk_flush_held(void);                    // printk.c: let held host lines out
 extern volatile int cons_owned;
 

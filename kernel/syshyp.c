@@ -230,6 +230,8 @@ sys_vm_destroy(void)
   return vm_destroy(vm);
 }
 
+static int vmctl_op(struct vm *vm, int op, uint64 arg);
+
 uint64
 sys_vm_ctl(void)
 {
@@ -246,6 +248,18 @@ sys_vm_ctl(void)
   struct vm *vm = vm_arg(vmid, &err);
   if (err)
     return err;
+  // every revision sets its facts first and bumps the generation after (the
+  // description is built from the new facts); the hold makes the models treat
+  // the gap as pending too (hyp.h vm_revising)
+  vm->revise_hold++;
+  int r = vmctl_op(vm, op, arg);
+  vm->revise_hold--;
+  return r;
+}
+
+static int
+vmctl_op(struct vm *vm, int op, uint64 arg)
+{
   switch (op) {
   case VMCTL_PAUSE:
     return vm_pause(vm);
@@ -258,9 +272,15 @@ sys_vm_ctl(void)
   case VMCTL_REVISE_INTC:
     return vm_revise_intc(vm, (int)arg);
   case VMCTL_REVISE_VEC:
+    if (arg == 2) {                 // `lazyvector' (F12 for a guest with a unit): away now, back when a task asks
+      vm->lazy_v = 1;
+      return vm_revise_vector(vm, 0);
+    }
     return vm_revise_vector(vm, (int)arg);
   case VMCTL_REVISE_INTCMAP:
     return vm_revise_intc_addr(vm, arg);
+  case VMCTL_REVISE_MAP:
+    return vm_revise_map(vm, arg);
   case VMCTL_REVISE_IRQMAP:
     return vm_revise_irqmap(vm, (int)arg);
   case VMCTL_IMSIC_HW:
@@ -404,8 +424,14 @@ sys_vm_info(void)
     info.revise_capable = vm->revise_capable;
     info.revise_gen = vm->revise_gen;
     info.revise_repeats = vm->revise_repeats;
+    info.irq_quiet_held = (uint32)vm->irq_quiet_held;
+    info.aplic_ie = vm->aplic.domaincfg[1] & 0x100; info.aplic_en = vm->aplic.enable; info.aplic_pend = vm->aplic.pending;
+    info.aplic_lvl = vm->aplic.level; info.aplic_idel0 = vm->aplic.idelivery[0]; info.aplic_idel1 = vm->aplic.idelivery[1];
+    info.aplic_tgt10 = vm->aplic.target[10];
     info.corun_busy = vm->corun_busy;
     info.corun_both = vm->corun_both;
+    info.lookup_direct = vm->lookup_direct; info.lookup_direct_cyc = vm->lookup_direct_cyc;
+    info.lookup_alias = vm->lookup_alias; info.lookup_alias_cyc = vm->lookup_alias_cyc;
     info.cfg = vm->cfg;
     info.entry = vm->entry;
     info.cboz_soft = hyp_cboz_exits;

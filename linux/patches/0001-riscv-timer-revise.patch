@@ -80,6 +80,7 @@
  static int __init riscv_timer_init_common(void)
  {
  	int error;
+
 --- a/arch/riscv/kernel/time.c	2026-09-27 22:59:20
 +++ b/arch/riscv/kernel/time.c	2026-09-27 22:59:20
 @@ -14,7 +14,7 @@
@@ -91,6 +92,7 @@
  EXPORT_SYMBOL_GPL(riscv_timebase);
  
  void __init time_init(void)
+
 --- a/kernel/time/sched_clock.c
 +++ b/kernel/time/sched_clock.c
 @@ -234,6 +234,53 @@
@@ -147,6 +149,7 @@
  void __init generic_sched_clock_init(void)
  {
  	/*
+
 --- a/include/linux/sched_clock.h
 +++ b/include/linux/sched_clock.h
 @@ -40,6 +40,7 @@
@@ -168,6 +171,7 @@
  #endif
  
  #endif
+
 --- a/kernel/time/timekeeping.c
 +++ b/kernel/time/timekeeping.c
 @@ -1539,6 +1539,22 @@
@@ -193,6 +197,7 @@
  /**
   * ktime_get_raw_ts64 - Returns the raw monotonic time in a timespec
   * @ts:		pointer to the timespec64 to be set
+
 --- a/include/linux/clocksource.h
 +++ b/include/linux/clocksource.h
 @@ -276,6 +276,7 @@

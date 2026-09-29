@@ -241,7 +241,10 @@ hyp_illegal(struct vcpu *v, uint32 inst)
     vm_observe(v->vm, OBS_VECTOR_USED);
     printk("hyp: vm %d: first vector instruction (0x%x): granting the unit\n",
            v->vm->id, inst);
-    if (vm_revise_vector(v->vm, 1) == 0)
+    v->vm->revise_hold++;
+    int r = vm_revise_vector(v->vm, 1);
+    v->vm->revise_hold--;
+    if (r == 0)
       return 0;                     // pc unchanged: re-execute after adoption
   }
   // not ours: the guest gets it as an illegal instruction exception.
@@ -289,7 +292,7 @@ hyp_virtinst(struct vcpu *v, uint32 inst)
   if ((inst & 0xfff07fff) == 0x0040200f) {
     struct vm *vm = v->vm;
     int n = vm->cboz_block;
-    if (vm->revise_acked != vm->revise_gen && vm->cboz_prev > n)
+    if (vm_revising(vm) && vm->cboz_prev > n)
       n = vm->cboz_prev;   // a revision between two sizes is pending: the larger
     uint64 va = v->regs[(inst >> 15) & 31];
     uint64 gva = va & ~((uint64)n - 1);

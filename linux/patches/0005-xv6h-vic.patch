@@ -1,0 +1,572 @@
+xv6H patch 0005: a description-bound root interrupt controller (F1 the controller's
+kind, F2 its address; L2). drivers/irqchip/irq-xv6h-vic.c: one flat irq domain that
+every device line of the machine hangs from, with a PLIC, APLIC-direct or
+APLIC-MSI+IMSIC backend chosen from the description (compatible "xv6h,vic",
+property xv6h,kind) and re-chosen by xv6h_vic_rebind() when the machrev driver reads
+a revised description; every line's enable, type and cpu are re-applied from the
+driver's own records on every hart. IPIs stay the kernel's SBI IPIs, the timer stays
+Sstc or SBI, so the channel a revision arrives on is independent of the controller.
+
+--- a/drivers/irqchip/Kconfig
++++ b/drivers/irqchip/Kconfig
+@@ -595,6 +595,18 @@
+ 	select IRQ_DOMAIN_HIERARCHY
+ 	select GENERIC_IRQ_EFFECTIVE_AFF_MASK if SMP
+ 
++config XV6H_VIC
++	bool "xv6H description-bound interrupt controller"
++	depends on RISCV
++	default y
++	select IRQ_DOMAIN_HIERARCHY
++	select GENERIC_IRQ_EFFECTIVE_AFF_MASK if SMP
++	help
++	  A root interrupt controller for a guest of the xv6H hypervisor whose
++	  controller -- a PLIC, an APLIC, or an APLIC with IMSICs -- and its
++	  address are facts of a revisable machine description. One irq domain,
++	  the backend chosen from the description and re-chosen when it changes.
++
+ config STARFIVE_JH8100_INTC
+ 	bool "StarFive JH8100 External Interrupt Controller"
+ 	depends on ARCH_STARFIVE || COMPILE_TEST
+--- a/drivers/irqchip/Makefile
++++ b/drivers/irqchip/Makefile
+@@ -100,6 +100,7 @@
+ obj-$(CONFIG_RISCV_APLIC_MSI)		+= irq-riscv-aplic-msi.o
+ obj-$(CONFIG_RISCV_IMSIC)		+= irq-riscv-imsic-state.o irq-riscv-imsic-early.o irq-riscv-imsic-platform.o
+ obj-$(CONFIG_SIFIVE_PLIC)		+= irq-sifive-plic.o
++obj-$(CONFIG_XV6H_VIC)			+= irq-xv6h-vic.o
+ obj-$(CONFIG_STARFIVE_JH8100_INTC)	+= irq-starfive-jh8100-intc.o
+ obj-$(CONFIG_IMX_IRQSTEER)		+= irq-imx-irqsteer.o
+ obj-$(CONFIG_IMX_INTMUX)		+= irq-imx-intmux.o
+--- /dev/null
++++ b/drivers/irqchip/irq-xv6h-vic.c
+@@ -0,0 +1,501 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * xv6H: a description-bound root interrupt controller (L2, patch 0005).
++ *
++ * A Linux guest of xv6H is told, through its machine description, which
++ * interrupt controller it has -- a PLIC, an APLIC in direct mode, or an APLIC
++ * in MSI mode with an IMSIC per hart -- and where. The kernel's own drivers
++ * bind one of them at boot and cannot be replaced under running drivers;
++ * that is why the paper's F1 (the controller's kind) and F2 (its address)
++ * were "two facts Linux cannot take". This driver takes them. It is one flat
++ * irq domain, the parent of every device line the machine has, with a backend
++ * chosen from the description and re-chosen when the description changes:
++ * the machrev driver calls xv6h_vic_rebind() with the new kind and window,
++ * the backend is brought up empty, every line's enable, priority and cpu are
++ * re-applied from this driver's own records, on every hart, and the guest
++ * acknowledges. Interrupts raised in the meantime are the host's business
++ * (the old window answers as a ghost until the acknowledgement; a line held
++ * asserted is re-asserted by the new model -- Theorem 1).
++ *
++ * The structure is xv6H's own intc.c: one interface, three backends. IPIs are
++ * not this driver's: the kernel's SBI IPIs are used whatever the controller
++ * (the description does not carry riscv,imsics nodes, so the kernel's IMSIC
++ * driver is not probed), and the timer is Sstc or SBI -- the channel a
++ * revision arrives on passes through nothing this driver changes (Theorem 2).
++ */
++#include <linux/bitops.h>
++#include <linux/cpu.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/irqchip.h>
++#include <linux/irqchip/chained_irq.h>
++#include <linux/irqdomain.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/smp.h>
++#include <linux/spinlock.h>
++#include <linux/irqchip/xv6h-vic.h>
++#include <asm/csr.h>
++#include <asm/smp.h>
++
++#define VIC_NR_IRQS		64
++
++/* PLIC: xv6H's model is the SiFive layout; the supervisor context of hart h is 2h+1 */
++#define PLIC_PRIORITY(irq)	(0x0000 + (irq) * 4)
++#define PLIC_ENABLE(ctx)	(0x2000 + (ctx) * 0x80)
++#define PLIC_CONTEXT(ctx)	(0x200000 + (ctx) * 0x1000)
++#define PLIC_THRESHOLD		0x0
++#define PLIC_CLAIM		0x4
++#define PLIC_SCTX(hart)		(2 * (hart) + 1)
++
++/* APLIC, supervisor domain */
++#define APLIC_DOMAINCFG		0x0000
++#define APLIC_DOMAINCFG_DM	BIT(2)
++#define APLIC_DOMAINCFG_IE	BIT(8)
++#define APLIC_SOURCECFG(i)	(0x0004 + ((i) - 1) * 4)
++#define APLIC_SM_LEVEL1		6
++#define APLIC_SM_EDGE1		4
++#define APLIC_SETIENUM		0x1EDC
++#define APLIC_CLRIENUM		0x1FDC
++#define APLIC_SETIPNUM_LE	0x2000
++#define APLIC_TARGET(i)		(0x3004 + ((i) - 1) * 4)
++#define APLIC_IDC(hart)		(0x4000 + (hart) * 32)
++#define APLIC_IDC_IDELIVERY	0x00
++#define APLIC_IDC_ITHRESHOLD	0x08
++#define APLIC_IDC_CLAIMI	0x1C
++
++/* IMSIC, the supervisor interrupt file of this hart, through siselect/sireg */
++#define VIC_EIDELIVERY		0x70
++#define VIC_EITHRESHOLD		0x72
++#define VIC_EIE0		0xC0
++
++enum vic_kind { VIC_PLIC = 0, VIC_APLIC = 1, VIC_IMSIC = 2 };
++static const char *const vic_kind_name[] = { "plic", "aplic", "imsic" };
++
++struct vic {
++	enum vic_kind kind;
++	void __iomem *regs;		/* the PLIC, or the APLIC's supervisor domain */
++	phys_addr_t base;
++	resource_size_t size;
++	struct irq_domain *domain;
++	struct fwnode_handle *fwnode;
++	int parent_irq;			/* this hart's S-mode external interrupt, whatever the controller */
++	raw_spinlock_t lock;
++	/* what the kernel asked of its lines, independent of the controller: re-applied on a rebind */
++	bool mapped[VIC_NR_IRQS];
++	bool enabled[VIC_NR_IRQS];
++	bool edge[VIC_NR_IRQS];
++	int cpu[VIC_NR_IRQS];
++	unsigned long rebinds, claimed;
++};
++
++static struct vic vic = { .kind = VIC_PLIC };
++
++static inline unsigned long hart_of(int cpu)
++{
++	return cpuid_to_hartid_map(cpu);
++}
++
++static inline void imsic_sel_write(unsigned long sel, unsigned long val)
++{
++	csr_write(CSR_SISELECT, sel);
++	csr_write(CSR_SIREG, val);
++}
++
++static inline void imsic_sel_set(unsigned long sel, unsigned long bits)
++{
++	csr_write(CSR_SISELECT, sel);
++	csr_set(CSR_SIREG, bits);
++}
++
++/* ---- the backends: how one line is programmed on the controller of the moment ---- */
++
++/* vic.lock held */
++static void backend_program_line(int irq)
++{
++	unsigned long hart = hart_of(vic.cpu[irq]);
++	u32 sm = vic.edge[irq] ? APLIC_SM_EDGE1 : APLIC_SM_LEVEL1;
++	int c;
++
++	switch (vic.kind) {
++	case VIC_PLIC:
++		writel(1, vic.regs + PLIC_PRIORITY(irq));
++		/* one context has the line enabled: the cpu it is bound to */
++		for_each_possible_cpu(c) {
++			void __iomem *en = vic.regs + PLIC_ENABLE(PLIC_SCTX(hart_of(c))) + (irq / 32) * 4;
++			u32 v = readl(en);
++
++			if (c == vic.cpu[irq] && vic.enabled[irq])
++				v |= BIT(irq % 32);
++			else
++				v &= ~BIT(irq % 32);
++			writel(v, en);
++		}
++		break;
++	case VIC_APLIC:
++		writel(sm, vic.regs + APLIC_SOURCECFG(irq));
++		writel(((u32)hart << 18) | 1, vic.regs + APLIC_TARGET(irq));	/* priority 1 */
++		writel(irq, vic.regs + (vic.enabled[irq] ? APLIC_SETIENUM : APLIC_CLRIENUM));
++		break;
++	case VIC_IMSIC:
++		writel(sm, vic.regs + APLIC_SOURCECFG(irq));
++		writel(((u32)hart << 18) | irq, vic.regs + APLIC_TARGET(irq));	/* guest file 0, identity = irq */
++		writel(irq, vic.regs + (vic.enabled[irq] ? APLIC_SETIENUM : APLIC_CLRIENUM));
++		break;
++	}
++}
++
++/* the domain-wide state of the controller of the moment: off, every line programmed, on. vic.lock held */
++static void backend_program_all(void)
++{
++	int irq;
++
++	if (vic.kind != VIC_PLIC)
++		writel(0, vic.regs + APLIC_DOMAINCFG);
++	for (irq = 1; irq < VIC_NR_IRQS; irq++)
++		if (vic.mapped[irq])
++			backend_program_line(irq);
++	if (vic.kind == VIC_APLIC)
++		writel(APLIC_DOMAINCFG_IE, vic.regs + APLIC_DOMAINCFG);
++	else if (vic.kind == VIC_IMSIC)
++		writel(APLIC_DOMAINCFG_IE | APLIC_DOMAINCFG_DM, vic.regs + APLIC_DOMAINCFG);
++}
++
++/* this hart's side of the controller of the moment: runs on the hart itself */
++static void backend_cpu_init(void *unused)
++{
++	unsigned long hart = hart_of(smp_processor_id());
++	unsigned long flags;
++	int i;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	switch (vic.kind) {
++	case VIC_PLIC:
++		writel(0, vic.regs + PLIC_CONTEXT(PLIC_SCTX(hart)) + PLIC_THRESHOLD);
++		break;
++	case VIC_APLIC:
++		writel(0, vic.regs + APLIC_IDC(hart) + APLIC_IDC_ITHRESHOLD);
++		writel(1, vic.regs + APLIC_IDC(hart) + APLIC_IDC_IDELIVERY);
++		break;
++	case VIC_IMSIC:
++		imsic_sel_write(VIC_EIDELIVERY, 0);
++		imsic_sel_write(VIC_EITHRESHOLD, 0);
++		/* every identity this driver may use is enabled in the file; the
++		 * APLIC's enable bit and target decide what reaches which hart */
++		for (i = 0; i < VIC_NR_IRQS; i += 64)
++			imsic_sel_set(VIC_EIE0 + 2 * (i / 64), ~0UL);
++		imsic_sel_write(VIC_EIDELIVERY, 1);
++		break;
++	}
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++}
++
++/* ---- the irq chip ---- */
++
++static void vic_irq_mask(struct irq_data *d)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	vic.enabled[d->hwirq] = false;
++	backend_program_line(d->hwirq);
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++}
++
++static void vic_irq_unmask(struct irq_data *d)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	vic.enabled[d->hwirq] = true;
++	backend_program_line(d->hwirq);
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++}
++
++static void vic_irq_eoi(struct irq_data *d)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	switch (vic.kind) {
++	case VIC_PLIC:
++		writel(d->hwirq, vic.regs + PLIC_CONTEXT(PLIC_SCTX(hart_of(smp_processor_id()))) + PLIC_CLAIM);
++		break;
++	case VIC_APLIC:
++		break;				/* claimi cleared the pending bit; a level source follows its input */
++	case VIC_IMSIC:
++		/* a level source's pending bit was cleared when the MSI went out;
++		 * writing setipnum re-pends it if the input is still asserted */
++		if (!vic.edge[d->hwirq])
++			writel(d->hwirq, vic.regs + APLIC_SETIPNUM_LE);
++		break;
++	}
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++}
++
++static int vic_irq_set_affinity(struct irq_data *d, const struct cpumask *mask, bool force)
++{
++	unsigned long flags;
++	int cpu;
++
++	if (force)
++		cpu = cpumask_first(mask);
++	else
++		cpu = cpumask_any_and(mask, cpu_online_mask);
++	if (cpu >= nr_cpu_ids)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	vic.cpu[d->hwirq] = cpu;
++	backend_program_line(d->hwirq);
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++	irq_data_update_effective_affinity(d, cpumask_of(cpu));
++	return IRQ_SET_MASK_OK_DONE;
++}
++
++static int vic_irq_set_type(struct irq_data *d, unsigned int type)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	vic.edge[d->hwirq] = (type & IRQ_TYPE_EDGE_BOTH) != 0;
++	if (vic.mapped[d->hwirq])
++		backend_program_line(d->hwirq);
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++	return 0;
++}
++
++static struct irq_chip vic_chip = {
++	.name		= "xv6h-vic",
++	.irq_mask	= vic_irq_mask,
++	.irq_unmask	= vic_irq_unmask,
++	.irq_eoi	= vic_irq_eoi,
++	.irq_set_affinity = vic_irq_set_affinity,
++	.irq_set_type	= vic_irq_set_type,
++	.flags		= IRQCHIP_SKIP_SET_WAKE,
++};
++
++static int vic_domain_map(struct irq_domain *dom, unsigned int virq, irq_hw_number_t hwirq)
++{
++	unsigned long flags;
++
++	if (hwirq == 0 || hwirq >= VIC_NR_IRQS)
++		return -EINVAL;
++	irq_domain_set_info(dom, virq, hwirq, &vic_chip, NULL, handle_fasteoi_irq, NULL, NULL);
++	irq_set_noprobe(virq);
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	vic.mapped[hwirq] = true;
++	vic.enabled[hwirq] = false;
++	vic.cpu[hwirq] = 0;
++	backend_program_line(hwirq);
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++	return 0;
++}
++
++static int vic_domain_translate(struct irq_domain *dom, struct irq_fwspec *fwspec,
++				unsigned long *hwirq, unsigned int *type)
++{
++	if (fwspec->param_count < 1)
++		return -EINVAL;
++	*hwirq = fwspec->param[0];
++	*type = fwspec->param_count > 1 ? fwspec->param[1] & IRQ_TYPE_SENSE_MASK : IRQ_TYPE_LEVEL_HIGH;
++	return 0;
++}
++
++static int vic_domain_alloc(struct irq_domain *dom, unsigned int virq, unsigned int nr_irqs, void *arg)
++{
++	struct irq_fwspec *fwspec = arg;
++	unsigned long hwirq;
++	unsigned int type;
++	int i, rc;
++
++	rc = vic_domain_translate(dom, fwspec, &hwirq, &type);
++	if (rc)
++		return rc;
++	for (i = 0; i < nr_irqs; i++) {
++		rc = vic_domain_map(dom, virq + i, hwirq + i);
++		if (rc)
++			return rc;
++		if (type != IRQ_TYPE_NONE)
++			irq_set_irq_type(virq + i, type);
++	}
++	return 0;
++}
++
++static const struct irq_domain_ops vic_domain_ops = {
++	.map		= vic_domain_map,
++	.translate	= vic_domain_translate,
++	.alloc		= vic_domain_alloc,
++	.free		= irq_domain_free_irqs_top,
++};
++
++/* ---- the per-hart external interrupt: claim on the controller of the moment ---- */
++
++static void vic_handle_irq(struct irq_desc *desc)
++{
++	struct irq_chip *chip = irq_desc_get_chip(desc);
++	unsigned long hart = hart_of(smp_processor_id());
++	unsigned long hwirq;
++	int n = 0;
++
++	chained_irq_enter(chip, desc);
++	for (;;) {
++		switch (READ_ONCE(vic.kind)) {
++		case VIC_PLIC:
++			hwirq = readl(vic.regs + PLIC_CONTEXT(PLIC_SCTX(hart)) + PLIC_CLAIM);
++			break;
++		case VIC_APLIC:
++			hwirq = readl(vic.regs + APLIC_IDC(hart) + APLIC_IDC_CLAIMI) >> 16;
++			break;
++		default:
++			hwirq = csr_swap(CSR_STOPEI, 0) >> TOPEI_ID_SHIFT;
++			break;
++		}
++		if (!hwirq || hwirq >= VIC_NR_IRQS)
++			break;
++		vic.claimed++;
++		if (generic_handle_domain_irq(vic.domain, hwirq))
++			pr_warn_ratelimited("xv6h-vic: no mapping for line %lu\n", hwirq);
++		if (++n > 1000)
++			break;			/* a storm is the host's to explain, not ours to spin on */
++	}
++	chained_irq_exit(chip, desc);
++}
++
++static int vic_starting_cpu(unsigned int cpu)
++{
++	backend_cpu_init(NULL);
++	if (vic.parent_irq)
++		enable_percpu_irq(vic.parent_irq, irq_get_trigger_type(vic.parent_irq));
++	return 0;
++}
++
++static int vic_dying_cpu(unsigned int cpu)
++{
++	if (vic.parent_irq)
++		disable_percpu_irq(vic.parent_irq);
++	return 0;
++}
++
++/* ---- the revision: another controller, or the same one somewhere else ---- */
++
++/*
++ * The description changed its interrupt controller (F1) or its address (F2).
++ * Called by the machrev driver with the new kind and window, before it
++ * acknowledges. The new backend is mapped, brought up with every line as the
++ * kernel last asked for it, on every hart; the old window is unmapped after.
++ * A line asserted at this moment is the host's to re-raise on the new model.
++ */
++int xv6h_vic_rebind(int kind, phys_addr_t base, resource_size_t size)
++{
++	void __iomem *nregs, *oregs;
++	unsigned long flags;
++	int okind, i, lines = 0;
++
++	if (kind < VIC_PLIC || kind > VIC_IMSIC)
++		return -EINVAL;
++	if (kind == vic.kind && base == vic.base)
++		return 0;
++	nregs = ioremap(base, size);
++	if (!nregs)
++		return -ENOMEM;
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	okind = vic.kind;
++	oregs = vic.regs;
++	vic.kind = kind;
++	vic.regs = nregs;
++	vic.base = base;
++	vic.size = size;
++	backend_program_all();
++	for (i = 1; i < VIC_NR_IRQS; i++)
++		lines += vic.mapped[i];
++	vic.rebinds++;
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++	on_each_cpu(backend_cpu_init, NULL, 1);
++	iounmap(oregs);
++	pr_info("xv6h-vic: %s -> %s at %pa: %d line(s) re-applied on %u cpu(s)\n",
++		vic_kind_name[okind], vic_kind_name[kind], &base, lines, num_online_cpus());
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xv6h_vic_rebind);
++
++/* the harts were renumbered (F9): contexts, IDCs and targets are by hart id */
++int xv6h_vic_rehart(void)
++{
++	unsigned long flags;
++
++	raw_spin_lock_irqsave(&vic.lock, flags);
++	backend_program_all();
++	raw_spin_unlock_irqrestore(&vic.lock, flags);
++	on_each_cpu(backend_cpu_init, NULL, 1);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(xv6h_vic_rehart);
++
++int xv6h_vic_kind(void)
++{
++	return vic.kind;
++}
++EXPORT_SYMBOL_GPL(xv6h_vic_kind);
++
++/* ---- probe: from the description's xv6h,vic node ---- */
++
++static int __init vic_parse_kind(struct device_node *node)
++{
++	const char *s = NULL;
++
++	if (of_property_read_string(node, "xv6h,kind", &s) || !s)
++		return -EINVAL;
++	if (!strcmp(s, "plic"))
++		return VIC_PLIC;
++	if (!strcmp(s, "aplic"))
++		return VIC_APLIC;
++	if (!strcmp(s, "imsic"))
++		return VIC_IMSIC;
++	return -EINVAL;
++}
++
++static int __init vic_init(struct device_node *node, struct device_node *parent)
++{
++	struct resource res;
++	int kind, rc;
++
++	kind = vic_parse_kind(node);
++	if (kind < 0) {
++		pr_err("xv6h-vic: %pOF: no usable xv6h,kind\n", node);
++		return kind;
++	}
++	rc = of_address_to_resource(node, 0, &res);
++	if (rc)
++		return rc;
++	raw_spin_lock_init(&vic.lock);
++	vic.kind = kind;
++	vic.base = res.start;
++	vic.size = resource_size(&res);
++	vic.regs = ioremap(vic.base, vic.size);
++	if (!vic.regs)
++		return -ENOMEM;
++	vic.fwnode = of_node_to_fwnode(node);
++	vic.domain = irq_domain_create_linear(vic.fwnode, VIC_NR_IRQS, &vic_domain_ops, &vic);
++	if (!vic.domain) {
++		iounmap(vic.regs);
++		return -ENOMEM;
++	}
++	/* this hart's S-mode external interrupt, from the node's interrupts-extended (the cpu's intc, cause 9) */
++	vic.parent_irq = irq_of_parse_and_map(node, 0);
++	if (!vic.parent_irq) {
++		pr_err("xv6h-vic: %pOF: no parent interrupt\n", node);
++		return -ENODEV;
++	}
++	backend_program_all();
++	irq_set_chained_handler(vic.parent_irq, vic_handle_irq);
++	cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "irqchip/xv6h-vic:online",
++			  vic_starting_cpu, vic_dying_cpu);
++	pr_info("xv6h-vic: %s at %pa, %d lines, the root of every device line; rebinds on revision\n",
++		vic_kind_name[kind], &vic.base, VIC_NR_IRQS - 1);
++	return 0;
++}
++
++IRQCHIP_DECLARE(xv6h_vic, "xv6h,vic", vic_init);
+--- /dev/null
++++ b/include/linux/irqchip/xv6h-vic.h
+@@ -0,0 +1,25 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * xv6H: the description-bound root interrupt controller (drivers/irqchip/irq-xv6h-vic.c),
++ * as the machrev driver drives it when the description changes.
++ */
++#ifndef _LINUX_IRQCHIP_XV6H_VIC_H
++#define _LINUX_IRQCHIP_XV6H_VIC_H
++
++#include <linux/types.h>
++
++#define XV6H_VIC_PLIC	0
++#define XV6H_VIC_APLIC	1
++#define XV6H_VIC_IMSIC	2
++
++#ifdef CONFIG_XV6H_VIC
++int xv6h_vic_rebind(int kind, phys_addr_t base, resource_size_t size);	/* F1, F2: another controller, or another address */
++int xv6h_vic_rehart(void);						/* F9: contexts, IDCs and targets follow the hart numbers */
++int xv6h_vic_kind(void);
++#else
++static inline int xv6h_vic_rebind(int kind, phys_addr_t base, resource_size_t size) { return -ENODEV; }
++static inline int xv6h_vic_rehart(void) { return -ENODEV; }
++static inline int xv6h_vic_kind(void) { return -1; }
++#endif
++
++#endif

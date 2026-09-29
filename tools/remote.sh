@@ -11,6 +11,7 @@
 #   tools/remote.sh log NAME                                # the full results file
 #   tools/remote.sh script NAME FILE.py [args...]            # sync, build, run a python script (test-hyp helpers available)
 #   tools/remote.sh kill NAME                               # stop a run
+#   LXTAG=-618 tools/remote.sh run ...                       # the Linux image of another kernel build (linux/build.sh TAG)
 #   tools/remote.sh rm NAME                                 # delete a run's copy
 #
 # the copy lives in ~/xv6h-runs/NAME on the box; the Linux artifacts come
@@ -61,7 +62,7 @@ sync_tree() { # NAME
     --exclude 'results.out' --exclude 'done' --exclude 'test-hyp.log' --exclude '.git' \
     "$HERE/" "$HOST:$RUNS/.seed/"
   ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/.seed $RUNS/$name && \
-    cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
+    cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
 }
 
 case "$cmd" in

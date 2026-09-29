@@ -14,6 +14,7 @@
  * kernel patch it says so, and leaves out of the mask; the host then knows.
  */
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
@@ -38,6 +39,11 @@
 #include <linux/virtio_net.h>
 #include <asm/sbi.h>
 #include <asm/cacheflush.h>
+#include <asm/vector.h>
+#include <linux/wait.h>
+#include <linux/irqchip/xv6h-vic.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
 
 /* linux/patches/0001-riscv-timer-revise.patch */
 extern void riscv_timer_revise(bool sstc, u32 hz);
@@ -46,6 +52,7 @@ extern int virtio_mmio_relocate(struct platform_device *pdev, resource_size_t ba
 extern struct virtio_device *virtio_mmio_vdev(struct platform_device *pdev);
 /* linux/patches/0003-riscv-rebind-hart.patch */
 extern int riscv_rebind_hart(unsigned int cpu, unsigned long hartid);
+/* linux/patches/0004-riscv-vector-revise.patch: riscv_v_revise(), riscv_v_withdrawn, riscv_v_request_hook (asm/vector.h) */
 
 #define SBI_EXT_MACH 0x4D414348
 #define MACH_VERSION 0
@@ -53,6 +60,7 @@ extern int riscv_rebind_hart(unsigned int cpu, unsigned long hartid);
 #define MACH_DESCRIBE 2
 #define MACH_ACK 3
 #define MACH_DTB_MAX 4
+#define MACH_REQUEST 5
 #define MACH_WHAT 6
 
 #define REV_DEVICES (1u << 0)
@@ -76,6 +84,7 @@ struct facts {
 	u64 ram_base, ram_size;
 	u32 cboz, timebase;
 	bool sstc;
+	bool vec;		/* the vector unit is described (F10) */
 	int nvirtio;
 	u64 virtio_base[MAX_VIRTIO];
 	u32 virtio_irq[MAX_VIRTIO];
@@ -83,6 +92,8 @@ struct facts {
 	u64 rtc_base;
 	u32 rtc_irq;
 	const char *intc;
+	int vic_kind;			/* the description-bound controller (patch 0005): 0 plic, 1 aplic, 2 imsic; -1 none */
+	u64 intc_base, intc_size;
 };
 
 struct machrev {
@@ -92,6 +103,9 @@ struct machrev {
 	struct facts cur;
 	unsigned long gen;
 	unsigned long revisions, adopted_total;
+	struct mutex lock;		/* one revision at a time: the anchor's thread and the poll */
+	struct delayed_work poll;	/* F1: the generation polled, because the anchor's line cannot announce the exchange of the controller that carries it */
+	unsigned long polled;
 };
 
 static struct sbiret mach(unsigned long fid, unsigned long a0)
@@ -106,6 +120,7 @@ static void read_facts(struct device_node *root, struct facts *f)
 	u64 reg[2];
 
 	memset(f, 0, sizeof(*f));
+	f->vic_kind = -1;
 	cpus = of_get_child_by_name(root, "cpus");
 	if (cpus) {
 		of_property_read_u32(cpus, "timebase-frequency", &f->timebase);
@@ -123,8 +138,15 @@ static void read_facts(struct device_node *root, struct facts *f)
 				f->online++;
 			f->ncpu++;
 			of_property_read_u32(n, "riscv,cboz-block-size", &f->cboz);
-			if (!of_property_read_string(n, "riscv,isa", &isa) && isa)
+			if (!of_property_read_string(n, "riscv,isa", &isa) && isa) {
+				const char *p;
+
 				f->sstc = strstr(isa, "sstc") != NULL;
+				/* the single-letter extensions after rv64, up to the first '_' */
+				for (p = isa + 4; *p && *p != '_'; p++)
+					if (*p == 'v')
+						f->vec = true;
+			}
 		}
 		of_node_put(cpus);
 	}
@@ -160,6 +182,19 @@ static void read_facts(struct device_node *root, struct facts *f)
 				f->intc = f->intc && !strcmp(f->intc, "imsic") ? f->intc : "aplic";
 			} else if (of_device_is_compatible(c, "riscv,imsics")) {
 				f->intc = "imsic";
+			} else if (of_device_is_compatible(c, "xv6h,vic")) {
+				/* the description-bound controller: its kind is a property, its window the reg */
+				const char *k = NULL;
+
+				of_property_read_string(c, "xv6h,kind", &k);
+				f->vic_kind = !k ? -1 : !strcmp(k, "plic") ? XV6H_VIC_PLIC : !strcmp(k, "aplic") ? XV6H_VIC_APLIC :
+					      !strcmp(k, "imsic") ? XV6H_VIC_IMSIC : -1;
+				f->intc = f->vic_kind == XV6H_VIC_PLIC ? "plic" : f->vic_kind == XV6H_VIC_APLIC ? "aplic" :
+					  f->vic_kind == XV6H_VIC_IMSIC ? "imsic" : NULL;
+				if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2) {
+					f->intc_base = reg[0];
+					f->intc_size = reg[1];
+				}
 			}
 		}
 	}
@@ -176,6 +211,7 @@ static void read_facts(struct device_node *root, struct facts *f)
  */
 static u32 hart_of_cpu[NR_CPUS];
 static bool hart_map_ready;
+static DECLARE_WAIT_QUEUE_HEAD(vec_back);	/* F12: the unit came back */
 
 static void hart_map_init(void)
 {
@@ -277,16 +313,26 @@ static int map_line(u32 hwirq)
 }
 
 /* F3/F15: a virtio device's window or line moved; the driver follows (patch 0002) */
+static int virtio_at(struct device *dev, const void *data)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+
+	return r && r->start == *(const u64 *)data && strstr(dev_name(dev), "virtio_mmio") != NULL;
+}
+
 static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq)
 {
-	char name[32];
 	struct device *dev;
 	int virq, rc;
 
-	snprintf(name, sizeof(name), "%llx.virtio_mmio", old_base);
-	dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+	/* by where the device is now, not by its boot name: a device moved once
+	 * keeps the name of its boot window (relocate updates the resource, the
+	 * platform bus does not rename), so a second move by name found nothing
+	 * and Linux then read the vanished window (d2e: Oops at 0x10103060) */
+	dev = bus_find_device(&platform_bus_type, NULL, &old_base, virtio_at);
 	if (!dev) {
-		pr_info("machrev: no platform device %s to move\n", name);
+		pr_info("machrev: no virtio_mmio platform device at 0x%llx to move\n", old_base);
 		return -ENODEV;
 	}
 	virq = map_line(new_irq);
@@ -349,10 +395,19 @@ static int nic_follow(const struct facts *f)
 		if (!nd)
 			continue;
 		if (!ether_addr_equal(nd->dev_addr, mac)) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+			struct sockaddr_storage sa;	/* 6.16 widened the address argument */
+#else
 			struct sockaddr sa;
+#endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+			sa.ss_family = ARPHRD_ETHER;
+			memcpy(sa.__data, mac, ETH_ALEN);
+#else
 			sa.sa_family = ARPHRD_ETHER;
 			memcpy(sa.sa_data, mac, ETH_ALEN);
+#endif
 			rtnl_lock();
 			dev_set_mac_address(nd, &sa, NULL);
 			rtnl_unlock();
@@ -435,8 +490,9 @@ static bool has_virtio(const struct facts *f, u64 base)
 }
 
 /* what this kernel can take, taken; what it cannot, said */
-static u32 apply(struct machrev *m, const struct facts *new, u32 what)
+static u32 apply(struct machrev *m, struct facts *new, u32 what)
 {
+	bool renumbered = false;
 	const struct facts *old = &m->cur;
 	u32 adopted = 0;
 	int i;
@@ -519,25 +575,41 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 		if (new->hartid[i] != old->hartid[i]) {
 			int cpu = cpu_of_hart(old->hartid[i]);
 
-			if (cpu < 0)
+			int rc;
+
+			if (cpu < 0) {
+				pr_info("machrev: hart %u is no cpu of this kernel: not renumbered\n", old->hartid[i]);
 				continue;
-			if (riscv_rebind_hart(cpu, new->hartid[i]) == 0) {
-				hart_of_cpu[cpu] = new->hartid[i];
-				adopted |= REV_DEVICES;
 			}
-			pr_info("machrev: cpu %d: hart %u -> %u\n", cpu, old->hartid[i], new->hartid[i]);
+			rc = riscv_rebind_hart(cpu, new->hartid[i]);
+			hart_of_cpu[cpu] = new->hartid[i];	/* the kernel's map changed whatever its controllers said */
+			adopted |= REV_DEVICES;
+			renumbered = true;
+			pr_info("machrev: cpu %d: hart %u -> %u%s\n", cpu, old->hartid[i], new->hartid[i],
+				rc ? " (a controller did not follow)" : "");
 		}
-	/* the RTC first: on a renumbering, the line it leaves may be the one a virtio device moves to (lxirq) */
+	if (renumbered && new->vic_kind >= 0)
+		xv6h_vic_rehart();		/* contexts, IDCs and targets are by hart id */
+	/*
+	 * The RTC leaves before the virtio devices move and comes back after
+	 * them: on a renumbering the line it leaves may be the one a virtio
+	 * device moves to (lxirq), and the line it moves to may be the one a
+	 * virtio device is still on -- registering it there fails with
+	 * "genirq: Flags mismatch irq 16 (goldfish_rtc) vs (virtio0)" and the
+	 * machine has no clock until the next revision (hunt4c, every arrival
+	 * on the default-numbered host from crossing ~160 on).
+	 */
+	bool rtc_returns = false;
 	if (new->rtc != old->rtc) {
 		if (new->rtc)
-			rtc_back(new->rtc_base, new->rtc_irq);
+			rtc_returns = true;
 		else
 			rtc_gone();
 		adopted |= REV_DEVICES;
 	} else if (new->rtc && (new->rtc_irq != old->rtc_irq || new->rtc_base != old->rtc_base)) {
 		/* F3/F15: the same clock on another line or at another address */
 		rtc_gone();
-		rtc_back(new->rtc_base, new->rtc_irq);
+		rtc_returns = true;
 		adopted |= REV_DEVICES;
 	}
 	/*
@@ -554,7 +626,25 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 					adopted |= REV_DEVICES;
 			}
 	}
-	if ((what & REV_INTC) && new->intc && old->intc && strcmp(new->intc, old->intc))
+	if (rtc_returns)
+		rtc_back(new->rtc_base, new->rtc_irq);
+	/*
+	 * F1/F2: the interrupt controller's kind or address. With the description-
+	 * bound controller (patch 0005) the driver re-binds: the new backend is
+	 * brought up with every line as this kernel last asked for it, on every
+	 * hart, before the acknowledgement. A kernel on the stock drivers keeps
+	 * its own and says so; the host serves it from the legacy tier.
+	 */
+	if ((what & REV_INTC) && new->vic_kind >= 0 &&
+	    (new->vic_kind != old->vic_kind || new->intc_base != old->intc_base)) {
+		int rc = xv6h_vic_rebind(new->vic_kind, new->intc_base, new->intc_size);
+
+		pr_info("machrev: interrupt controller %s at 0x%llx -> %s at 0x%llx: %s\n",
+			old->intc ? old->intc : "?", old->intc_base, new->intc ? new->intc : "?", new->intc_base,
+			rc ? "not taken" : "rebound");
+		if (!rc)
+			adopted |= REV_INTC;
+	} else if ((what & REV_INTC) && new->intc && old->intc && strcmp(new->intc, old->intc))
 		pr_info("machrev: interrupt controller %s -> %s: Linux keeps its own (legacy tier)\n", old->intc, new->intc);
 	/* F22: the SBI extension set. Linux keeps one decision from its boot-time
 	 * probe: remote fences through SBI RFENCE (a static key) or through IPIs.
@@ -571,9 +661,62 @@ static u32 apply(struct machrev *m, const struct facts *new, u32 what)
 			rf ? "SBI RFENCE" : "IPI", rf == had ? " (as before)" : "");
 		adopted |= REV_SBI;
 	}
-	if ((what & REV_VLEN))
-		pr_info("machrev: the vector unit changed: not taken by this kernel\n");
+	/*
+	 * F10/F11: the vector unit taken away or given back (patch 0004). Away:
+	 * ceded if no task holds vector state, refused with the count if one does
+	 * -- the host then keeps the description as it was (the unit stays) and
+	 * the operator's move is refused with that reason. Back: taken, with the
+	 * width the hart now reports.
+	 */
+	if ((what & REV_VLEN) && new->vec != old->vec) {
+		if (!new->vec) {
+			int held = riscv_v_revise(false);
+
+			if (held > 0) {
+				pr_info("machrev: keeping the vector unit, %d task(s) hold vector state\n", held);
+				new->vec = true;	/* what this kernel actually has */
+			} else if (held < 0) {
+				pr_info("machrev: the vector unit cannot be withdrawn here (%d)\n", held);
+				new->vec = true;
+			} else {
+				pr_info("machrev: vector unit withdrawn: no task held state\n");
+				adopted |= REV_VLEN;
+			}
+		} else {
+			int rc = riscv_v_revise(true);
+
+			pr_info("machrev: vector unit back%s\n", rc ? ": not taken" : "");
+			if (!rc) {
+				adopted |= REV_VLEN;
+				wake_up_all(&vec_back);
+			}
+		}
+	}
 	return adopted;
+}
+
+/*
+ * F12: a task met the withdrawn unit (the kernel's first-use trap, patch 0004)
+ * and asks the machine for it. The host grants it if it was only hidden
+ * (`lazyvector', or a machine that arrived at a host that has one), and the
+ * revision that brings it back comes on the anchor's line; the task waits for
+ * it to be taken, then retries its instruction. Refused, the task gets its
+ * illegal instruction.
+ */
+static int machrev_ask_vector(void)
+{
+	struct sbiret r = mach(MACH_REQUEST, REV_VLEN);
+
+	if (r.error) {
+		pr_info_ratelimited("machrev: asked the host for the vector unit: refused (%ld)\n", r.error);
+		return -ENODEV;
+	}
+	if (!wait_event_timeout(vec_back, !READ_ONCE(riscv_v_withdrawn), HZ)) {
+		pr_info("machrev: asked the host for the vector unit: granted, but the revision did not come\n");
+		return -ETIMEDOUT;
+	}
+	pr_info("machrev: asked the host for the vector unit: granted\n");
+	return 0;
 }
 
 /* one revision: read the tree the host rewrote, take it, acknowledge */
@@ -586,22 +729,27 @@ static void take_revision(struct machrev *m)
 	struct facts fresh;
 	u32 adopted;
 
+	mutex_lock(&m->lock);
 	r = mach(MACH_PENDING, 0);
 	gen = r.value;
-	if (r.error || gen == m->gen)
+	if (r.error || gen == m->gen) {
+		mutex_unlock(&m->lock);
 		return;
+	}
 	what = mach(MACH_WHAT, 0).value;
 	gpa = mach(MACH_DESCRIBE, 0).value;
 	len = mach(MACH_DTB_MAX, 0).value;
 	blob = memremap(gpa, len, MEMREMAP_WB);
 	if (!blob) {
 		pr_err("machrev: cannot map the description at 0x%lx\n", gpa);
+		mutex_unlock(&m->lock);
 		return;
 	}
 	mem = of_fdt_unflatten_tree((const unsigned long *)blob, NULL, &root);
 	if (!mem || !root) {
 		pr_err("machrev: the description at 0x%lx does not parse\n", gpa);
 		memunmap(blob);
+		mutex_unlock(&m->lock);
 		return;
 	}
 	read_facts(root, &fresh);
@@ -614,6 +762,30 @@ static void take_revision(struct machrev *m)
 	pr_info("machrev: revision %lu (what 0x%lx): adopted 0x%x\n", gen, what, adopted);
 	kfree(mem);
 	memunmap(blob);
+	mutex_unlock(&m->lock);
+}
+
+/*
+ * F1's channel problem. Every revision is announced on the anchor's line,
+ * which is a device line through the interrupt controller -- and the one
+ * revision that exchanges the controller cannot be announced by a line that
+ * goes through it (lxintc4: "described no", both vcpus idle, the line raised
+ * on a controller the guest's driver had not yet bound). Theorem 2 asks for a
+ * channel independent of what the revision changes; for the controller
+ * itself that channel is the generation counter, which the guest reads with
+ * one SBI call. With the description-bound controller in use, the driver
+ * polls it every 50 ms; the anchor's line stays the fast path for everything
+ * else, and the poll is what makes the exchange of the controller a revision
+ * like the others.
+ */
+static void machrev_poll(struct work_struct *w)
+{
+	struct machrev *m = container_of(to_delayed_work(w), struct machrev, poll);
+
+	m->polled++;
+	if (mach(MACH_PENDING, 0).value != m->gen)
+		take_revision(m);
+	schedule_delayed_work(&m->poll, msecs_to_jiffies(50));
 }
 
 static irqreturn_t machrev_hard(int irq, void *p)
@@ -662,14 +834,21 @@ static int machrev_probe(struct platform_device *pdev)
 	read_facts(of_root, &m->cur);
 	m->gen = mach(MACH_PENDING, 0).value;	/* what the tree we booted from is */
 	dev_set_drvdata(&pdev->dev, m);
+	mutex_init(&m->lock);
+	INIT_DELAYED_WORK(&m->poll, machrev_poll);
 	err = devm_request_threaded_irq(&pdev->dev, m->irq, machrev_hard, machrev_thread,
 					IRQF_ONESHOT, "machrev", m);
 	if (err)
 		return err;
+	if (m->cur.vic_kind >= 0) {
+		schedule_delayed_work(&m->poll, msecs_to_jiffies(50));
+		pr_info("machrev: the controller is revisable: polling the generation every 50 ms as well\n");
+	}
 	device_create_file(&pdev->dev, &dev_attr_revisions);
-	pr_info("machrev: speaking revision to the host (protocol %lu): %d cpu(s) (%d online), %llu MB, cache block %u, %s\n",
+	riscv_v_request_hook = machrev_ask_vector;	/* F12 */
+	pr_info("machrev: speaking revision to the host (protocol %lu): %d cpu(s) (%d online), %llu MB, cache block %u, %s, vector unit %s\n",
 		r.value, m->cur.ncpu, m->cur.online, m->cur.ram_size >> 20, m->cur.cboz,
-		m->cur.intc ? m->cur.intc : "?");
+		m->cur.intc ? m->cur.intc : "?", m->cur.vec ? "present" : "absent");
 	/* a revision owed before this driver was here (a machine that arrived from elsewhere) */
 	if (readl(m->regs + MR_STATUS) & 1) {
 		writel(1, m->regs + MR_ACK);

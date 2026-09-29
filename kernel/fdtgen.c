@@ -186,7 +186,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   char name[32];
 
   // phandles: cpu intcs 10.., plic 3, aplic S 4, aplic M 5, imsic S 6, imsic M 7
-  int ic_phandle = (vm->vic_kind == VIC_PLIC) ? 3 : 4;
+  int ic_phandle = VM_VICSHIM(vm) ? 8 : (vm->vic_kind == VIC_PLIC) ? 3 : 4;
   int hart_bits = 0;
   while ((1 << hart_bits) < vm->nvcpu)
     hart_bits++;
@@ -379,104 +379,127 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   node_end(&w);
   }
 
-  if (vm->vic_kind == VIC_PLIC) {
-    node_begin(&w, unit_name(uname, "plic", G_PLIC_BASE + vm->intc_shift));
-    prop_str(&w, "compatible", "riscv,plic0");
-    prop_reg(&w, G_PLIC_BASE + vm->intc_shift, G_PLIC_SIZE);
-    prop_u32(&w, "riscv,ndev", 31);
+  if (VM_VICSHIM(vm)) {
+    // L2: one node, whatever the controller. A guest with the description-bound
+    // driver (Linux patch 0005) hangs every device line from it and re-binds
+    // its backend when the kind or the window changes; the stock drivers never
+    // see a compatible they know, so nothing else claims the controller.
+    uint64 vbase = vm->vic_kind == VIC_PLIC ? G_PLIC_BASE + vm->intc_shift : G_APLIC_S + vm->intc_shift;
+    uint64 vsize = vm->vic_kind == VIC_PLIC ? G_PLIC_SIZE : 0x8000;
+    node_begin(&w, unit_name(uname, "interrupt-controller", vbase));
+    prop_str(&w, "compatible", "xv6h,vic");
+    prop_str(&w, "xv6h,kind", vm->vic_kind == VIC_PLIC ? "plic" : vm->vic_kind == VIC_APLIC ? "aplic" : "imsic");
+    prop_reg(&w, vbase, vsize);
     prop_empty(&w, "interrupt-controller");
     prop_u32(&w, "#interrupt-cells", 1);
     prop_u32(&w, "#address-cells", 0);
     for (int i = 0; i < vm->nvcpu; i++) {
-      cells[4 * i] = CPU_PHANDLE(i);
-      cells[4 * i + 1] = 11;
-      cells[4 * i + 2] = CPU_PHANDLE(i);
-      cells[4 * i + 3] = 9;
+      cells[2 * i] = CPU_PHANDLE(i);
+      cells[2 * i + 1] = 9;                  // the supervisor external interrupt of each hart
     }
-    prop_cells(&w, "interrupts-extended", cells, 4 * vm->nvcpu);
-    prop_u32(&w, "phandle", 3);
+    prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
+    prop_u32(&w, "phandle", 8);
     node_end(&w);
   } else {
-    // APLIC: machine domain (root, with the supervisor domain as its child)
-    node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_M + vm->intc_shift));
-    prop_str(&w, "compatible", "riscv,aplic");
-    prop_reg(&w, G_APLIC_M + vm->intc_shift, 0x8000);
-    prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
-    prop_empty(&w, "interrupt-controller");
-    prop_u32(&w, "#interrupt-cells", 2);
-    prop_u32(&w, "riscv,children", 4);
-    cells[0] = 4;
-    cells[1] = 1;
-    cells[2] = VAPLIC_NSRC - 1;
-    prop_cells(&w, "riscv,delegation", cells, 3);
-    if (vm->vic_kind == VIC_IMSIC) {
-      prop_u32(&w, "msi-parent", 7);
-    } else {
-      for (int i = 0; i < vm->nvcpu; i++) {
-        cells[2 * i] = CPU_PHANDLE(i);
-        cells[2 * i + 1] = 11;
-      }
-      prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
-    }
-    prop_u32(&w, "phandle", 5);
-    node_end(&w);
-
-    node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_S + vm->intc_shift));
-    prop_str(&w, "compatible", "riscv,aplic");
-    prop_reg(&w, G_APLIC_S + vm->intc_shift, 0x8000);
-    prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
-    prop_empty(&w, "interrupt-controller");
-    prop_u32(&w, "#interrupt-cells", 2);
-    if (vm->vic_kind == VIC_IMSIC) {
-      prop_u32(&w, "msi-parent", 6);
-    } else {
-      for (int i = 0; i < vm->nvcpu; i++) {
-        cells[2 * i] = CPU_PHANDLE(i);
-        cells[2 * i + 1] = 9;
-      }
-      prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
-    }
-    prop_u32(&w, "phandle", 4);
-    node_end(&w);
-
-    if (vm->vic_kind == VIC_IMSIC) {
-      node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_M + vm->intc_shift));
-      prop_str(&w, "compatible", "riscv,imsics");
-      prop_reg(&w, G_IMSIC_M + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
-      for (int i = 0; i < vm->nvcpu; i++) {
-        cells[2 * i] = CPU_PHANDLE(i);
-        cells[2 * i + 1] = 11;
-      }
-      prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
-      prop_u32(&w, "riscv,num-ids", VIMSIC_NIDS - 1);
-      prop_u32(&w, "riscv,guest-index-bits", 0);
-      prop_u32(&w, "riscv,hart-index-bits", hart_bits);
-      prop_u32(&w, "riscv,group-index-bits", 0);
+    if (vm->vic_kind == VIC_PLIC) {
+      node_begin(&w, unit_name(uname, "plic", G_PLIC_BASE + vm->intc_shift));
+      prop_str(&w, "compatible", "riscv,plic0");
+      prop_reg(&w, G_PLIC_BASE + vm->intc_shift, G_PLIC_SIZE);
+      prop_u32(&w, "riscv,ndev", 31);
       prop_empty(&w, "interrupt-controller");
-      prop_empty(&w, "msi-controller");
-      prop_u32(&w, "#msi-cells", 0);
-      prop_u32(&w, "#interrupt-cells", 0);
-      prop_u32(&w, "phandle", 7);
+      prop_u32(&w, "#interrupt-cells", 1);
+      prop_u32(&w, "#address-cells", 0);
+      for (int i = 0; i < vm->nvcpu; i++) {
+        cells[4 * i] = CPU_PHANDLE(i);
+        cells[4 * i + 1] = 11;
+        cells[4 * i + 2] = CPU_PHANDLE(i);
+        cells[4 * i + 3] = 9;
+      }
+      prop_cells(&w, "interrupts-extended", cells, 4 * vm->nvcpu);
+      prop_u32(&w, "phandle", 3);
+      node_end(&w);
+    } else {
+      // APLIC: machine domain (root, with the supervisor domain as its child)
+      node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_M + vm->intc_shift));
+      prop_str(&w, "compatible", "riscv,aplic");
+      prop_reg(&w, G_APLIC_M + vm->intc_shift, 0x8000);
+      prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
+      prop_empty(&w, "interrupt-controller");
+      prop_u32(&w, "#interrupt-cells", 2);
+      prop_u32(&w, "riscv,children", 4);
+      cells[0] = 4;
+      cells[1] = 1;
+      cells[2] = VAPLIC_NSRC - 1;
+      prop_cells(&w, "riscv,delegation", cells, 3);
+      if (vm->vic_kind == VIC_IMSIC) {
+        prop_u32(&w, "msi-parent", 7);
+      } else {
+        for (int i = 0; i < vm->nvcpu; i++) {
+          cells[2 * i] = CPU_PHANDLE(i);
+          cells[2 * i + 1] = 11;
+        }
+        prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
+      }
+      prop_u32(&w, "phandle", 5);
       node_end(&w);
 
-      node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_S + vm->intc_shift));
-      prop_str(&w, "compatible", "riscv,imsics");
-      prop_reg(&w, G_IMSIC_S + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
-      for (int i = 0; i < vm->nvcpu; i++) {
-        cells[2 * i] = CPU_PHANDLE(i);
-        cells[2 * i + 1] = 9;
-      }
-      prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
-      prop_u32(&w, "riscv,num-ids", VIMSIC_NIDS - 1);
-      prop_u32(&w, "riscv,guest-index-bits", 0);
-      prop_u32(&w, "riscv,hart-index-bits", hart_bits);
-      prop_u32(&w, "riscv,group-index-bits", 0);
+      node_begin(&w, unit_name(uname, "interrupt-controller", G_APLIC_S + vm->intc_shift));
+      prop_str(&w, "compatible", "riscv,aplic");
+      prop_reg(&w, G_APLIC_S + vm->intc_shift, 0x8000);
+      prop_u32(&w, "riscv,num-sources", VAPLIC_NSRC);
       prop_empty(&w, "interrupt-controller");
-      prop_empty(&w, "msi-controller");
-      prop_u32(&w, "#msi-cells", 0);
-      prop_u32(&w, "#interrupt-cells", 0);
-      prop_u32(&w, "phandle", 6);
+      prop_u32(&w, "#interrupt-cells", 2);
+      if (vm->vic_kind == VIC_IMSIC) {
+        prop_u32(&w, "msi-parent", 6);
+      } else {
+        for (int i = 0; i < vm->nvcpu; i++) {
+          cells[2 * i] = CPU_PHANDLE(i);
+          cells[2 * i + 1] = 9;
+        }
+        prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
+      }
+      prop_u32(&w, "phandle", 4);
       node_end(&w);
+
+      if (vm->vic_kind == VIC_IMSIC) {
+        node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_M + vm->intc_shift));
+        prop_str(&w, "compatible", "riscv,imsics");
+        prop_reg(&w, G_IMSIC_M + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
+        for (int i = 0; i < vm->nvcpu; i++) {
+          cells[2 * i] = CPU_PHANDLE(i);
+          cells[2 * i + 1] = 11;
+        }
+        prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
+        prop_u32(&w, "riscv,num-ids", VIMSIC_NIDS - 1);
+        prop_u32(&w, "riscv,guest-index-bits", 0);
+        prop_u32(&w, "riscv,hart-index-bits", hart_bits);
+        prop_u32(&w, "riscv,group-index-bits", 0);
+        prop_empty(&w, "interrupt-controller");
+        prop_empty(&w, "msi-controller");
+        prop_u32(&w, "#msi-cells", 0);
+        prop_u32(&w, "#interrupt-cells", 0);
+        prop_u32(&w, "phandle", 7);
+        node_end(&w);
+
+        node_begin(&w, unit_name(uname, "interrupt-controller", G_IMSIC_S + vm->intc_shift));
+        prop_str(&w, "compatible", "riscv,imsics");
+        prop_reg(&w, G_IMSIC_S + vm->intc_shift, 0x1000L * (vm->nvcpu + vm->hart_shift));
+        for (int i = 0; i < vm->nvcpu; i++) {
+          cells[2 * i] = CPU_PHANDLE(i);
+          cells[2 * i + 1] = 9;
+        }
+        prop_cells(&w, "interrupts-extended", cells, 2 * vm->nvcpu);
+        prop_u32(&w, "riscv,num-ids", VIMSIC_NIDS - 1);
+        prop_u32(&w, "riscv,guest-index-bits", 0);
+        prop_u32(&w, "riscv,hart-index-bits", hart_bits);
+        prop_u32(&w, "riscv,group-index-bits", 0);
+        prop_empty(&w, "interrupt-controller");
+        prop_empty(&w, "msi-controller");
+        prop_u32(&w, "#msi-cells", 0);
+        prop_u32(&w, "#interrupt-cells", 0);
+        prop_u32(&w, "phandle", 6);
+        node_end(&w);
+      }
     }
   }
 
@@ -494,7 +517,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_str(&w, "compatible", "ns16550a");
   prop_reg(&w, G_UART_BASE, 0x100);
   prop_u32(&w, "interrupt-parent", ic_phandle);
-  cells[0] = vm_irq(vm, G_UART_IRQ);
+  cells[0] = vm_irq_described(vm, G_UART_IRQ);
   cells[1] = 4;
   prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
   prop_u32(&w, "clock-frequency", 3686400);
@@ -506,7 +529,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   prop_str(&w, "compatible", "virtio,mmio");
   prop_reg(&w, G_VIRTIO_BASE + vm->mmio_shift, 0x1000);
   prop_u32(&w, "interrupt-parent", ic_phandle);
-  cells[0] = vm_irq(vm, G_VIRTIO_IRQ);
+  cells[0] = vm_irq_described(vm, G_VIRTIO_IRQ);
   cells[1] = 4;
   prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
   node_end(&w);
@@ -516,7 +539,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "google,goldfish-rtc");
     prop_reg(&w, G_RTC_BASE, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = vm_irq(vm, G_RTC_IRQ);
+    cells[0] = vm_irq_described(vm, G_RTC_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -527,7 +550,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_BALLOON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = vm_irq(vm, G_BALLOON_IRQ);
+    cells[0] = vm_irq_described(vm, G_BALLOON_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -541,7 +564,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_CON_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = vm_irq(vm, G_CON_IRQ);
+    cells[0] = vm_irq_described(vm, G_CON_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);
@@ -552,7 +575,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
     prop_str(&w, "compatible", "virtio,mmio");
     prop_reg(&w, G_VNET_BASE + vm->mmio_shift, 0x1000);
     prop_u32(&w, "interrupt-parent", ic_phandle);
-    cells[0] = vm_irq(vm, G_VNET_IRQ);
+    cells[0] = vm_irq_described(vm, G_VNET_IRQ);
     cells[1] = 4;
     prop_cells(&w, "interrupts", cells, vm->vic_kind == VIC_PLIC ? 1 : 2);
     node_end(&w);

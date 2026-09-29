@@ -1580,7 +1580,61 @@ vm_irq(struct vm *vm, int irq)
   // and RTC lines follow (machrev.ko); this one is the second anchor.
   if (irq == G_UART_IRQ && VM_FOREIGN(vm))
     return irq;
+  // F3's alias: until the guest has taken the new numbering, a device raises
+  // on the number the guest knows it by. Raised on the new number, a line the
+  // guest had given to another device brings that device's handler, which
+  // finds nothing, returns, and is brought again: an exit storm (hunt4d
+  // crossing 384, 1.8 M exits, the arrival never acknowledged), or Linux
+  // disabling the line as "nobody cared" and the device it belonged to deaf.
+  if (vm->irq_alias_on && vm_revising(vm))
+    return irq_map(vm->irq_alias_alt, irq);
   return irq_map(vm->irq_alt, irq);
+}
+
+// The number a device is *described* with: the new numbering, from the moment
+// the revision is decided. vm_irq() is the number a device *raises* on, which
+// stays the old one until the ack (F3's alias). The description must use this
+// one: built through vm_irq() it carried the old numbers while the revision
+// hold was up, the guest compared and found "no-change" (d2reg,
+// guest-revise-irqmap, both controllers) -- the alias had leaked into the
+// description it was meant to bridge.
+int
+vm_irq_described(struct vm *vm, int irq)
+{
+  if (irq == G_UART_IRQ && VM_FOREIGN(vm))
+    return irq;
+  return irq_map(vm->irq_alt, irq);
+}
+
+// the acknowledgement: the guest has the new numbering; what the devices hold
+// moves from the old numbers to the new ones. vm->lock held.
+void
+vm_irq_alias_end(struct vm *vm)
+{
+  if (!vm->irq_alias_on)
+    return;
+  vm->irq_alias_on = 0;
+  uint64 levels = vm->vic_kind == VIC_PLIC ? vm->plic.level : vm->aplic.level;
+  levels |= vm->quiet_set;        // what was raised during the quiet window, by its old number
+  vm->quiet_set = 0;
+  vm->irq_quiet = 0;
+  uint64 moved = 0;
+  for (int i = 0; i < vm->ndev; i++) {
+    struct vdev *d = &vm->dev[i];
+    if (d->irq0 < 0)
+      continue;
+    if (d->irq0 == G_UART_IRQ && VM_FOREIGN(vm))
+      continue;
+    if (levels & (1ull << irq_map(vm->irq_alias_alt, d->irq0)))
+      moved |= 1ull << irq_map(vm->irq_alt, d->irq0);
+    d->irq = irq_map(vm->irq_alt, d->irq0);
+  }
+  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+    if (levels & (1ull << irq))
+      vic_set_level(vm, irq, 0);
+  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
+    if (moved & (1ull << irq))
+      vic_set_level(vm, irq, 1);
 }
 
 // Renumber a running guest's interrupt lines and tell it. What the host owns --
@@ -1604,40 +1658,25 @@ vm_revise_irqmap(struct vm *vm, int alt)
     return -EAGAIN;
   }
   int old = vm->irq_alt;
-  uint64 moved = 0;
-  for (int i = 0; i < vm->ndev; i++) {
-    struct vdev *d = &vm->dev[i];
-    if (d->irq0 < 0)
-      continue;
-    if (levels & (1ull << d->irq))
-      moved |= 1ull << irq_map(alt, d->irq0);
-    d->irq = irq_map(alt, d->irq0);
-  }
+  // The same controller, the lines renumbered: until the guest has taken the
+  // new numbering the devices go on raising on the old one (vm_irq's alias),
+  // and what they hold moves to the new numbers at the acknowledgement
+  // (vm_irq_alias_end). *Not* vic_levels_restore(): that rebuilds the model
+  // from nothing, and on an IMSIC host with a hardware guest file loaded on a
+  // running vcpu it zeroes the per-vcpu file bookkeeping underneath it (m2a).
+  vm->irq_alias_on = 1;
+  vm->irq_alias_alt = old;
   vm->irq_alt = alt;
-  // The same controller, the lines moved: drop what was held on the old
-  // numbers and hold it on the new ones, in the model as it stands. *Not*
-  // vic_levels_restore(): that rebuilds the model from nothing, and on an
-  // IMSIC host with a hardware guest file loaded on a running vcpu it zeroes
-  // the per-vcpu file bookkeeping (hwfile) underneath it -- the exit then
-  // reads nothing back and frees nothing, the guest's enables are lost with
-  // the file, and no interrupt is ever delivered again (m2a: the
-  // guest-revise-irqmap-imsic hang, reproduced on the laptop).
-  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
-    if (levels & (1ull << irq))
-      vic_set_level(vm, irq, 0);
-  for (int irq = 1; irq < VPLIC_NIRQ; irq++)
-    if (moved & (1ull << irq))
-      vic_set_level(vm, irq, 1);
   release(&vm->lock);
-  printk("hyp: vm %d: interrupt lines renumbered %s -> %s, %d line(s) held\n", vm->id,
-         old ? "alt" : "default", alt ? "alt" : "default", vic_held(moved));
+  printk("hyp: vm %d: interrupt lines renumbered %s -> %s, %d line(s) held on the old numbers until the ack\n", vm->id,
+         old ? "alt" : "default", alt ? "alt" : "default", vic_held(levels));
   int r = vm_revise(vm, REV_DEVICES);
   if (r < 0) {
     acquire(&vm->lock);
-    for (int i = 0; i < vm->ndev; i++)
-      if (vm->dev[i].irq0 >= 0)
-        vm->dev[i].irq = irq_map(old, vm->dev[i].irq0);
+    vm->irq_alias_on = 0;
+    vm->irq_quiet = 0;
     vm->irq_alt = old;
+    uint64 moved = 0;
     for (int irq = 1; irq < VPLIC_NIRQ; irq++)
       if (moved & (1ull << irq))
         vic_set_level(vm, irq, 0);
@@ -1669,19 +1708,73 @@ vm_revise_intc_addr(struct vm *vm, uint64 shift)
     return 0;
   acquire(&vm->lock);
   uint64 old = vm->intc_shift;
+  vm->map_seq++; __sync_synchronize();          // the map is being moved: lookups wait (hypmmio.c)
   for (int i = 0; i < vm->ndev; i++)
     if (vm->dev[i].obs == OBS_INTC)
       vm->dev[i].base = vm->dev[i].base - old + shift;
   vm->intc_shift = shift;
+  vm->intc_alias_on = 1;          // the old window answers until the ack (Invariant 4, F2)
+  vm->intc_alias_shift = old;
+  __sync_synchronize(); vm->map_seq++;
   release(&vm->lock);
   printk("hyp: vm %d: interrupt controller registers +0x%lx -> +0x%lx\n", vm->id, old, shift);
   int r = vm_revise(vm, REV_INTC);
   if (r < 0) {
     acquire(&vm->lock);
+    vm->map_seq++; __sync_synchronize();
     for (int i = 0; i < vm->ndev; i++)
       if (vm->dev[i].obs == OBS_INTC)
         vm->dev[i].base = vm->dev[i].base - shift + old;
     vm->intc_shift = old;
+    vm->intc_alias_on = 0;
+    __sync_synchronize(); vm->map_seq++;
+    release(&vm->lock);
+    return r;
+  }
+  return 0;
+}
+
+// F15, live: move a running machine's device windows a megabyte up the map (or
+// back). Until now the map changed only on arrival at a host of another shape;
+// the same mechanism -- the windows move, the old ones answer through the alias
+// until the guest has taken the new map (hypmmio.c find_dev), the guest is
+// told -- works under a running guest, and gives the alias window something
+// to be stressed with (L33) and its cost something to be measured on (L20).
+int
+vm_revise_map(struct vm *vm, uint64 shift)
+{
+  if (vm == 0 || (vm->state != VM_RUNNING && vm->state != VM_PAUSED))
+    return -EINVAL;
+  if (shift != 0 && shift != G_MMIO_ALT_SHIFT)
+    return -EINVAL;
+  if (shift == vm->mmio_shift)
+    return 0;
+  acquire(&vm->lock);
+  uint64 old = vm->mmio_shift;
+  vm->map_seq++; __sync_synchronize();          // the map is being moved: lookups wait (hypmmio.c)
+  for (int i = 0; i < vm->ndev; i++) {
+    struct vdev *d = &vm->dev[i];
+    if (!d->ghost && d->base >= G_VIRTIO_BASE + old && d->base < G_CON_BASE + 0x1000 + old)
+      d->base = d->base - old + shift;
+  }
+  vm->mmio_shift = shift;
+  vm->alias_on = 1;               // the old windows answer until it has taken the new map
+  vm->alias_shift = old;
+  __sync_synchronize(); vm->map_seq++;
+  release(&vm->lock);
+  printk("hyp: vm %d: device windows +0x%lx -> +0x%lx\n", vm->id, old, shift);
+  int r = vm_revise(vm, REV_DEVICES);
+  if (r < 0) {
+    acquire(&vm->lock);
+    vm->map_seq++; __sync_synchronize();
+    for (int i = 0; i < vm->ndev; i++) {
+      struct vdev *d = &vm->dev[i];
+      if (!d->ghost && d->base >= G_VIRTIO_BASE + shift && d->base < G_CON_BASE + 0x1000 + shift)
+        d->base = d->base - shift + old;
+    }
+    vm->mmio_shift = old;
+    vm->alias_on = 0;
+    __sync_synchronize(); vm->map_seq++;
     release(&vm->lock);
     return r;
   }
@@ -1715,15 +1808,17 @@ vm_revise_vector(struct vm *vm, int on)
   acquire(&vm->lock);
   vm->vec_revoked = !on;
   vm->vec_pending = 1;
-  // Off when revoked, so the next vector instruction is an illegal-instruction
-  // trap; Initial when granted, which is what a guest expects of a unit it has
-  // not used yet.
-  for (int i = 0; i < vm->nvcpu; i++) {
-    struct vcpu *v = &vm->vcpu[i];
-    v->vsstatus &= ~SSTATUS_VS_MASK;
-    if (on)
-      v->vsstatus |= SSTATUS_VS_INITIAL;
-  }
+  // The description changes now; the unit does not. Invariant 4 holds for the
+  // vector unit as for a device window: until the guest acknowledges, a task
+  // that holds vector state keeps computing on it -- the guest may be about to
+  // refuse because of that very task -- and forcing VS Off here made Linux's
+  // first-use trap find a task with a save area and no VS (a WARN, a leak,
+  // the registers' contents surviving only by luck). Off is enforced at the
+  // acknowledgement that cedes the unit (hypsbi.c fid 3). Granted, nothing is
+  // written either: a guest turns VS on itself when a task first uses the
+  // unit (xv6 trap.c, Linux riscv_v_first_use_handler); VS=Initial written by
+  // the host told Linux a task had live state and no save area -- an Oops on
+  // the return to user (lxvs4).
   release(&vm->lock);
 
   printk("hyp: vm %d: vector unit %s\n", vm->id, on ? "granted" : "revoked");
@@ -3153,12 +3248,23 @@ vcpu_enter(struct vcpu *v)
   if (plat.intc_kind == INTC_IMSIC)
     csr_write(CSR_VSISELECT, v->vsiselect);
   csr_write(CSR_HVIP, hvip);
+  // Defect 19. A guest with the AIA CSRs finds *which* interrupt is pending by
+  // reading stopi, and for a VS-level guest with no guest interrupt file vstopi
+  // shows the external interrupt only when hvictl names it (IID 9). The IMSIC
+  // software model wrote hvictl at every entry; the PLIC and APLIC models
+  // never did -- xv6 reads scause and never noticed -- so a Linux booted with
+  // Smaia/Ssaia in its ISA string and then given a PLIC or an APLIC took
+  // cause-9 traps with topi 0 forever (vicprobe5: the model's state was right
+  // and the guest never claimed). Named here for every model; the IMSIC path's
+  // own write agrees with it, and a guest file (vgein != 0) reports itself.
+  if (plat.has_aia_csrs && v->vgein == 0)
+    csr_write(CSR_HVICTL, (hvip & HVIP_VSEIP) ? HVICTL_VSEIP : 0);
   // F5: Sstc for this machine or not (STCE); A/D updating always. F6: a
   // machine with another timebase may not read `time' itself (TM off).
   // F21: cbo.zero in hardware only when the block described is the block the
   // host has (and no revision between two sizes is pending); else it traps
   int cboz_native = vm->cboz_block == plat.cboz_block &&
-                    (vm->cboz_prev == vm->cboz_block || vm->revise_acked == vm->revise_gen);
+                    (vm->cboz_prev == vm->cboz_block || !vm_revising(vm));
   if (plat_bootarg("nocbozmodel"))
     cboz_native = 1;    // the control: no software model, the hazard shows
   csr_write(CSR_HENVCFG, HENVCFG_ADUE | HENVCFG_CBCFE | HENVCFG_CBIE | (cboz_native ? HENVCFG_CBZE : 0) |
@@ -3229,6 +3335,10 @@ vcpu_enter(struct vcpu *v)
   v->pc = r_sepc();
   v->priv = (r_sstatus() & SSTATUS_SPP) ? 1 : 0;
   v->vsstatus = csr_read(CSR_VSSTATUS);
+  if (v->vs_force) {              // the guest ceded its vector unit while this vcpu ran: Off, at this exit's save
+    v->vsstatus &= ~SSTATUS_VS_MASK;
+    v->vs_force = 0;
+  }
   v->vsie = csr_read(CSR_VSIE);
   v->vstvec = csr_read(CSR_VSTVEC);
   v->vsscratch = csr_read(CSR_VSSCRATCH);

@@ -42,7 +42,7 @@
  	vm_dev->base = devm_platform_ioremap_resource(pdev, 0);
  	if (IS_ERR(vm_dev->base)) {
  		rc = PTR_ERR(vm_dev->base);
-@@ -693,9 +695,55 @@
+@@ -693,9 +695,63 @@
  
  free_vm_dev:
  	kfree(vm_dev);
@@ -79,6 +79,14 @@
 +	vm_dev->irq = virq;
 +	ob = vm_dev->base;
 +	vm_dev->base = nb;
++	{	/* the platform resource follows, so the device can be found by where it is */
++		struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++		if (r) {
++			resource_size_t n = resource_size(r);
++			r->start = base;
++			r->end = base + n - 1;
++		}
++	}
 +	dev_info(&pdev->dev, "relocated to %pa, irq %d\n", &base, virq);
 +	(void)ob;	/* the devm mapping of the boot window stays until the device goes */
  	return rc;
