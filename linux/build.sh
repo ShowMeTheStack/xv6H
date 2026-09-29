@@ -109,6 +109,11 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
   if [ -f $WORK/src/vecuser.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecuser $WORK/src/vecuser.c || log "vecuser did not build"
   fi
+  # crossck: memory, clock and vector file verified from inside the guest across a crossing (L17)
+  [ -f $WORK/src/vecprobe.c ] && ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecprobe $WORK/src/vecprobe.c
+  if [ -f $WORK/src/crossck.c ]; then
+    ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/crossck $WORK/src/crossck.c || log "crossck did not build"
+  fi
   mkdir -p $root/proc $root/sys $root/dev $root/etc $root/mnt $root/tmp $root/root
   cat > $root/init <<'INIT'
 #!/bin/sh
@@ -201,6 +206,7 @@ CONFIG_MODULE_UNLOAD=y
 CONFIG_MEMORY_HOTPLUG=y
 CONFIG_MEMORY_HOTREMOVE=y
 CONFIG_MEMORY_HOTPLUG_DEFAULT_ONLINE=y
+CONFIG_MHP_DEFAULT_ONLINE_TYPE_ONLINE_AUTO=y
 CONFIG_HOTPLUG_CPU=y
 CONFIG_VIRTIO_BALLOON=y
 CONFIG_VIRTIO_CONSOLE=y

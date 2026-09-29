@@ -1,0 +1,15 @@
+NAME
+     vecprobe - does a task's vector register file survive a system call?
+
+SYNOPSIS
+     vecprobe
+
+DESCRIPTION
+     vecprobe loads the vector registers with known values, makes a
+     system call (a printf) and sums them again. It says whether the
+     registers came back intact. On this kernel they do; the same probe
+     on Linux shows the registers discarded on every system call, which
+     Linux does by design.
+
+SEE ALSO
+     vhold(1), memck(1)

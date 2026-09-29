@@ -168,6 +168,7 @@ sys_vm_migrate(void)
       vm_resume(vm);        // it was stopped for the last round; it stays ours
     return r;
   }
+  vm->t_acked = r_time();
   // the far end has it and says so; commit -- it runs the machine only on
   // this word, so a sender that never gets here has left nothing running
   // over there
@@ -176,6 +177,12 @@ sys_vm_migrate(void)
       vm_resume(vm);
     return r;
   }
+  vm->t_committed = r_time();
+  // L15: the source's half of the outage, from the moment the vcpus stopped
+  if (vm->t_stop)
+    printk("hyp: vm %d: crossing, this side: stopped +0, last page +%ld us, taken by the far end +%ld us, committed +%ld us\n",
+           vm->id, (long)((vm->t_lastpage - vm->t_stop) / 10), (long)((vm->t_acked - vm->t_stop) / 10),
+           (long)((vm->t_committed - vm->t_stop) / 10));
   // it is over there now. What is here must stop being a machine before
   // the other end starts it, which is why this is not a copy.
   vm_destroy(vm);
@@ -424,6 +431,7 @@ sys_vm_info(void)
     info.revise_capable = vm->revise_capable;
     info.revise_gen = vm->revise_gen;
     info.revise_repeats = vm->revise_repeats;
+    info.revise_stale = vm->revise_stale;
     info.irq_quiet_held = (uint32)vm->irq_quiet_held;
     info.aplic_ie = vm->aplic.domaincfg[1] & 0x100; info.aplic_en = vm->aplic.enable; info.aplic_pend = vm->aplic.pending;
     info.aplic_lvl = vm->aplic.level; info.aplic_idel0 = vm->aplic.idelivery[0]; info.aplic_idel1 = vm->aplic.idelivery[1];

@@ -48,6 +48,7 @@ HOST_APPEND = ""   # --append: words for every host's command line
 
 
 class QEMU(object):
+    live = []     # the hosts the running test has started (timeline_report)
     def __init__(self, intc=None, cpus=None, mem=None, aia_guests=2, hyp=None, vec=None,
                  vlen=None, sv=None, log=None,
                  extra_env=None, keep_fs=False, fsimg=None, cboz=None):
@@ -112,6 +113,7 @@ class QEMU(object):
         self.proc = subprocess.Popen(cmd.split(), cwd=HERE, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.buf = b""
+        QEMU.live.append(self)
         self.consumed = 0
         self.gone = False   # the machine's console has closed
 
@@ -1992,6 +1994,17 @@ def t_hostfiles(log):
         subprocess.run(cmd, cwd=HERE, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
 
+TIMELINE = re.compile(rb"hyp: vm \d+: ((?:crossing, this side|arrival timeline): [^\r\n]*)")
+
+def timeline_report():
+    """L15: the crossing's timeline as the two hosts printed it -- the source's
+    "crossing, this side: stopped +0, last page +A us, ..." and the destination's
+    "arrival timeline: ..." -- kept with the test's own output, because a queue's
+    logs keep no consoles (tools/timeline_table.py reads them from either)."""
+    for i, q in enumerate(QEMU.live):
+        for m in TIMELINE.finditer(q.buf):
+            print("    host %d: %s" % (i, m.group(1).decode(errors="replace")))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("suite", nargs="?", default="all")
@@ -2192,8 +2205,10 @@ def main():
     for name, fn in tests:
         print("== %s" % name)
         t0 = time.time()
+        QEMU.live = []
         try:
             fn()
+            timeline_report()
             print("== %s: PASS (%.0fs)" % (name, time.time() - t0))
             results.append({"test": name, "result": "pass",
                             "seconds": round(time.time() - t0, 1)})
@@ -2211,6 +2226,7 @@ def main():
             if not msg.strip():
                 msg = traceback.format_exc().strip().splitlines()[-3:]
                 msg = " | ".join(l.strip() for l in msg)
+            timeline_report()
             print("== %s: FAIL (%.0fs): %s" % (name, time.time() - t0, msg))
             results.append({"test": name, "result": "fail",
                             "seconds": round(time.time() - t0, 1),

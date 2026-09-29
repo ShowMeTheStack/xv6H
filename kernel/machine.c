@@ -388,6 +388,19 @@ machine_request(uint32 what)
   return 0;
 }
 
+// Does this hart owe the per-hart part of a revision another hart has
+// already taken? A memory compare, for the paths that run too often to ask
+// the host: the announcement is one SSIP bit shared with ordinary IPIs, and
+// a hart whose announcement coincided with a TLB flush handled the flush and
+// dropped the announcement, while the host had already stopped repeating it
+// because the first hart had read the description (defect 21, found by the
+// model: the hart kept the old controller and timer state after the ack).
+int
+machine_revise_owed(void)
+{
+  return supported() && revision_hart[cpuid()] != revision_global;
+}
+
 void
 machine_revise_check(void)
 {
@@ -786,5 +799,5 @@ machine_revise_check(void)
   // What could not be taken is reported rather than hidden: the host learns
   // exactly which parts of a revision this guest managed, so a refusal is
   // something it can plan around instead of a silent failure.
-  sbi_call(SBI_EXT_MACHINE, MACH_ACK, adopted);
+  sbi_call2(SBI_EXT_MACHINE, MACH_ACK, adopted, gen);   // named: a stale ack is refused (defect 20)
 }

@@ -587,6 +587,7 @@ struct vm {
   uint64 revise_done;     // host tick when the ack came back
   uint64 revise_repeat_at; // L1: when the announcement was last repeated
   uint32 revise_repeats;   // how many times it had to be (a lost announcement, explained)
+  uint32 revise_stale;     // acks refused for naming an older generation (defect 20)
   uint32 revise_described; // the generation the guest last asked describe() for
   int revise_wd_printed;   // the watchdog's line, once per generation
   uint64 corun_busy, corun_both; // L6: ticks with >=2 vcpus busy; of those, >=2 on a hart together
@@ -594,7 +595,15 @@ struct vm {
   uint64 request_at, requests_refused;  // L21: fid 5 rate limit
   int irq_alias_on, irq_alias_alt;      // F3 alias: devices raise on the numbering the guest still has, until the ack
   int irq_quiet; uint64 quiet_set; uint64 irq_quiet_held;
-  volatile uint32 map_seq;              // odd while the device map is being moved (hypmmio.c find_dev retries: a lookup must see one map, not half of two)      // the quiet window: from describe() to ack() a renumbering machine's device
+  volatile uint32 map_seq;
+  // L15: the crossing's timeline, in host ticks (r_time, 10 MHz). Source: when the
+  // vcpus stopped for the last round, when the last page went, when the far end
+  // said it had the machine, when the commit went. Destination: when the stream
+  // ended, when the commit was read and the machine resumed, when a vcpu first
+  // entered; the revision's own stamps are revise_asked/revise_done.
+  uint64 t_stop, t_lastpage, t_acked, t_committed;
+  uint64 t_stream_end, t_resumed, t_first_entry;
+  int arrival_timeline;                 // set at the stream's end, cleared once the timeline is printed              // odd while the device map is being moved (hypmmio.c find_dev retries: a lookup must see one map, not half of two)      // the quiet window: from describe() to ack() a renumbering machine's device
                                         // lines are held here (by their old number) and raised on the new ones at the ack
   volatile int revise_hold;             // a revision is being made: its facts are set, its generation not yet bumped (syshyp.c vmctl)
   int intc_alias_on; uint64 intc_alias_shift;   // F2 alias: the controller's old window answers until the ack

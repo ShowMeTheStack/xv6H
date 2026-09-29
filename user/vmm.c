@@ -1594,6 +1594,8 @@ info(int id)
   printf("  revision: %s, generation %d, announcement repeated %d time(s)\n",
          vi.revise_capable ? "guest speaks the protocol" : "guest does not speak it",
          vi.revise_gen, vi.revise_repeats);
+  if (vi.revise_stale)
+    printf("  stale acks refused: %d (the guest acknowledged an older generation; the announcement stood)\n", vi.revise_stale);
   if (vi.corun_busy)
     printf("  co-run: both vcpus on harts in %ld%% of the %ld ticks with two busy\n",
            vi.corun_both * 100 / vi.corun_busy, vi.corun_busy);

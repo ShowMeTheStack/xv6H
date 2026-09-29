@@ -1,0 +1,16 @@
+NAME
+     memck - check memory, clock and vector state across a crossing
+
+SYNOPSIS
+     memck [MB] [SECONDS]
+
+DESCRIPTION
+     memck fills MB megabytes (default 16) of memory with a pattern keyed
+     by the address and, once a second for SECONDS, verifies all of it,
+     checks that the clock has not gone back and that it advances at the
+     rate of the ticks, and checksums a set of vector registers it holds.
+     One line per round; a mismatch is fatal and names its address. It is
+     the oracle the crossing tests start before a move and read after it.
+
+SEE ALSO
+     cksum(1), vhold(1), zerocheck(1)

@@ -259,7 +259,7 @@ revise(void)
     adopted |= 2;                                        // REV_INTC
   }
   seen_gen = gen;
-  sbi(SBI_MACH, 3, adopted, 0);                          // ack
+  sbi(SBI_MACH, 3, adopted, gen);                        // ack, named (defect 20)
   puts("revguest: revision "); putnum(gen); puts(": now on "); puts(kindname[cur.kind]);
   puts(" (adopted "); puthex(adopted); puts(")\n");
 }

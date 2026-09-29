@@ -1,0 +1,16 @@
+NAME
+     zerocheck - fresh memory from the kernel must be zero
+
+SYNOPSIS
+     zerocheck [PAGES]
+
+DESCRIPTION
+     zerocheck takes PAGES pages with sbrk, reads every byte and requires
+     it to be zero, then writes a pattern so that the pages are really its
+     own, and says so. The kernel zeroes pages with cbo.zero at the
+     cache-block size the machine is described with; a guest that believes
+     a longer block than the hardware has leaves every other block
+     unzeroed, and this is what shows it.
+
+SEE ALSO
+     memck(1)

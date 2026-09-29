@@ -201,6 +201,7 @@ struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
   int revise_capable, revise_gen;  // speaks the revision protocol; generation
   uint32 revise_repeats;           // L1: announcements repeated (a lost one, counted)
+  uint32 revise_stale;             // acks refused as stale (defect 20)
   uint32 irq_quiet_held;           // F3: device interrupts held in the quiet window and raised on the new numbers at the ack
   uint32 aplic_ie, aplic_idel0, aplic_idel1, aplic_tgt10; uint64 aplic_en, aplic_pend, aplic_lvl;   // the APLIC model, for a guest that is not answering
   uint64 corun_busy, corun_both;   // L6: ticks with two vcpus busy; of those, both on harts

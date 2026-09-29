@@ -1,0 +1,15 @@
+NAME
+     vhold - hold vector state for a while
+
+SYNOPSIS
+     vhold [SECONDS]
+
+DESCRIPTION
+     vhold touches the vector registers every 10 ms for SECONDS, so that
+     at any instant a host asking whether a task holds state in the unit
+     gets a deterministic yes. It exits 0 when the time is up and prints
+     the sum it computed, so the registers were really used. The
+     negotiation tests use it to make a refusal certain.
+
+SEE ALSO
+     vecprobe(1), memck(1)

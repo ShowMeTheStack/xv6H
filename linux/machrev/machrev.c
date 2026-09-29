@@ -113,6 +113,11 @@ static struct sbiret mach(unsigned long fid, unsigned long a0)
 	return sbi_ecall(SBI_EXT_MACH, fid, a0, 0, 0, 0, 0, 0);
 }
 
+static struct sbiret mach2(unsigned long fid, unsigned long a0, unsigned long a1)
+{
+	return sbi_ecall(SBI_EXT_MACH, fid, a0, a1, 0, 0, 0, 0);
+}
+
 /* what the tree says the machine is; the same reading for the live tree and a revised one */
 static void read_facts(struct device_node *root, struct facts *f)
 {
@@ -758,7 +763,7 @@ static void take_revision(struct machrev *m)
 	m->gen = gen;
 	m->revisions++;
 	m->adopted_total |= adopted;
-	mach(MACH_ACK, adopted);
+	mach2(MACH_ACK, adopted, gen);	/* named: a stale ack is refused (defect 20) */
 	pr_info("machrev: revision %lu (what 0x%lx): adopted 0x%x\n", gen, what, adopted);
 	kfree(mem);
 	memunmap(blob);

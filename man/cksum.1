@@ -1,0 +1,14 @@
+NAME
+     cksum - CRC-32 and byte count of each file
+
+SYNOPSIS
+     cksum [FILE...]
+
+DESCRIPTION
+     cksum prints the CRC-32 and the length of each FILE, or of standard
+     input, one line each: "crc length name", as POSIX cksum prints them.
+     The tests use it to show that a guest's data survived something the
+     host did to the machine underneath it.
+
+SEE ALSO
+     memck(1), cat(1)

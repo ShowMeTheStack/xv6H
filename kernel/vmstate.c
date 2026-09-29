@@ -830,6 +830,7 @@ vm_save_file(struct vm *vm, struct file *f)
 static int hs_put(struct file *f, char answer, uint32 arg);
 static int hs_get(struct file *f, char *answer, uint32 *arg);
 static int cede(struct vm *vm, uint32 mask);
+static uint now_ticks(void);
 
 // the machine's shape, as the CFG section carries it
 static void
@@ -899,6 +900,31 @@ save_to(struct vm *vm, struct sink *s)
   hdr.saved_time = r_time();
   if ((r = put(s, &hdr, sizeof(hdr))) < 0)
     goto out;
+
+  // defect 22 (found by the model, L22): a machine crosses only between
+  // revisions. The stream carries the description the machine is on, not the
+  // alias of a revision the guest has not yet read: a machine stopped between
+  // the announcement and the guest's read would arrive believing the old
+  // numbering, which the destination does not answer; one stopped between the
+  // read and the ack would acknowledge a generation the destination has moved
+  // past (defect 20 refuses that ack, but the guest's description is then
+  // adopted late). A guest that speaks the protocol acks within milliseconds:
+  // this waits for it, up to 5 s, and refuses the move otherwise.
+  if (vm->revise_capable) {
+    uint deadline = now_ticks() + 500;
+    while (vm->revise_acked != vm->revise_gen) {
+      if (now_ticks() >= deadline) {
+        printk("hyp: vm %d: revision %d is still unacknowledged: the move is refused\n",
+               vm->id, vm->revise_gen);
+        r = -EBUSY;
+        goto out;
+      }
+      acquire(&tickslock);
+      sleep_prepare((void *)&ticks);
+      release(&tickslock);
+      sleep();
+    }
+  }
 
   fill_cfg(vm, &w->cfg);
   if ((r = put_sec(s, "CFG", &w->cfg, sizeof(w->cfg))) < 0)
@@ -981,6 +1007,7 @@ save_to(struct vm *vm, struct sink *s)
   was_running = (vm->state == VM_RUNNING);
   if (was_running)
     vm_pause(vm);
+  vm->t_stop = r_time();          // L15: the outage begins here
   if ((r = drain(vm)) < 0)
     goto out;
 
@@ -1058,6 +1085,7 @@ save_to(struct vm *vm, struct sink *s)
     lr.marked = pc.dirty;     // everything anyone remembered, not yet sent
     lr.msums = pc.msum;       // 0 unless admeasure=1
     r = save_mem(vm, s, &mem, 0, 0, pc.sum, 1, &lr);
+    vm->t_lastpage = r_time();
     printk("hyp: vm %d: stopped for %d page(s), %ld KB; %ld written by the "
            "guest under the copy; %d page(s) nobody had marked\n",
            vm->id, lr.nsent, (long)(mem / 1024), (long)vm->snap.faulted,
@@ -2317,6 +2345,8 @@ restore_from(struct src *s, const char *name, int *idp)
     } else if (strncmp(sec.name, "END", sizeof(sec.name)) == 0) {
       // the sections are over. A file says in its header as well; a
       // connection has only this.
+      vm->t_stream_end = r_time();     // L15: the destination's clock starts here
+      vm->arrival_timeline = (s->f != 0);
       break;
     }
     s->off = next;         // whatever it was, skip the rest of it
@@ -2344,8 +2374,17 @@ restore_from(struct src *s, const char *name, int *idp)
     owed |= REV_INTC | REV_DEVICES;
   if (src_kind >= 0 && src_ishift != vm->intc_shift) {
     owed |= REV_INTC;
+    // Invariant 4 at the arrival, F2: the guest's driver reads the controller
+    // where it was until it has taken the new description; xv6 never needed
+    // this (it adopts in the trap before it touches the controller), Linux's
+    // driver claimed the anchor's interrupt at the old window, found no window,
+    // and died of the access fault in its interrupt handler (lxintcs3:
+    // "described no" for 20 s). The old window answers until the ack, as
+    // for a live move (vm_revise_intc_addr).
+    vm->intc_alias_on = 1;
+    vm->intc_alias_shift = src_ishift;
     printk("hyp: vm %d: arrived with its interrupt controller at +0x%lx, this host puts "
-           "it at +0x%lx\n", vm->id, src_ishift, vm->intc_shift);
+           "it at +0x%lx (the old window answers until the ack)\n", vm->id, src_ishift, vm->intc_shift);
   }
   if (src_kind >= 0 && src_no_clint != vm->no_clint) {
     owed |= REV_DEVICES;

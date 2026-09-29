@@ -11,9 +11,13 @@
 #   tools/remote.sh log NAME                                # the full results file
 #   tools/remote.sh script NAME FILE.py [args...]            # sync, build, run a python script (test-hyp helpers available)
 #   tools/remote.sh kill NAME                               # stop a run
+#   tools/remote.sh resume NAME [qrun args...]               # continue a queue where it stopped (same args)
 #   LXTAG=-618 tools/remote.sh run ...                       # the Linux image of another kernel build (linux/build.sh TAG)
+#   SEED=NAME tools/remote.sh ...                            # reuse that run's synced tree instead of the working tree
 #   tools/remote.sh rm NAME                                 # delete a run's copy
 #
+# each run is a user systemd unit xv6h-NAME (linger is on: it survives the ssh session that
+# started it -- two tmux-started runs died the moment other sessions came and went);
 # the copy lives in ~/xv6h-runs/NAME on the box; the Linux artifacts come
 # from ~/xv6h-linux/out there. results: ~/xv6h-runs/NAME/results.out and
 # a "done" file holding the exit status.
@@ -31,6 +35,15 @@ cmd=$1; shift || true
 # that seed -- which is a disk-to-disk copy on a machine with 32 cores.
 sync_tree() { # NAME
   local name=$1
+  # SEED=OTHER: copy that run's tree instead of syncing the working tree, so a
+  # script that queues stages over a night cannot pick up an edit made
+  # between them (night 4 lost five stages to a half-made edit that way)
+  if [ -n "${SEED:-}" ]; then
+    ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/$SEED $RUNS/$name && cd $RUNS/$name && \
+      rm -rf qlogs qresults.txt results.out done build.out run_script.py && \
+      mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img"
+    return
+  fi
   ssh -o BatchMode=yes $HOST "mkdir -p $RUNS/.seed"
   # --delete-excluded as well as --delete: a file that becomes
   # excluded (a host binary built for the laptop, say) must go from
@@ -70,8 +83,8 @@ run)
   name=$1; shift; suite=$1; shift || true
   [ -n "$name" ] && [ -n "$suite" ] || { echo "usage: remote.sh run NAME SUITE [args]"; exit 1; }
   sync_tree "$name"
-  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
-    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && ./test-hyp.py $suite $* > results.out 2>&1; echo \\\$? > done)\""
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && systemctl --user stop xv6h-$name 2>/dev/null; systemctl --user reset-failed xv6h-$name 2>/dev/null; \
+    systemd-run --user --collect --quiet --unit xv6h-$name bash -c \"cd $RUNS/$name && (make -s > build.out 2>&1 && ./test-hyp.py $suite $* > results.out 2>&1; echo \\\$? > done)\""
   echo "started $name: ./test-hyp.py $suite $* on $HOST (tools/remote.sh status $name)"
   ;;
 script)
@@ -79,8 +92,8 @@ script)
   [ -n "$name" ] && [ -f "$script" ] || { echo "usage: remote.sh script NAME FILE.py [args]"; exit 1; }
   sync_tree "$name"
   scp -q "$script" "$HOST:$RUNS/$name/run_script.py"
-  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
-    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=192 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && systemctl --user stop xv6h-$name 2>/dev/null; systemctl --user reset-failed xv6h-$name 2>/dev/null; \
+    systemd-run --user --collect --quiet --unit xv6h-$name bash -c \"cd $RUNS/$name && (make -s > build.out 2>&1 && rm -f fs.img && make -s fs.img HOSTFS_MB=192 HOSTFILES='linux/Image linux/linux.img' >> build.out 2>&1 && python3 run_script.py $* > results.out 2>&1; echo \\\$? > done)\""
   echo "started $name: $script $* on $HOST"
   ;;
 queue)
@@ -89,9 +102,27 @@ queue)
   sync_tree "$name"
   # qrun builds once itself and then runs every test as its own job, so
   # the build here is only the file system image the jobs copy.
-  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && tmux kill-session -t xv6h-$name 2>/dev/null; \
-    tmux new-session -d -s xv6h-$name \"cd $RUNS/$name && (python3 tools/qrun.py $* > results.out 2>&1; echo \\\$? > done)\""
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && systemctl --user stop xv6h-$name 2>/dev/null; systemctl --user reset-failed xv6h-$name 2>/dev/null; \
+    systemd-run --user --collect --quiet --unit xv6h-$name bash -c \"cd $RUNS/$name && (python3 tools/qrun.py $* > results.out 2>&1; echo \\\$? > done)\""
   echo "started $name: tools/qrun.py $* on $HOST (tools/remote.sh status $name)"
+  ;;
+
+build)
+  # sync and build only (kernel, guests, user programs): a compile check
+  # that leaves the box's queues alone
+  name=$1; shift || true
+  [ -n "$name" ] || { echo "usage: remote.sh build NAME"; exit 1; }
+  sync_tree "$name"
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && nice -n 15 make -s > build.out 2>&1; echo \$? > done; cat build.out | tail -40; echo build-exit \$(cat done)"
+  ;;
+resume)
+  # continue a queue in its existing copy (qrun --resume believes qresults.txt):
+  # no sync, no rm -- the copy is the run (n3-lx100 died at 1 013 of 2 400)
+  name=$1; shift || true
+  [ -n "$name" ] || { echo "usage: remote.sh resume NAME [qrun args...]"; exit 1; }
+  ssh -o BatchMode=yes $HOST "cd $RUNS/$name && rm -f done && systemctl --user stop xv6h-$name 2>/dev/null; systemctl --user reset-failed xv6h-$name 2>/dev/null; \
+    systemd-run --user --collect --quiet --unit xv6h-$name bash -c \"cd $RUNS/$name && (python3 tools/qrun.py --resume $* >> results.out 2>&1; echo \\\$? > done)\""
+  echo "resumed $name: tools/qrun.py --resume $* on $HOST"
   ;;
 
 status)
@@ -116,7 +147,7 @@ log)
   ssh -o BatchMode=yes $HOST "cat $RUNS/$1/results.out"
   ;;
 kill)
-  ssh -o BatchMode=yes $HOST "tmux kill-session -t xv6h-$1 2>/dev/null; pkill -f 'xv6h-runs/$1/' ; echo killed" 
+  ssh -o BatchMode=yes $HOST "systemctl --user stop xv6h-$1 2>/dev/null; tmux kill-session -t xv6h-$1 2>/dev/null; pkill -f 'xv6h-runs/$1/' ; echo killed" 
   ;;
 rm)
   ssh -o BatchMode=yes $HOST "tmux kill-session -t xv6h-$1 2>/dev/null; rm -rf $RUNS/$1"

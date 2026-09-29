@@ -42,8 +42,12 @@ def linux_cmd(q, cmd, timeout=30):
     q.send(cmd + (" echo " if cmd.rstrip().endswith("&") else "; echo ") + tag + "\n")
     q.expect(r"\n" + tag + r"\r?\n", timeout)
     q.expect(r"linux# ", 10)
-    # a host line that landed inside the guest's output is not the guest's answer
-    return re.sub(r"^hyp: [^\n]*\n?", "", q.output_since(mark), flags=re.M)
+    # a host line that landed inside the guest's output is not the guest's answer;
+    # one that landed in the middle of a guest line split it, and the two halves are
+    # rejoined once the host's line is taken out (n3-lx100: "virtio device at 0hyp: vm 0: ...")
+    out = q.output_since(mark)
+    out = re.sub(r"(?<!\n)hyp: [^\n]*\r?\n", "", out)
+    return re.sub(r"^hyp: [^\n]*\n?", "", out, flags=re.M)
 
 
 def have_https(q):
@@ -66,7 +70,7 @@ def t_linux_boot(QEMU, intc, cpus, log):
         start_linux(q)
         print("    booted to a shell in %.0fs" % (time.time() - t0))
         out = linux_cmd(q, "uname -a")
-        assert "6.12" in out and "riscv64" in out, out
+        assert re.search(r"Linux \S+ 6\.(12|18)\.", out) and "riscv64" in out, out   # the two LTS kernels the patches are proven on (L5)
         out = linux_cmd(q, "cat /etc/marker")
         assert "marker-in-initramfs" in out, out
         out = linux_cmd(q, "cat /proc/cpuinfo")

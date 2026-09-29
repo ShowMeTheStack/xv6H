@@ -172,6 +172,21 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     break;
   case 3:
     acquire(&vm->lock);
+    // defect 20 (found by the model, L22): an ack names the generation it
+    // acknowledges (a1; 0 from a guest that predates this). Without it the ack
+    // of an older revision ended a newer one: the guest read generation g, the
+    // machine crossed mid-revision, the destination asked g+1 and re-announced,
+    // and the guest's ack of g -- arriving after -- ended g+1's alias with the
+    // guest still on g's description. A stale ack is refused and the
+    // announcement stands: the guest reads again and acknowledges what it read.
+    if (a1 && (uint32)a1 != vm->revise_gen) {
+      vm->revise_stale++;
+      printk("hyp: vm %d: stale ack of revision %d (the machine is on %d): refused\n",
+             vm->id, (int)a1, vm->revise_gen);
+      release(&vm->lock);
+      r.err = SBI_ERR_INVALID_PARAM;
+      break;
+    }
     vm->revise_acked = vm->revise_gen;
     vm_del_ghosts(vm);            // the old controller's window has answered its last
     vm_irq_alias_end(vm);         // F3: what the devices hold moves to the new numbers
@@ -206,6 +221,13 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       }
     }
     release(&vm->lock);
+    if (vm->arrival_timeline && vm->t_first_entry) {
+      uint64 t0 = vm->t_stream_end;
+      printk("hyp: vm %d: arrival timeline: revision asked +%ld us, adopted +%ld us (of which the guest's %ld us)\n",
+             vm->id, (long)((vm->revise_asked - t0) / 10), (long)((vm->revise_done - t0) / 10),
+             (long)((vm->revise_done - vm->revise_asked) / 10));
+      vm->arrival_timeline = 0;
+    }
     printk("hyp: vm %d: revision %d adopted (0x%lx) after %ld us\n", vm->id,
            vm->revise_acked, a0,
            (long)((vm->revise_done - vm->revise_asked) / 10));

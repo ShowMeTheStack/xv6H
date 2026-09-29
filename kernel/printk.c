@@ -92,7 +92,7 @@ static int
 hold_due(void)
 {
   return hold.w != hold.r &&
-         (cons_owned == 0 || cons_last_nl || (uint)(ticks - cons_last_write) >= 10);
+         (cons_owned == 0 || cons_last_nl || (uint)(ticks - cons_last_write) >= 30);   // 300 ms: under a loaded box a guest's line stalled longer than 100 ms and a host line landed inside it (n3-lx100, 9 of 37)
 }
 
 void
@@ -130,7 +130,7 @@ static void
 pflush(void)
 {
   if (pr.n > 0) {
-    if (cons_owned > 0 && !panicking && !cons_last_nl && (uint)(ticks - cons_last_write) < 10)
+    if (cons_owned > 0 && !panicking && !cons_last_nl && (uint)(ticks - cons_last_write) < 30)
       hold_line(pr.buf, pr.n);       // the guest is in the middle of a line
     else {
       if (hold.w != hold.r)

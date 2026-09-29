@@ -831,6 +831,27 @@ vm_revise(struct vm *vm, uint32 what)
                  vm->state != VM_PAUSED))
     return -1;
 
+  // One thing at a time (L22: the model's host asks one revision and waits
+  // for its ack; this one did not, and its ack handler took any ack as the
+  // current generation's, defect 20). A revision asked over an unacknowledged
+  // one would end the earlier alias with the guest's ack of the earlier
+  // generation while the guest has yet to read the later description. A
+  // guest that speaks the protocol acks within milliseconds: the second
+  // revision waits for that, up to 5 s; one that never acks is the
+  // watchdog's, and is not let to hold every revision after it.
+  if (vm->revise_capable && vm->revise_acked != vm->revise_gen) {
+    uint64 deadline = r_time() + 5 * HOST_TIMEBASE;
+    while (vm->revise_acked != vm->revise_gen && r_time() < deadline) {
+      acquire(&tickslock);
+      sleep_prepare(&ticks);
+      release(&tickslock);
+      sleep();
+    }
+    if (vm->revise_acked != vm->revise_gen)
+      printk("hyp: vm %d: revision %d asked over revision %d, unacknowledged for 5 s\n",
+             vm->id, vm->revise_gen + 1, vm->revise_gen);
+  }
+
   // The new description goes to a slot of its own, never over the blob the
   // guest booted from: Linux's live device tree keeps pointers into that
   // blob (property values are not copied at unflatten), and rewriting it in
@@ -3053,6 +3074,8 @@ vm_resume(struct vm *vm)
     return -1;
   }
   vm->state = VM_RUNNING;
+  if (vm->arrival_timeline && !vm->t_resumed)
+    vm->t_resumed = r_time();       // L15: the commit was read and the machine let go
   struct sched_group *sg = vm->sg;
   release(&vm->lock);
   sched_group_freeze(sg, 0);
@@ -3206,6 +3229,17 @@ vcpu_enter(struct vcpu *v)
     acquire(&vm->lock);
   }
   v->running_hart = cpuid();
+  if (vm->arrival_timeline && !vm->t_first_entry) {
+    vm->t_first_entry = r_time();   // L15: the guest's first instruction on this host
+    uint64 t0 = vm->t_stream_end;
+    if (!vm->t_resumed)
+      vm->t_resumed = vm->t_first_entry;   // an arrival is started by its first entry, not through vm_resume
+    printk("hyp: vm %d: arrival timeline: stream done +0, resumed +%ld us, first instruction +%ld us%s\n",
+           vm->id, (long)((vm->t_resumed - t0) / 10), (long)((vm->t_first_entry - t0) / 10),
+           vm->revise_acked != vm->revise_gen ? "; a revision is owed" : "");
+    if (vm->revise_acked == vm->revise_gen)
+      vm->arrival_timeline = 0;     // nothing more to add for this machine
+  }
   if (v->ssip_req) {
     v->ssip_req = 0;
     v->vssip = 1;

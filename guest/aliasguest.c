@@ -132,7 +132,7 @@ revise(void)
   while (round_busy) ;
   seen_gen = gen;
   revisions++;
-  sbi(SBI_MACH, 3, 1, 0);                      // ack REV_DEVICES
+  sbi(SBI_MACH, 3, 1, gen);                    // ack REV_DEVICES, named (defect 20)
   if (revisions % 50 == 0) report();
 }
 

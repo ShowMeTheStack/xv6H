@@ -492,6 +492,11 @@ def t_migrate_hetero(QEMU, cpus, log):
 
         # a machine on A, on A's controller, with something of its own on disk
         vm = g.start_guest(a, "-n h1 -m 32 -c 1", 120)
+        # L17: the guest verifies 8 MB of its memory and its clock every second, across the crossing (user/memck.c)
+        a.send("memck 2 600 &\n")                # 2 MB: under emulation the guest verifies about a megabyte a second
+        a.expect(r"memck: 2 MB written", 60)   # the prompt came back before this line: a background job
+        a.send("\n")
+        a.expect(r"\$ ", 30)
         a.send("echo crossed-shapes > /tmp/keep\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
@@ -537,6 +542,13 @@ def t_migrate_hetero(QEMU, cpus, log):
         b.expect(r"disk-ok", 60)
         b.expect(r"\$ ", ATONCE)
         assert "kernel is booting" not in b.output_since(m), b.output_since(m)
+        # L17: two more rounds of the in-guest check after the move (sleep is in ticks of 100 ms)
+        b.send("sleep 6; echo memck-look\n")             # the sleep command takes seconds; two of memck's rounds
+        b.expect(r"memck-look", 60)
+        b.expect(r"\$ ", ATONCE)
+        recent = b.output_since(m)
+        assert re.search(r"memck: round \d+ ok=yes", recent), recent[-800:]
+        assert not re.search(r"memck: .*(wrong|went back|FAILED)", recent), recent[-800:]
         g.detach(b)
         out = run(b, "vmm info h1", 30)
         # the exits kept coming after the switch, which is the difference
@@ -1441,6 +1453,13 @@ def t_migrate_cboz(QEMU, cpus, log, legacy, hazard=0):
                 pass
 
 
+# a crossing test asks the timer to work after the move, not to be precise: on a box
+# running eight hosts (the n=100 batches) `sleep 1` has taken 1.65-1.83 s of the guest's
+# own clock ("hrtimer: interrupt took 498 ms" beside it), and a 1.6 s bound counted the
+# box's load as a failure of the mechanism (12 of 1 013). The precise claims are the
+# host-timed timer tests, run alone.
+SLEEP_BOUND = 2.5
+
 LX_START = "-k /Image -r 0x80200000 -m 128 -a console=ttyS0 earlycon=sbi -f /linux.img -c 2 -H"
 
 
@@ -1634,7 +1653,7 @@ def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
             assert "cache block 128 -> 64 bytes" in out, out
         out = lx.linux_cmd(b, "time sleep 1", 60)
         m = re.search(r"real\s+0m\s*([\d.]+)s", out)
-        assert m and 0.9 <= float(m.group(1)) <= 1.6, out
+        assert m and 0.9 <= float(m.group(1)) <= SLEEP_BOUND, out
         g.detach(b)
         info = run(b, "vmm info lm", 60)
         mm = re.search(r"cbo.zero in software (\d+)", info)
@@ -1751,6 +1770,12 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
         a.expect(r"linux# ", 120)
         out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
         assert re.search(r"\n%d\r?\n" % (0 if legacy else 1), out), out
+        # L17: the guest verifies 64 MB of its memory, its monotonic clock and its vector
+        # register file every second, across the crossing (linux/crossck.c)
+        lx.linux_cmd(a, "crossck 64 600 > /tmp/ck.log 2>&1 &", 20)
+        # writing 64 MB takes the guest a few seconds under emulation; wait for its first line
+        out = lx.linux_cmd(a, "for i in $(seq 40); do grep -q 'crossck:' /tmp/ck.log && break; sleep 1; done; tail -1 /tmp/ck.log", 60)
+        assert "crossck:" in out, out
         g.detach(a)
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
@@ -1762,7 +1787,20 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
         try:
             if legacy or name == "disk":
                 raise StopIteration      # nothing is asked of a guest that cannot be told; F20 is carried by the device, no revision
-            b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
+            try:
+                b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
+            except Exception as e:
+                # the guest's own view before giving up (n3-lx100: 2 of 42 controller
+                # crossings "described no" for 20 s, nothing else on the host side)
+                info = run(b, "vmm info la", 30)
+                g.attach(b, "la"); b.send("\n")
+                try:
+                    b.expect(r"linux# ", 20)
+                    view = lx.linux_cmd(b, "dmesg | tail -20; cat /proc/interrupts | head -12; cat /sys/bus/platform/devices/10005000.machrev/revisions", 60)
+                except Exception as e2:
+                    view = "guest does not answer: %s\n%s" % (str(e2)[:80], b.buf.decode(errors="replace")[-1500:])
+                g.detach(b)
+                raise AssertionError("no adoption: %s\n--- host:\n%s\n--- guest:\n%s" % (str(e)[:120], info[-1200:], view[-2500:]))
         except StopIteration:
             pass
         except Exception:
@@ -1797,7 +1835,12 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
                 assert re.search(r"marker-on-virtio-disk[\s\S]*\nx\r?\n", out), out
             out = lx.linux_cmd(b, "time sleep 1", 60)
             m = re.search(r"real\s+0m\s*([\d.]+)s", out)
-            assert m and 0.9 <= float(m.group(1)) <= 1.6, out
+            assert m and 0.9 <= float(m.group(1)) <= SLEEP_BOUND, out
+            # L17: two more rounds of the in-guest check after the move, and not one complaint
+            out = lx.linux_cmd(b, "sleep 2; tail -2 /tmp/ck.log; grep -E 'wrong|went back|changed|FAILED|advanced' /tmp/ck.log || echo crossck-clean", 60)
+            assert "crossck-clean" in out and re.search(r"crossck: round \d+ ok=yes", out), out
+            if disk != "none":
+                lx.linux_cmd(b, "umount /mnt 2>/dev/null; sync", 60)
         except Exception:
             # the guest's state as the host sees it, twice, for the log
             try:
@@ -1809,6 +1852,10 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
                 pass
             raise
         g.detach(b)
+        if disk != "none":
+            # L17: the disk that crossed, looked over by the host once the guest let go of it
+            out = run(b, "fsck.ext4 -n /linux.img", 120)
+            assert "clean" in out, out
         run(b, "vmm kill la", 60)
         print("    a stock Linux (no module) crossed to a host with another %s: kept its description, served by the models" % name
               if legacy else "    Linux crossed to a host with another %s, was told on arrival and took it" % name)
