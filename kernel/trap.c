@@ -467,14 +467,16 @@ devintr()
     // nobody asked for this one. As a guest, that is how the hypervisor says
     // the machine description has changed -- a channel that does not pass
     // through the interrupt controller, because a revision may be changing it.
-    if (reasons == 0 || machine_revise_owed())
+    if (reasons == 0)
       machine_revise_check();
+    else if (machine_revise_owed())
+      machine_revise_late("IPI that came with it");
     return 1;
   } else if (scause == 0x8000000000000005L) {
     // timer interrupt.
     clockintr();
     if (machine_revise_owed())    // defect 21: a hart whose announcement was eaten by an IPI
-      machine_revise_check();
+      machine_revise_late("tick");
     return 2;
   } else if (scause == 0x800000000000000cL) {
     // supervisor guest external interrupt (IMSIC guest file).

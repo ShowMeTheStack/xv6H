@@ -32,11 +32,13 @@ res = {"plic": {"write": [], "read": []}, "imsic": {"write": [], "read": []}}
 try:
     q.expect(r"init: starting sh", 90); q.expect(r"\$ ", 30)
     vmid = g.start_guest(q, "-c 1 -m 64", 120)
-    guest("fsbench 6 > /dev/null 2>&1; sync")          # warm: the file exists, the cache is primed
+    # fsbench takes -s MB -n FILES now (the first version's "fsbench 6" is a usage error,
+    # which "> /dev/null 2>&1" hid: n4b-revcost measured 0 disk interrupts per round)
+    guest("rm -rf /bench; fsbench -q -s 6 -n 20; sync")   # warm: the files exist, the cache is primed
     g.detach(q)
     kind = "imsic"
     for r in range(N):
-        for work, cmd in (("write", "fsbench 6 > /dev/null 2>&1; sync"), ("read", "cat /fsbench.out > /dev/null; cat README > /dev/null")):
+        for work, cmd in (("write", "rm -rf /bench; fsbench -q -s 6 -n 20; sync"), ("read", "cat /bench/big/f* > /dev/null")):
             c0, i0, e0 = counters(vmid)
             g.attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 30)
             guest(cmd)

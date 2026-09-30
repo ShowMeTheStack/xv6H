@@ -13,6 +13,7 @@
 #include "defs.h"
 #include "platform.h"
 #include "hyp.h"
+#include "aplic.h"
 
 void
 vic_init(struct vm *vm)
@@ -96,9 +97,13 @@ vic_levels_snapshot(struct vm *vm, uint64 *levels)
 }
 
 // Build the new model from nothing and re-assert what the devices are holding.
-// caller holds vm->lock; vm->vic_kind has already been changed.
+// caller holds vm->lock; vm->vic_kind has already been changed. `from' is the
+// kind the guest was bound to and `shift' where its registers were: on a live
+// exchange that model is in the table and becomes the ghost; on an arrival it
+// never was (this host built its own kind at creation), so the ghost is made
+// from nothing at the source's address (defect 24). -1: the table's own.
 void
-vic_levels_restore(struct vm *vm, uint64 levels)
+vic_levels_restore(struct vm *vm, uint64 levels, int from, uint64 shift)
 {
   // the outgoing controller's device models first, or they alias the incoming
   // ones (PLIC and APLIC-M both live at 0x0c000000) and the guest goes on
@@ -111,6 +116,16 @@ vic_levels_restore(struct vm *vm, uint64 levels)
   vm_ghost_dev(vm, "aplic-s");
   vm_ghost_dev(vm, "imsic-m");
   vm_ghost_dev(vm, "imsic-s");
+  if (from == VIC_PLIC)
+    vm_add_ghost(vm, "plic", G_PLIC_BASE + shift, G_PLIC_SIZE);
+  else if (from == VIC_APLIC || from == VIC_IMSIC) {
+    vm_add_ghost(vm, "aplic-m", G_APLIC_M + shift, APLIC_MMIO_SIZE);
+    vm_add_ghost(vm, "aplic-s", G_APLIC_S + shift, APLIC_MMIO_SIZE);
+    if (from == VIC_IMSIC) {
+      vm_add_ghost(vm, "imsic-m", G_IMSIC_M + shift, 0x1000L * NVCPU);
+      vm_add_ghost(vm, "imsic-s", G_IMSIC_S + shift, 0x1000L * NVCPU);
+    }
+  }
   vic_init(vm);
   for (int irq = 1; irq < VPLIC_NIRQ; irq++)
     if (levels & (1ull << irq))

@@ -160,26 +160,34 @@ prop_reg(struct fdtw *w, uint64 base, uint64 size)
 #define CPU_PHANDLE(i) (10 + (i))
 
 // build the guest's device tree and copy it into guest RAM at gpa.
-// the structure block gets a page of its own and the strings block
-// another, and the blob is copied out in three pieces, so no contiguous
-// host buffer is needed. returns the blob's size, or -1.
+// The structure block and the strings block are built in two static
+// buffers under a lock and copied out in three pieces, so no contiguous
+// host buffer is needed. One page each was the first version's, and a
+// guest of eight vcpus did not fit (L14: "guest device tree will not fit
+// (error 1, 4664 bytes)" -- the error was the structure block's page, not
+// the blob's 64 KB); NVCPU is 64. returns the blob's size, or -1.
+#define FDT_STMAX (4 * PGSIZE)
+#define FDT_SSMAX (2 * PGSIZE)
+static char fdt_st[FDT_STMAX], fdt_ss[FDT_SSMAX];
+static struct spinlock fdtlock;
+
+void
+fdtgen_init(void)
+{
+  initlock(&fdtlock, "fdtgen");
+}
+
 int
 hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
 {
   struct fdtw w;
-  char *stpage = kalloc(), *sspage = kalloc();
-  if (stpage == 0 || sspage == 0) {
-    if (stpage)
-      kfree(stpage);
-    if (sspage)
-      kfree(sspage);
-    return -1;
-  }
+  acquire(&fdtlock);
+  char *stpage = fdt_st, *sspage = fdt_ss;
   memset(&w, 0, sizeof(w));
   w.st = stpage;
-  w.stmax = PGSIZE;
+  w.stmax = FDT_STMAX;
   w.ss = sspage;
-  w.ssmax = PGSIZE;
+  w.ssmax = FDT_SSMAX;
 
   char uname[32];
   uint32 cells[32];
@@ -591,8 +599,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   int total = off_strings + w.sspos;
   if (w.err || total > max) {
     printk("hyp: guest device tree will not fit (error %d, %d bytes, max %d)\n", w.err, total, max);
-    kfree(stpage);
-    kfree(sspage);
+    release(&fdtlock);
     return -1;
   }
   char buf[56];
@@ -611,7 +618,6 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   if (vm_copyout(vm, gpa, buf, 56) < 0 || vm_copyout(vm, gpa + off_struct, w.st, w.stpos) < 0 ||
       vm_copyout(vm, gpa + off_strings, w.ss, w.sspos) < 0)
     ret = -1;
-  kfree(stpage);
-  kfree(sspage);
+  release(&fdtlock);
   return ret;
 }

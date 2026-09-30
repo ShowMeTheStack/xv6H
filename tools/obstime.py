@@ -31,7 +31,7 @@ try:
     g.detach(q); sample(vmid, "after boot")
     time.sleep(3); sample(vmid, "idle +3s")
     g.attach(q, str(vmid)); q.send("\n")
-    if KIND == "xv6": q.expect(r"\$ ", 30); run("fsbench 4 > /dev/null 2>&1; sync")
+    if KIND == "xv6": q.expect(r"\$ ", 30); run("rm -rf /bench; fsbench -q -s 4 -n 8; sync")
     else: q.expect(r"linux# ", 30); run("mount /dev/vda /mnt 2>/dev/null; dd if=/dev/zero of=/mnt/f bs=1M count=4 2>/dev/null; sync")
     g.detach(q); sample(vmid, "after disk work")
     time.sleep(3); sample(vmid, "idle +3s")

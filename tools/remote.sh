@@ -14,6 +14,7 @@
 #   tools/remote.sh resume NAME [qrun args...]               # continue a queue where it stopped (same args)
 #   LXTAG=-618 tools/remote.sh run ...                       # the Linux image of another kernel build (linux/build.sh TAG)
 #   SEED=NAME tools/remote.sh ...                            # reuse that run's synced tree instead of the working tree
+#   tools/remote.sh clean                                    # strip every finished run to its results and logs (disk)
 #   tools/remote.sh rm NAME                                 # delete a run's copy
 #
 # each run is a user systemd unit xv6h-NAME (linger is on: it survives the ssh session that
@@ -114,6 +115,14 @@ build)
   [ -n "$name" ] || { echo "usage: remote.sh build NAME"; exit 1; }
   sync_tree "$name"
   ssh -o BatchMode=yes $HOST "cd $RUNS/$name && nice -n 15 make -s > build.out 2>&1; echo \$? > done; cat build.out | tail -40; echo build-exit \$(cat done)"
+  ;;
+clean)
+  # strip finished (or dead) runs on the box to their results and logs: a run is a
+  # copy of the tree plus disk images, and 487 of them filled the box's disk (30 Sep)
+  ssh -o BatchMode=yes $HOST "cd $RUNS; active=\$(systemctl --user list-units 'xv6h-*' --no-legend | awk '{print \$1}' | sed 's/xv6h-//; s/.service//'); n=0; \
+    for d in */; do d=\${d%/}; [ \"\$d\" = .seed ] && continue; echo \"\$active\" | grep -qx \"\$d\" && continue; \
+    find \"\$d\" -mindepth 1 -maxdepth 1 ! -name results.out ! -name qresults.txt ! -name qlogs ! -name done ! -name build.out ! -name console.log ! -name test-hyp.log ! -name run_script.py ! -name '*.json' ! -name '*.md' ! -name '*.txt' -exec rm -rf {} + 2>/dev/null; n=\$((n+1)); done; \
+    echo \"stripped \$n runs\"; df -h ~ | tail -1"
   ;;
 resume)
   # continue a queue in its existing copy (qrun --resume believes qresults.txt):

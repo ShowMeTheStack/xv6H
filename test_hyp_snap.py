@@ -1702,7 +1702,9 @@ LX_AXES = {
 }
 LX_AXES["ipi"] = ("guestipi=sbi", r"arrived with clint ipis, this host has no clint",
                   "machrev: revision",
-                  "(i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & wait; grep -c 'IPI1' /proc/interrupts; echo PAR-OK", r"PAR-OK")
+                  # the two loops in a subshell of their own: a bare `wait' waits for every job of the
+                  # shell, and since L17 that shell also owns crossck, for 600 s (n6-timeline: 0/20)
+                  "( (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & wait ); grep -c 'IPI1' /proc/interrupts; echo PAR-OK", r"PAR-OK")
 LX_AXES["disk"] = ("", r"arrived with a 32768-sector disk, this host's image has 49152: told through the device",
                    "new size: 49152",
                    "cat /sys/block/vda/size", r"\n49152\r?\n")

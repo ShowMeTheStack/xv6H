@@ -171,6 +171,8 @@ void            virtio_balloon_rebase(uint64, uint64);
 void            virtio_con_rebase(uint64, uint64);
 void            machine_revise_check(void);
 int             machine_revise_owed(void);
+void            fdtgen_init(void);
+void            machine_revise_late(const char *);
 int             machine_request(uint32);
 uint32          machine_sbi_present(void);
 void            machine_sbi_set_timer(uint64);

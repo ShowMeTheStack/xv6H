@@ -1,0 +1,16 @@
+NAME
+     dirty - dirty memory at a set rate
+
+SYNOPSIS
+     dirty MB RATE SECONDS
+
+DESCRIPTION
+     dirty takes MB megabytes of memory, writes all of it, then rewrites
+     RATE megabytes of it a second for SECONDS, cycling through the region
+     so that every page is dirtied again and again. Each write is a pattern
+     keyed by the address and the round, and at the end the last round is
+     verified: a page copied stale by a migration shows as a mismatch. It
+     is the tunable dirtier behind the migration curves.
+
+SEE ALSO
+     memck(1), cksum(1)

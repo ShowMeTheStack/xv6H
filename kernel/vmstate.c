@@ -428,7 +428,7 @@ save_dev(struct vm *vm, struct vmstate_dev *d)
 }
 
 static void
-restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, int capable)
+restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, uint64 src_shift, int capable)
 {
   vm->uart = d->uart;
   vm->plic = d->plic;
@@ -450,7 +450,7 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, int capabl
   if (src_kind != vm->vic_kind && !revise_muted()) {
     uint64 levels = (src_kind == VIC_PLIC) ? d->plic.level : d->aplic.level;
     acquire(&vm->lock);
-    vic_levels_restore(vm, levels);
+    vic_levels_restore(vm, levels, src_kind, src_shift);   // and the source kind's windows as ghosts
     release(&vm->lock);
     printk("hyp: vm %d: arrived as %s, this host gives %s: %d line(s) still held\n",
            vm->id, vic_kindname(src_kind), vic_kindname(vm->vic_kind),
@@ -1820,7 +1820,7 @@ vm_clone(struct vm *src, const char *name, const char *disk, int *idp)
       memmove(dst->vcpu[i].vstate, src->vcpu[i].vstate, PGSIZE);
   }
   save_dev(src, dev);
-  restore_dev(dst, dev, src->vic_kind, 1);   // a clone is a new machine: it gets this slot's NIC identity, and is told
+  restore_dev(dst, dev, src->vic_kind, src->intc_shift, 1);   // a clone is a new machine: it gets this slot's NIC identity, and is told
   dst->revise_gen = src->revise_gen;
   dst->revise_acked = src->revise_gen;
   dst->cons_out = src->cons_out;
@@ -2299,7 +2299,7 @@ restore_from(struct src *s, const char *name, int *idp)
       }
       if ((r = get(s, dev, sizeof(*dev))) < 0)
         goto out;
-      restore_dev(vm, dev, src_kind, (w->cfg.flags2 & VMSTATE_F_CAPABLE) != 0);
+      restore_dev(vm, dev, src_kind, src_ishift, (w->cfg.flags2 & VMSTATE_F_CAPABLE) != 0);
     } else if (strncmp(sec.name, "CONSO", sizeof(sec.name)) == 0) {
       if (vm == 0 || sec.len != sizeof(vm->cons_out)) {
         r = -EINVAL;

@@ -54,7 +54,7 @@ try:
             print("%-9s adoption ms n=%d median %.1f p90 %.1f max %.1f%s" % (name, len(v), statistics.median(v), sorted(v)[int(0.9 * (len(v) - 1))], max(v), "" if ok else "  (then a miss)"))
     # the workloads: still alive, and their own checks
     g.attach(q, str(vmid)); q.send("\n"); q.expect(r"\$ ", 60)
-    q.send("kill %1 2>/dev/null; kill %2 2>/dev/null; sleep 100; echo LOADS-DONE\n"); q.expect(r"LOADS-DONE", 120); q.expect(r"\$ ", 30)
+    q.send("kill %1 2>/dev/null; kill %2 2>/dev/null; sleep 3; echo LOADS-DONE\n"); q.expect(r"LOADS-DONE", 120); q.expect(r"\$ ", 30)   # xv6H's sleep takes seconds (100 was past the expect)
     m = q.mark(); q.send("cat /tmp/fs.out | tail -3; cat /tmp/sched.out | tail -3; echo _end_\n"); q.expect(r"_end_", 60)
     print("workloads' last words:\n" + q.output_since(m)[-800:])
     g.detach(q)

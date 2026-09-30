@@ -302,6 +302,7 @@ void
 hypinit(void)
 {
   initlock(&vmslock, "vms");
+  fdtgen_init();
   for (int i = 0; i < NVM; i++)
     vmtab[i] = 0;
   if (!plat.has_h) {
@@ -972,7 +973,7 @@ vm_revise_intc(struct vm *vm, int kind)
   vm->vic_kind = kind;
   vm->imsic_hw = (kind == VIC_IMSIC && vimsic_geilen() > 0 &&
                   !(vm->cfg.flags & VMF_SOFTIMSIC));
-  vic_levels_restore(vm, levels);
+  vic_levels_restore(vm, levels, -1, 0);
   vm->vic_hold = 0;
   release(&vm->lock);
 
@@ -985,7 +986,7 @@ vm_revise_intc(struct vm *vm, int kind)
     // controller it has never heard of
     acquire(&vm->lock);
     vm->vic_kind = old;
-    vic_levels_restore(vm, levels);
+    vic_levels_restore(vm, levels, -1, 0);
     release(&vm->lock);
     return r;
   }

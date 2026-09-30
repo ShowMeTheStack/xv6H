@@ -1523,6 +1523,54 @@ def t_revise_hartid(QEMU, intc, cpus, log):
         q.close()
 
 
+def t_revise_flushstorm(QEMU, intc, cpus, log):
+    """defect 21's case, provoked: the announcement of a revision is one software
+    interrupt bit that the guest's own IPIs share, so a hart whose announcement
+    lands together with a TLB-flush IPI handles the flush and would have dropped
+    the announcement -- while the first hart had already read and acknowledged, so
+    the host neither repeats nor waits. The guest now checks at every software
+    interrupt and every tick whether it owes the per-hart part, and says so when it
+    catches up that way. Here a two-vcpu guest forks and exits without pause on
+    both vcpus (flush IPIs) while a per-hart fact is revised sixty times; every
+    revision must be adopted and the guest must be alive at the end, and the test
+    reports how many per-hart catch-ups the storm produced."""
+    q = boot_host(QEMU, intc, cpus, log)
+    try:
+        vmid = start_guest(q, "-c 2 -m 64")
+        # the storm: processes forked, exec'd and exited on both vcpus for the whole run
+        q.send("schedbench -t 3000 -c -1 > /tmp/s.out 2>&1 &\n"); q.expect(r"\$ ", 30)
+        q.send("fsbench -s 4 -n 64 -q > /tmp/f.out 2>&1 &\n"); q.expect(r"\$ ", 30)
+        detach(q)
+        m0 = q.mark()
+        n = 0
+        for i in range(30):
+            for shift in ("4", "0"):
+                m = q.mark()
+                q.send("vmm revise %d hartid %s\n" % (vmid, shift))
+                q.expect(r"\$ ", 30)
+                wait_adopted(q, m)
+                n += 1
+        # the guest: alive, both harts on the last numbering, and how often a hart caught up late
+        attach(q, str(vmid))
+        q.send("\n"); q.expect(r"\$ ", 60)
+        q.send("kill %1 2>/dev/null; kill %2 2>/dev/null; echo STORM-OFF\n")
+        q.expect(r"STORM-OFF", 60); q.expect(r"\$ ", ATONCE)
+        mm = q.mark()
+        q.send("for i in 1 2 3 4; do (echo h-$i | cat) & done; wait; echo HARTS-OK\n")
+        q.expect(r"HARTS-OK", 120); q.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in q.output_since(mm), q.output_since(mm)
+        late = re.findall(r"machine: hart (\d) took revision (\d+) late, from the ([^(]+)\(", q.output_since(m0))
+        detach(q)
+        kill_vm(q, vmid)
+        by = {}
+        for hart, gen, how in late:
+            by[how.strip()] = by.get(how.strip(), 0) + 1
+        print("    %d revisions adopted under a fork-and-exit storm on two vcpus; per-hart catch-ups outside the announcement: %d%s"
+              % (n, len(late), (" (" + ", ".join("%d from the %s" % (v, k) for k, v in sorted(by.items())) + ")") if late else ""))
+    finally:
+        q.close()
+
+
 def t_revise_mac(QEMU, intc, cpus, log):
     """F19: the NIC's identity changed under a running guest, and back. Not a
     revision: the device announces a configuration change and the driver
@@ -1916,6 +1964,7 @@ def tests(modes, cpus, log, QEMU, usertests_ok):
     t.append(("guest-revise-timebase", lambda: t_revise_timebase(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-hartid", lambda: t_revise_hartid(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-hartid-imsic", lambda: t_revise_hartid(QEMU, "imsic", cpus, log)))
+    t.append(("guest-revise-flushstorm", lambda: t_revise_flushstorm(QEMU, "imsic", cpus, log)))
     t.append(("guest-revise-mac", lambda: t_revise_mac(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-rtc", lambda: t_revise_rtc(QEMU, "plic", cpus, log)))
     t.append(("guest-revise-console", lambda: t_revise_console(QEMU, "plic", cpus, log)))

@@ -178,6 +178,22 @@ vm_ghost_dev(struct vm *vm, const char *name)
   }
 }
 
+// A ghost for a window this host never had a live model of: the controller
+// a machine arrived bound to, when this host gives another kind (defect 24:
+// vm_ghost_dev() ghosts what is in the table, and the source's PLIC never
+// was; a Linux completing an interrupt on arrival stored to 0xc201004,
+// "store to unmapped gpa", oops in vic_irq_eoi, the description never read
+// -- the ~5 %% of controller crossings, n3-lx100 and n7-lxintc60).
+void
+vm_add_ghost(struct vm *vm, const char *name, uint64 base, uint64 size)
+{
+  for (int i = 0; i < vm->ndev; i++)
+    if (vm->dev[i].name && strncmp(vm->dev[i].name, name, 12) == 0)
+      return;                       // present (live, or already a ghost)
+  vm_add_dev(vm, name, -1, OBS_INTC, base, size, ghost_read, ghost_write, 0);
+  vm->dev[vm->ndev - 1].ghost = 1;
+}
+
 void
 vm_del_ghosts(struct vm *vm)
 {

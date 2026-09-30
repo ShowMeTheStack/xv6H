@@ -424,6 +424,7 @@ UPROGS=\
 	$U/_fpbench\
 	$U/_vecbench\
 	$U/_memck\
+	$U/_dirty\
 	$U/_vecprobe\
 	$U/_vhold\
 	$U/_mandel\

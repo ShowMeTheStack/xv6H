@@ -801,7 +801,8 @@ uint64 hyp_guest_room_bytes(void);              // hyp.c: memory this host has f
 int  vm_split_all(struct vm *vm);               // hyp.c: 4 KB pages everywhere (F24)
 int  vm_revise_irqmap(struct vm *vm, int alt);  // hyp.c: renumber a running guest's lines (F3)
 int  vic_levels_snapshot(struct vm *vm, uint64 *levels);   // vic.c
-void vic_levels_restore(struct vm *vm, uint64 levels);     // vic.c
+void vic_levels_restore(struct vm *vm, uint64 levels, int from, uint64 shift);     // vic.c
+void vm_add_ghost(struct vm *vm, const char *name, uint64 base, uint64 size);      // hypmmio.c
 const char *vic_kindname(int kind);                         // vic.c
 int  vic_held(uint64 levels);                              // vic.c
 void vm_observe(struct vm *vm, uint32 what);   // hyp.c: record an observation

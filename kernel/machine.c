@@ -401,6 +401,22 @@ machine_revise_owed(void)
   return supported() && revision_hart[cpuid()] != revision_global;
 }
 
+// ... and when it does owe one, say so: the announcement was lost to an IPI
+// that arrived with it, or never came, and this hart is catching up from the
+// tick or from an IPI's trap instead. Counted, and printed, so that a test
+// can show the case occurring and being caught.
+static int revise_late;
+void
+machine_revise_late(const char *how)
+{
+  int hart = cpuid();
+  uint32 want = revision_global;
+  machine_revise_check();
+  revise_late++;
+  printk("machine: hart %d took revision %d late, from the %s (%d so far)\n",
+         hart, want, how, revise_late);
+}
+
 void
 machine_revise_check(void)
 {
