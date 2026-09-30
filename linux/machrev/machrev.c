@@ -14,6 +14,7 @@
  * kernel patch it says so, and leaves out of the mask; the host then knows.
  */
 #include <linux/module.h>
+#include <linux/timekeeping.h>
 #include <linux/version.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
@@ -350,6 +351,7 @@ static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq)
 
 static void rtc_back(u64 base, u32 hwirq)
 {
+	struct timespec64 wall0, mono0, wall1, mono1, want, moved;
 	struct resource res[2];
 	int virq = map_line(hwirq);
 
@@ -360,11 +362,28 @@ static void rtc_back(u64 base, u32 hwirq)
 	memset(res, 0, sizeof(res));
 	res[0] = DEFINE_RES_MEM(base, 0x1000);
 	res[1] = DEFINE_RES_IRQ(virq);
+	/* Registering an RTC runs the core's hctosys and sets the wall clock from
+	 * it, to the second (defect 28: every renumbering that moved the RTC's line
+	 * moved CLOCK_REALTIME against CLOCK_MONOTONIC by up to a second, plus
+	 * whatever the host's clock and the guest's disagreed by across a move).
+	 * The wall clock was right before; it stays where its own monotonic
+	 * clock says it should be. */
+	ktime_get_real_ts64(&wall0);
+	ktime_get_ts64(&mono0);
 	machrev_rtc = platform_device_register_resndata(NULL, "goldfish_rtc", -1, res, 2, NULL, 0);
 	if (IS_ERR(machrev_rtc)) {
 		pr_info("machrev: rtc back at 0x%llx, registering it failed: %ld\n", base, PTR_ERR(machrev_rtc));
 		machrev_rtc = NULL;
 		return;
+	}
+	ktime_get_real_ts64(&wall1);
+	ktime_get_ts64(&mono1);
+	want = timespec64_add(wall0, timespec64_sub(mono1, mono0));
+	moved = timespec64_sub(wall1, want);
+	if (moved.tv_sec != 0 || moved.tv_nsec > 10000000 || moved.tv_nsec < -10000000) {
+		do_settimeofday64(&want);
+		pr_info("machrev: the rtc's registration moved the wall clock by %lld ms: put back\n",
+			(long long)(moved.tv_sec * 1000 + moved.tv_nsec / 1000000));
 	}
 	pr_info("machrev: rtc back at 0x%llx line %u (irq %d): goldfish_rtc registered\n", base, hwirq, virq);
 }

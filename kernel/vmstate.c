@@ -2371,8 +2371,16 @@ restore_from(struct src *s, const char *name, int *idp)
     uint64 g = x;
     if (src_timebase && src_timebase != HOST_TIMEBASE)
       g = w->cfg.tb_g0 + vm_scale_by(x - w->cfg.tb_x0, src_timebase, HOST_TIMEBASE);
-    vm->tb_x0 = x;
-    vm->tb_g0 = g;
+    if (vm_scaled_time(vm)) {
+      vm->tb_x0 = x;
+      vm->tb_g0 = g;
+    } else {
+      // this host's rate is the hardware's: the anchors are not consulted, and
+      // the counter continues through the offset instead (defect 27: from a
+      // 1 MHz host to a 10 MHz one, a guest thirty seconds old read an uptime of
+      // 278 s -- the raw counter, ten times what it had been shown)
+      vm->htimedelta = g - r_time();
+    }
     printk("hyp: vm %d: arrived with a %u Hz clock at %lu; this host's %u Hz goes on from there\n",
            vm->id, src_timebase ? src_timebase : (uint32)HOST_TIMEBASE, (unsigned long)g,
            vm->timebase ? vm->timebase : (uint32)HOST_TIMEBASE);

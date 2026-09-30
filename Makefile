@@ -976,7 +976,13 @@ ifneq ($(strip $(LINK)),)
 # network to reach, and the only thing at the other end of the wire is the
 # other emulated machine. LINKSRV=on is the end that makes the socket.
 LINKSRV ?= off
+# the client side reconnects if the server host is restarted in another shape (the
+# grand tour, tools/grandtour.py: two slots, the destination freshly booted per hop)
+ifeq ($(LINKSRV),off)
+QEMUOPTS += -netdev stream,id=n0,server=off,addr.type=unix,addr.path=$(LINK),reconnect-ms=1000
+else
 QEMUOPTS += -netdev stream,id=n0,server=$(LINKSRV),addr.type=unix,addr.path=$(LINK)
+endif
 QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 else ifneq ($(NET),0)
 QEMUOPTS += -netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1

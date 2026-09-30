@@ -2850,8 +2850,8 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   // and how its harts are numbered (F9): `guesthart=4' makes a host whose
   // guests' harts are 4..; ids stay below NVCPU so a guest can index by them
   vm->hart_shift = (cfg->flags & VMF_HART_SET) ? cfg->hart_shift : (int)plat_bootarg_num("guesthart");
-  if (vm->hart_shift < 0 || vm->hart_shift + nvcpu > NVCPU)
-    vm->hart_shift = 0;
+  if (vm->hart_shift < 0 || vm->hart_shift + nvcpu > NVCPU || (vm->hart_shift && vm->hart_shift < nvcpu))
+    vm->hart_shift = 0;      // a shift under the vcpu count makes the PLIC's two context names collide (vplic.c)
   // and the identity of its NIC (F19): `guestmac=alt' is a host that hands out
   // other addresses
   vm->mac_alt = (cfg->flags & VMF_MAC_SET) ? (cfg->mac_alt != 0) : plat_bootarg("guestmac=alt");

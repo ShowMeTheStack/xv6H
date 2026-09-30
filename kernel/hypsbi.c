@@ -59,17 +59,23 @@ for_each_hart(struct vm *vm, uint64 mask, uint64 base, void (*fn)(struct vcpu *,
       fn(&vm->vcpu[i], arg);
     return 0;
   }
-  // F9: the mask names hart ids; the vcpus are id - shift
-  if (base >= (uint64)(vm->nvcpu + vm->hart_shift))
-    return -1;
+  // F9: the mask names hart ids; the vcpus are id - shift, or, while a
+  // renumbering is being taken, id - the previous shift (vm_vcpu_of_hart). The
+  // base was checked against this host's numbering before any bit was looked
+  // at, so a mask in the old numbering was refused whole (defect 30: a Linux
+  // arriving from harts 4 and 5 fenced and cross-called harts 4 and 5, got
+  // -22, and its timer's re-rate waited for a cpu that was never asked).
+  int hit = 0;
   for (int b = 0; b < 64; b++) {
     if (!(mask & (1UL << b)))
       continue;
     int i = vm_vcpu_of_hart(vm, base + b);
-    if (i >= 0)
+    if (i >= 0) {
       fn(&vm->vcpu[i], arg);
+      hit++;
+    }
   }
-  return 0;
+  return (hit || mask == 0) ? 0 : -1;
 }
 
 static void
