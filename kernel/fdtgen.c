@@ -137,11 +137,13 @@ prop_u32(struct fdtw *w, const char *name, uint32 v)
 }
 
 // cells: an array of big-endian u32 values
+// (sixteen cells was the second thing an eight-vcpu guest did not fit: the
+// PLIC's interrupts-extended is two cells per context, two contexts a hart)
 static void
 prop_cells(struct fdtw *w, const char *name, uint32 *vals, int n)
 {
-  char b[64];
-  if (n > 16) {
+  char b[4 * 4 * NVCPU];
+  if (n > 4 * NVCPU) {
     w->err = 1;
     return;
   }
@@ -190,7 +192,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   w.ssmax = FDT_SSMAX;
 
   char uname[32];
-  uint32 cells[32];
+  uint32 cells[4 * NVCPU];
   char name[32];
 
   // phandles: cpu intcs 10.., plic 3, aplic S 4, aplic M 5, imsic S 6, imsic M 7

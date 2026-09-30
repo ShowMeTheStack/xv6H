@@ -1391,8 +1391,8 @@ vm_revise_mac(struct vm *vm, int alt)
 // tb_g0 + scale(X - tb_x0), with X = host time + htimedelta and (tb_x0, tb_g0)
 // the moment and the value at the last change; and a machine described as
 // 1 MHz from birth simply has tb_x0 = tb_g0 = 0.
-static uint64
-scale_by(uint64 x, uint64 num, uint64 den)
+uint64
+vm_scale_by(uint64 x, uint64 num, uint64 den)
 {
   return (x / den) * num + ((x % den) * num) / den;
 }
@@ -1403,7 +1403,7 @@ vm_guest_time(struct vm *vm)
   uint64 x = r_time() + vm->htimedelta;
   if (!vm_scaled_time(vm))
     return x;
-  return vm->tb_g0 + scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
+  return vm->tb_g0 + vm_scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
 }
 
 uint64
@@ -1413,7 +1413,7 @@ vm_guest_time_of(struct vm *vm, uint64 x)
     return x;
   if (x < vm->tb_x0)
     return vm->tb_g0;
-  return vm->tb_g0 + scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
+  return vm->tb_g0 + vm_scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
 }
 
 uint64
@@ -1423,7 +1423,7 @@ vm_host_time_of(struct vm *vm, uint64 gt)
     return gt;
   if (gt < vm->tb_g0)
     return vm->tb_x0;                       // already behind: fires at once
-  return vm->tb_x0 + scale_by(gt - vm->tb_g0, HOST_TIMEBASE, vm->timebase);
+  return vm->tb_x0 + vm_scale_by(gt - vm->tb_g0, HOST_TIMEBASE, vm->timebase);
 }
 
 int

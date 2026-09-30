@@ -95,7 +95,7 @@
 
 --- a/kernel/time/sched_clock.c
 +++ b/kernel/time/sched_clock.c
-@@ -234,6 +234,53 @@
+@@ -234,6 +234,58 @@
  	pr_debug("Registered %pS as sched_clock source\n", read);
  }
  
@@ -123,7 +123,12 @@
 +
 +	rd = cd.read_data[0];
 +	cyc = cd.actual_read_sched_clock();
-+	ns = rd.epoch_ns + cyc_to_ns((cyc - rd.epoch_cyc) & rd.sched_clock_mask, rd.mult, rd.shift);
++	/* the counter may not have advanced since the epoch (a host that re-rated
++	 * it without carrying the value on); a delta that wrapped is no delta */
++	if (((cyc - rd.epoch_cyc) & rd.sched_clock_mask) > (rd.sched_clock_mask >> 1))
++		ns = rd.epoch_ns;
++	else
++		ns = rd.epoch_ns + cyc_to_ns((cyc - rd.epoch_cyc) & rd.sched_clock_mask, rd.mult, rd.shift);
 +
 +	rd.mult = new_mult;
 +	rd.shift = new_shift;

@@ -13,7 +13,7 @@
 #   ./test-hyp.py sched             # the scheduler: fairness, latency, affinity, the tick rate
 #   ./test-hyp.py all               # everything
 #
-import argparse, os, re, select, shutil, subprocess, sys, time
+import argparse, os, re, select, shlex, shutil, subprocess, sys, time
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -110,7 +110,7 @@ class QEMU(object):
                 continue
             assert dev.startswith("stream,") and "addr.type=unix" in dev, cmd
             assert "addr.host=" not in dev and "addr.port=" not in dev, cmd
-        self.proc = subprocess.Popen(cmd.split(), cwd=HERE, stdin=subprocess.PIPE,
+        self.proc = subprocess.Popen(shlex.split(cmd), cwd=HERE, stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.buf = b""
         QEMU.live.append(self)

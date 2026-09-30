@@ -1730,6 +1730,144 @@ LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axi
 }
 
 
+def t_migrate_multi(QEMU, cpus, log, names, legacy):
+    """L30: host B differs from A in several facts at once (the axes' boot words
+    joined); a participating guest is told every one on arrival and adopts them
+    all, a legacy guest keeps what it left with; both keep working. Two aliases
+    pending at once is the hard case of Invariant 4."""
+    import os
+    axes = [AXES[n] for n in names]
+    append = " ".join(a[1] for a in axes)
+    tag = "mx%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img", extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
+        b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30); run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        g.start_guest(a, "-n ax -m 32 -c 2" + (" -a norevise" if legacy else ""), 120)
+        a.send("echo before-the-move > /keep; sync\n"); a.expect(r"\$ ", ATONCE)
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); run(b, "sleep 1", 20)
+        mb0 = b.mark()
+        out = run(a, "vmm migrate ax 10.7.0.2:9000", 300)
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        b.expect(r"arrived: 2 vcpu", 120)
+        bits = 0
+        for name, ap, legacy_msg, part_msg, guest_msg, bit in axes:
+            bits |= bit
+        if not legacy and bits:
+            m = b.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\)", 120)
+            adopted = int(m.group(1), 16)
+        else:
+            adopted = 0
+        b.send("\n"); b.expect(r"\$ ", 30)
+        arrival = b.output_since(mb0)
+        missing = [name for name, ap, legacy_msg, part_msg, guest_msg, bit in axes
+                   if not re.search(legacy_msg if legacy else part_msg, arrival)]
+        assert not missing, "not said on arrival: %s\n%s" % (missing, arrival[-2000:])
+        if not legacy:
+            assert adopted & bits == bits, "adopted 0x%x, the axes need 0x%x" % (adopted, bits)
+        g.attach(b, "ax")
+        b.send("\n"); b.expect(r"\$ ", 60)
+        if not legacy:
+            said = b.buf.decode(errors="replace")[-6000:]
+            unsaid = [name for name, ap, legacy_msg, part_msg, guest_msg, bit in axes if guest_msg and not re.search(guest_msg, said)]
+            assert not unsaid, "the guest did not say: %s" % unsaid
+        b.send("cat /keep\n"); b.expect(r"before-the-move", 60); b.expect(r"\$ ", ATONCE)
+        mb = b.mark()
+        b.send("echo after-the-move > /after; sync; cat /after; sleep 1; echo SLEPT\n")
+        b.expect(r"after-the-move", 60); b.expect(r"SLEPT", 60); b.expect(r"\$ ", ATONCE)
+        assert "kernel is booting" not in b.output_since(mb), b.output_since(mb)
+        g.detach(b)
+        print("    %d facts changed at once on arrival (%s): %s" % (len(names), ",".join(names),
+              "a legacy guest kept every one and worked" if legacy else "told every one, adopted 0x%x, worked" % adopted))
+    finally:
+        for q in (a, b):
+            if q is not None:
+                try: q.close()
+                except Exception: pass
+        for f in (tag + "-a.img", tag + "-b.img", link):
+            try: os.unlink(os.path.join(HERE, f))
+            except OSError: pass
+
+
+def t_lx_migrate_multi(QEMU, cpus, log, names):
+    """L30 for Linux: host B differs in several facts at once; the module takes
+    every one on arrival and the guest's own view agrees on each."""
+    import os
+    import test_hyp_linux as lx
+    axes = [LX_AXES[n] for n in names]
+    append = " ".join(a[0] for a in axes)
+    tag = "lm%d" % os.getpid()
+    link = os.path.join(HERE, tag + ".sock")
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    a = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+    b = None
+    try:
+        a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
+        b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img", extra_env={"LINK": link, "LINKSRV": "off", "APPEND": append})
+        b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
+        run(a, "ip addr add 10.7.0.1/24 dev eth0", 30); run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
+        mb = 128 if "ram" in names else 256
+        a.send("vmm start -n la -k /Image -r 0x80200000 -m %d -a console=ttyS0 earlycon=sbi -f /linux.img -c 2 -H\n" % mb)
+        a.expect(r"vm (\d+) la: ", 20); a.expect(r"linux# ", 120)
+        out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
+        assert re.search(r"\n1\r?\n", out), out
+        g.detach(a)
+        b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); run(b, "sleep 1", 20)
+        mb0 = b.mark()
+        out = run(a, "vmm migrate la 10.7.0.2:9000", 600)
+        assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
+        b.expect(r"arrived: 2 vcpu", 120)
+        b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
+        b.send("\n"); b.expect(r"\$ ", 30)
+        arrival = b.output_since(mb0)
+        missing = [n for n, ax in zip(names, axes) if ax[1] and not re.search(ax[1], arrival)]
+        assert not missing, "not said on arrival: %s\n%s" % (missing, arrival[-2000:])
+        run(b, "vmm info la", 30)
+        g.attach(b, "la")
+        b.send("\n"); b.expect(r"linux# ", 60)
+        out = lx.linux_cmd(b, "dmesg | grep -E 'machrev|riscv-timer|new size' | tail -30", 60)
+        expect = {n: ax[2] for n, ax in zip(names, axes) if ax[2]}
+        if "layout" in expect and "irq" in expect:
+            # one line says both: the window moved and the line renumbered at once
+            expect["layout"] = expect["irq"] = "machrev: virtio device at 0x10001000 -> 0x10101000 line 11: moved"
+        unsaid = [n for n, want in expect.items() if want not in out]
+        assert not unsaid, "the module did not say: %s\n%s" % (unsaid, out[-2000:])
+        done = set()
+        for n, ax in zip(names, axes):
+            if ax[3] and ax[3] not in done:        # two axes share one check (a mount): once
+                done.add(ax[3])
+                out = lx.linux_cmd(b, ax[3], 120)
+                assert re.search(ax[4], out), (n, ax[3], out[-800:])
+        out = lx.linux_cmd(b, "time sleep 1", 60)
+        m = re.search(r"real\s+0m\s*([\d.]+)s", out)
+        assert m and 0.9 <= float(m.group(1)) <= SLEEP_BOUND, out
+        out = lx.linux_cmd(b, "dmesg | tail -1", 30)
+        m = re.search(r"\[\s*(\d+)\.\d+\]", out)
+        assert m and int(m.group(1)) < 900, "the guest's printk clock: " + out[-200:]     # defect 26
+        g.detach(b)
+        print("    Linux was told %d facts at once on arrival (%s) and its own view agrees on each" % (len(names), ",".join(names)))
+    finally:
+        for q in (a, b):
+            if q is not None:
+                try: q.close()
+                except Exception: pass
+        for f in (tag + "-a.img", tag + "-b.img", link):
+            try: os.unlink(os.path.join(HERE, f))
+            except OSError: pass
+
+
 def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
     """M5 across a move, one fact at a time: host B differs from A on one axis
     (a boot word); a Linux with machrev.ko is told on arrival and takes it;
@@ -1841,6 +1979,11 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
             # L17: two more rounds of the in-guest check after the move, and not one complaint
             out = lx.linux_cmd(b, "sleep 2; tail -2 /tmp/ck.log; grep -E 'wrong|went back|changed|FAILED|advanced' /tmp/ck.log || echo crossck-clean", 60)
             assert "crossck-clean" in out and re.search(r"crossck: round \d+ ok=yes", out), out
+            # defect 26: the guest's printk clock must not have jumped (it read 8 793 s after
+            # every timebase arrival, unread until eight facts at once made it matter)
+            out = lx.linux_cmd(b, "dmesg | tail -1", 30)
+            m = re.search(r"\[\s*(\d+)\.\d+\]", out)
+            assert m and int(m.group(1)) < 900, "the guest's printk clock: " + out[-200:]
             if disk != "none":
                 lx.linux_cmd(b, "umount /mnt 2>/dev/null; sync", 60)
         except Exception:
@@ -2070,6 +2213,10 @@ def tests(modes, cpus, log, QEMU):
         # F4, F5, F22 across a move, both tiers
         ("snap-migrate-ipi", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ipi"], 0)),
         ("snap-migrate-ipi-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ipi"], 1)),
+        ("snap-migrate-multi4", lambda: t_migrate_multi(QEMU, cpus, log, ["timer", "timebase", "hartid", "rtc"], 0)),
+        ("snap-migrate-multi4-legacy", lambda: t_migrate_multi(QEMU, cpus, log, ["timer", "timebase", "hartid", "rtc"], 1)),
+        ("snap-migrate-multi8", lambda: t_migrate_multi(QEMU, cpus, log, ["timer", "timebase", "hartid", "rtc", "ipi", "mac", "console", "sbi"], 0)),
+        ("snap-migrate-multi8-legacy", lambda: t_migrate_multi(QEMU, cpus, log, ["timer", "timebase", "hartid", "rtc", "ipi", "mac", "console", "sbi"], 1)),
         ("snap-migrate-timer", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timer"], 0)),
         ("snap-migrate-timer-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timer"], 1)),
         ("snap-migrate-timebase", lambda: t_migrate_axis(QEMU, cpus, log, AXES["timebase"], 0)),
@@ -2110,6 +2257,8 @@ def tests(modes, cpus, log, QEMU):
         ("snap-lx-migrate-intc-addr", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc-addr", 0)),
         ("snap-lx-migrate-intc-legacy", lambda: t_lx_migrate_axis(QEMU, cpus, log, "intc", 1)),
         ("snap-lx-migrate-ipi", lambda: t_lx_migrate_axis(QEMU, cpus, log, "ipi")),
+        ("snap-lx-migrate-multi4", lambda: t_lx_migrate_multi(QEMU, cpus, log, ["timer", "timebase", "rtc", "sbi"])),
+        ("snap-lx-migrate-multi8", lambda: t_lx_migrate_multi(QEMU, cpus, log, ["cpus", "timer", "timebase", "rtc", "sbi", "ram", "layout", "irq"])),
         ("snap-lx-migrate-hartid-imsic", lambda: t_lx_migrate_axis(QEMU, cpus, log, "hartid", 0, "imsic")),
         ("snap-lx-migrate-disk", lambda: t_lx_migrate_axis(QEMU, cpus, log, "disk")),
         ("snap-migrate-ram-legacy", lambda: t_migrate_axis(QEMU, cpus, log, AXES["ram"], 1)),

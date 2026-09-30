@@ -1016,4 +1016,4 @@ fmt:
 # with its own HOSTFS_MB/HOSTFILES; a dependency on fs.img here would
 # rebuild it with the defaults).
 qemucmd:
-	@echo $(QEMU) $(QEMUOPTS)
+	@echo '$(QEMU) $(QEMUOPTS)'    # single-quoted: the -append's double quotes survive the echo (a multi-word APPEND is one argument; test-hyp.py splits with shlex)

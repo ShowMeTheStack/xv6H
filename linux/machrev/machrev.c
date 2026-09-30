@@ -502,6 +502,36 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	u32 adopted = 0;
 	int i;
 
+	/* The order matters (defect 25, found by eight facts at once): first the two
+	 * facts that change how every later step waits and flushes. The SBI set,
+	 * because add_memory and cpu_down flush TLBs, and a flush through an
+	 * extension this host withholds fails (-ENOTSUPP) until the key follows;
+	 * the timer and timebase, because a delay or a timeout runs at the rate the
+	 * kernel believes, and a hart parking that waits at a tenth of the rate
+	 * waits ten times (the crossing adopted after 72-114 s, alone each fact
+	 * in under 100 ms). Then everything else. */
+	/* F22: the SBI extension set. Linux keeps one decision from its boot-time
+	 * probe: remote fences through SBI RFENCE (a static key) or through IPIs.
+	 * The key is exported; the probe is repeated and the key follows. */
+	if ((what & REV_SBI)) {
+		bool rf = sbi_probe_extension(SBI_EXT_RFENCE) > 0;
+		bool had = static_branch_likely(&riscv_sbi_for_rfence);
+
+		if (rf && !had)
+			static_branch_enable(&riscv_sbi_for_rfence);
+		else if (!rf && had)
+			static_branch_disable(&riscv_sbi_for_rfence);
+		pr_info("machrev: sbi extensions re-probed: remote fences by %s%s\n",
+			rf ? "SBI RFENCE" : "IPI", rf == had ? " (as before)" : "");
+		adopted |= REV_SBI;
+	}
+	/* F5/F6: the timer's source and rate, through the one patch the timer needs (0001) */
+	if (new->sstc != old->sstc || (new->timebase && new->timebase != old->timebase)) {
+		riscv_timer_revise(new->sstc, new->timebase);
+		pr_info("machrev: timer via %s at %u Hz\n", new->sstc ? "stimecmp" : "sbi", new->timebase);
+		adopted |= REV_TIMER;
+	}
+
 	/* F21: the cache-block size cbo.zero clears. clear_page reads the variable on every page. */
 	if (new->cboz && new->cboz != riscv_cboz_block_size) {
 		pr_info("machrev: cache block %u -> %u bytes\n", riscv_cboz_block_size, new->cboz);
@@ -549,12 +579,6 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 		}
 		pr_info("machrev: cpus %d -> %d (%d up, %d down)\n", old->online, new->online, up, down);
 		adopted |= REV_DEVICES;
-	}
-	/* F5/F6: the timer's source and rate, through the one patch the timer needs (0001) */
-	if (new->sstc != old->sstc || (new->timebase && new->timebase != old->timebase)) {
-		riscv_timer_revise(new->sstc, new->timebase);
-		pr_info("machrev: timer via %s at %u Hz\n", new->sstc ? "stimecmp" : "sbi", new->timebase);
-		adopted |= REV_TIMER;
 	}
 	/* F18 and friends: virtio devices that came or went (see above) */
 	if (new->nvirtio != old->nvirtio) {
@@ -651,21 +675,6 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 			adopted |= REV_INTC;
 	} else if ((what & REV_INTC) && new->intc && old->intc && strcmp(new->intc, old->intc))
 		pr_info("machrev: interrupt controller %s -> %s: Linux keeps its own (legacy tier)\n", old->intc, new->intc);
-	/* F22: the SBI extension set. Linux keeps one decision from its boot-time
-	 * probe: remote fences through SBI RFENCE (a static key) or through IPIs.
-	 * The key is exported; the probe is repeated and the key follows. */
-	if ((what & REV_SBI)) {
-		bool rf = sbi_probe_extension(SBI_EXT_RFENCE) > 0;
-		bool had = static_branch_likely(&riscv_sbi_for_rfence);
-
-		if (rf && !had)
-			static_branch_enable(&riscv_sbi_for_rfence);
-		else if (!rf && had)
-			static_branch_disable(&riscv_sbi_for_rfence);
-		pr_info("machrev: sbi extensions re-probed: remote fences by %s%s\n",
-			rf ? "SBI RFENCE" : "IPI", rf == had ? " (as before)" : "");
-		adopted |= REV_SBI;
-	}
 	/*
 	 * F10/F11: the vector unit taken away or given back (patch 0004). Away:
 	 * ceded if no task holds vector state, refused with the count if one does

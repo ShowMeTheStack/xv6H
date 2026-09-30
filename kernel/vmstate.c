@@ -2360,6 +2360,23 @@ restore_from(struct src *s, const char *name, int *idp)
   // to the host's: htimedelta is what the guest adds to the host's
   // counter, and the difference between then and now is what it lost.
   vm->htimedelta = w->tm.htimedelta - (r_time() - w->tm.saved_time);
+  // F6 at arrival (defect 26): when this host's rate is not the one the machine
+  // left with, the counter continues -- the value the guest would read this
+  // instant under the source's rate is where this host's rate starts, as a live
+  // rate change anchors it (vm_revise_timebase). Without it a guest arriving
+  // from 10 MHz at a 1 MHz host saw its counter drop to a tenth, and its
+  // scheduler clock, re-rated across the drop, wrapped to 8 793 s.
+  if (vm->timebase != src_timebase) {
+    uint64 x = r_time() + vm->htimedelta;
+    uint64 g = x;
+    if (src_timebase && src_timebase != HOST_TIMEBASE)
+      g = w->cfg.tb_g0 + vm_scale_by(x - w->cfg.tb_x0, src_timebase, HOST_TIMEBASE);
+    vm->tb_x0 = x;
+    vm->tb_g0 = g;
+    printk("hyp: vm %d: arrived with a %u Hz clock at %lu; this host's %u Hz goes on from there\n",
+           vm->id, src_timebase ? src_timebase : (uint32)HOST_TIMEBASE, (unsigned long)g,
+           vm->timebase ? vm->timebase : (uint32)HOST_TIMEBASE);
+  }
   // A machine that has landed on a host of a different shape owes its guest a
   // new description. It is asked for here, with no vcpu running yet: the request
   // is a flag and a pending VSSIP per vcpu, so the guest meets it on its very

@@ -9,10 +9,10 @@
 #                                                block (cboz), and for xv6 the controller
 #   python3 tools/scale.py ram xv6|linux [N]     (c) F13: +64, +256, +1024, +2048 MB
 #                                                added to a running guest (vmm resize)
-#   python3 tools/scale.py load xv6 [N]          (e) 1, 2, 4 guests on the host, every
+#   python3 tools/scale.py load xv6 [N]          (e) 1, 2, 3 guests on the host, every
 #                                                other one busy; the first one revised
-#   python3 tools/scale.py devices xv6 [N]       (b) F15 with 1, 2, 3 virtio devices in
-#                                                the tree (disk; +net; +console)
+#   python3 tools/scale.py devices xv6 [N]       (b) F15 with 3 or 4 virtio devices in the tree
+#   python3 tools/scale.py console xv6 [N]       the guest's console line: UART vs virtio
 import os, re, sys, time, statistics
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from importlib.machinery import SourceFileLoader
@@ -102,17 +102,17 @@ elif axis == "ram":
             q.close()
 
 elif axis == "load":
-    # the host image carries three spare guest disks (GUESTDISKS=3), so up to three busy
-    # guests beside the one revised; the host has three harts, so four guests already
+    # the host image carries three guest disks (GUESTDISKS=3): guest 1 has /disk0.img, so
+    # up to two busy guests beside it; the host has three harts, so three guests already
     # time-slice them
-    for k in (1, 2, 4):
+    for k in (1, 2, 3):
         q = th.QEMU(intc="imsic", cpus=3, mem="4G", log=LOG)
         try:
             q.expect(r"init: starting sh", 120); q.expect(r"\$ ", 30)
             vmid = g.start_guest(q, "-c 1 -m 32", 180)
             g.detach(q)
             for j in range(k - 1):
-                other = g.start_guest(q, "-n b%d -c 1 -m 32 -f /disk%d.img" % (j, j), 180)   # its own disk: the default one is guest 1's
+                other = g.start_guest(q, "-n b%d -c 1 -m 32 -f /disk%d.img" % (j, j + 1), 180)   # its own disk: /disk0.img is guest 1's
                 # busy: files written and read back, processes forked and switched, for the whole run
                 q.send("fsbench -s 4 -n 64 -q > /tmp/fs.out 2>&1 &\n"); q.expect(r"\$ ", 30)
                 q.send("schedbench -t 3000 -c -1 > /tmp/sched.out 2>&1 &\n"); q.expect(r"\$ ", 30)
@@ -123,6 +123,25 @@ elif axis == "load":
                 row("%d guest(s), %d busy" % (k, k - 1), fact, lat, miss)
         finally:
             q.close()
+
+elif axis == "console":
+    # is the xv6 guest's 5-10 ms its own console line? The handler prints one line
+    # before it acknowledges; through the 16550 model that is an exit per character.
+    # The same facts with the UART console, then with a virtio console, then back.
+    q = th.QEMU(intc="imsic", cpus=3, mem="2G", log=LOG)
+    try:
+        q.expect(r"init: starting sh", 120); q.expect(r"\$ ", 30)
+        vmid = g.start_guest(q, "-c 2 -m 64", 180)
+        g.detach(q)
+        for con in ("uart", "virtio", "uart"):
+            if con != "uart" or True:
+                try: adopted(q, vmid, "vmm revise %d console %s" % (vmid, con))
+                except Exception: q.send("\n"); q.expect(r"\$ ", 60)
+            for fact, there, back in FACTS:
+                lat, miss = measure(q, vmid, there, back, N)
+                row("console %s" % con, fact, lat, miss)
+    finally:
+        q.close()
 
 elif axis == "devices":
     # the map revision moves every virtio window at once (F15): the disk, the NIC, the

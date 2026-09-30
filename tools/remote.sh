@@ -118,10 +118,12 @@ build)
   ;;
 clean)
   # strip finished (or dead) runs on the box to their results and logs: a run is a
-  # copy of the tree plus disk images, and 487 of them filled the box's disk (30 Sep)
+  # copy of the tree plus disk images, and 487 of them filled the box's disk (30 Sep).
+  # The per-slot console logs (q*.log) stay: the guest's view when a job hangs
+  # (defect 24 was read from them; a later miss could not be, once stripped)
   ssh -o BatchMode=yes $HOST "cd $RUNS; active=\$(systemctl --user list-units 'xv6h-*' --no-legend | awk '{print \$1}' | sed 's/xv6h-//; s/.service//'); n=0; \
     for d in */; do d=\${d%/}; [ \"\$d\" = .seed ] && continue; echo \"\$active\" | grep -qx \"\$d\" && continue; \
-    find \"\$d\" -mindepth 1 -maxdepth 1 ! -name results.out ! -name qresults.txt ! -name qlogs ! -name done ! -name build.out ! -name console.log ! -name test-hyp.log ! -name run_script.py ! -name '*.json' ! -name '*.md' ! -name '*.txt' -exec rm -rf {} + 2>/dev/null; n=\$((n+1)); done; \
+    find \"\$d\" -mindepth 1 -maxdepth 1 ! -name results.out ! -name qresults.txt ! -name qlogs ! -name done ! -name build.out ! -name console.log ! -name test-hyp.log ! -name run_script.py ! -name '*.json' ! -name '*.md' ! -name '*.txt' ! -name 'q*.log' -exec rm -rf {} + 2>/dev/null; n=\$((n+1)); done; \
     echo \"stripped \$n runs\"; df -h ~ | tail -1"
   ;;
 resume)

@@ -802,6 +802,7 @@ int  vm_split_all(struct vm *vm);               // hyp.c: 4 KB pages everywhere 
 int  vm_revise_irqmap(struct vm *vm, int alt);  // hyp.c: renumber a running guest's lines (F3)
 int  vic_levels_snapshot(struct vm *vm, uint64 *levels);   // vic.c
 void vic_levels_restore(struct vm *vm, uint64 levels, int from, uint64 shift);     // vic.c
+uint64 vm_scale_by(uint64 x, uint64 num, uint64 den);                              // hyp.c: x * num / den without overflow
 void vm_add_ghost(struct vm *vm, const char *name, uint64 base, uint64 size);      // hypmmio.c
 const char *vic_kindname(int kind);                         // vic.c
 int  vic_held(uint64 levels);                              // vic.c
