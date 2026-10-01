@@ -4,6 +4,7 @@
 #define IPI_KICK 1  // a vcpu running on that hart must exit to re-evaluate
 #define IPI_TLBFLUSH 2 // flush the TLB and acknowledge (kstack.c)
 #define IPI_RESCHED 4  // something with less virtual time is waiting there
+#define IPI_REARM 8    // a second task landed on that hart: bring its stretched tick back (defect 33)
 
 // IMSIC interrupt identity used for IPIs (device irqs are 1..95).
 #define IMSIC_IPI_ID 100

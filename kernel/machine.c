@@ -406,11 +406,19 @@ machine_revise_owed(void)
 // tick or from an IPI's trap instead. Counted, and printed, so that a test
 // can show the case occurring and being caught.
 static int revise_late;
+static uint32 revision_applying;       // the generation a hart is applying right now (defect 33)
+static uint32 revision_yielded[NCPU];  // a hart that stood aside from the global part and takes its own part later
 void
 machine_revise_late(const char *how)
 {
   int hart = cpuid();
   uint32 want = revision_global;
+  if (revision_yielded[hart] == want) {
+    // not lost: this hart stood aside while another applied the global part (defect 33)
+    revision_yielded[hart] = 0;
+    machine_revise_check();
+    return;
+  }
   machine_revise_check();
   revise_late++;
   printk("machine: hart %d took revision %d late, from the %s (%d so far)\n",
@@ -461,6 +469,19 @@ machine_revise_check(void)
     revision_hart[hart] = gen;
     return;
   }
+  if (revision_applying == gen) {
+    // another hart is in the middle of the global part. This hart's own part is
+    // owed (machine_revise_owed) and is taken at its next software interrupt or
+    // tick, quietly -- not by spinning here on rev_lock while the other hart
+    // applies and prints its line. With both vcpus on one host hart that spin
+    // kept the lock holder preempted until the host's stretched tick: 88 ms to
+    // acknowledge instead of 8 (defect 33).
+    revision_yielded[hart] = gen;
+    release(&rev_lock);
+    return;
+  }
+  revision_applying = gen;
+  release(&rev_lock);          // the apply and its line run without the lock
 
   uint32 changed = reread((uint64)d.val, &fresh);
   // the part of a description that is not in the tree: what the host says
@@ -808,6 +829,7 @@ machine_revise_check(void)
          (changed & REV_DEVICES) ? "devices " : "",
          changed ? "" : "no-change ", adopted);
 
+  acquire(&rev_lock);
   revision_global = gen;
   revision_hart[hart] = gen;
   release(&rev_lock);

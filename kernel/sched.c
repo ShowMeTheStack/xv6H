@@ -787,6 +787,19 @@ sched_enqueue(struct proc *p, int how)
       sched_kick(cpu);
     else
       sched_need_resched();
+  } else {
+    // no preemption, but the hart's timer may have been stretched eight
+    // times while its one task ran alone (timer_rearm: a vcpu with nothing
+    // waiting). With two tasks there now, the next tick is the only thing that
+    // will switch between them, and eighty milliseconds is too long for it: a
+    // guest vcpu preempted while holding a spinlock kept its sibling spinning
+    // on that hart for exactly that long (defect 33: the xv6 guest's revision
+    // acknowledged at 88 ms instead of 8, the acker preempted mid-line by the
+    // sibling it had just woken). Bring the tick back now.
+    if (cpu != cpuid())
+      intc_ipi(cpu, IPI_REARM);
+    else
+      timer_rearm();
   }
 }
 
@@ -1172,6 +1185,13 @@ void
 sched_begin(struct proc *p)
 {
   struct rq *rq = &rqs[cpuid()];
+
+  // a tick stretched for a task that ran alone is wrong for the one that
+  // runs now with another waiting: bring it back at the dispatch (defect 33,
+  // the second half: the announcer's own hart took the local preempt branch,
+  // which re-armed nothing)
+  if (rq->nr_running > 1)
+    timer_rearm();
 
   acquire(&rq->lock);
   p->cpu = cpuid();

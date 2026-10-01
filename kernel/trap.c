@@ -422,6 +422,8 @@ extintr(int irq)
       kstack_flush_ack();
     if (reasons & IPI_RESCHED)
       mycpu()->resched = 1;
+    if (reasons & (IPI_RESCHED | IPI_REARM))
+      timer_rearm();        // a hart whose tick was stretched has company now (defect 33)
   } else if (irq == plat.uart_irq) {
     uartintr();
   } else if ((idx = platform_virtio_by_irq(irq)) >= 0) {
@@ -464,6 +466,8 @@ devintr()
       kstack_flush_ack();
     if (reasons & IPI_RESCHED)
       mycpu()->resched = 1;
+    if (reasons & (IPI_RESCHED | IPI_REARM))
+      timer_rearm();        // a hart whose tick was stretched has company now (defect 33)
     // nobody asked for this one. As a guest, that is how the hypervisor says
     // the machine description has changed -- a channel that does not pass
     // through the interrupt controller, because a revision may be changing it.

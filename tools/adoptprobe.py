@@ -31,6 +31,10 @@ if len(sys.argv) > 3:       # only these facts (a word of the name), e.g. cpus,r
     only = sys.argv[3].split(",")
     FACTS = [f for f in FACTS if any(w in f[0] for w in only)]
 LOG = open("console.log", "w")
+def load():
+    try: return open("/proc/loadavg").read().split()[0]
+    except Exception: return "?"
+print("box load at start: %s" % load()); sys.stdout.flush()
 # an IMSIC host offers all three controllers (F1 there and back); the others are the same on any
 q = th.QEMU(intc="imsic" if kind == "xv6" else "plic", cpus=3, log=LOG)
 res = {}
@@ -67,6 +71,7 @@ try:
                     host("sleep 3", 20)
         good = sorted(x for x in lat if x == x)
         res[name] = (len(lat), good, masks)
+        print("  (box load now %s)" % load())
         if good:
             print("%-22s n=%-3d ok=%-3d min %7.1f  median %7.1f  p90 %7.1f  max %7.1f ms  adopted %s" % (
                 name, len(lat), len(good), good[0], good[len(good)//2], good[min(len(good)-1, int(0.9*len(good)))], good[-1], ",".join(sorted(masks))))

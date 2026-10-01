@@ -544,6 +544,41 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 			rf ? "SBI RFENCE" : "IPI", rf == had ? " (as before)" : "");
 		adopted |= REV_SBI;
 	}
+	/* ... then the harts' numbers (F9), before anything sends an IPI by hart id: the
+	 * timer's re-rate cross-calls every cpu, and a cross-call addressed to the old
+	 * numbers never returns (the grand tour's hop C->A: "__sbi_rfence_v02_call:
+	 * hbase = [4] ... failed (error [-22])", a soft lockup in riscv_timer_revise) */
+	/* F9: the harts were renumbered. cpu i was hart old[i]; it is hart new[i] now. */
+	for (i = 0; i < new->ncpu && i < old->ncpu; i++)
+		if (new->hartid[i] != old->hartid[i]) {
+			int cpu = cpu_of_hart(old->hartid[i]);
+
+			int rc;
+
+			if (cpu < 0) {
+				pr_info("machrev: hart %u is no cpu of this kernel: not renumbered\n", old->hartid[i]);
+				continue;
+			}
+			rc = riscv_rebind_hart(cpu, new->hartid[i]);
+			hart_of_cpu[cpu] = new->hartid[i];	/* the kernel's map changed whatever its controllers said */
+			adopted |= REV_DEVICES;
+			renumbered = true;
+			pr_info("machrev: cpu %d: hart %u -> %u%s\n", cpu, old->hartid[i], new->hartid[i],
+				rc ? " (a controller did not follow)" : "");
+		}
+	if (renumbered && new->vic_kind >= 0)
+		xv6h_vic_rehart();		/* contexts, IDCs and targets are by hart id */
+	/*
+	 * The RTC leaves before the virtio devices move and comes back after
+	 * them: on a renumbering the line it leaves may be the one a virtio
+	 * device moves to (lxirq), and the line it moves to may be the one a
+	 * virtio device is still on -- registering it there fails with
+	 * "genirq: Flags mismatch irq 16 (goldfish_rtc) vs (virtio0)" and the
+	 * machine has no clock until the next revision (hunt4c, every arrival
+	 * on the default-numbered host from crossing ~160 on).
+	 */
+	bool rtc_returns = false;
+
 	/* F5/F6: the timer's source and rate, through the one patch the timer needs (0001) */
 	if (new->sstc != old->sstc || (new->timebase && new->timebase != old->timebase)) {
 		riscv_timer_revise(new->sstc, new->timebase);
@@ -618,36 +653,6 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 		adopted |= REV_DEVICES;
 
 	/* what a stock kernel keeps in a place this module cannot reach */
-	/* F9: the harts were renumbered. cpu i was hart old[i]; it is hart new[i] now. */
-	for (i = 0; i < new->ncpu && i < old->ncpu; i++)
-		if (new->hartid[i] != old->hartid[i]) {
-			int cpu = cpu_of_hart(old->hartid[i]);
-
-			int rc;
-
-			if (cpu < 0) {
-				pr_info("machrev: hart %u is no cpu of this kernel: not renumbered\n", old->hartid[i]);
-				continue;
-			}
-			rc = riscv_rebind_hart(cpu, new->hartid[i]);
-			hart_of_cpu[cpu] = new->hartid[i];	/* the kernel's map changed whatever its controllers said */
-			adopted |= REV_DEVICES;
-			renumbered = true;
-			pr_info("machrev: cpu %d: hart %u -> %u%s\n", cpu, old->hartid[i], new->hartid[i],
-				rc ? " (a controller did not follow)" : "");
-		}
-	if (renumbered && new->vic_kind >= 0)
-		xv6h_vic_rehart();		/* contexts, IDCs and targets are by hart id */
-	/*
-	 * The RTC leaves before the virtio devices move and comes back after
-	 * them: on a renumbering the line it leaves may be the one a virtio
-	 * device moves to (lxirq), and the line it moves to may be the one a
-	 * virtio device is still on -- registering it there fails with
-	 * "genirq: Flags mismatch irq 16 (goldfish_rtc) vs (virtio0)" and the
-	 * machine has no clock until the next revision (hunt4c, every arrival
-	 * on the default-numbered host from crossing ~160 on).
-	 */
-	bool rtc_returns = false;
 	if (new->rtc != old->rtc) {
 		if (new->rtc)
 			rtc_returns = true;

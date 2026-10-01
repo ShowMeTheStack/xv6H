@@ -399,6 +399,8 @@ struct vcpu {
   uint64 vcsrs[4];
   int vssip;              // virtual supervisor software interrupt pending
   volatile int ssip_req;  // vclint asked for VSSIP since the last entry
+  uint64 t_woke, t_entry; // revision trace: when this vcpu left wfi for the announcement, and entered with it
+  uint64 t_idle;          // revision trace: the first wfi sleep after the ask
   int vgein;              // hardware guest interrupt file (0 = none)
   struct vimsic imsic;
 
@@ -583,6 +585,8 @@ struct vm {
   uint32 revise_acked;
   uint32 revise_adopted;
   uint64 revise_asked;    // host tick when the notification went out
+  uint64 t_pending, t_describe; // revision trace: the guest's first pending() and describe() after the ask
+  uint64 t_first_tx, t_last_tx; int tx_vcpu; // revision trace: the guest's console writes after the ask, and who wrote last
   uint32 revise_what;     // what the last revision said had changed (REV_*), for MACH fid 6
   uint64 revise_done;     // host tick when the ack came back
   uint64 revise_repeat_at; // L1: when the announcement was last repeated

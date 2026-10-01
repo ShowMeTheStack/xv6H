@@ -71,6 +71,11 @@ tx_put(struct vm *vm, char c)
   if (cring_full(&vm->cons_out))
     vm->cons_out.r++; // drop oldest
   cring_put(&vm->cons_out, c);
+  if (vm->revise_acked != vm->revise_gen) {   // revision trace: the guest's line before its ack
+    if (!vm->t_first_tx) vm->t_first_tx = r_time();
+    vm->t_last_tx = r_time();
+    { struct proc *p = myproc(); vm->tx_vcpu = (p && p->vcpu) ? ((struct vcpu *)p->vcpu)->id : -1; }
+  }
   wakeup(&vm->cons_out);
 }
 

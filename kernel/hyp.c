@@ -873,6 +873,9 @@ vm_revise(struct vm *vm, uint32 what)
   vm->revise_adopted = 0;
   vm->revise_asked = r_time();
   vm->revise_repeat_at = vm->revise_asked;
+  vm->t_pending = vm->t_describe = vm->t_first_tx = vm->t_last_tx = 0; vm->tx_vcpu = -1;
+  for (int i = 0; i < vm->nvcpu; i++)
+    vm->vcpu[i].t_woke = vm->vcpu[i].t_entry = vm->vcpu[i].t_idle = 0;
   vm->revise_wd_printed = 0;
   vm->revise_done = 0;
   // every vcpu, not just the first. A guest with several harts has per-hart
@@ -886,9 +889,9 @@ vm_revise(struct vm *vm, uint32 what)
   for (int i = 0; i < vm->nvcpu; i++)
     vm->vcpu[i].ssip_req = 1;
   vmachrev_notify(vm);         // and over the anchor, for a guest that listens there (Linux)
-  release(&vm->lock);
   for (int i = 0; i < vm->nvcpu; i++)
-    vcpu_kick(&vm->vcpu[i]);   // and wake the idle ones
+    vcpu_kick(&vm->vcpu[i]);   // and wake the idle ones -- under the lock, as the kick asks
+  release(&vm->lock);
   printk("hyp: vm %d: revision %d asked for (what=0x%x)\n", vm->id,
          vm->revise_gen, what);
   return 0;
@@ -3244,6 +3247,8 @@ vcpu_enter(struct vcpu *v)
   if (v->ssip_req) {
     v->ssip_req = 0;
     v->vssip = 1;
+    if (!v->t_entry)
+      v->t_entry = r_time();
   }
   if (v->vssip)
     hvip |= HVIP_VSSIP;
@@ -3494,9 +3499,18 @@ vcpu_idle(struct vcpu *v)
   acquire(&vm->lock);
   while (!(v->vssip || v->ssip_req || vic_seip(v) || r_time() + v->vm->htimedelta >= v->vstimecmp ||
            vm->state != VM_RUNNING || killed(v->p))) {
-    v->idle = 1;
+    // on the wait queue first, then idle. vcpu_kick() and the deadline scan
+    // read `idle' without this lock and call wakeup(v) when they see it; with
+    // the flag set before the registration, a kick that fell between the two
+    // found nobody to wake and the vcpu slept until its next timer (defect 31:
+    // the live adoption probe on the frozen build, F2 and F3 at a median of
+    // 91 ms instead of 9, and one announcement unseen for 20 s)
     v->wfi_sleeps++;
+    if (!v->t_idle && vm->revise_acked != vm->revise_gen)
+      v->t_idle = r_time();     // revision trace
     sleep_prepare(v);
+    __sync_synchronize();
+    v->idle = 1;
     release(&vm->lock);
     // and the host's timer is set for this guest's own deadline before
     // the sleep, not at the next tick. timer_rearm() takes the first of
@@ -3509,6 +3523,8 @@ vcpu_idle(struct vcpu *v)
     acquire(&vm->lock);
     v->idle = 0;
   }
+  if (v->ssip_req && !v->t_woke)
+    v->t_woke = r_time();
   release(&vm->lock);
 }
 
@@ -3565,9 +3581,9 @@ hyp_tick(void)
       for (int j = 0; j < vm->nvcpu; j++)
         vm->vcpu[j].ssip_req = 1;
       vmachrev_notify(vm);
-      release(&vm->lock);
       for (int j = 0; j < vm->nvcpu; j++)
         vcpu_kick(&vm->vcpu[j]);
+      release(&vm->lock);
       if (now - vm->revise_asked > 20 * HOST_TIMEBASE && !vm->revise_wd_printed) {
         vm->revise_wd_printed = 1;
         printk("hyp: vm %d: revision %d not acknowledged for 20 s (described %s, repeated %d times; lines %s, held 0x%lx)\n",
@@ -3666,7 +3682,13 @@ handle_exit(struct vcpu *v)
       printk("hyp: unexpected interrupt scause=0x%lx\n", scause);
       return -1;
     }
-    if (which == 2)
+    // and a reschedule asked for by IPI (sched_kick: a task with less
+    // virtual time -- a woken sibling vcpu -- is waiting for this hart) is
+    // honoured here, not at the next timer: with the tick stretched eight
+    // times for a hart running a guest alone, "the next timer" was 80 ms,
+    // and a vcpu woken for a revision waited that long behind its sibling
+    // (defect 32)
+    if (which == 2 || mycpu()->resched)
       yield();
     return 0;
   }

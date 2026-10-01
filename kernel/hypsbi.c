@@ -165,9 +165,11 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     vm->revise_capable = 1;   // it asked, so it speaks: the legacy tier is off
     break;
   case 1:
+    if (!v->vm->t_pending) v->vm->t_pending = r_time();     // revision trace
     r.val = vm->revise_gen;
     break;
   case 2:
+    if (!v->vm->t_describe) v->vm->t_describe = r_time();   // revision trace
     // the guest asks where its description is; a1 is returned in the second
     // register, which the caller reads as sbiret.val after a second call --
     // simpler to hand back the address here and the length on fid 4.
@@ -234,9 +236,18 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
              (long)((vm->revise_done - vm->revise_asked) / 10));
       vm->arrival_timeline = 0;
     }
-    printk("hyp: vm %d: revision %d adopted (0x%lx) after %ld us\n", vm->id,
-           vm->revise_acked, a0,
-           (long)((vm->revise_done - vm->revise_asked) / 10));
+    {
+      // the trace: where the time between the ask and the ack went, in us after the ask
+      // (-1: never, for a vcpu that was not asleep or did not enter with the bit)
+      uint64 t0 = vm->revise_asked;
+#define TR(t) ((t) ? (long)(((t) - t0) / 10) : -1L)
+      printk("hyp: vm %d: revision %d adopted (0x%lx) after %ld us [vcpu0 woke %ld entered %ld idle %ld; vcpu1 woke %ld entered %ld idle %ld; pending %ld described %ld; tx %ld..%ld by vcpu %d; ack from vcpu %d]\n",
+             vm->id, vm->revise_acked, a0, (long)((vm->revise_done - t0) / 10),
+             TR(vm->vcpu[0].t_woke), TR(vm->vcpu[0].t_entry), TR(vm->vcpu[0].t_idle),
+             vm->nvcpu > 1 ? TR(vm->vcpu[1].t_woke) : -1L, vm->nvcpu > 1 ? TR(vm->vcpu[1].t_entry) : -1L, vm->nvcpu > 1 ? TR(vm->vcpu[1].t_idle) : -1L,
+             TR(vm->t_pending), TR(vm->t_describe), TR(vm->t_first_tx), TR(vm->t_last_tx), vm->tx_vcpu, v->id);
+#undef TR
+    }
     break;
   case 4:
     r.val = VM_DTB_MAX;
