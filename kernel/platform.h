@@ -34,6 +34,8 @@ struct platform {
   int imsic_nids;       // riscv,num-ids
 
   uint64 clint_base;    // 0: no CLINT, IPIs go through SBI (F4)
+  int has_time_csr;     // the hart answers `time' (else mtime at the CLINT, time_mmio)
+  int has_htimedelta;   // the H extension's htimedelta exists (Rocket: no, there is no `time' to offset)
   int has_sstc;         // the timer is stimecmp (Sstc); else the SBI timer (F5)
   int cboz_block;       // F21: bytes cbo.zero clears (riscv,cboz-block-size); 0 without Zicboz
   int hartid[NCPU];     // F9: the hart id of logical cpu i (tp), from the tree's cpu nodes
@@ -44,6 +46,7 @@ struct platform {
   uint64 timebase;      // ticks of the time counter per second
   uint64 tb_t0, tb_ns0; // the monotonic clock's anchor at the last rate change (F6)
 
+  uint64 ramdisk_base, ramdisk_size;   // an xv6h,ramdisk node (the ZedBoard), 0 if none
   uint64 uart_base;
   int uart_irq;
 

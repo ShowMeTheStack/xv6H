@@ -42,7 +42,7 @@ sync_tree() { # NAME
   if [ -n "${SEED:-}" ]; then
     ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/$SEED $RUNS/$name && cd $RUNS/$name && \
       rm -rf qlogs qresults.txt results.out done build.out run_script.py && \
-      mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img"
+      mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/${LXIMAGE:-Image-hf} linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img"
     return
   fi
   ssh -o BatchMode=yes $HOST "mkdir -p $RUNS/.seed"
@@ -76,7 +76,7 @@ sync_tree() { # NAME
     --exclude 'results.out' --exclude 'done' --exclude 'test-hyp.log' --exclude '.git' \
     "$HERE/" "$HOST:$RUNS/.seed/"
   ssh -o BatchMode=yes $HOST "rm -rf $RUNS/$name && cp -a $RUNS/.seed $RUNS/$name && \
-    cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/Image-hf linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
+    cd $RUNS/$name && mkdir -p linux && ln -sf ~/xv6h-linux/out${LXTAG:-}/${LXIMAGE:-Image-hf} linux/Image && ln -sf ~/xv6h-linux/out/linux.img linux/linux.img && rm -f done results.out"
 }
 
 case "$cmd" in

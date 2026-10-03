@@ -1699,19 +1699,28 @@ info(int id)
          vi.last_cause, vi.last_gpa, vi.running_hart, vi.idle, vi.mmode);
   printf("         vsatp 0x%lx vstvec 0x%lx vsepc 0x%lx vscause 0x%lx vsstatus 0x%lx vstval 0x%lx\n",
          vi.vsatp, vi.vstvec, vi.vsepc, vi.vscause, vi.vsstatus, vi.vstval);
-  printf("         sp 0x%lx ra 0x%lx vsie 0x%lx vstimecmp 0x%lx\n", vi.sp, vi.ra, vi.vsie,
+  printf("         sp 0x%lx ra 0x%lx a0 0x%lx vsie 0x%lx vstimecmp 0x%lx\n", vi.sp, vi.ra, vi.a0_0, vi.vsie,
          vi.vstimecmp);
   printf("         scounteren 0x%lx senvcfg 0x%lx hcounteren 0x%lx\n", vi.scounteren, vi.senvcfg,
          vi.hcounteren);
   printf("  clock: host time 0x%lx, htimedelta 0x%lx, guest time 0x%lx (%s vstimecmp)\n", vi.host_time,
          vi.htimedelta, vi.host_time + vi.htimedelta,
          (long)(vi.host_time + vi.htimedelta - vi.vstimecmp) >= 0 ? "past" : "before");
-  printf("         imsic0: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n", vi.deliv0, vi.thr0, vi.eie0_0, vi.eip0_0);
-  if (vi.nvcpu > 1)
+  printf("         imsic0: deliv %d thr %d eie0 0x%lx eip0 0x%lx top %d; last entry hvip 0x%lx\n", vi.deliv0, vi.thr0,
+         vi.eie0_0, vi.eip0_0, vi.topid0, vi.hvip0);
+  if (vi.csr_n[0]) {
+    printf("  csr exits by csr:");
+    for (int i = 0; i < 16 && vi.csr_n[i]; i++)
+      printf(" 0x%x=%d", vi.csr_id[i], vi.csr_n[i]);
+    printf("\n");
+  }
+  if (vi.nvcpu > 1) {
+    printf("  vcpu1: a0 0x%lx ra 0x%lx\n", vi.a0_1, vi.ra1);
     printf("  vcpu1: pc 0x%lx last cause 0x%lx exits %ld idle %d hsm %d hart %d vstimecmp 0x%lx\n"
            "         imsic1: deliv %d thr %d eie0 0x%lx eip0 0x%lx\n",
            vi.pc1, vi.cause1, vi.exits1, vi.idle1, vi.hsm1, vi.hart1, vi.vstimecmp1, vi.deliv1, vi.thr1, vi.eie0_1,
            vi.eip0_1);
+  }
 }
 
 static void
@@ -1867,6 +1876,17 @@ main(int argc, char *argv[])
     exit(cmd_restore(argc - 2, argv + 2));
   } else if (strcmp(cmd, "exec") == 0) {
     exit(cmd_exec(argc - 2, argv + 2));
+  } else if (strcmp(cmd, "peek") == 0 && (argc == 4 || argc == 5)) {
+    // `vmm peek VM GPA [N]': N 32-bit words of the guest's memory from a guest-physical address
+    // (diagnosis: the lock a spinning vcpu waits on, read from outside)
+    int id = atoi(argv[2]);
+    unsigned long gpa = strtoul(argv[3], 0, 0);
+    int n = argc == 5 ? atoi(argv[4]) : 4;
+    for (int i = 0; i < n; i++) {
+      int w = vm_ctl(id, VMCTL_PEEK, gpa + 4 * i);
+      printf("0x%lx: 0x%x\n", gpa + 4 * i, (unsigned)w);
+    }
+    exit(0);
   } else if (strcmp(cmd, "ps") == 0 && argc == 2) {
     exit(cmd_ctps());
   } else if (strcmp(cmd, "stop") == 0 && argc == 3) {

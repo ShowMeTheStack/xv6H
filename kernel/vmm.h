@@ -192,6 +192,7 @@ struct vmentry {
 #define VMCTL_REVISE_CPUS 25     // arg: harts online (F7 up, F8 down)
 #define VMCTL_REVISE_CBOZ 26     // arg: cache-block size in bytes (F21)
 #define VMCTL_REVISE_MAP 27      // arg: the device windows' shift, 0 or 0x100000 (F15, live)
+#define VMCTL_PEEK 28            // arg: a guest-physical address; returns the 32-bit word there (diagnosis)
 
 #define VMCONS_READ   0
 #define VMCONS_WRITE  1
@@ -250,6 +251,10 @@ struct vminfo {
   int idle1, hsm1, hart1;
   uint64 eie0_0, eip0_0, eie0_1, eip0_1;
   int deliv0, deliv1, thr0, thr1;
+  uint64 hvip0;                   // the hvip bits vcpu0's last entry injected
+  uint64 a0_0, a0_1, ra1;         // a0 of each vcpu and vcpu1's ra (a lock's address while spinning)
+  uint32 csr_id[16], csr_n[16];   // CSR exits by CSR, the first sixteen seen
+  int topid0;                     // the software IMSIC's top pending id for vcpu0
 };
 
 #endif

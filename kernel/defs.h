@@ -21,6 +21,7 @@ struct gendisk;
 void            consoleinit(void);
 void            devnullinit(void);
 void            virtio_disk_register(void);
+void            ramdisk_register(void);
 void            blkinit(void);
 uint32          crc32c(uint32 crc, const void *data, int len);
 void            procfs_init(void);
@@ -231,6 +232,7 @@ void            uartintr(void);
 void            uartwrite(char [], int);
 void            uartputc_sync(int);
 void            uartputs_sync(const char *, int);
+void            uart_debug_tick(uint64);
 
 // vm.c
 void            kvminit(void);
@@ -491,6 +493,7 @@ int             audit_snapshot(char *dst, int max);
 void            audit_stats(uint64 *seq, uint64 *lost);
 
 // hyp.c
+void*           vcpu_machine(void *vcpu);   // hyp.c: the machine a vcpu belongs to (sched.c)
 void            hypinit(void);
 void            hypinithart(void);
 void            hyp_tick(void);
@@ -499,3 +502,4 @@ void            hyp_sgei(void);
 
 // number of elements in fixed-size array
 #define NELEM(x) (sizeof(x) / sizeof((x)[0]))
+int             plat_bootarg_str(const char *key, char *out, int max);

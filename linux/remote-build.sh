@@ -8,6 +8,6 @@ cd "$(dirname "$0")"
 ssh $HOST "mkdir -p xv6h-linux/src/machrev xv6h-linux/src/patches"
 rsync -q -a --delete machrev/ $HOST:xv6h-linux/src/machrev/
 rsync -q -a --delete patches/ $HOST:xv6h-linux/src/patches/
-scp -q build.sh zerocheck.c vecuser.c crossck.c vecprobe.c $HOST:xv6h-linux/src/
-ssh $HOST "REBUILD=1 KVER=${KVER:-6.12.41} TAG=${TAG:-} bash ~/xv6h-linux/src/build.sh" 2>&1 | tail -${TAIL:-15}
+scp -q build.sh zerocheck.c vecuser.c crossck.c vecprobe.c maskbench.c ../user/kvlat.c $HOST:xv6h-linux/src/
+ssh $HOST "REBUILD=1 KVER=${KVER:-6.12.41} TAG=${TAG:-} LOCKDEP=${LOCKDEP:-} bash ~/xv6h-linux/src/build.sh" 2>&1 | tail -${TAIL:-15}
 [ -n "$TAG" ] || ./fetch.sh          # a tagged build stays on the box (the tests link to it there)

@@ -75,6 +75,15 @@ vmachrev_init(struct vm *vm)
 void
 vmachrev_notify(struct vm *vm)
 {
+  // Every announcement is an edge. A line already high (an announcement the guest has not yet
+  // acknowledged on the device, or a machine restored with the line high in its controller's
+  // state) raised again was no change at all: in the APLIC's MSI mode no message was sent, so a
+  // guest told only by this line -- a Linux bound to its IMSIC, which never enables the
+  // software interrupt -- was never told. Found when a Linux saved on QEMU was restored on the
+  // ZedBoard and on its QEMU stand-in: the revision on arrival was "described no, repeated 10
+  // times" with the anchor's level held (B.4).
+  if (vm->machrev_line)
+    vic_set_level(vm, G_MACHREV_IRQ, 0);
   vm->machrev_line = 1;
   vic_set_level(vm, G_MACHREV_IRQ, 1);
 }

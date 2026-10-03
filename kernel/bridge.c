@@ -164,9 +164,22 @@ inbound_ok(struct vm *vm, struct mbuf *m)
     return 1;
   }
   vm->net_filtered++;
-  if (vm_gripe(&vm->g_filter))
-    printk("hyp: vm %d: frame nobody asked for, not delivered (%ld times)\n",
-           vm->id, vm->net_filtered);
+  if (vm_gripe(&vm->g_filter)) {
+    // what it was: an operator reading this needs the frame, not only the count
+    uint16 ty = ntohs(e->type);
+    if (ty == ETHTYPE_IP && m->len >= (int)(sizeof(*e) + sizeof(struct ip) + 4)) {
+      uint8 *ip = (uint8 *)m->head + sizeof(*e);
+      struct ip *h = (struct ip *)ip;
+      uint8 *l4 = ip + (h->vhl & 0xf) * 4;
+      uint32 src = ntohl(h->src);
+      printk("hyp: vm %d: frame nobody asked for, not delivered (%ld times): proto %d from %d.%d.%d.%d:%d to port %d\n",
+             vm->id, vm->net_filtered, h->pro, (int)(src >> 24), (int)((src >> 16) & 255), (int)((src >> 8) & 255),
+             (int)(src & 255), (l4[0] << 8) | l4[1], (l4[2] << 8) | l4[3]);
+    } else {
+      printk("hyp: vm %d: frame nobody asked for, not delivered (%ld times): ethertype 0x%x\n",
+             vm->id, vm->net_filtered, ty);
+    }
+  }
   mbuffree(m);
   return 0;
 }

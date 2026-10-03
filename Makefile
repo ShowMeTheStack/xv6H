@@ -19,6 +19,7 @@ OBJS = \
   $K/cgroup.o \
   $K/sysfilter.o \
   $K/vmstate.o \
+  $K/sha256.o \
   $K/ramfs.o \
   $K/sysfs.o \
   $K/overlayfs.o \
@@ -54,6 +55,8 @@ OBJS = \
   $K/kernelvec.o \
   $K/plic.o \
   $K/virtio_disk.o \
+  $K/ramdisk.o \
+  $K/mtrap.o \
   $K/fdt.o \
   $K/platform.o \
   $K/mvec.o \
@@ -459,6 +462,7 @@ UPROGS=\
 	$U/_taskset\
 	$U/_schedbench\
 	$U/_netbench\
+	$U/_kvlat\
 	$U/_cgrun\
 	$U/_cgtest\
 	$U/_fuzzsys\
@@ -978,12 +982,18 @@ ifneq ($(strip $(LINK)),)
 LINKSRV ?= off
 # the client side reconnects if the server host is restarted in another shape (the
 # grand tour, tools/grandtour.py: two slots, the destination freshly booted per hop)
+# The two ends have their own hardware addresses: with QEMU's default on both, a guest that had
+# crossed to the second host answered the first with a frame addressed to its own host's MAC,
+# which that host's switch kept (E5's crossings: the service unreachable for 15-34 s). Tests that
+# only looked at the guest on its console never saw it.
 ifeq ($(LINKSRV),off)
 QEMUOPTS += -netdev stream,id=n0,server=off,addr.type=unix,addr.path=$(LINK),reconnect-ms=1000
+LINKMAC ?= 52:54:00:12:34:57
 else
 QEMUOPTS += -netdev stream,id=n0,server=$(LINKSRV),addr.type=unix,addr.path=$(LINK)
+LINKMAC ?= 52:54:00:12:34:56
 endif
-QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
+QEMUOPTS += -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1,mac=$(LINKMAC)
 else ifneq ($(NET),0)
 QEMUOPTS += -netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1
 endif

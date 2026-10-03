@@ -29,6 +29,10 @@
 #define MS_TICKS(ms)  (((ms) * tick_hz + 999) / 1000)
 #define SEC_TICKS(s)  ((s) * tick_hz)
 
+// what recovery cost, for /proc/net/sockstat (E5: a crossing's stall after the move): timeouts
+// that fired, the largest timeout armed when one fired (ms), fast and partial-ack retransmits
+uint64 tcp_nrto, tcp_maxrto_ms, tcp_nfast, tcp_npartial;
+
 
 static struct tcpcb tcbs[NTCP];
 static uint32 iss_next = 0x1000;
@@ -417,6 +421,9 @@ tcp_timer(void)
       if (t->ssthresh < 2 * t->mss)
         t->ssthresh = 2 * t->mss;
       t->cwnd = t->mss;
+      tcp_nrto++;
+      if ((uint64)t->rto * 1000 / tick_hz > tcp_maxrto_ms)
+        tcp_maxrto_ms = (uint64)t->rto * 1000 / tick_hz;
       t->rto *= 2;
       // A minute between attempts is for a path that may come back in a
       // minute. Everything this kernel talks to is on the same machine or
@@ -507,6 +514,7 @@ tcp_ack(struct tcpcb *t, uint32 ack)
         t->cwnd = t->ssthresh + 3 * t->mss;
         t->recover = t->snd_nxt;
         t->in_recovery = 1;
+        tcp_nfast++;
         tcp_retransmit(t);
       }
     }
@@ -526,8 +534,10 @@ tcp_ack(struct tcpcb *t, uint32 ack)
   // that lost several frames (41 per side per hunt3 run) used to recover one
   // segment per round trip, and a 30-second wait on the far end ran out.
   if (t->in_recovery) {
-    if (SEQ_LT(ack, t->recover))
+    if (SEQ_LT(ack, t->recover)) {
+      tcp_npartial++;
       tcp_retransmit(t);
+    }
     else
       t->in_recovery = 0;
   }

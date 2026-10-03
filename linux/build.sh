@@ -109,6 +109,15 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
   if [ -f $WORK/src/vecuser.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecuser $WORK/src/vecuser.c || log "vecuser did not build"
   fi
+  # maskbench: what a description costs a program (the masking baseline, C): vector and scalar
+  # bandwidth, the clock's read, a page's first touch, direct disk reads
+  if [ -f $WORK/src/maskbench.c ]; then
+    ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/maskbench $WORK/src/maskbench.c || log "maskbench did not build"
+  fi
+  # kvlat: a key-value service and an open-loop load generator (E5: what an application sees)
+  if [ -f $WORK/src/kvlat.c ]; then
+    ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/kvlat $WORK/src/kvlat.c || log "kvlat did not build"
+  fi
   # crossck: memory, clock and vector file verified from inside the guest across a crossing (L17)
   [ -f $WORK/src/vecprobe.c ] && ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecprobe $WORK/src/vecprobe.c
   if [ -f $WORK/src/crossck.c ]; then
@@ -248,6 +257,14 @@ CFG
   log "kernel $1 done: $(du -h $OUT/Image-$1 | cut -f1)"
 }
 build_kernel hf $OUT/initramfs-hf.cpio.gz "CONFIG_FPU=y"
+# a diagnostic kernel with lockdep (LOCKDEP=1): the same guest, reporting a lock taken both in
+# interrupt context and with interrupts on at its first inconsistent use (E7: the two vcpus found
+# spinning in do_raw_spin_lock in interrupt context, which no watchdog can report)
+if [ -n "${LOCKDEP:-}" ]; then
+  build_kernel hfld $OUT/initramfs-hf.cpio.gz "CONFIG_FPU=y
+CONFIG_PROVE_LOCKING=y
+CONFIG_DEBUG_ATOMIC_SLEEP=y"
+fi
 if [ -f $OUT/initramfs-sf.cpio.gz ]; then
   build_kernel nofpu $OUT/initramfs-sf.cpio.gz "CONFIG_FPU=n"
 fi

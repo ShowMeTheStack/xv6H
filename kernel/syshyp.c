@@ -255,6 +255,14 @@ sys_vm_ctl(void)
   struct vm *vm = vm_arg(vmid, &err);
   if (err)
     return err;
+  // a word of the guest's memory, read from outside (E7: which cpu holds the lock both vcpus
+  // spin on). Before the hold below: reading is not a revision.
+  if (op == VMCTL_PEEK) {
+    uint32 w;
+    if (vm_copyin(vm, &w, arg, sizeof(w)) < 0)
+      return -1;
+    return (int)w;
+  }
   // every revision sets its facts first and bumps the generation after (the
   // description is built from the new facts); the hold makes the models treat
   // the gap as pending too (hyp.h vm_revising)
@@ -494,6 +502,17 @@ sys_vm_info(void)
       info.exit_hist[k] = v->exit_hist[k];
     info.eie0_0 = v->imsic.eie[0];
     info.eip0_0 = v->imsic.eip[0];
+    info.hvip0 = v->last_hvip;
+    info.a0_0 = v->regs[10];
+    if (vm->nvcpu > 1) {
+      info.a0_1 = vm->vcpu[1].regs[10];
+      info.ra1 = vm->vcpu[1].regs[1];
+    }
+    for (int i = 0; i < 16; i++) {
+      info.csr_id[i] = vm->csr_hist[i].csr;
+      info.csr_n[i] = vm->csr_hist[i].n;
+    }
+    info.topid0 = vimsic_top(&v->imsic);
     info.deliv0 = v->imsic.eidelivery;
     info.thr0 = v->imsic.eithreshold;
     if (vm->nvcpu > 1) {

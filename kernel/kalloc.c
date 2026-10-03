@@ -196,7 +196,10 @@ kinit(void)
   if (km.alloc_end <= km.alloc_start + 64 * PGSIZE)
     panic("kinit: no memory");
   km.total = (km.alloc_end - km.alloc_start) >> PGSHIFT;
-  km.reserve = HOSTMEM >> PGSHIFT;
+  // hostmem=MB on the command line overrides the build's HOSTMEM_MB (the ZedBoard's
+  // 192 MB keeps 48 for the host, from its tree's bootargs)
+  uint64 hostmem_mb = plat_bootarg_num("hostmem");
+  km.reserve = (hostmem_mb ? hostmem_mb << 20 : HOSTMEM) >> PGSHIFT;
   if (km.reserve > km.total / 2)
     km.reserve = km.total / 2;
   if (plat.is_guest)

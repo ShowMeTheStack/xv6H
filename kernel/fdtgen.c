@@ -265,7 +265,10 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   node_begin(&w, "cpus");
   prop_u32(&w, "#address-cells", 1);
   prop_u32(&w, "#size-cells", 0);
-  prop_u32(&w, "timebase-frequency", vm->timebase ? vm->timebase : 10000000);   // F6
+  {
+    uint32 tb = vm->tb_pending_on ? vm->tb_pending : vm->timebase;   // F6: the rate described
+    prop_u32(&w, "timebase-frequency", tb ? tb : (plat.timebase ? plat.timebase : 10000000));
+  }
   for (int i = 0; i < vm->nvcpu; i++) {
     int hid = i + vm->hart_shift;     // F9: the hart id this machine gives vcpu i
     memmove(name, "cpu@", 4);

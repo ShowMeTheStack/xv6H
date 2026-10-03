@@ -7,6 +7,12 @@
 #include "intc.h"
 
 void main();
+int mprobe_time(void);
+int mprobe_cycle(void);
+int mprobe_misaligned_traps(void);
+extern uint64 time_mmio;
+int cycle_absent;
+extern uint64 host_timebase;
 void timerinit();
 void mvec();
 
@@ -14,7 +20,7 @@ void mvec();
 __attribute__((aligned(16))) char stack0[4096 * NCPU];
 
 // mvec.S needs a small machine-mode stack per CPU.
-#define MSTACK 512
+#define MSTACK 4096   // mtrap.c runs C on it (misaligned accesses, the report)
 __attribute__((aligned(16))) char mstack0[MSTACK * NCPU];
 
 // entry.S jumps here in machine mode on stack0,
@@ -26,6 +32,19 @@ __attribute__((aligned(16))) char mstack0[MSTACK * NCPU];
 __attribute__((no_stack_protector)) void
 start(uint64 hartid, uint64 fdt)
 {
+  // the time counter, before anything reads it (canary_init does): a hart
+  // without the `time' CSR traps on the read, and nothing is at mtvec yet. The
+  // CLINT is where the boot ROM's machine has it until the tree says otherwise
+  // (platform_init). Assembly only, so it runs before the canary is set.
+  if (!mprobe_time())
+    time_mmio = CLINT_BASE + 0xbff8;
+  if (!mprobe_cycle())
+    cycle_absent = 1;
+  // and whether a misaligned access traps -- here, before mepc and MPP are set for the mret
+  // into main below: a probe that traps rewrites both (its guard returns by mret), and the
+  // first board run with the probe further down went to the probe's next instruction in a
+  // lesser mode instead of to main ("unexpected trap: mcause 1 mepc 0")
+  int misaligned_traps = mprobe_misaligned_traps();
   canary_init(hartid);
 
   // The first hart to get here is the boot hart -- not "hart 0": a machine may
@@ -65,6 +84,10 @@ start(uint64 hartid, uint64 fdt)
     medeleg |= (1L << 20) | (1L << 21) | (1L << 22) | (1L << 23);
     mideleg |= (1L << 12);
   }
+  if (!plat.has_sstc)
+    medeleg &= ~(1L << 9);      // ecall from S: the TIME call is machine mode's (mvec.S)
+  if (misaligned_traps)
+    medeleg &= ~((1L << 4) | (1L << 6));   // misaligned loads and stores: performed in mtrap.c
   w_medeleg(medeleg);
   w_mideleg(mideleg);
   w_sie(r_sie() | SIE_SEIE | SIE_STIE | SIE_SSIE);
@@ -111,6 +134,12 @@ timerinit()
   // allow supervisor (and guests) to use stimecmp, time, cycle, instret.
   w_mcounteren(r_mcounteren() | 7);
 
-  // ask for the very first timer interrupt.
-  w_stimecmp(r_time() + 1000000);
+  // ask for the very first timer interrupt: stimecmp, or the machine's own
+  // mtimecmp on a hart without Sstc (its interrupt raises STIP, mvec.S)
+  if (plat.has_sstc) {
+    w_stimecmp(r_time() + 1000000);
+  } else {
+    *(volatile uint64 *)(plat.clint_base + 0x4000 + 8 * r_mhartid()) = r_time() + host_timebase / 10;
+    w_mie(r_mie() | MIE_MTIE);
+  }
 }

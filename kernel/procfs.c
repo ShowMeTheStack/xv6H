@@ -562,6 +562,17 @@ gen_net(struct gen *g, uint inum)
     gen_num(g, c.counts[SOCK_DGRAM]);
     gen_str(g, "\nRAW: inuse ");
     gen_num(g, c.counts[SOCK_ICMP]);
+    {
+      extern uint64 tcp_nrto, tcp_maxrto_ms, tcp_nfast, tcp_npartial;
+      gen_str(g, "\nTCPX: rto ");
+      gen_num(g, tcp_nrto);
+      gen_str(g, " maxrto_ms ");
+      gen_num(g, tcp_maxrto_ms);
+      gen_str(g, " fast ");
+      gen_num(g, tcp_nfast);
+      gen_str(g, " partial ");
+      gen_num(g, tcp_npartial);
+    }
     gen_str(g, "\n");
     break;
   }

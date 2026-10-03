@@ -1,6 +1,6 @@
 --- a/drivers/clocksource/timer-riscv.c	2026-09-27 22:59:20
 +++ b/drivers/clocksource/timer-riscv.c	2026-09-28 00:02:12
-@@ -152,8 +152,79 @@
+@@ -152,8 +152,110 @@
  	evdev->event_handler(evdev);
  
  	return IRQ_HANDLED;
@@ -53,8 +53,36 @@
 +		riscv_clock_event_stop();
  }
  
-+void riscv_timer_revise(bool sstc, u32 hz);
-+void riscv_timer_revise(bool sstc, u32 hz)
++/* inside the stop_machine of timekeeping_rerate(), on every cpu: its clock event device takes the
++ * new rate before any cpu runs again. Done afterwards by cross-call, a cpu converted its deadlines
++ * at the old rate meanwhile: from 1 MHz to 10 MHz every timer it armed fired ten times early and
++ * was armed again, and the cross-call waited behind that (E5: a service stalled for seconds). */
++struct riscv_rerate {
++	u32 hz;
++	void (*now)(void);
++};
++
++static void riscv_timer_rerate_each(void *arg)
++{
++	clockevents_update_freq(this_cpu_ptr(&riscv_clock_event), ((struct riscv_rerate *)arg)->hz);
++}
++
++/* on the one cpu that re-bases the timekeeper, before it does: the scheduler's clock is re-anchored
++ * at the old rate up to this instant and takes the new one, and only then does the counter's new
++ * rate begin (now(): the hypervisor is told). Done after the stop_machine, sched_clock converted
++ * the new counter with the old rate until then -- ten times fast from 1 to 10 MHz -- and leapt by
++ * the error at its re-anchor, and the watchdogs it feeds reported lockups (E5). */
++static void riscv_timer_rerate_first(void *arg)
++{
++	struct riscv_rerate *r = arg;
++
++	sched_clock_revise(r->hz);
++	if (r->now)
++		r->now();
++}
++
++void riscv_timer_revise(bool sstc, u32 hz, void (*now)(void));
++void riscv_timer_revise(bool sstc, u32 hz, void (*now)(void))
 +{
 +	bool had = static_branch_likely(&riscv_sstc_available);
 +
@@ -66,13 +94,16 @@
 +		pr_info("riscv-timer: timer via %s\n", sstc ? "stimecmp" : "sbi");
 +	}
 +	if (hz && hz != riscv_timebase) {
++		struct riscv_rerate r = { hz, now };
++
 +		pr_info("riscv-timer: timebase %lu -> %u Hz\n", riscv_timebase, hz);
 +		riscv_timebase = hz;
 +		__clocksource_update_freq_hz(&riscv_clocksource, hz);
-+		timekeeping_rerate();	/* the timekeeper copied the old mult at setup (kernel/time/timekeeping.c) */
-+		sched_clock_revise(hz);	/* the scheduler's clock too (kernel/time/sched_clock.c) */
-+	} else
-+		hz = 0;
++		/* the timekeeper copied the old mult at setup (kernel/time/timekeeping.c); now(), if given,
++		 * has the host serve the new rate at that exact point, every other CPU stopped */
++		timekeeping_rerate(riscv_timer_rerate_first, riscv_timer_rerate_each, &r);
++	}
++	hz = 0;		/* every device has its rate already: the cross-call only re-arms */
 +	on_each_cpu(riscv_timer_rearm_now, &hz, 1);
 +}
 +EXPORT_SYMBOL_GPL(riscv_timer_revise);
@@ -179,7 +210,7 @@
 
 --- a/kernel/time/timekeeping.c
 +++ b/kernel/time/timekeeping.c
-@@ -1539,6 +1539,22 @@
+@@ -1539,6 +1539,56 @@
  	return tk->tkr_mono.clock == clock ? 0 : -1;
  }
  
@@ -190,11 +221,45 @@
 + * copied them at setup; re-base it on the same clocksource exactly as a
 + * clocksource change would, with the elapsed time carried forward.
 + */
-+void timekeeping_rerate(void)
++struct rerate_arg {
++	struct clocksource *cs;
++	void (*first)(void *);
++	void (*each)(void *);
++	void *arg;
++	atomic_t claimed, done;
++};
++
++/*
++ * Under stop_machine, on every cpu. The first cpu here runs first() -- which has the counter's
++ * new rate begin (the hypervisor is told, if it asks to be) -- and re-bases the timekeeper on it;
++ * the others wait for that, and then every cpu runs each() (its own clock event device), before
++ * any cpu runs again.
++ */
++static int rerate_clocksource(void *data)
++{
++	struct rerate_arg *a = data;
++	int ret = 0;
++
++	if (atomic_cmpxchg(&a->claimed, 0, 1) == 0) {
++		if (a->first)
++			a->first(a->arg);
++		ret = change_clocksource(a->cs);
++		atomic_set_release(&a->done, 1);
++	} else {
++		while (!atomic_read_acquire(&a->done))
++			cpu_relax();
++	}
++	if (a->each)
++		a->each(a->arg);
++	return ret;
++}
++
++void timekeeping_rerate(void (*first)(void *), void (*each)(void *), void *arg)
 +{
 +	struct timekeeper *tk = &tk_core.timekeeper;
++	struct rerate_arg a = { tk->tkr_mono.clock, first, each, arg, ATOMIC_INIT(0), ATOMIC_INIT(0) };
 +
-+	stop_machine(change_clocksource, tk->tkr_mono.clock, NULL);
++	stop_machine(rerate_clocksource, &a, cpu_online_mask);
 +	tick_clock_notify();
 +}
 +EXPORT_SYMBOL_GPL(timekeeping_rerate);
@@ -209,7 +274,7 @@
  #endif
  
  extern int timekeeping_notify(struct clocksource *clock);
-+extern void timekeeping_rerate(void);	/* xv6H: F6 */
++extern void timekeeping_rerate(void (*first)(void *), void (*each)(void *), void *arg);	/* xv6H: F6 */
  
  extern u64 clocksource_mmio_readl_up(struct clocksource *);
  extern u64 clocksource_mmio_readl_down(struct clocksource *);

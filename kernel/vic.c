@@ -13,6 +13,7 @@
 #include "defs.h"
 #include "platform.h"
 #include "hyp.h"
+#include "imsic.h"
 #include "aplic.h"
 
 void
@@ -227,5 +228,22 @@ vic_csr(struct vcpu *v, uint32 inst)
 {
   if (v->vm->vic_kind == VIC_IMSIC)
     return vimsic_csr(v, inst);
+  // An IMSIC the guest is leaving, as a ghost, like the windows of any controller it leaves:
+  // its registers read as zero and ignore writes until the guest acknowledges. Its registers
+  // are CSRs, and the guest's driver (patch 0005) silences the backend it leaves before it
+  // brings up the new one -- by these CSRs, after this host has already rebuilt the model as
+  // a PLIC. Refused, they were an illegal instruction inside the guest's cross-call: every
+  // imsic -> plic exchange hung (lx-revise-intc, 3/3, with the guest of 3 October).
+  int csr = inst >> 20;
+  if (vm_revising(v->vm) &&
+      (csr == CSR_SISELECT || csr == CSR_SIREG || csr == CSR_STOPEI || csr == CSR_STOPI ||
+       csr == CSR_SISELECT + 0x100 || csr == CSR_SIREG + 0x100 || csr == CSR_STOPEI + 0x100 ||
+       csr == CSR_STOPI + 0x100)) {
+    int rdn = (inst >> 7) & 31;
+    if (rdn)
+      v->regs[rdn] = 0;
+    v->pc += 4;
+    return 0;
+  }
   return -1;
 }

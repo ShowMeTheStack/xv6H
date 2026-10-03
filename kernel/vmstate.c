@@ -38,6 +38,7 @@
 #include "vmm.h"
 #include "hyp.h"
 #include "vmstate.h"
+#include "sha256.h"
 
 // one vcpu, as the file holds it. The host's parts of struct vcpu are not
 // here: which hart it last ran on, which host process is inside vm_run,
@@ -177,7 +178,36 @@ struct sink {
   struct inode *ip;
   struct file *f;
   uint off;
+  int mac_on;              // M12: every byte written, authenticated (a connection with a key)
+  struct hmac mac;
 };
+
+// M12: the key two hosts share for their migration streams (`migkey=' on both command lines),
+// into k; its length, or 0 for none. The MAC is HMAC-SHA256 (sha256.c), checked against RFC
+// 4231 once; a host whose implementation fails the check authenticates nothing and says so.
+static int
+mig_key(uint8 *k)
+{
+  static int ok = -1;
+  int n = plat_bootarg_str("migkey", (char *)k, 64);
+
+  if (n == 0)
+    return 0;
+  if (ok < 0) {
+    ok = sha256_selftest();
+    if (!ok)
+      printk("hyp: HMAC-SHA256 failed its self-test: migration streams are not authenticated\n");
+  }
+  return ok ? n : 0;
+}
+
+// M12, replay: a destination opens every connection with 16 bytes of its own randomness, and a
+// source with a key MACs them ahead of the header -- so a stream recorded once and sent again
+// does not authenticate at a destination that asked with a different nonce. Every connection
+// exchanges one, key or not, so a mismatch of keys is still refused at the header.
+#define MIG_NONCE 16
+static int nonce_get(struct file *f, uint8 *nonce);
+
 
 static int
 put(struct sink *s, const void *buf, uint n)
@@ -199,6 +229,8 @@ put(struct sink *s, const void *buf, uint n)
   }
   if (r != (int)n)
     return -EIO;
+  if (s->mac_on)
+    hmac_update(&s->mac, buf, n);
   s->off += n;
   return 0;
 }
@@ -433,6 +465,15 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, uint64 src
   vm->uart = d->uart;
   vm->plic = d->plic;
   vm->aplic = d->aplic;
+  // the anchor's line as the controller's state has it: the anchor device itself was made new
+  vm->machrev_line = (int)((((src_kind == VIC_PLIC) ? d->plic.level : d->aplic.level) >> G_MACHREV_IRQ) & 1);
+  if (vm->machrev_line)
+    printk("hyp: vm %d: arrived with the anchor's line high\n", vm->id);
+  if (src_kind != VIC_PLIC)
+    printk("hyp: vm %d: the anchor's line on the APLIC as it arrived: domaincfg 0x%x sourcecfg 0x%x target 0x%x "
+           "enabled %d pending %d level %d\n", vm->id, d->aplic.domaincfg[1], d->aplic.sourcecfg[G_MACHREV_IRQ],
+           d->aplic.target[G_MACHREV_IRQ], (int)((d->aplic.enable >> G_MACHREV_IRQ) & 1),
+           (int)((d->aplic.pending >> G_MACHREV_IRQ) & 1), (int)((d->aplic.level >> G_MACHREV_IRQ) & 1));
   // A machine that arrives on a host of a different shape gets that host's
   // interrupt controller, not the one it left. The register state just copied
   // in belongs to a model this machine no longer has, and translating it would
@@ -898,6 +939,24 @@ save_to(struct vm *vm, struct sink *s)
   memmove(hdr.magic, VMSTATE_MAGIC, 8);
   hdr.version = VMSTATE_VERSION;
   hdr.saved_time = r_time();
+  // M12: over a connection, with a key, the whole stream is authenticated from this header on;
+  // the tag follows END, and the destination runs nothing before it has checked it
+  uint8 key[64], nonce[MIG_NONCE];
+  if (s->f) {
+    if (s->f->type != FD_SOCK || s->f->sock == 0) {
+      r = -EINVAL;
+      goto out;
+    }
+    if ((r = nonce_get(s->f, nonce)) < 0)
+      goto out;
+  }
+  int kl = s->f ? mig_key(key) : 0;
+  if (kl) {
+    hdr.flags |= VMSTATE_HDR_MAC;
+    hmac_init(&s->mac, key, kl);
+    hmac_update(&s->mac, nonce, sizeof(nonce));
+    s->mac_on = 1;
+  }
   if ((r = put(s, &hdr, sizeof(hdr))) < 0)
     goto out;
 
@@ -1104,6 +1163,13 @@ save_to(struct vm *vm, struct sink *s)
   // longer the last of them.
   if ((r = put_sec(s, "END", 0, 0)) < 0)
     goto out;
+  if (s->mac_on) {
+    uint8 tag[32];
+    hmac_final(&s->mac, tag);
+    s->mac_on = 0;
+    if ((r = put(s, tag, sizeof(tag))) < 0)
+      goto out;
+  }
   // and the header again for a file, which can say how long it is; a
   // connection has already sent it and ends with END instead.
   if (s->ip) {
@@ -1248,6 +1314,36 @@ hs_get(struct file *f, char *answer, uint32 *arg)
   }
   *answer = buf[0];
   *arg = (uint8)buf[1] | ((uint32)(uint8)buf[2] << 8) | ((uint32)(uint8)buf[3] << 16) | ((uint32)(uint8)buf[4] << 24);
+  return 0;
+}
+
+// the destination's nonce, read by the source before it writes anything (bounded, as hs_get)
+static int
+nonce_get(struct file *f, uint8 *nonce)
+{
+  int got = 0;
+  uint deadline = now_ticks() + ACK_TICKS;
+
+  while (got < MIG_NONCE) {
+    int ready = sockready(f->sock, 0);
+    if (ready < 0)
+      return -EIO;
+    if (ready == 0) {
+      if (killed(myproc()))
+        return -EINTR;
+      if (now_ticks() >= deadline)
+        return -ETIMEDOUT;
+      acquire(&tickslock);
+      sleep_prepare((void *)&ticks);
+      release(&tickslock);
+      sleep();
+      continue;
+    }
+    int n = sockread(f->sock, 0, (uint64)nonce + got, MIG_NONCE - got);
+    if (n <= 0)
+      return -EIO;
+    got += n;
+  }
   return 0;
 }
 
@@ -1849,6 +1945,8 @@ struct src {
   struct file *f;
   uint off;
   uint len;
+  int mac_on;              // M12: every byte read, authenticated
+  struct hmac mac;
 };
 
 static int
@@ -1869,6 +1967,8 @@ get(struct src *s, void *buf, uint n)
         return -EIO;
       got += r;
     }
+    if (s->mac_on)
+      hmac_update(&s->mac, buf, n);
     s->off += n;
     return 0;
   }
@@ -1877,6 +1977,8 @@ get(struct src *s, void *buf, uint n)
   iunlock(s->ip);
   if (r != (int)n)
     return -EIO;
+  if (s->mac_on)
+    hmac_update(&s->mac, buf, n);
   s->off += n;
   return 0;
 }
@@ -1936,10 +2038,40 @@ restore_from(struct src *s, const char *name, int *idp)
   // a file too short to hold a header is not a saved machine, and saying
   // "invalid argument" is the answer; "input/output error" would be a
   // complaint about the disk, which is not what is wrong.
+  uint8 key[64], nonce[MIG_NONCE];
+  int kl = 0;
+  if (s->f) {
+    // M12, replay: this connection's nonce, before anything is read
+    random_bytes(nonce, sizeof(nonce));
+    if (s->f->type != FD_SOCK || s->f->sock == 0 ||
+        sockwrite(s->f->sock, 0, (uint64)nonce, sizeof(nonce)) != sizeof(nonce)) {
+      r = -EIO;
+      goto out;
+    }
+  }
   if (get(s, &hdr, sizeof(hdr)) < 0 ||
       memcmp(hdr.magic, VMSTATE_MAGIC, 8) != 0) {
     r = -EINVAL;
     goto out;
+  }
+  // M12: a stream between hosts with a key is authenticated, and one without is not taken by
+  // a host that has a key (nor an authenticated one by a host that has none to check it with)
+  kl = s->f ? mig_key(key) : 0;
+  if (s->f && (hdr.flags & VMSTATE_HDR_MAC) && !kl) {
+    printk("hyp: an authenticated migration stream, and this host has no key: refused\n");
+    r = -EACCES;
+    goto out;
+  }
+  if (kl && !(hdr.flags & VMSTATE_HDR_MAC)) {
+    printk("hyp: an unauthenticated migration stream to a host with a key: refused\n");
+    r = -EACCES;
+    goto out;
+  }
+  if (kl) {
+    hmac_init(&s->mac, key, kl);
+    hmac_update(&s->mac, nonce, sizeof(nonce));
+    hmac_update(&s->mac, &hdr, sizeof(hdr));
+    s->mac_on = 1;
   }
   if (hdr.version != VMSTATE_VERSION) {
     // a file from a kernel built from other structures is not a machine
@@ -1967,6 +2099,13 @@ restore_from(struct src *s, const char *name, int *idp)
     struct vmstate_sec sec;
     if ((r = get(s, &sec, sizeof(sec))) < 0)
       goto out;
+    // a section's length is the other host's word: it must fit what is left of a file (and of
+    // the 32-bit offset), and a known section has exactly its own size (below). It was cut to
+    // uint and trusted, so a length of -16 in a file read the same header for ever (M12).
+    if (sec.len > (uint64)(end - s->off) || sec.len > 0x7fffffffULL) {
+      r = -EINVAL;
+      goto out;
+    }
     uint next = s->off + (uint)sec.len;
     if (strncmp(sec.name, "CFG", sizeof(sec.name)) == 0) {
       if (sec.len != sizeof(w->cfg)) {
@@ -2016,9 +2155,19 @@ restore_from(struct src *s, const char *name, int *idp)
         else
           refuse = MIG_REFUSE_VECTOR;
       }
-      if (w->cfg.paging_mode == 9 && plat.mmu_levels < 4) {
-        printk("hyp: refusing a machine in Sv48: this host's G-stage is Sv39x4\n");
-        refuse = MIG_REFUSE_PAGING;
+      // The guest's own paging mode (its vsatp) is chosen by the guest at boot, by probing --
+      // Linux tries Sv57, then Sv48, then Sv39 -- and cannot be told again: its page tables are
+      // built for it. A host whose hardware does not walk that mode cannot take the machine.
+      // This compared Sv48 only, and with the host's G-stage depth; a Linux saved on a QEMU host
+      // (Sv57) arrived on the ZedBoard's Rocket (Sv39 only), its vsatp write fell back to Bare,
+      // and it fetched its trap vector's virtual address as a guest-physical one for ever (B.4).
+      {
+        int need = w->cfg.paging_mode == 8 ? 39 : w->cfg.paging_mode == 9 ? 48 :
+                   w->cfg.paging_mode == 10 ? 57 : 0;
+        if (need > plat.mmu_max || (need == 48 && plat.mmu_levels < 4)) {
+          printk("hyp: refusing a machine in Sv%d: this host's hardware walks Sv%d at most\n", need, plat.mmu_max);
+          refuse = MIG_REFUSE_PAGING;
+        }
       }
       // F14: room. A machine resident in more memory than this host has for
       // it is asked, through its balloon, to be smaller before it comes --
@@ -2081,11 +2230,13 @@ restore_from(struct src *s, const char *name, int *idp)
       // The policy, measured (tiercost): revising to the host's native controller
       // is worth it only when native is *cheaper* -- hardware guest interrupt
       // files, where an interrupt costs no exit. On a host without them a
-      // software IMSIC and a PLIC cost the same, so `guestpolicy=cheapest' keeps
-      // whatever the guest arrived with and asks for no revision. The default
-      // stays `native', which is what the correctness tests exercise.
+      // software IMSIC and a PLIC cost the same, so the policy keeps whatever
+      // the guest arrived with and asks for no revision. This is the default
+      // `guestpolicy=native' revises to the host's own
+      // controller always, the policy the endurance and correctness runs of the
+      // first submission exercised.
       int target = native;
-      if (plat_bootarg("guestpolicy=cheapest") &&
+      if (!plat_bootarg("guestpolicy=native") &&
           !(plat.intc_kind == INTC_IMSIC && vimsic_geilen() > 0))
         target = w->cfg.vic_kind;
       // Speaking the protocol is not the same as being able to take F1/F2. A
@@ -2208,7 +2359,18 @@ restore_from(struct src *s, const char *name, int *idp)
       // it -- and is served in software if this host's differs; one that
       // can is described this host's on arrival and told (owed, below)
       src_cboz = w->cfg.cboz_block;
-      if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.cboz_block && (int)w->cfg.cboz_block != plat.cboz_block) {
+      // A host without Zicboz is not another block size: whether the instruction exists is fixed
+      // at the guest's boot (Linux patches clear_page with it), and a guest told "block 0" still
+      // executes it. So it keeps its block, told or not, and the instruction -- illegal on this
+      // hardware -- is done in software (hyp_illegal). Found when a Linux saved on QEMU arrived
+      // on the ZedBoard's Rocket and took an illegal instruction in clear_page (B.4).
+      if (w->cfg.cboz_block && plat.cboz_block == 0 && (w->cfg.flags2 & VMSTATE_F_CAPABLE)) {
+        w->cfg.cfg.flags |= VMF_CBOZ_SET;
+        w->cfg.cfg.cboz_block = w->cfg.cboz_block;
+        src_cboz = 0;
+        printk("hyp: a machine arriving with a %u-byte cache block on a host without Zicboz: keeping it (cbo.zero in software)\n",
+               w->cfg.cboz_block);
+      } else if (!(w->cfg.flags2 & VMSTATE_F_CAPABLE) && w->cfg.cboz_block && (int)w->cfg.cboz_block != plat.cboz_block) {
         w->cfg.cfg.flags |= VMF_CBOZ_SET;
         w->cfg.cfg.cboz_block = w->cfg.cboz_block;
         printk("hyp: a machine arriving with a %u-byte cache block does not speak revision: keeping it (this host's is %d, cbo.zero in software)\n",
@@ -2237,7 +2399,7 @@ restore_from(struct src *s, const char *name, int *idp)
         w->cfg.cfg.flags |= target == VIC_PLIC  ? VMF_WANT_PLIC
                           : target == VIC_APLIC ? VMF_WANT_APLIC : VMF_WANT_IMSIC;
         printk("hyp: a machine arriving as %s: this %s host has no cheaper "
-               "controller, keeping %s (guestpolicy=cheapest)\n",
+               "controller, keeping %s (the cheapest-controller policy)\n",
                vic_kindname(src_kind), vic_kindname(native), vic_kindname(target));
       }
       id = vm_create_blank(&w->cfg.cfg);
@@ -2262,15 +2424,23 @@ restore_from(struct src *s, const char *name, int *idp)
       vm->tb_x0 = w->cfg.tb_x0;
       vm->tb_g0 = w->cfg.tb_g0;
     } else if (strncmp(sec.name, "TIME", sizeof(sec.name)) == 0) {
+      if (sec.len != sizeof(w->tm)) {
+        r = -EINVAL;
+        goto out;
+      }
       if ((r = get(s, &w->tm, sizeof(w->tm))) < 0)
         goto out;
     } else if (strncmp(sec.name, "VCPU", sizeof(sec.name)) == 0) {
-      if (vm == 0 || nvs >= vm->nvcpu) {
+      if (vm == 0 || nvs >= vm->nvcpu || sec.len < sizeof(w->vs)) {
         r = -EINVAL;
         goto out;
       }
       if ((r = get(s, &w->vs, sizeof(w->vs))) < 0)
         goto out;
+      if (sec.len != sizeof(w->vs) + (w->vs.has_vstate ? PGSIZE : 0)) {
+        r = -EINVAL;
+        goto out;
+      }
       restore_vcpu(&vm->vcpu[nvs], &w->vs);
       if (w->vs.has_vstate) {
         // straight into the vcpu's own page: the machine has one for
@@ -2349,9 +2519,31 @@ restore_from(struct src *s, const char *name, int *idp)
       vm->arrival_timeline = (s->f != 0);
       break;
     }
-    s->off = next;         // whatever it was, skip the rest of it
+    // whatever it was, skip the rest of it -- on a connection by reading it (the offset there
+    // only counts), and a section that read past its own length is not a section
+    if (s->off > next) {
+      r = -EINVAL;
+      goto out;
+    }
+    while (s->f && s->off < next) {
+      uint k = next - s->off < PGSIZE ? next - s->off : PGSIZE;
+      if ((r = get(s, page, k)) < 0)
+        goto out;
+    }
+    s->off = next;
   }
 
+  // M12: the tag, before anything of this machine runs or is answered
+  if (s->mac_on) {
+    uint8 want[32], got[32];
+    hmac_final(&s->mac, want);
+    s->mac_on = 0;
+    if ((r = get(s, got, sizeof(got))) < 0 || !tag_equal(want, got, sizeof(got))) {
+      printk("hyp: the migration stream failed authentication: refused\n");
+      r = -EACCES;
+      goto out;
+    }
+  }
   if (vm == 0 || nvs != vm->nvcpu) {
     r = -EINVAL;
     goto out;

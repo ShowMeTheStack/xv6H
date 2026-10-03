@@ -67,6 +67,27 @@ trapinithart(void)
 }
 
 //
+// A user program read `time' (rdtime, csrr rd, time) on a hart that has no
+// such CSR (Rocket: the ZedBoard). The answer is the CLINT's mtime, which is
+// what the CSR would have said; the program goes on at the next instruction.
+static int
+user_rdtime(struct proc *p)
+{
+  uint32 inst;
+  uint64 epc = p->trapframe->epc;
+
+  if (copyin(p->mm, (char *)&inst, epc, 4) < 0)
+    return 0;
+  // csrrs rd, time, x0 (rdtime) or csrrc rd, time, x0: a read and nothing else
+  if ((inst & 0xfff0707f) != 0xc0102073 && (inst & 0xfff0707f) != 0xc0103073)
+    return 0;
+  int rd = (inst >> 7) & 31;
+  if (rd != 0)
+    (&p->trapframe->ra)[rd - 1] = r_time();
+  p->trapframe->epc = epc + 4;
+  return 1;
+}
+
 // handle an interrupt, exception, or system call from user space.
 // called from, and returns to, trampoline.S
 // return value is user satp for trampoline.S to switch to.
@@ -127,6 +148,9 @@ usertrap(void)
       for (int k = 0; k < 4; k++)
         p->trapframe->vcsrs[k] = 0;
       goto retry;
+    }
+    if (cause == 2 && !plat.has_time_csr && user_rdtime(p)) {
+      goto retry;               // `time' on a hart without the CSR: answered
     }
     if (cause == 2) {
       sig = SIGILL;
@@ -392,6 +416,7 @@ clockintr()
     mycpu()->tick = 1;    // one to charge whoever this interrupted
     sched_balance();      // work waiting here and a hart idle next door
     if (me == 0) {
+      uart_debug_tick(ticks);
       acquire(&tickslock);
       ticks++;
       wakeup(&ticks);

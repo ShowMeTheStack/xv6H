@@ -28,6 +28,7 @@
 #define MIG_REFUSE_PAGING 2    // the guest's paging mode is deeper than this host's
 #define MIG_REFUSE_MEMORY 3    // the guest holds more memory than this host has
 
+#define VMSTATE_HDR_MAC 0x100   // M12: the stream is authenticated (HMAC-SHA256 after END)
 struct vmstate_hdr {
   char magic[8];
   uint32 version;

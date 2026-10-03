@@ -58,8 +58,12 @@ mcsr_read(struct vcpu *v, int csr, uint64 *val)
   // which of these a guest asks for is what decides where it can still be
   // migrated to, so the asking is recorded (see OBS_* in hyp.h)
   switch (csr) {
-  case 0xc01:   // time: only trapped when this machine's clock is scaled (F6)
+  case 0xc01:   // time: trapped when this machine's clock is scaled (F6), or the hart has none
     *val = vm_guest_time(v->vm);
+    return 0;
+  case 0xc00:   // cycle, instret: trapped only on a hart without them
+  case 0xc02:
+    *val = r_cycle();
     return 0;
   case 0x14d:   // stimecmp on a machine without Sstc (F5/F6): the same deadline,
                 // emulated, so the window between the host's change and the
@@ -204,9 +208,28 @@ is_vector_inst(uint32 inst)
   return 0;
 }
 
+// count an exit for a CSR: the first sixteen CSRs a machine traps on, and how often (vmm info)
+void
+vm_csr_count(struct vm *vm, int csr)
+{
+  for (int i = 0; i < 16; i++) {
+    if (vm->csr_hist[i].n && vm->csr_hist[i].csr == csr) {
+      vm->csr_hist[i].n++;
+      return;
+    }
+    if (vm->csr_hist[i].n == 0) {
+      vm->csr_hist[i].csr = csr;
+      vm->csr_hist[i].n = 1;
+      return;
+    }
+  }
+}
+
 int
 hyp_illegal(struct vcpu *v, uint32 inst)
 {
+  if ((inst & 0x7f) == 0x73 && ((inst >> 12) & 3) != 0)
+    vm_csr_count(v->vm, inst >> 20);
   if ((inst & 0x7f) == 0x73) {
     int funct3 = (inst >> 12) & 7;
     if (funct3 == 0) {
@@ -247,6 +270,10 @@ hyp_illegal(struct vcpu *v, uint32 inst)
     if (r == 0)
       return 0;                     // pc unchanged: re-execute after adoption
   }
+  // F21: cbo.zero on hardware without Zicboz, from a guest that was described a block (it
+  // arrived from a host that had one): the software model, as for a block of another size
+  if ((inst & 0xfff07fff) == 0x0040200f && v->vm->cboz_block > 0)
+    return hyp_virtinst(v, inst);
   // not ours: the guest gets it as an illegal instruction exception.
   vcpu_inject(v, EXC_ILLEGAL, inst);
   return 0;
@@ -317,9 +344,13 @@ hyp_virtinst(struct vcpu *v, uint32 inst)
   }
   if ((inst & 0x7f) == 0x73 && ((inst >> 12) & 3) != 0) {
     int csr = inst >> 20;
+    vm_csr_count(v->vm, csr);
     // F6: `time' read by a machine whose clock is described at another rate
     // (hcounteren.TM is off for it): answered at that rate, continuous
-    if ((csr == 0xc01 || csr == 0x14d) && csr_rmw(v, inst, mcsr_read, mcsr_write) == 0)
+    // and `cycle'/`instret' on a host without them (Zicntr is optional; QEMU's
+    // zicntr=false, the board's profile for development): the host's counter
+    if ((csr == 0xc01 || csr == 0x14d || csr == 0xc00 || csr == 0xc02) &&
+        csr_rmw(v, inst, mcsr_read, mcsr_write) == 0)
       return 0;
     if (vic_csr(v, inst) == 0)
       return 0;

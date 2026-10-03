@@ -1,0 +1,1 @@
+vmm start -n linux -k /Image -r 0x80200000 -m 80 -a console=ttyS0 earlycon=sbi -f /linux.img -c 1 -H -V

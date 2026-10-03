@@ -193,8 +193,8 @@ virtio_disk_init(void)
     disk_init(d);
     ndisks = i + 1;
   }
-  if (ndisks == 0 || disks[0].base == 0)
-    panic("could not find virtio disk");
+  if ((ndisks == 0 || disks[0].base == 0) && plat.ramdisk_size == 0)
+    panic("could not find virtio disk");   // nor a disk in RAM (ramdisk.c)
 }
 
 int

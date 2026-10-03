@@ -411,6 +411,7 @@ struct vcpu {
 
   // emulated machine-mode state (the guest's own start() runs in VS mode).
   int in_mmode;
+  uint64 last_hvip;        // the hvip bits the last entry injected (vmm info)
   uint64 m_mstatus, m_mepc, m_medeleg, m_mideleg, m_mie, m_mtvec, m_mscratch;
   uint64 m_menvcfg, m_mcounteren, m_pmpaddr0, m_pmpcfg0;
 
@@ -565,6 +566,7 @@ struct vm {
   int online;              // F7/F8: vcpus [0, online) are started; the rest are described `disabled' and HSM-stopped
   int cboz_block;          // F21: the cache-block size described (bytes cbo.zero clears). The host's own: native
                            // (henvcfg.CBZE). Another: cbo.zero traps and is done here at the described size
+  struct { uint16 csr; uint32 n; } csr_hist[16];   // CSR exits by CSR (vmm info), first 16 seen
   int cboz_prev;           // the size before a revision still pending: cleared at the larger of the two
   int machrev_line;        // the anchor device's line is up (a revision announced, not yet taken by the driver)
   // Where the description is. `dtb_gpa' is the blob the guest booted from, in
@@ -577,6 +579,9 @@ struct vm {
   int no_clint;            // F4: no CLINT; the guest sends IPIs through SBI
   int no_sstc;             // F5: no Sstc; the guest's timer is the SBI timer, VSTIP injected
   uint32 timebase;         // F6: the timebase-frequency presented; 0 = the host's own (10 MHz).
+  uint32 tb_pending;       // F6: the rate asked and described, served from the guest's read of the
+  int tb_pending_on;       //     guest's re-base on (the old rate until then: Invariant 1)
+  uint32 tb_old;           //     the rate before the last switch (its log line)
                            // When it differs, `time' is trapped and scaled and the timer is SBI's.
   uint64 tb_x0, tb_g0;     // the clock's value is continuous across a rate change: guest time is
                            // tb_g0 + scale(X - tb_x0), X = host time + htimedelta, set at each change
@@ -719,6 +724,13 @@ extern volatile int cons_owned;
 // hypcsr.c
 int hyp_illegal(struct vcpu *v, uint32 inst);
 int hyp_virtinst(struct vcpu *v, uint32 inst);
+int vimsic_top(struct vimsic *im);
+int vcpu_soft_timer_due(struct vcpu *v);
+void vm_timebase_switch(struct vm *vm);
+int vm_timebase_switch_locked(struct vm *vm);
+void vm_timebase_switched(struct vm *vm);
+int vcpu_timer_pending(struct vcpu *v);
+void vm_csr_count(struct vm *vm, int csr);
 int hyp_ecall(struct vcpu *v);           // hypsbi.c
 int vcpu_hsm_start(struct vcpu *v, uint64 addr, uint64 opaque);
 void vcpu_request_fence(struct vcpu *v, int what);
@@ -798,7 +810,8 @@ static inline int vm_vcpu_of_hart(struct vm *vm, long hart) {
 uint64 vm_guest_time(struct vm *vm);              // hyp.c: `time' as this machine sees it
 uint64 vm_host_time_of(struct vm *vm, uint64 gt); // hyp.c: and back
 uint64 vm_guest_time_of(struct vm *vm, uint64 x); // hyp.c: a host moment as the guest would read it
-#define HOST_TIMEBASE 10000000UL
+extern uint64 host_timebase;       // platform.c: the host's timebase-frequency (10 MHz on QEMU, 1 MHz on the ZedBoard)
+#define HOST_TIMEBASE host_timebase
 #define vm_scaled_time(vm) ((vm)->timebase != 0 && (vm)->timebase != HOST_TIMEBASE)
 uint32 sbi_hidden_default(void);                // hyp.c: what the host command line withholds
 uint64 hyp_guest_room_bytes(void);              // hyp.c: memory this host has for an arriving guest (F14)

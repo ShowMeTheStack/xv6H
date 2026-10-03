@@ -11,6 +11,12 @@
 #include "defs.h"
 #include "platform.h"
 
+uint64 time_mmio;               // riscv.h r_time(): the CLINT's mtime, or 0 for the CSR
+uint64 host_timebase = 10000000; // hyp.h HOST_TIMEBASE: this host's timebase, from its tree
+int mprobe_time(void);          // mvec.S: does a machine-mode read of the CSR trap?
+int mprobe_stimecmp(void);
+int mprobe_htimedelta(void);
+
 struct platform plat;
 __attribute__((aligned(16))) char fdt_copy[FDT_COPY_MAX];
 
@@ -122,6 +128,9 @@ finalize(struct nodeacc *n)
     pt->uart_irq = n->nirq ? n->irqs[0] : 0;
   } else if (fdt_strlist_has(n->compat, n->compat_len, "virtio,mmio")) {
     add_virtio(n->reg[0], n->nirq ? n->irqs[0] : 0);
+  } else if (fdt_strlist_has(n->compat, n->compat_len, "xv6h,ramdisk")) {
+    pt->ramdisk_base = n->reg[0];
+    pt->ramdisk_size = n->nreg > 1 ? n->reg[1] : 0;
   } else if (fdt_strlist_has(n->compat, n->compat_len, "google,goldfish-rtc")) {
     pt->rtc_base = n->reg[0];
     pt->rtc_irq = n->nirq ? n->irqs[0] : 0;
@@ -329,6 +338,30 @@ plat_bootarg_num(const char *key)
   return 0;
 }
 
+// the text after `key=' on the command line, copied into out (at most max bytes); its length, or 0
+int
+plat_bootarg_str(const char *key, char *out, int max)
+{
+  const char *s = plat.bootargs;
+  int n = strlen(key);
+  while (*s) {
+    while (*s == ' ')
+      s++;
+    const char *e = s;
+    while (*e && *e != ' ')
+      e++;
+    if (e - s > n + 1 && memcmp(s, key, n) == 0 && s[n] == '=') {
+      int l = e - (s + n + 1);
+      if (l > max)
+        l = max;
+      memmove(out, s + n + 1, l);
+      return l;
+    }
+    s = e;
+  }
+  return 0;
+}
+
 // does the host's command line contain the word w?
 int
 plat_bootarg(const char *w)
@@ -411,13 +444,30 @@ platform_init(uint64 fdt_pa)
   // sstc in the isa means the SBI timer
   if (pt->clint_base == 0 && !pt->is_guest)
     pt->clint_base = CLINT_BASE;
-  if (!pt->is_guest)
+  // ... and what this hart actually has is asked of the hart, not assumed: a
+  // machine-mode read of each CSR behind a one-instruction trap (mvec.S). Rocket
+  // (the ZedBoard) has none of the three; QEMU's virt has all three unless told
+  // otherwise (sstc=false, zicntr=false: the board's profile, for development).
+  if (!pt->is_guest && pt == &plat) {
+    pt->has_sstc = mprobe_stimecmp();
+    pt->has_time_csr = mprobe_time();
+    time_mmio = pt->has_time_csr ? 0 : pt->clint_base + 0xbff8;
+  } else if (!pt->is_guest) {
     pt->has_sstc = 1;
+    pt->has_time_csr = 1;
+  } else {
+    pt->has_time_csr = 1;       // a guest's reads are answered by its hypervisor
+  }
   if (pt == &plat)
     clint_msip_base = pt->clint_base;
 
   pt->misa = r_misa();
   pt->has_h = (pt->misa >> 7) & 1;
+  if (pt == &plat && !pt->is_guest) {
+    pt->has_htimedelta = pt->has_h && mprobe_htimedelta();
+    if (pt->timebase)
+      host_timebase = pt->timebase;
+  }
   pt->has_v = (pt->misa >> 21) & 1;
   pt->has_aia_csrs = (pt->intc_kind == INTC_IMSIC);
   if (pt->has_v) {

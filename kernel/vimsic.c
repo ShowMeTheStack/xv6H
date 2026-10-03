@@ -111,6 +111,13 @@ top_id(struct vimsic *im)
   return 0;
 }
 
+// the same, for vmm info
+int
+vimsic_top(struct vimsic *im)
+{
+  return top_id(im);
+}
+
 int
 vimsic_seip(struct vcpu *v)
 {
@@ -248,7 +255,7 @@ vimsic_csr(struct vcpu *v, uint32 inst)
       old = (9L << 16) | 1;
     else if ((ie & (1L << 1)) && v->vssip)
       old = (1L << 16) | 1;
-    else if ((ie & (1L << 5)) && r_time() >= v->vstimecmp)
+    else if ((ie & (1L << 5)) && vcpu_timer_pending(v))
       old = (5L << 16) | 1;
     else
       old = 0;

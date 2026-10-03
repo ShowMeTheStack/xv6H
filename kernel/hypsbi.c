@@ -196,6 +196,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       break;
     }
     vm->revise_acked = vm->revise_gen;
+    int tb_switched = vm_timebase_switch_locked(vm);   // F6: a guest that did not ask for the rate at its re-base gets it now
     vm_del_ghosts(vm);            // the old controller's window has answered its last
     vm_irq_alias_end(vm);         // F3: what the devices hold moves to the new numbers
     vm->cboz_prev = vm->cboz_block;   // F21: the old stride is gone
@@ -229,6 +230,8 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       }
     }
     release(&vm->lock);
+    if (tb_switched)
+      vm_timebase_switched(vm);
     if (vm->arrival_timeline && vm->t_first_entry) {
       uint64 t0 = vm->t_stream_end;
       printk("hyp: vm %d: arrival timeline: revision asked +%ld us, adopted +%ld us (of which the guest's %ld us)\n",
@@ -254,6 +257,13 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     break;
   case 6:
     r.val = vm->revise_what;
+    break;
+  case 7:
+    // F6: serve the described rate from now. The guest makes this call inside the stop_machine
+    // that re-bases its timekeeper (patch 0001), so no CPU of it reads the clock between the
+    // counter's change and its own. A guest that never makes it gets the rate at its ack.
+    vm_timebase_switch(vm);
+    r.val = vm->timebase ? vm->timebase : HOST_TIMEBASE;
     break;
   case 5:
     // Lazy revelation, from the guest's side: a machine presented without a

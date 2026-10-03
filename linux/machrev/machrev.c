@@ -47,7 +47,7 @@
 #include <linux/mutex.h>
 
 /* linux/patches/0001-riscv-timer-revise.patch */
-extern void riscv_timer_revise(bool sstc, u32 hz);
+extern void riscv_timer_revise(bool sstc, u32 hz, void (*now)(void));
 /* linux/patches/0002-virtio-mmio-relocate.patch */
 extern int virtio_mmio_relocate(struct platform_device *pdev, resource_size_t base, int virq);
 extern struct virtio_device *virtio_mmio_vdev(struct platform_device *pdev);
@@ -89,6 +89,7 @@ struct facts {
 	int nvirtio;
 	u64 virtio_base[MAX_VIRTIO];
 	u32 virtio_irq[MAX_VIRTIO];
+	u32 virtio_irq_type[MAX_VIRTIO];	/* the second cell where the controller has two (APLIC); 0: level-high */
 	bool rtc;
 	u64 rtc_base;
 	u32 rtc_irq;
@@ -119,7 +120,59 @@ static struct sbiret mach2(unsigned long fid, unsigned long a0, unsigned long a1
 	return sbi_ecall(SBI_EXT_MACH, fid, a0, a1, 0, 0, 0, 0);
 }
 
+/*
+ * F6: the host serves the described rate from this call. riscv_timer_revise() makes it inside the
+ * stop_machine that re-bases the timekeeper, so no CPU reads the clock between the counter's
+ * change and the timekeeper's. A host that does not know the call (it answers "not supported")
+ * changes the rate at the acknowledgement instead.
+ */
+#define MACH_RATE_NOW 7
+static void machrev_rate_now(void)
+{
+	mach(MACH_RATE_NOW, 0);
+}
+
 /* what the tree says the machine is; the same reading for the live tree and a revised one */
+/* one node of the description: a device, the RTC or an interrupt controller */
+static void read_node(struct device_node *c, struct facts *f)
+{
+	u64 reg[2];
+
+	if (of_device_is_compatible(c, "virtio,mmio") && f->nvirtio < MAX_VIRTIO) {
+		if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2)
+			f->virtio_base[f->nvirtio] = reg[0];
+		of_property_read_u32_index(c, "interrupts", 0, &f->virtio_irq[f->nvirtio]);
+		f->virtio_irq_type[f->nvirtio] = 0;
+		if (of_property_count_u32_elems(c, "interrupts") >= 2)
+			of_property_read_u32_index(c, "interrupts", 1, &f->virtio_irq_type[f->nvirtio]);
+		f->nvirtio++;
+	} else if (of_device_is_compatible(c, "google,goldfish-rtc")) {
+		f->rtc = true;
+		if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2)
+			f->rtc_base = reg[0];
+		of_property_read_u32_index(c, "interrupts", 0, &f->rtc_irq);
+	} else if (of_device_is_compatible(c, "riscv,plic0") || of_device_is_compatible(c, "sifive,plic-1.0.0")) {
+		f->intc = "plic";
+	} else if (of_device_is_compatible(c, "riscv,aplic")) {
+		f->intc = f->intc && !strcmp(f->intc, "imsic") ? f->intc : "aplic";
+	} else if (of_device_is_compatible(c, "riscv,imsics")) {
+		f->intc = "imsic";
+	} else if (of_device_is_compatible(c, "xv6h,vic")) {
+		/* the description-bound controller: its kind is a property, its window the reg */
+		const char *k = NULL;
+
+		of_property_read_string(c, "xv6h,kind", &k);
+		f->vic_kind = !k ? -1 : !strcmp(k, "plic") ? XV6H_VIC_PLIC : !strcmp(k, "aplic") ? XV6H_VIC_APLIC :
+			      !strcmp(k, "imsic") ? XV6H_VIC_IMSIC : -1;
+		f->intc = f->vic_kind == XV6H_VIC_PLIC ? "plic" : f->vic_kind == XV6H_VIC_APLIC ? "aplic" :
+			  f->vic_kind == XV6H_VIC_IMSIC ? "imsic" : NULL;
+		if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2) {
+			f->intc_base = reg[0];
+			f->intc_size = reg[1];
+		}
+	}
+}
+
 static void read_facts(struct device_node *root, struct facts *f)
 {
 	struct device_node *n, *cpus;
@@ -165,43 +218,21 @@ static void read_facts(struct device_node *root, struct facts *f)
 		}
 		of_node_put(n);
 	}
-	/* the devices live under /soc (xv6H puts them there, as QEMU's virt does) */
+	/*
+	 * the devices live on a bus node, and the interrupt controllers on the bus or at the
+	 * root: xv6H and QEMU's virt put them all under /soc, kvmtool puts the devices under /smb
+	 * and the controllers at the root. The module first looked for /soc by name and, under
+	 * kvmtool, found no devices (the KVM port's first device-map revision was "adopted 0x0")
+	 * and no controller; a bus is a "simple-bus", whatever it is called.
+	 */
 	for_each_child_of_node(root, n) {
-		struct device_node *soc = of_node_name_eq(n, "soc") ? n : NULL, *c;
+		struct device_node *c;
 
-		if (!soc)
-			continue;
-		for_each_child_of_node(soc, c) {
-			if (of_device_is_compatible(c, "virtio,mmio") && f->nvirtio < MAX_VIRTIO) {
-				if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2)
-					f->virtio_base[f->nvirtio] = reg[0];
-				of_property_read_u32_index(c, "interrupts", 0, &f->virtio_irq[f->nvirtio]);
-				f->nvirtio++;
-			} else if (of_device_is_compatible(c, "google,goldfish-rtc")) {
-				f->rtc = true;
-				if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2)
-					f->rtc_base = reg[0];
-				of_property_read_u32_index(c, "interrupts", 0, &f->rtc_irq);
-			} else if (of_device_is_compatible(c, "riscv,plic0") || of_device_is_compatible(c, "sifive,plic-1.0.0")) {
-				f->intc = "plic";
-			} else if (of_device_is_compatible(c, "riscv,aplic")) {
-				f->intc = f->intc && !strcmp(f->intc, "imsic") ? f->intc : "aplic";
-			} else if (of_device_is_compatible(c, "riscv,imsics")) {
-				f->intc = "imsic";
-			} else if (of_device_is_compatible(c, "xv6h,vic")) {
-				/* the description-bound controller: its kind is a property, its window the reg */
-				const char *k = NULL;
-
-				of_property_read_string(c, "xv6h,kind", &k);
-				f->vic_kind = !k ? -1 : !strcmp(k, "plic") ? XV6H_VIC_PLIC : !strcmp(k, "aplic") ? XV6H_VIC_APLIC :
-					      !strcmp(k, "imsic") ? XV6H_VIC_IMSIC : -1;
-				f->intc = f->vic_kind == XV6H_VIC_PLIC ? "plic" : f->vic_kind == XV6H_VIC_APLIC ? "aplic" :
-					  f->vic_kind == XV6H_VIC_IMSIC ? "imsic" : NULL;
-				if (of_property_read_variable_u64_array(c, "reg", reg, 2, 2) == 2) {
-					f->intc_base = reg[0];
-					f->intc_size = reg[1];
-				}
-			}
+		if (of_node_name_eq(n, "soc") || of_device_is_compatible(n, "simple-bus")) {
+			for_each_child_of_node(n, c)
+				read_node(c, f);
+		} else {
+			read_node(n, f);
 		}
 	}
 }
@@ -296,13 +327,18 @@ static void rtc_gone(void)
 }
 
 /* a wired line of the machine, as a Linux irq, mapped on the live tree's controller */
-static int map_line(u32 hwirq)
+static int map_line_type(u32 hwirq, u32 type)
 {
 	struct device_node *ic;
 	struct irq_fwspec fwspec = { };
 	int virq;
 
-	ic = of_find_compatible_node(NULL, NULL, "riscv,plic0");
+	/* the description-bound controller first (patch 0005): when the tree has one, every
+	 * device line hangs from it, whatever the backend (KVM's first vic tree: every move
+	 * "not moved", because only the PLIC and APLIC compatibles were looked for) */
+	ic = of_find_compatible_node(NULL, NULL, "xv6h,vic");
+	if (!ic)
+		ic = of_find_compatible_node(NULL, NULL, "riscv,plic0");
 	if (!ic)
 		ic = of_find_compatible_node(NULL, NULL, "sifive,plic-1.0.0");
 	if (!ic)
@@ -311,23 +347,58 @@ static int map_line(u32 hwirq)
 		return -ENODEV;
 	fwspec.fwnode = of_node_to_fwnode(ic);
 	fwspec.param[0] = hwirq;
-	fwspec.param[1] = IRQ_TYPE_LEVEL_HIGH;
+	fwspec.param[1] = type ? type : IRQ_TYPE_LEVEL_HIGH;
 	fwspec.param_count = of_device_is_compatible(ic, "riscv,aplic") ? 2 : 1;
+	/*
+	 * A line already mapped is taken as it is mapped. Asking for it again with
+	 * another trigger is refused ("type mismatch, failed to map hwirq"): kvmtool
+	 * describes its virtio lines as edge-rising, and every move under KVM was
+	 * "not moved" until this. A line not yet mapped is asked for level-high (a
+	 * virtio-mmio device holds its line until the status is acknowledged, so a
+	 * level is right whatever the tree said; an edge source raised as a level
+	 * is seen once per edge).
+	 */
+	{
+		struct irq_domain *d = irq_find_matching_fwnode(fwspec.fwnode, DOMAIN_BUS_ANY);
+
+		virq = d ? irq_find_mapping(d, hwirq) : 0;
+		if (virq > 0) {
+			of_node_put(ic);
+			return virq;
+		}
+	}
 	virq = irq_create_fwspec_mapping(&fwspec);
 	of_node_put(ic);
 	return virq > 0 ? virq : -ENODEV;
 }
 
+static int map_line(u32 hwirq)
+{
+	return map_line_type(hwirq, 0);
+}
+
 /* F3/F15: a virtio device's window or line moved; the driver follows (patch 0002) */
+/*
+ * a virtio-mmio device is one whose node says so or that the virtio-mmio driver
+ * holds, not one whose name has "virtio_mmio" in it: the name is the boot node's,
+ * "virtio_mmio@" under xv6H and QEMU but "virtio@" under kvmtool, where every
+ * move was "no virtio_mmio platform device" (the KVM port's first device map)
+ */
+static bool is_virtio_mmio(struct device *dev)
+{
+	return (dev->of_node && of_device_is_compatible(dev->of_node, "virtio,mmio")) ||
+	       (dev->driver && !strcmp(dev->driver->name, "virtio-mmio"));
+}
+
 static int virtio_at(struct device *dev, const void *data)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct resource *r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 
-	return r && r->start == *(const u64 *)data && strstr(dev_name(dev), "virtio_mmio") != NULL;
+	return r && r->start == *(const u64 *)data && is_virtio_mmio(dev);
 }
 
-static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq)
+static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq, u32 type)
 {
 	struct device *dev;
 	int virq, rc;
@@ -341,7 +412,7 @@ static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq)
 		pr_info("machrev: no virtio_mmio platform device at 0x%llx to move\n", old_base);
 		return -ENODEV;
 	}
-	virq = map_line(new_irq);
+	virq = map_line_type(new_irq, type);
 	rc = virq < 0 ? virq : virtio_mmio_relocate(to_platform_device(dev), new_base, virq);
 	put_device(dev);
 	pr_info("machrev: virtio device at 0x%llx -> 0x%llx line %u: %s\n", old_base, new_base, new_irq,
@@ -400,14 +471,12 @@ static int nic_follow(const struct facts *f)
 	int i, changed = 0;
 
 	for (i = 0; i < f->nvirtio; i++) {
-		char name[32];
 		struct device *dev;
 		struct virtio_device *vdev;
 		struct net_device *nd;
 		u8 mac[ETH_ALEN];
 
-		snprintf(name, sizeof(name), "%llx.virtio_mmio", f->virtio_base[i]);
-		dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+		dev = bus_find_device(&platform_bus_type, NULL, &f->virtio_base[i], virtio_at);
 		if (!dev)
 			continue;
 		vdev = virtio_mmio_vdev(to_platform_device(dev));
@@ -456,11 +525,11 @@ static int nic_follow(const struct facts *f)
 static struct platform_device *machrev_vdev[MAX_VIRTIO];
 static int machrev_nvdev;
 
-static void virtio_appeared(u64 base, u32 hwirq)
+static void virtio_appeared(u64 base, u32 hwirq, u32 type)
 {
 	struct resource res[2];
 	struct platform_device *pdev;
-	int virq = map_line(hwirq);
+	int virq = map_line_type(hwirq, type);
 
 	if (virq < 0 || machrev_nvdev >= MAX_VIRTIO) {
 		pr_info("machrev: a virtio device at 0x%llx appeared, and could not be made\n", base);
@@ -480,7 +549,6 @@ static void virtio_appeared(u64 base, u32 hwirq)
 
 static void virtio_went(u64 base)
 {
-	char name[32];
 	struct device *dev;
 	int i;
 
@@ -494,8 +562,7 @@ static void virtio_went(u64 base)
 			return;
 		}
 	}
-	snprintf(name, sizeof(name), "%llx.virtio_mmio", base);
-	dev = bus_find_device_by_name(&platform_bus_type, NULL, name);
+	dev = bus_find_device(&platform_bus_type, NULL, &base, virtio_at);
 	if (dev) {
 		platform_device_unregister(to_platform_device(dev));
 		put_device(dev);
@@ -581,7 +648,7 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 
 	/* F5/F6: the timer's source and rate, through the one patch the timer needs (0001) */
 	if (new->sstc != old->sstc || (new->timebase && new->timebase != old->timebase)) {
-		riscv_timer_revise(new->sstc, new->timebase);
+		riscv_timer_revise(new->sstc, new->timebase, machrev_rate_now);
 		pr_info("machrev: timer via %s at %u Hz\n", new->sstc ? "stimecmp" : "sbi", new->timebase);
 		adopted |= REV_TIMER;
 	}
@@ -638,7 +705,7 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	if (new->nvirtio != old->nvirtio) {
 		for (i = 0; i < new->nvirtio; i++)
 			if (!has_virtio(old, new->virtio_base[i])) {
-				virtio_appeared(new->virtio_base[i], new->virtio_irq[i]);
+				virtio_appeared(new->virtio_base[i], new->virtio_irq[i], new->virtio_irq_type[i]);
 				adopted |= REV_DEVICES;
 			}
 		for (i = 0; i < old->nvirtio; i++)
@@ -675,7 +742,7 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	if (new->nvirtio == old->nvirtio) {
 		for (i = 0; i < new->nvirtio; i++)
 			if (new->virtio_base[i] != old->virtio_base[i] || new->virtio_irq[i] != old->virtio_irq[i]) {
-				if (virtio_moved(old->virtio_base[i], new->virtio_base[i], new->virtio_irq[i]) == 0)
+				if (virtio_moved(old->virtio_base[i], new->virtio_base[i], new->virtio_irq[i], new->virtio_irq_type[i]) == 0)
 					adopted |= REV_DEVICES;
 			}
 	}

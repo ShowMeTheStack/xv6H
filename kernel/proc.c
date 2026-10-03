@@ -1671,6 +1671,7 @@ forkret(void)
     // the disks come first now: the root may be ext4, and finding out
     // means reading a block through the block layer.
     virtio_disk_register(); // the disks and their partitions, which needs to sleep
+    ramdisk_register();     // and a disk in RAM, where the machine has one (the ZedBoard)
     root_mount();
     p->fs->cwd = namei("/");
     if (p->fs->cwd == 0)

@@ -188,9 +188,31 @@ uart_set_console(int on)
   WriteReg(IER, on ? (IER_TX_ENABLE | IER_RX_ENABLE) : 0);
 }
 
+// `uartdebug' on the command line (the ZedBoard's bring-up): hart 0's tick says, every
+// two seconds and synchronously, that it is alive and what the uart's line and interrupt
+// enable registers hold (not the IIR: reading it acknowledges the interrupt)
+void
+uart_debug_tick(uint64 ticks)
+{
+  static uint64 last, intrs_seen;
+  static int on = -1;
+  extern uint64 uart_intrs;
+  if (on < 0)
+    on = plat_bootarg("uartdebug");
+  if (!on || ticks - last < 2 * 100)
+    return;
+  last = ticks;
+  printk("[uartdbg ticks %lu lsr %x ier %x intrs %lu]\n", ticks, ReadReg(LSR), ReadReg(IER),
+         uart_intrs - intrs_seen);
+  intrs_seen = uart_intrs;
+}
+
+uint64 uart_intrs;
+
 void
 uartintr(void)
 {
+  uart_intrs++;
   ReadReg(ISR); // acknowledge the interrupt
   if (plat.console_kind != 0) {
     // not the console (F18): its bytes are not ours to take. Whatever it

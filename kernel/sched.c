@@ -146,6 +146,7 @@ struct sched_group {
 };
 
 static struct sched_group groups[NSCHEDGROUP];
+static int rq_tasks(int cpu);
 static struct spinlock groups_lock;
 
 struct rq {
@@ -895,6 +896,41 @@ task_hot(struct proc *p, uint64 now)
   return now - p->exec_start < migration_cost;
 }
 
+// ... except a vcpu waiting behind a sibling of the same machine. Siblings do not take turns to
+// pass messages; they spin on each other's locks, and the one waiting is very often the one the
+// other is spinning for. Kept together because each had "only just run", the two vcpus of a
+// Linux guest shared one hart while the other two harts of the host idled, and every hand-over
+// of a contended guest lock cost a host tick: a key-value service in the guest stalled for
+// seconds (E5; worst at a scaled timebase, where every clock read in a critical section traps;
+// gone with one vcpu). A waiting sibling is taken by an idle hart however recently it ran.
+// the tasks a hart has to run, counted for balancing. rq->nr_running counts the entities at its
+// root, and a group is one entity however many of its tasks are runnable here: a machine whose
+// two vcpus were both on one hart -- one running, one waiting -- counted as one task, so neither
+// the tick's balance (two wanted) nor an idle hart's steal (more than one wanted) ever looked at
+// it, and the waiting vcpu waited while another hart was idle (E5: the guest's lock convoys).
+// Unlocked, like every other reading the balance makes of another hart.
+static int
+rq_tasks(int cpu)
+{
+  struct rq *rq = &rqs[cpu];
+  int n = rq->nr_running;
+
+  for (int i = 0; i < NSCHEDGROUP; i++) {
+    struct gq *q = &groups[i].q[cpu];
+    if (groups[i].used && q->se.counted && q->nr_running > 1)
+      n += q->nr_running - 1;
+  }
+  return n;
+}
+
+static int
+sibling_of_curr(struct rq *src, struct proc *c)
+{
+  struct proc *cur = src->curr;
+
+  return c->vcpu && cur && cur->vcpu && vcpu_machine(c->vcpu) == vcpu_machine(cur->vcpu);
+}
+
 // the task on `src' that would run last there and may run on `to':
 // taken off src's trees and out of its counts, or 0. src->lock held.
 //
@@ -910,14 +946,14 @@ take_farthest(struct rq *src, int to)
   for (struct rb_node *n = rb_last(&src->tree); n && p == 0; n = rb_prev(n)) {
     if (n->tag == SE_TASK) {
       struct proc *c = rb_owner(n);
-      if (c == src->curr || !sched_may_run(c, to) || task_hot(c, now))
+      if (c == src->curr || !sched_may_run(c, to) || (task_hot(c, now) && !sibling_of_curr(src, c)))
         continue;
       p = c;
     } else {
       struct gq *q = (struct gq *)n;
       for (struct rb_node *m = rb_last(&q->tree); m; m = rb_prev(m)) {
         struct proc *c = rb_owner(m);
-        if (c == src->curr || !sched_may_run(c, to) || task_hot(c, now))
+        if (c == src->curr || !sched_may_run(c, to) || (task_hot(c, now) && !sibling_of_curr(src, c)))
           continue;
         p = c;
         break;
@@ -977,8 +1013,10 @@ sched_tickless_ok(void)
   struct proc *p = rq->curr;
 
   // nr_running counts the task on the processor too (see the note above
-  // ent_count), so one means this task and nobody else.
-  if (p == 0 || rq->nr_running > 1 || p->vcpu == 0)
+  // ent_count), so one means this task and nobody else -- counted as tasks, not root entities: a
+  // vcpu with its sibling waiting in the same group is not alone, and its hart must keep ticking
+  // to balance the sibling away (E5)
+  if (p == 0 || rq_tasks(cpuid()) > 1 || p->vcpu == 0)
     return 0;
   struct gq *q = rq->curr_gq;
   if (q && q->sg && __atomic_load_n(&q->sg->quota, __ATOMIC_RELAXED) != 0)
@@ -1006,7 +1044,7 @@ sched_balance(void)
   // cost far more than it gained -- is that such a pair is never both
   // runnable at once, and that take_farthest will not move a task
   // that was running a moment ago.
-  if (rq->nr_running < 2)
+  if (rq_tasks(me) < 2)
     return;
   for (int i = 0; i < plat.ncpu; i++) {
     if (i != me && rqs[i].nr_running == 0) {
@@ -1018,7 +1056,7 @@ sched_balance(void)
     return;
 
   acquire(&rq->lock);
-  struct proc *p = rq->nr_running >= 2 ? take_farthest(rq, to) : 0;
+  struct proc *p = rq_tasks(me) >= 2 ? take_farthest(rq, to) : 0;
   if (p)
     rq->steals++;
   release(&rq->lock);
@@ -1042,7 +1080,7 @@ steal(int me)
     if (i == me)
       continue;
     // something waiting behind the one it is running
-    if (rqs[i].nr_running > 1 && rqs[i].load > most) {
+    if (rq_tasks(i) > 1 && rqs[i].load > most) {
       most = rqs[i].load;
       from = i;
     }
@@ -1053,7 +1091,7 @@ steal(int me)
   struct rq *src = &rqs[from];
   struct proc *p = 0;
   acquire(&src->lock);
-  if (src->nr_running > 1) {
+  if (rq_tasks(from) > 1) {
     p = take_farthest(src, me);
     if (p)
       src->steals++;

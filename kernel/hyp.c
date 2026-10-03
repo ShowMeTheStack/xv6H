@@ -334,7 +334,8 @@ hypinithart(void)
   // guests use the Sstc stimecmp (as vstimecmp), and their page tables
   // rely on hardware A/D bit updates (xv6 never sets A/D itself).
   csr_write(CSR_HENVCFG, HENVCFG_STCE | HENVCFG_ADUE);
-  csr_write(CSR_HTIMEDELTA, 0);
+  if (plat.has_htimedelta)
+    csr_write(CSR_HTIMEDELTA, 0);
   csr_write(CSR_HGEIE, 0);
   csr_write(CSR_HVIP, 0);
   csr_write(CSR_HGATP, 0);
@@ -1048,6 +1049,8 @@ vm_revise_timer(struct vm *vm, int sbi)
     return -EINVAL;
   if (sbi == vm->no_sstc)
     return 0;
+  if (!sbi && !plat.has_sstc)
+    return -ENOTSUP;            // the hardware has no vstimecmp: Sstc is not this host's to describe
   acquire(&vm->lock);
   int old = vm->no_sstc;
   vm->no_sstc = sbi;
@@ -1409,6 +1412,32 @@ vm_guest_time(struct vm *vm)
   return vm->tb_g0 + vm_scale_by(x - vm->tb_x0, vm->timebase, HOST_TIMEBASE);
 }
 
+// the guest's emulated timer (no Sstc for it, or a scaled clock): is its deadline due? The one
+// predicate for the entry path, which raises VSTIP, and for the emulated stopi, which reports it.
+// stopi had compared the host's raw counter with the deadline, which is in the guest's time
+// (host time + htimedelta): after a migration the two differ, and the guest was told of a timer
+// interrupt before it was due (a guest behind its host: it took the interrupt, found nothing
+// expired, and read stopi 470 000 times in ten seconds) or not told of one that was raised (a
+// guest ahead: it trapped, read 0, returned and trapped again). Found by B.4 on the ZedBoard.
+int
+vcpu_soft_timer_due(struct vcpu *v);
+
+// is the guest's timer interrupt pending: the emulated one by the deadline, the hardware's
+// (Sstc, vstimecmp in the CPU) as the CPU has it
+int
+vcpu_timer_pending(struct vcpu *v)
+{
+  if (v->vm->no_sstc || vm_scaled_time(v->vm))
+    return vcpu_soft_timer_due(v);
+  return (csr_read(CSR_HIP) & HVIP_VSTIP) != 0;
+}
+
+int
+vcpu_soft_timer_due(struct vcpu *v)
+{
+  return v->vstimecmp != ~0UL && (long)(r_time() + v->vm->htimedelta - v->vstimecmp) >= 0;
+}
+
 uint64
 vm_guest_time_of(struct vm *vm, uint64 x)
 {
@@ -1438,34 +1467,75 @@ vm_revise_timebase(struct vm *vm, uint32 hz)
     hz = 0;
   if (hz != 0 && (hz < 1000 || hz > 1000000000))
     return -EINVAL;
-  if (hz == vm->timebase)
+  if (hz == vm->timebase && !vm->tb_pending_on)
     return 0;
+  // The rate is described now and served from the guest's re-base: MACH call 7, made inside the
+  // stop_machine in which the guest re-bases its timekeeper, or the ack for a guest that does not
+  // make it (vm_timebase_switch). It used to change here, at the ask: the guest's
+  // clock then ran at the new rate while its code still converted with the old, every timer it
+  // armed was already past, and a guest slow to read the announcement -- under load, or busy
+  // with exactly those timers -- reprogrammed its timer in a loop and could not get to the read
+  // (E5: a key-value service stalled for seconds on four of ten timebase revisions; one vcpu
+  // in sbi_set_timer, 29 of 30 samples). The old description holds until the guest acts on the
+  // new one, as for every other fact.
   acquire(&vm->lock);
-  uint32 old = vm->timebase;
-  uint64 ox0 = vm->tb_x0, og0 = vm->tb_g0;
-  // continuity: the value now, under the old rate, is where the new rate starts
-  uint64 gnow = vm_guest_time(vm);
-  vm->tb_x0 = r_time() + vm->htimedelta;
-  vm->tb_g0 = gnow;
-  vm->timebase = hz;
-  // deadlines were set in the old units; they mean the same moment in the new
-  for (int i = 0; i < vm->nvcpu; i++)
-    ;                           // (vstimecmp is kept in host units: unchanged)
+  vm->tb_pending = hz;
+  vm->tb_pending_on = 1;
   release(&vm->lock);
-  for (int i = 0; i < vm->nvcpu; i++)
-    vcpu_kick(&vm->vcpu[i]);    // re-enter with the other hcounteren/henvcfg
-  printk("hyp: vm %d: timebase %u -> %u Hz (clock at %lu)\n", vm->id, old ? old : (uint32)HOST_TIMEBASE,
-         hz ? hz : (uint32)HOST_TIMEBASE, (unsigned long)gnow);
+  printk("hyp: vm %d: timebase %u -> %u Hz asked (served from the guest's read)\n", vm->id,
+         vm->timebase ? vm->timebase : (uint32)HOST_TIMEBASE, hz ? hz : (uint32)HOST_TIMEBASE);
   int r = vm_revise(vm, REV_TIMER);
   if (r < 0) {
     acquire(&vm->lock);
-    vm->timebase = old;
-    vm->tb_x0 = ox0;
-    vm->tb_g0 = og0;
+    vm->tb_pending_on = 0;
     release(&vm->lock);
     return r;
   }
   return 0;
+}
+
+// the machine a vcpu belongs to: the scheduler keeps a machine's vcpus apart (sched.c)
+void *
+vcpu_machine(void *v)
+{
+  return ((struct vcpu *)v)->vm;
+}
+
+// F6: the guest has read the description that gives it the pending rate: serve it from now,
+// continuous with the clock the guest has been reading. caller holds no lock.
+// the state change, with vm->lock held; 1 if the rate changed (then vm_timebase_switched, unlocked)
+int
+vm_timebase_switch_locked(struct vm *vm)
+{
+  if (!vm->tb_pending_on)
+    return 0;
+  vm->tb_old = vm->timebase;
+  // continuity: the value now, under the old rate, is where the new rate starts
+  vm->tb_g0 = vm_guest_time(vm);
+  vm->tb_x0 = r_time() + vm->htimedelta;
+  vm->timebase = vm->tb_pending;
+  vm->tb_pending_on = 0;
+  // deadlines were set in the old units and are kept in host units: they mean the same moment
+  return 1;
+}
+
+void
+vm_timebase_switched(struct vm *vm)
+{
+  for (int i = 0; i < vm->nvcpu; i++)
+    vcpu_kick(&vm->vcpu[i]);    // re-enter with the other hcounteren/henvcfg
+  printk("hyp: vm %d: timebase %u -> %u Hz (clock at %lu)\n", vm->id, vm->tb_old ? vm->tb_old : (uint32)HOST_TIMEBASE,
+         vm->timebase ? vm->timebase : (uint32)HOST_TIMEBASE, (unsigned long)vm->tb_g0);
+}
+
+void
+vm_timebase_switch(struct vm *vm)
+{
+  acquire(&vm->lock);
+  int sw = vm_timebase_switch_locked(vm);
+  release(&vm->lock);
+  if (sw)
+    vm_timebase_switched(vm);
 }
 
 // F14: how much of this host's memory a guest arriving here may be resident
@@ -2846,6 +2916,9 @@ vm_create_flags(struct vmconfig *cfg, int noload)
   // without Sstc
   vm->no_clint = (cfg->flags & VMF_IPI_SET) ? (cfg->no_clint != 0) : plat_bootarg("guestipi=sbi");
   vm->no_sstc = (cfg->flags & VMF_TIMER_SET) ? (cfg->no_sstc != 0) : plat_bootarg("guesttimer=sbi");
+  if (!plat.has_sstc)
+    vm->no_sstc = 1;            // a host without Sstc has no vstimecmp to give
+
   // and the rate its clock is described as running at (F6): `guesttimebase=HZ'
   vm->timebase = (cfg->flags & VMF_TIMEBASE_SET) ? cfg->timebase : (uint32)plat_bootarg_num("guesttimebase");
   if (vm->timebase == HOST_TIMEBASE)
@@ -3254,10 +3327,10 @@ vcpu_enter(struct vcpu *v)
     hvip |= HVIP_VSSIP;
   // F5: without Sstc the timer interrupt is this hypervisor's to raise
   // (and F6: a scaled clock has no hardware comparator to use)
-  if ((vm->no_sstc || vm_scaled_time(vm)) && v->vstimecmp != ~0UL &&
-      (long)(r_time() + vm->htimedelta - v->vstimecmp) >= 0)
+  if ((vm->no_sstc || vm_scaled_time(vm)) && vcpu_soft_timer_due(v))
     hvip |= HVIP_VSTIP;
   hvip |= vic_vcpu_enter(v);
+  v->last_hvip = hvip;       // what this entry injects (vmm info)
   release(&vm->lock);
 
   int hart = cpuid();
@@ -3284,7 +3357,8 @@ vcpu_enter(struct vcpu *v)
   csr_write(CSR_VSCAUSE, v->vscause);
   csr_write(CSR_VSTVAL, v->vstval);
   csr_write(CSR_VSATP, v->vsatp);
-  csr_write(CSR_VSTIMECMP, v->vstimecmp);
+  if (plat.has_sstc)
+    csr_write(CSR_VSTIMECMP, v->vstimecmp);
   if (plat.intc_kind == INTC_IMSIC)
     csr_write(CSR_VSISELECT, v->vsiselect);
   csr_write(CSR_HVIP, hvip);
@@ -3310,7 +3384,8 @@ vcpu_enter(struct vcpu *v)
   csr_write(CSR_HENVCFG, HENVCFG_ADUE | HENVCFG_CBCFE | HENVCFG_CBIE | (cboz_native ? HENVCFG_CBZE : 0) |
                          ((vm->no_sstc || vm_scaled_time(vm)) ? 0 : HENVCFG_STCE));
   csr_write(CSR_HCOUNTEREN, vm_scaled_time(vm) ? 5 : 7);
-  csr_write(CSR_HTIMEDELTA, vm->htimedelta);
+  if (plat.has_htimedelta)
+    csr_write(CSR_HTIMEDELTA, vm->htimedelta);   // without it every `time' read traps (hypcsr.c)
 
   if (hart_hgatp[hart] != vm->hgatp) {
     csr_write(CSR_HGATP, vm->hgatp);
@@ -3386,7 +3461,8 @@ vcpu_enter(struct vcpu *v)
   v->vscause = csr_read(CSR_VSCAUSE);
   v->vstval = csr_read(CSR_VSTVAL);
   v->vsatp = csr_read(CSR_VSATP);
-  v->vstimecmp = csr_read(CSR_VSTIMECMP);
+  if (plat.has_sstc)
+    v->vstimecmp = csr_read(CSR_VSTIMECMP);
   v->vssip = (csr_read(CSR_HVIP) & HVIP_VSSIP) ? 1 : 0;
   // Has this guest used its vector unit? Nothing traps when it does -- the unit
   // is enabled and a vector instruction is just an instruction -- so there is no

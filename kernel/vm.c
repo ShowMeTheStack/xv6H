@@ -66,7 +66,7 @@ kmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
       panic("kmap: out of memory");
     if (*pte & PTE_V)
       panic("kmap: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    *pte = PA2PTE(pa) | perm | PTE_V | PTE_LEAF_AD;
     uint64 step = PGSIZE << (9 * level);
     va += step;
     pa += step;
@@ -101,6 +101,8 @@ kvmmake(void)
 
   // CLINT, for inter-processor interrupts (msip)
   kvmmap(kpgtbl, plat.clint_base, plat.clint_base, 0x10000, PTE_R | PTE_W);
+  if (plat.ramdisk_size)          // a disk in RAM, outside the memory the allocator owns
+    kvmmap(kpgtbl, plat.ramdisk_base, plat.ramdisk_base, plat.ramdisk_size, PTE_R | PTE_W);
 
   // the finisher: a halfword written here stops the machine. it is one
   // page and it is what reboot(2) uses, so it has to be mapped before
@@ -201,7 +203,7 @@ kvmmap_rt(uint64 va, uint64 pa, uint64 sz, int perm)
     }
     if (*pte & PTE_V)
       panic("kvmmap_rt: remap");
-    *pte = PA2PTE(pa + off) | perm | PTE_V;
+    *pte = PA2PTE(pa + off) | perm | PTE_V | PTE_LEAF_AD;
   }
   release(&kpt_lock);
   return 0;
@@ -364,7 +366,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
       return -1;
     if (*pte & PTE_V)
       panic("mappages: remap");
-    *pte = PA2PTE(pa) | perm | PTE_V;
+    *pte = PA2PTE(pa) | perm | PTE_V | PTE_LEAF_AD;
     if (a == last)
       break;
     a += PGSIZE;

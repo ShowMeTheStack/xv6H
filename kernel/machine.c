@@ -37,6 +37,7 @@
 #define MACH_DTB_MAX  4
 #define MACH_REQUEST  5
 #define MACH_WHAT     6
+#define MACH_RATE_NOW 7     // F6: serve the described rate from now (at the re-anchor)
 
 // what a revision can change, and what we report adopting (must match hyp.h)
 #define REV_DEVICES  (1u << 0)
@@ -739,8 +740,15 @@ machine_revise_check(void)
       // derived from it (tickinit); the wall clock and the scheduler read
       // the rate each time they convert, and the count itself is continuous
       // (the host scales the whole count, not a delta).
+      // the host serves the new rate from the call; the clock is re-anchored at once after it,
+      // with this hart's interrupts off between, so nothing here reads it in between
+      int was = intr_get();
+      intr_off();
+      sbi_call(SBI_EXT_MACHINE, MACH_RATE_NOW, 0);
       clock_reanchor();          // the ns so far stay; the rate from here is new
       plat.timebase = fresh.timebase;
+      if (was)
+        intr_on();
       tickinit();
       tick_reanchor();           // and the next tick is one new interval away
       printk("machine: timebase %lu Hz\n", (unsigned long)plat.timebase);

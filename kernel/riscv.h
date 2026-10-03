@@ -198,6 +198,7 @@ w_sie(uint64 x)
 // Machine-mode Interrupt Enable
 #define MIE_STIE (1L << 5) // supervisor timer
 #define MIE_MSIE (1L << 3) // machine software
+#define MIE_MTIE (1L << 7) // machine timer (a host without Sstc: mvec.S)
 static inline uint64
 r_mie()
 {
@@ -408,19 +409,36 @@ r_mcounteren()
   return x;
 }
 
+#ifdef KERNEL
+extern int cycle_absent;        // start.c: the hart has no `cycle' CSR (QEMU zicntr=false)
+static inline uint64 r_time();
+#endif
 static inline uint64
 r_cycle()
 {
   uint64 x;
+#ifdef KERNEL
+  if (cycle_absent)
+    return r_time();            // a counter that moves is what callers need of it
+#endif
   asm volatile("csrr %0, cycle" : "=r"(x));
   return x;
 }
 
-// machine-mode cycle counter
+// the time counter. A hart without the `time' CSR (Rocket: Zicntr's time is
+// left to the firmware) is read at the CLINT's mtime, which the kernel maps;
+// time_mmio is that address, or 0 for the CSR (platform.c, probed at boot)
+#ifdef KERNEL
+extern uint64 time_mmio;
+#endif
 static inline uint64
 r_time()
 {
   uint64 x;
+#ifdef KERNEL
+  if (time_mmio)
+    return *(volatile uint64 *)time_mmio;
+#endif
   asm volatile("csrr %0, time" : "=r"(x));
   return x;
 }
@@ -517,6 +535,13 @@ typedef uint64 *pagetable_t; // 512 PTEs
 #define PTE_W (1L << 2)
 #define PTE_X (1L << 3)
 #define PTE_U (1L << 4) // user can access
+#define PTE_A (1L << 6) // accessed
+#define PTE_D (1L << 7) // dirty
+// every leaf is made accessed and dirty: a hart without hardware A/D updating
+// (Svade: Rocket, the ZedBoard) takes a page fault on a leaf with A clear, or
+// a store to one with D clear, and nothing in this kernel decides anything by
+// them (dirty tracking write-protects; the stage-2 leaves always had them)
+#define PTE_LEAF_AD (PTE_A | PTE_D)
 #define PTE_COW (1L << 8) // (reserved bit) a shared frame: copy on the first write
 
 // shift a physical address to the right place for a PTE.
