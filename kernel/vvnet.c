@@ -47,19 +47,80 @@ wr16(struct vm *vm, uint64 gpa, uint16 v)
   return vm_copyout(vm, gpa, &v, 2);
 }
 
+// E5: an interrupt raised more than half a second ago and never acknowledged, with frames still
+// arriving (delivered or dropped for want of a buffer): the guest is not servicing its NIC. Say
+// what the controller and the target's interrupt file hold, at most once in ten seconds: a lost
+// MSI, or a guest that has it and does not take it? caller holds vm->lock.
+static void
+stale_check(struct vm *vm)
+{
+  struct vvnet *n = &vm->vnet;
+  uint64 now = r_time();
+
+  if (n->intr_status && n->raised_at && now - n->raised_at > plat.timebase / 2 &&
+      (!n->stale_said || now - n->stale_said > 10 * plat.timebase)) {
+    int irq = vm_irq(vm, G_VNET_IRQ);
+    uint32 t = vm->aplic.target[irq];
+    int vc = vm_vcpu_of_hart(vm, t >> 18), eiid = t & 0x7ff;
+    n->stale_said = now;
+    if (vc >= 0 && vc < vm->nvcpu) {
+      struct vcpu *v = &vm->vcpu[vc];
+      struct vimsic *im = &v->imsic;
+      printk("hyp: vm %d: nic: interrupt raised %ld ms ago, not acknowledged: line %d level %d "
+             "pending %d enabled %d; target vcpu %d eiid %d; %s eip %d eie %d threshold %d delivery %d; "
+             "vcpu running on %d, idle %d; msis sent %d, the last %ld ms ago; claims of it %d, the last %ld ms "
+             "ago (software model only); hardware files %s\n", vm->id, (long)((now - n->raised_at) / (plat.timebase / 1000)),
+             irq, (int)((vm->aplic.level >> irq) & 1), (int)((vm->aplic.pending >> irq) & 1),
+             (int)((vm->aplic.enable >> irq) & 1), vc, eiid,
+             im->hwfile ? "in a hardware file (soft copy stale):" : "soft file:",
+             (int)((im->eip[eiid / 64] >> (eiid % 64)) & 1), (int)((im->eie[eiid / 64] >> (eiid % 64)) & 1),
+             (int)im->eithreshold, (int)im->eidelivery, v->running_hart, v->idle,
+             irq < 16 ? (int)vm->trace_nmsi[irq] : -1,
+             irq < 16 && vm->trace_tmsi[irq] ? (long)((now - vm->trace_tmsi[irq]) / (plat.timebase / 1000)) : -1L,
+             eiid < 16 ? (int)v->trace_nclaim[eiid] : -1,
+             eiid < 16 && v->trace_tclaim[eiid] ? (long)((now - v->trace_tclaim[eiid]) / (plat.timebase / 1000)) : -1L,
+             vm->imsic_hw ? "on" : "off");
+      sched_report(v->p);   // and what the host's scheduler is doing with its thread
+      // the last MSIs sent, oldest first: when, to whom, by which path, and where it was
+      for (uint32 k = vm->msiring_n > 32 ? vm->msiring_n - 32 : 0; k < vm->msiring_n; k++) {
+        struct msirec *r = &vm->msiring[k % 32];
+        if (now - r->t > 3 * plat.timebase)
+          continue;
+        printk("hyp: vm %d: nic: msi -%ld ms vcpu %d eiid %d %s running %d file %d@%d idle %d\n", vm->id,
+               (long)((now - r->t) / (plat.timebase / 1000)), r->vcpu, r->eiid,
+               r->path == 'h' ? "hw" : "soft", r->running, r->hwfile, r->hwhart, r->idle);
+      }
+    } else {
+      printk("hyp: vm %d: nic: interrupt raised %ld ms ago, not acknowledged; target 0x%x maps to no vcpu\n",
+             vm->id, (long)((now - n->raised_at) / (plat.timebase / 1000)), t);
+    }
+  }
+}
+
 // caller holds vm->lock.
 static void
 raise_irq(struct vm *vm)
 {
-  vm->vnet.intr_status |= 1;
+  struct vvnet *n = &vm->vnet;
+
+  if (n->intr_status == 0)
+    n->raised_at = r_time();
+  else
+    stale_check(vm);
+  n->intr_status |= 1;
   vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), 1);
 }
+
+// frames the guest NICs of this host dropped, by reason (E5: where a crossing's lost segments
+// go): 0 the machine was stopped, 1 no buffer posted, 2 anything else. /proc/net/sockstat.
+uint64 vnet_drops[3];
 
 // deliver a frame into the guest's receive queue. takes ownership.
 void
 vvnet_rx(struct vm *vm, struct mbuf *m)
 {
   struct vvnet *n = &vm->vnet;
+  int why = 2;           // for /proc/net/sockstat: 0 machine stopped, 1 no buffer posted, 2 other
   acquire(&vm->lock);
   struct vq_state *q = &n->q[0];
   if (!n->present || !q->ready || q->num == 0 || q->num > MAXQ || !(n->status & VIRTIO_CONFIG_S_DRIVER_OK))
@@ -69,11 +130,32 @@ vvnet_rx(struct vm *vm, struct mbuf *m)
   // far end stale or not at all (busy8a: `0x805f5000 changed under the copy
   // and nobody had marked it'). vm_pause takes this lock, so once it has
   // returned no delivery is in flight. A NIC on a stopped machine drops.
-  if (vm->state != VM_RUNNING)
+  if (vm->state != VM_RUNNING) {
+    why = 0;
     goto drop;
+  }
   uint16 avail_idx, head;
-  if (rd16(vm, q->avail + 2, &avail_idx) < 0 || avail_idx == q->last_avail)
+  if (rd16(vm, q->avail + 2, &avail_idx) < 0 || avail_idx == q->last_avail) {
+    why = 1;
+    // E5: a crossing's lost requests went here. Once per arrival, what the device and the
+    // controller hold: is the guest not refilling because it never heard the last interrupt?
+    if (!n->nobuf_said) {
+      uint16 used_idx = 0;
+      uint64 lv = 0;
+      int irq = vm_irq(vm, G_VNET_IRQ);
+      n->nobuf_said = 1;
+      rd16(vm, q->used + 2, &used_idx);
+      vic_levels_snapshot(vm, &lv);
+      printk("hyp: vm %d: nic: no receive buffer: avail %d, device next %d, used %d, interrupt "
+             "status 0x%x, line %d level %d aplic pending %d enabled %d, %ld ms after arrival\n",
+             vm->id, avail_idx, q->last_avail, used_idx, n->intr_status, irq,
+             (int)((lv >> irq) & 1), (int)((vm->aplic.pending >> irq) & 1),
+             (int)((vm->aplic.enable >> irq) & 1),
+             vm->t_stream_end ? (long)((r_time() - vm->t_stream_end) / (plat.timebase / 1000)) : -1L);
+    }
+    stale_check(vm);
     goto drop; // no buffers posted
+  }
   if (rd16(vm, q->avail + 4 + 2 * (q->last_avail % q->num), &head) < 0)
     goto drop;
   // walk the chain of writable buffers: header then data.
@@ -131,6 +213,7 @@ vvnet_rx(struct vm *vm, struct mbuf *m)
   return;
 drop:
   n->rx_dropped++;
+  vnet_drops[why]++;
   release(&vm->lock);
   mbuffree(m);
 }
@@ -300,6 +383,8 @@ vvnet_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
     break;
   case VIRTIO_MMIO_INTERRUPT_ACK:
     n->intr_status &= ~val;
+    if (n->intr_status == 0)
+      n->raised_at = 0;
     vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), n->intr_status != 0);
     break;
   case VIRTIO_MMIO_STATUS:

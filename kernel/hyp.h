@@ -216,6 +216,9 @@ struct vvnet {
   struct vq_state q[2];     // 0: receive, 1: transmit
   uint32 intr_status, status;
   uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
+  int nobuf_said;           // E5: the first no-buffer drop since arrival has been reported
+  uint64 raised_at;         // E5: when intr_status last went from 0 to 1 (host time), 0 if clear
+  uint64 stale_said;        // and when a stale interrupt was last reported
 };
 
 // ---- what a guest has observed about its machine ----
@@ -424,6 +427,9 @@ struct vcpu {
   uint64 exit_window_start, exit_window_count, exit_throttles;
   uint64 nudges;          // slices handed to a sibling vcpu
   uint64 last_cause, last_gpa;
+  // and the guest's claims per identity, seen by the software IMSIC model only (not migrated)
+  uint32 trace_nclaim[16];
+  uint64 trace_tclaim[16];
 };
 
 // ---- vm ----
@@ -645,6 +651,12 @@ struct vm {
   // to, so that the guest's clock goes on from where it stopped rather
   // than jumping forward by however long the file sat on a disk.
   uint64 htimedelta;
+  // E5's lost interrupts, this host only (not migrated): MSIs the APLIC model sent per source
+  // and the last MSIs sent to its vcpus' files, newest at msiring_n - 1 (mod 32)
+  struct msirec { uint64 t; short vcpu, eiid, running, hwfile, hwhart, idle; uint8 path; } msiring[32];
+  uint32 msiring_n;
+  uint32 trace_nmsi[16];
+  uint64 trace_tmsi[16];
 };
 
 extern struct vm *vmtab[NVM]; // slot i's VM, or 0 until first used

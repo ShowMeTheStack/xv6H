@@ -9,8 +9,9 @@ from kvmh import *
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 facts = sys.argv[2].split(",") if len(sys.argv) > 2 else ["devmap", "irqmap"]
 VALUES = {"devmap": ("alt", "default"), "irqmap": ("alt", "default"), "intc": ("plic", "imsic")}
+IDLE = float(os.environ.get("IDLE_BEFORE", "0"))
 BOOT_ENV = os.environ.get("BOOT_ENV", "")     # XV6H_INTC=plic: the guest boots on the PLIC
-h = Host(log=K + "/t_devmap.host.log")
+h = Host(log=K + "/t_devmap%s.host.log" % os.environ.get("TAG", ""))
 ok = bad = 0; lat = {}
 try:
     h.run(("export %s; " % BOOT_ENV if BOOT_ENV else "") + guest_cmd("g", extra="--revise"))
@@ -20,6 +21,8 @@ try:
         for i in range(N):
             for val in VALUES[fact]:
                 before = len(h.run("cat /tmp/g.log", 30))
+                if IDLE:
+                    time.sleep(IDLE)        # the guest left idle before the ask (the module's 1 s bound)
                 r = h.run("lkvm revise -n g %s %s" % (fact, val), 60)
                 m = None
                 for _ in range(30):

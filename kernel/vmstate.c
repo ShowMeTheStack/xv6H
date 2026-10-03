@@ -496,6 +496,14 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, uint64 src
     printk("hyp: vm %d: arrived as %s, this host gives %s: %d line(s) still held\n",
            vm->id, vic_kindname(src_kind), vic_kindname(vm->vic_kind),
            vic_held(levels));
+  } else if (vm->vic_kind == VIC_IMSIC || vm->vic_kind == VIC_APLIC) {
+    // the same kind: the controller's own state crossed, but a held line whose MSI is pending
+    // nowhere is not delivered again by it (defect 53)
+    acquire(&vm->lock);
+    int n = vaplic_rearm_held(vm);
+    release(&vm->lock);
+    if (n)
+      printk("hyp: vm %d: arrived with %d held line(s) pending nowhere: raised again\n", vm->id, n);
   }
   // the network device keeps the hardware address this host gave it: the
   // switch knows the machine by that, and a saved one may be restored
@@ -510,6 +518,9 @@ restore_dev(struct vm *vm, const struct vmstate_dev *d, int src_kind, uint64 src
   int present = vm->vnet.present;
   vm->vnet = d->vnet;
   vm->vnet.present = present;
+  vm->vnet.nobuf_said = 0;
+  vm->vnet.raised_at = vm->vnet.intr_status ? r_time() : 0;   // the source's time means nothing here
+  vm->vnet.stale_said = 0;
   if (memcmp(vm->vnet.mac, hostmac, 6) != 0) {
     if (capable) {
       printk("hyp: vm %d: arrived with nic 52:54:00:%x:76:%x, this host gives 52:54:00:%x:76:%x: "

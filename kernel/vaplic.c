@@ -149,6 +149,10 @@ msi_flush(struct vm *vm)
     uint32 t = a->target[i];
     int vcpu = vm_vcpu_of_hart(vm, t >> 18), eiid = t & 0x7ff;   // F9: the target is a hart id
     a->pending &= ~(1UL << i);
+    if (i < 16) {
+      vm->trace_nmsi[i]++;
+      vm->trace_tmsi[i] = r_time();
+    }
     if (vm->hart_shift && plat_bootarg("aplicdbg"))
       printk("aplic: vm %d msi irq %d -> hart %d vcpu %d eiid %d\n", vm->id, i, (int)(t >> 18), vcpu, eiid);
     if (vcpu >= 0 && eiid != 0)
@@ -170,6 +174,36 @@ notify(struct vm *vm)
     if (vaplic_seip(v))
       vcpu_kick(v);
   }
+}
+
+// On arrival (defect 53): a level source whose input is held and whose MSI is pending nowhere is
+// a line the guest will never hear of again. In MSI mode a level source pends only on a rising
+// edge, and a held line has none to give. The source's MSI may have gone out on the far host
+// after the vcpus' interrupt files were written into the stream, before the device and the
+// controller were. Theorem 1 asks for every held line to be raised again on the controller the
+// machine arrives at; until now that was done only when the controller's kind changed. Re-pend
+// every held level source and let it be delivered. An MSI the guest already holds is the same
+// bit set again, and one it is servicing is a spurious interrupt its handler finds nothing in.
+// caller holds vm->lock; returns how many were re-armed.
+int
+vaplic_rearm_held(struct vm *vm)
+{
+  struct vaplic *a = &vm->aplic;
+  int n = 0;
+
+  if (!msimode(vm))
+    return 0;
+  for (int i = 1; i < VAPLIC_NSRC; i++) {
+    if (!is_active(a, i) || !is_level(sm_of(a, i)) || !rectified(a, i))
+      continue;
+    if (!((a->pending >> i) & 1)) {
+      a->pending |= 1UL << i;
+      n++;
+    }
+  }
+  if (n)
+    notify(vm);
+  return n;
 }
 
 // set the pending bit of a source, honouring the source-mode rules.

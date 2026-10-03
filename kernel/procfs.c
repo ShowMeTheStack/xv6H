@@ -572,6 +572,17 @@ gen_net(struct gen *g, uint inum)
       gen_num(g, tcp_nfast);
       gen_str(g, " partial ");
       gen_num(g, tcp_npartial);
+      extern uint64 vnet_drops[3], bridge_orphan_in, bridge_orphan_host;
+      gen_str(g, "\nVNETX: drop_stopped ");
+      gen_num(g, vnet_drops[0]);
+      gen_str(g, " drop_nobuf ");
+      gen_num(g, vnet_drops[1]);
+      gen_str(g, " drop_other ");
+      gen_num(g, vnet_drops[2]);
+      gen_str(g, " orphan_in ");
+      gen_num(g, bridge_orphan_in);
+      gen_str(g, " orphan_out ");
+      gen_num(g, bridge_orphan_host);
     }
     gen_str(g, "\n");
     break;

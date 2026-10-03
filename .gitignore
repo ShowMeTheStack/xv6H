@@ -57,3 +57,4 @@ user/syscallnames.h
 *-fs.img
 bench/campaign/
 .DS_Store
+BUILDSTAMP

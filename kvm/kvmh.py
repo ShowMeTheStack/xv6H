@@ -9,7 +9,7 @@ class Host:
     def __init__(self, cpus=4, mem="4G", aia="aplic-imsic,aia-guests=7", cpu=None, log="host.log", extra=()):
         cmd = ["qemu-system-riscv64", "-M", "virt,aia=" + aia, "-cpu", cpu or os.environ.get("HOSTCPU", "rva23s64"),
                "-smp", str(cpus), "-m", mem, "-nographic",
-               "-kernel", K + "/build-host/arch/riscv/boot/Image", "-initrd", K + "/host-initramfs.cpio.gz",
+               "-kernel", K + "/build-host/arch/riscv/boot/Image", "-initrd", os.environ.get("HOSTINITRD", K + "/host-initramfs.cpio.gz"),
                "-append", "console=ttyS0 earlycon"] + list(extra)
         self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.buf = b""; self.log = open(log, "wb")

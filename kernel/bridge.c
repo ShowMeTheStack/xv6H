@@ -24,6 +24,16 @@
 
 static struct spinlock bridgelock;
 uint64 bridge_guest_blocked;
+// frames for a guest MAC (52:54:00:78|79:76:xx) with no running guest here: from the link, and
+// from this host's own stack (/proc/net/sockstat; E5, a crossing's lost segments)
+uint64 bridge_orphan_in, bridge_orphan_host;
+
+static int
+guest_mac(const uint8 *mac)
+{
+  return mac[0] == 0x52 && mac[1] == 0x54 && mac[2] == 0x00 &&
+         (mac[3] == 0x78 || mac[3] == 0x79) && mac[4] == 0x76;
+}
 
 void
 bridgeinit(void)
@@ -340,6 +350,8 @@ bridge_rx_uplink(struct mbuf *m)
     cgw_rx_public(g, m);
     return;
   }
+  if (guest_mac(e->dhost))
+    bridge_orphan_in++;
   note(m, CT_IN, 0);
   net_rx(m); // the host's own MAC, or promiscuous noise
 }
@@ -373,6 +385,8 @@ bridge_tx_host(struct mbuf *m)
     cgw_rx_public(gw, m);
     return 0;
   }
+  if (guest_mac(e->dhost))
+    bridge_orphan_host++;      // to a guest not running here: out on the link
   if (!uplink_policy(m, 0)) {
     net_policy_dropped++;
     mbuffree(m);

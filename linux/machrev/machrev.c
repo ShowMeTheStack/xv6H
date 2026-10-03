@@ -106,7 +106,8 @@ struct machrev {
 	unsigned long gen;
 	unsigned long revisions, adopted_total;
 	struct mutex lock;		/* one revision at a time: the anchor's thread and the poll */
-	struct delayed_work poll;	/* F1: the generation polled, because the anchor's line cannot announce the exchange of the controller that carries it */
+	struct delayed_work poll;	/* F1: the generation polled, because the anchor's line cannot announce the exchange of the controller that carries it; deferrable, 50 ms */
+	struct delayed_work poll_slow;	/* and a plain one each second, the bound on an idle guest */
 	unsigned long polled;
 };
 
@@ -879,18 +880,36 @@ static void take_revision(struct machrev *m)
  * channel independent of what the revision changes; for the controller
  * itself that channel is the generation counter, which the guest reads with
  * one SBI call. With the description-bound controller in use, the driver
- * polls it every 50 ms; the anchor's line stays the fast path for everything
- * else, and the poll is what makes the exchange of the controller a revision
- * like the others.
+ * polls it; the anchor's line stays the fast path for everything else, and
+ * the poll is what makes the exchange of the controller a revision like the
+ * others.
+ *
+ * The poll must not wake an idle cpu: at 50 ms it cost an idle guest under KVM
+ * 52 exits a second, ten times a guest without it (kvm/t_idle.py). So the 50 ms
+ * poll is deferrable -- it runs when its cpu is awake anyway, which a busy
+ * guest's is -- and a plain one each second bounds the wait on an idle guest.
  */
+static void machrev_poll_check(struct machrev *m)
+{
+	m->polled++;
+	if (mach(MACH_PENDING, 0).value != m->gen)
+		take_revision(m);
+}
+
 static void machrev_poll(struct work_struct *w)
 {
 	struct machrev *m = container_of(to_delayed_work(w), struct machrev, poll);
 
-	m->polled++;
-	if (mach(MACH_PENDING, 0).value != m->gen)
-		take_revision(m);
+	machrev_poll_check(m);
 	schedule_delayed_work(&m->poll, msecs_to_jiffies(50));
+}
+
+static void machrev_poll_slow(struct work_struct *w)
+{
+	struct machrev *m = container_of(to_delayed_work(w), struct machrev, poll_slow);
+
+	machrev_poll_check(m);
+	schedule_delayed_work(&m->poll_slow, msecs_to_jiffies(1000));
 }
 
 static irqreturn_t machrev_hard(int irq, void *p)
@@ -940,14 +959,16 @@ static int machrev_probe(struct platform_device *pdev)
 	m->gen = mach(MACH_PENDING, 0).value;	/* what the tree we booted from is */
 	dev_set_drvdata(&pdev->dev, m);
 	mutex_init(&m->lock);
-	INIT_DELAYED_WORK(&m->poll, machrev_poll);
+	INIT_DEFERRABLE_WORK(&m->poll, machrev_poll);
+	INIT_DELAYED_WORK(&m->poll_slow, machrev_poll_slow);
 	err = devm_request_threaded_irq(&pdev->dev, m->irq, machrev_hard, machrev_thread,
 					IRQF_ONESHOT, "machrev", m);
 	if (err)
 		return err;
 	if (m->cur.vic_kind >= 0) {
 		schedule_delayed_work(&m->poll, msecs_to_jiffies(50));
-		pr_info("machrev: the controller is revisable: polling the generation every 50 ms as well\n");
+		schedule_delayed_work(&m->poll_slow, msecs_to_jiffies(1000));
+		pr_info("machrev: the controller is revisable: polling the generation every 50 ms while awake, and each second\n");
 	}
 	device_create_file(&pdev->dev, &dev_attr_revisions);
 	riscv_v_request_hook = machrev_ask_vector;	/* F12 */

@@ -1720,3 +1720,33 @@ sched_stats(uint64 *out, int n)
     release(&rqs[i].lock);
   }
 }
+
+// E5: the scheduler's view of a task left waiting (the stale-interrupt report in vvnet.c): the
+// task, its group's queue on its hart, and every hart. Read without locks: a diagnostic, racy
+// by design, printed at most once in ten seconds.
+void
+sched_report(struct proc *p)
+{
+  uint64 now = sched_now(), ms = plat.timebase / 1000;
+
+  if (p == 0)
+    return;
+  struct rq *rq = &rqs[p->cpu];
+  struct gq *q = group_q(rq, p);
+  printk("sched: pid %d state %d cpu %d on_rq %d ran %ld ms ago vrt %ld (rq min %ld)",
+         p->pid, p->state, p->cpu, p->se.on_rq,
+         p->exec_start ? (long)((now - p->exec_start) / ms) : -1L,
+         (long)(p->se.vruntime / ms), (long)(rq->min_vruntime / ms));
+  if (q)
+    printk("; group q on_rq %d throttled %d nr %d curr %d vrt %ld min %ld",
+           q->se.on_rq, q->throttled, q->nr_running, q->curr ? q->curr->pid : -1,
+           (long)(q->se.vruntime / ms), (long)(q->min_vruntime / ms));
+  printk("\n");
+  for (int c = 0; c < plat.ncpu && c < NCPU; c++) {
+    struct rq *r = &rqs[c];
+    struct proc *cu = r->curr;
+    printk("sched: hart %d curr %d %s nr %d tasks %d min %ld switches %ld steals %ld\n", c,
+           cu ? cu->pid : -1, cu ? cu->name : "-", r->nr_running, rq_tasks(c),
+           (long)(r->min_vruntime / ms), (long)r->switches, (long)r->steals);
+  }
+}

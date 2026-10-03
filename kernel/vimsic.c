@@ -152,6 +152,14 @@ vimsic_send(struct vcpu *v, int eiid)
 {
   if (eiid <= 0 || eiid >= VIMSIC_NIDS)
     return;
+  {
+    // E5: what this send found (the stale-interrupt report prints the last 32)
+    struct vm *vm = v->vm;
+    struct msirec *r = &vm->msiring[vm->msiring_n++ % 32];
+    r->t = r_time(); r->vcpu = v->id; r->eiid = eiid; r->running = v->running_hart;
+    r->hwfile = v->imsic.hwfile; r->hwhart = v->imsic.hwhart; r->idle = v->idle;
+    r->path = (v->imsic.hwfile && v->running_hart >= 0) ? 'h' : 's';
+  }
   if (v->imsic.hwfile && v->running_hart >= 0) {
     // hardware file in use on that hart: a plain store delivers it.
     *(volatile uint32 *)imsic_file_addr(v->imsic.hwhart, v->imsic.hwfile) = eiid;
@@ -287,6 +295,10 @@ vimsic_csr(struct vcpu *v, uint32 inst)
       int id = top_id(im);
       if (id)
         im->eip[id / 64] &= ~(1UL << (id % 64));
+      if (id > 0 && id < 16) {
+        v->trace_nclaim[id]++;
+        v->trace_tclaim[id] = r_time();
+      }
       break;
     }
     case CSR_VSTOPI:

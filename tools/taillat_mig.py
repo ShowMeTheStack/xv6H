@@ -28,12 +28,22 @@ log = open("tmig-console.log", "w")
 a = T.QEMU(intc="imsic", cpus=3, log=log, fsimg="tmig-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
 b = None
 rows = []
+said = set()
 def run(q, c, t=60):
     m = q.mark(); q.send(c + "\n"); q.expect(r"\$ ", t); return q.output_since(m)
 def client_tcp():
     # the client's recovery so far (xv6H's TCP, /proc/net/sockstat's TCPX line)
     m = re.search(r"TCPX: rto (\d+) maxrto_ms (\d+) fast (\d+) partial (\d+)", run(a, "cat /proc/net/sockstat", 30))
     return tuple(int(x) for x in m.groups()) if m else None
+def host_vnet(q):
+    # a host's guest-NIC drops by reason and its frames for a guest not running there
+    m = re.search(r"VNETX: drop_stopped (\d+) drop_nobuf (\d+) drop_other (\d+) orphan_in (\d+) orphan_out (\d+)",
+                  run(q, "cat /proc/net/sockstat", 30))
+    return tuple(int(x) for x in m.groups()) if m else None
+def vdelta(x, y):
+    if not x or not y:
+        return "-"
+    return "stopped +%d nobuf +%d other +%d orphan_in +%d orphan_out +%d" % tuple(b - a for a, b in zip(x, y))
 def guest_tcp(q):
     # the guest's (Linux): RetransSegs, and TCPTimeouts, TCPLossProbes, TCPSpuriousRTOs, TCPFastRetrans
     G.attach(q, "lm"); q.send("\n"); q.expect(r"linux# ", 120)
@@ -62,10 +72,21 @@ try:
     # connections with it (the client needs one address)
     vmid = L.start_linux(a, "-f /linux.img -c 2 -H -V -i 10.7.0.50/24 -p 6379", name="lm", timeout=300)
     L.linux_cmd(a, "mount /dev/vda /mnt; setsid kvlat serve < /dev/null > /tmp/kvs.log 2>&1 &", 60)
+    # the guest's own view of a stall: when eth0's received count stands still for 0.6 s, the
+    # interrupt counts go to the kernel log (read back after a crossing that lost requests)
+    # (one printf: linux_cmd appends a marker to the line, which a heredoc's terminator cannot take)
+    L.linux_cmd(a, 'printf \'%s\\n\' \'p=x; t=0\' \'while sleep 0.2; do\' \'  r=$(cat /sys/class/net/eth0/statistics/rx_packets)\' \'  if [ "$r" = "$p" ]; then t=$((t+1)); else t=0; fi\' \'  if [ $t = 3 ] || [ $t = 12 ]; then echo "GMON stall $t rx $r" > /dev/kmsg\' \'    grep -v CPU /proc/interrupts | while read l; do echo "GMON $l" > /dev/kmsg; done; fi\' \'  p=$r\' \'done\' > /tmp/gmon.sh', 30)
+    L.linux_cmd(a, "setsid sh /tmp/gmon.sh < /dev/null > /dev/null 2>&1 &", 30)
     G.detach(a)
+    SOFT = os.environ.get("SOFTIMSIC") or (len(sys.argv) > 3 and sys.argv[3] == "soft")   # (a unit gets no environment)
+    if SOFT:
+        # the software IMSIC model, whose claims the host sees (E5's lost interrupts)
+        print("  software IMSIC: %s" % run(a, "vmm imsichw lm off", 30).strip().splitlines()[-1:]); sys.stdout.flush()
     here, there = a, b
     for k in range(2 * ROUNDS):
-        c0 = client_tcp(); g0 = guest_tcp(here)
+        # (the guest's own TCP counters were 0 in 49 of 50 crossings; reading them costs two attaches)
+        GT = os.environ.get("GUESTTCP")
+        c0 = client_tcp(); g0 = guest_tcp(here) if GT else None; va0 = host_vnet(a); vb0 = host_vnet(b)
         # the load, from A, for 40 s; the crossing 5 s in
         run(a, "kvlat load -c 10.7.0.50 -r 500 -t 40 -b 100 -k 2000 > /tmp/kv.out &")
         time.sleep(4)
@@ -85,6 +106,8 @@ try:
         except Exception:
             adopt = None
         there.send("\n"); there.expect(r"\$ ", 60)
+        if SOFT:
+            run(there, "vmm imsichw lm off", 30)
         t_mig = time.time()
         # the network's view, without TCP's back-off: A pings the guest until it answers
         first = None
@@ -101,11 +124,22 @@ try:
         o = run(a, "cat /tmp/kv.out", 60)
         bad = [l for l in o.splitlines() if l.startswith("kvlat bin") and (" err 0" not in l or re.search(r"p99 (\d+)", l) and int(re.search(r"p99 (\d+)", l).group(1)) > 100000)]
         print("  BINS (the move asked at 5.0 s; %d bins affected): %s" % (len(bad), " ; ".join(b.replace("kvlat bin ", "") for b in bad)[:1500])); sys.stdout.flush()
-        c1 = client_tcp(); g1 = guest_tcp(there)
-        print("  TCP during the round: client %s; guest %s" % (delta(c0, c1), delta(g0, g1))); sys.stdout.flush()
+        c1 = client_tcp(); g1 = guest_tcp(there) if GT else None; va1 = host_vnet(a); vb1 = host_vnet(b)
+        print("  TCP during the round: client %s; guest %s" % (delta(c0, c1), delta(g0, g1)))
+        print("  NIC during the round: A %s; B %s" % (vdelta(va0, va1), vdelta(vb0, vb1))); sys.stdout.flush()
+        for h, nm in ((a, "A"), (b, "B")):
+            for l in re.findall(r"(?:hyp: vm \d+: nic: (?:no receive buffer|interrupt raised|msi -)|sched: )[^\n]*", h.output_since(0)[-200000:]):
+                if l not in said:
+                    said.add(l); print("  %s: %s" % (nm, l))
         t = re.search(r"kvlat total (\d+) answered (\d+) errors (\d+) reconnects (\d+) p50 (\d+) p99 (\d+) p999 (\d+) max (\d+) gap (\d+)", o)
         row = (k, "A->B" if here is a else "B->A", ok, t.groups() if t else None, adopt)
         rows.append(row)
+        if t and t.group(3) != "0":
+            # the guest's own record of the stall
+            G.attach(there, "lm"); there.send("\n"); there.expect(r"linux# ", 120)
+            g = L.linux_cmd(there, "dmesg | grep -E \"GMON (stall|14:|IPI)\" | tail -40; dmesg -c > /dev/null", 120)
+            G.detach(there)
+            print("  GUEST: " + " | ".join(l.strip() for l in g.splitlines() if "GMON" in l)[-3000:])
         print("E5MIG %s %d %s migrated %s: %s; adoption on arrival %s ms" % (AXIS, k, row[1], ok,
               t.group(0) if t else "(no total)", "%.1f" % adopt if adopt else "-")); sys.stdout.flush()
         here, there = there, here
