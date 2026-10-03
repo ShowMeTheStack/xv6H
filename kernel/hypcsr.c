@@ -271,9 +271,9 @@ hyp_illegal(struct vcpu *v, uint32 inst)
       return 0;                     // pc unchanged: re-execute after adoption
   }
   // F21: cbo.zero on hardware without Zicboz, from a guest that was described a block (it
-  // arrived from a host that had one): the software model, as for a block of another size
-  if ((inst & 0xfff07fff) == 0x0040200f && v->vm->cboz_block > 0)
-    return hyp_virtinst(v, inst);
+  // arrived from a host that had one), is emulated by handle_exit before interrupts are let in
+  // (hyp_cboz, defect 54) and never reaches here; emulating it here, with interrupts on, would be
+  // that defect again, so a cbo.zero that does arrive is the guest's illegal instruction.
   // not ours: the guest gets it as an illegal instruction exception.
   vcpu_inject(v, EXC_ILLEGAL, inst);
   return 0;
@@ -310,13 +310,21 @@ hsv_zero8(uint64 a, uint64 *tval, uint64 *htval)
   return cause;
 }
 
+// F21: cbo.zero, trapped because the block the guest is described with is not the host's
+// (henvcfg.CBZE off), or because the host has no Zicboz: clear the described block, in the
+// guest's own address space (hsv.d, VS-level translation).
+//
+// Defect 54: the stores go through whatever vsatp and hgatp the hart holds, so this must run on
+// the hart the guest trapped on, before interrupts are let in -- as the fetch of the
+// instruction does. Run after intr_on, a preemption could move the thread to a hart holding
+// another machine's tables (or none: a bare hgatp, the host's own memory): the guest's block was
+// left unzeroed -- 128 stale bytes in a legacy guest's fresh page, snap-migrate-cboz-legacy, 1 of
+// 20 -- and the zeroes went wherever that hart's tables pointed. handle_exit calls this with
+// interrupts still off. caller: interrupts off, the guest's translation loaded.
 int
-hyp_virtinst(struct vcpu *v, uint32 inst)
+hyp_cboz(struct vcpu *v, uint32 inst)
 {
-  // F21: cbo.zero, trapped because the block the guest is described with is
-  // not the host's (henvcfg.CBZE off): clear the described block, in the
-  // guest's own address space (hsv.d, VS-level translation)
-  if ((inst & 0xfff07fff) == 0x0040200f) {
+  {
     struct vm *vm = v->vm;
     int n = vm->cboz_block;
     if (vm_revising(vm) && vm->cboz_prev > n)
@@ -342,6 +350,11 @@ hyp_virtinst(struct vcpu *v, uint32 inst)
     v->pc += 4;
     return 0;
   }
+}
+
+int
+hyp_virtinst(struct vcpu *v, uint32 inst)
+{
   if ((inst & 0x7f) == 0x73 && ((inst >> 12) & 3) != 0) {
     int csr = inst >> 20;
     vm_csr_count(v->vm, csr);

@@ -3835,6 +3835,12 @@ handle_exit(struct vcpu *v)
   }
   }
 
+  // defect 54: cbo.zero is emulated by stores through the guest's translation, here, on this
+  // hart, before interrupts are let in (hypcsr.c hyp_cboz)
+  if ((inst & 0xfff07fff) == 0x0040200f &&
+      (scause == EXC_VIRT_INST || (scause == EXC_ILLEGAL && v->vm->cboz_block > 0)))
+    return hyp_cboz(v, inst);
+
   intr_on();
 
   switch (scause) {

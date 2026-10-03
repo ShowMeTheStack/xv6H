@@ -1,0 +1,44 @@
+NAME
+     kvlat - a key-value service, and an open-loop load to measure it with
+
+SYNOPSIS
+     kvlat serve [-p PORT]
+     kvlat load -c HOST[,HOST2] [-p PORT] [-r RATE] [-t SECS] [-b MS]
+                [-m MARK] [-k MS]
+
+DESCRIPTION
+     kvlat measures what a service sees while the machine it runs on
+     is revised or moved. It builds for this system and for Linux.
+
+     serve answers one request per line on TCP port PORT (6379): "GET
+     key" with "VALUE value" or "NONE", and "SET key value" with "OK".
+     It takes any number of connections, in one thread.
+
+     load sends RATE requests a second (1000), one SET for every ten
+     GETs, for SECS seconds (10), on one connection. Each request is
+     sent at its scheduled time, whatever has been answered, so a
+     stall shows as latency and not as fewer requests. A request's
+     latency runs from its scheduled time to its answer, however late.
+     For every bin of MS milliseconds (100) it prints the requests,
+     the 50th and 99th percentiles and the maximum, in microseconds,
+     and the errors. At the end it prints the totals and the gap, the
+     longest time without an answer.
+
+     A request is an error if the connection it was sent on was
+     closed, or if it is unanswered 5 s after the run ends.
+
+OPTIONS
+     -c HOST[,HOST2]  the service; with two addresses, a connection
+                      made again goes to the other one
+     -m MARK          print MARK and the time when "mark" arrives on
+                      standard input, to place an event in the bins
+     -k MS            give a connection up when requests have waited
+                      MS milliseconds with no answer, count what was
+                      queued on it as errors, and make it again
+
+EXAMPLES
+     kvlat serve &
+     kvlat load -c 10.7.0.50 -r 500 -t 40 -b 100 -k 2000
+
+SEE ALSO
+     netbench(1), nc(1)

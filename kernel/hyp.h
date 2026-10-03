@@ -736,6 +736,7 @@ extern volatile int cons_owned;
 // hypcsr.c
 int hyp_illegal(struct vcpu *v, uint32 inst);
 int hyp_virtinst(struct vcpu *v, uint32 inst);
+int hyp_cboz(struct vcpu *v, uint32 inst);
 int vimsic_top(struct vimsic *im);
 int vcpu_soft_timer_due(struct vcpu *v);
 void vm_timebase_switch(struct vm *vm);

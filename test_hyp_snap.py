@@ -9,6 +9,7 @@
 #
 import os
 import re
+import time
 import test_hyp_guest as g
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -452,7 +453,7 @@ def t_migrate_busy(QEMU, intc, cpus, log):
                 pass
 
 
-def t_migrate_hetero(QEMU, cpus, log):
+def t_migrate_hetero(QEMU, cpus, log, policy="native"):
     """a machine moved to a host that is not the same shape as the one it left.
 
     This is the one a compatibility set forbids. Host A presents its guests an
@@ -468,6 +469,10 @@ def t_migrate_hetero(QEMU, cpus, log):
     destination's controller rather than pretending."""
     import os
     tag = "het%d" % os.getpid()
+    # native: both hosts revise an arriving guest to their own controller (`guestpolicy=native',
+    # the first policy). cheapest (the default since m9): a PLIC host has nothing cheaper than the
+    # IMSIC the guest arrives with, so it keeps it on the software model and asks nothing.
+    ap = "guestpolicy=native" if policy == "native" else ""
     link = os.path.join(HERE, tag + ".sock")
     try:
         os.unlink(link)
@@ -476,13 +481,13 @@ def t_migrate_hetero(QEMU, cpus, log):
     # A has the AIA, B has only the PLIC: the heterogeneity is the hosts' own,
     # not a flag on the guest.
     a = QEMU(intc="imsic", cpus=cpus, log=log, fsimg=tag + "-a.img",
-             extra_env={"LINK": link, "LINKSRV": "on"})
+             extra_env={"LINK": link, "LINKSRV": "on", "APPEND": ap})
     b = None
     try:
         a.expect(r"init: starting sh", 90)
         a.expect(r"\$ ", 30)
         b = QEMU(intc="plic", cpus=cpus, log=log, fsimg=tag + "-b.img",
-                 extra_env={"LINK": link, "LINKSRV": "off"})
+                 extra_env={"LINK": link, "LINKSRV": "off", "APPEND": ap})
         b.expect(r"init: starting sh", 90)
         b.expect(r"\$ ", 30)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
@@ -513,17 +518,27 @@ def t_migrate_hetero(QEMU, cpus, log):
         assert "migrated to 10.7.0.2:9000" in out, out
 
         # B says what it noticed and what it did about it
-        b.expect(r"arrived as imsic, this host gives plic: \d+ line\(s\) still held", 120)
-        b.expect(r"revision 1 asked for", 60)
-        b.expect(r"arrived: 1 vcpu", 120)
-        # and the guest took it. This is the load-bearing line of the test: the
-        # guest re-read its description and rebound to a controller it was not
-        # booted with, while holding the state it had on A.
-        b.expect(r"revision 1 adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        if policy == "native":
+            b.expect(r"arrived as imsic, this host gives plic: \d+ line\(s\) still held", 120)
+            b.expect(r"revision 1 asked for", 60)
+            b.expect(r"arrived: 1 vcpu", 120)
+            # and the guest took it. This is the load-bearing line of the test: the
+            # guest re-read its description and rebound to a controller it was not
+            # booted with, while holding the state it had on A.
+            b.expect(r"revision 1 adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        else:
+            mb = b.mark()
+            b.expect(r"keeping imsic \(the cheapest-controller policy\)", 120)
+            b.expect(r"arrived: 1 vcpu", 120)
         b.send("\n")
         b.expect(r"\$ ", 30)
         out = run(b, "vmm info h1", 30)
-        assert "intc plic" in out, out
+        if policy == "native":
+            assert "intc plic" in out, out
+        else:
+            # kept, on the software model, and nothing asked of the guest
+            assert "intc aplic-msi+imsic" in out, out
+            assert not re.search(r"revision \d+ asked for", b.output_since(mb)), b.output_since(mb)[-600:]
 
         # alive: its userspace runs, its file is there, and its disk still works
         g.attach(b, "h1")
@@ -565,9 +580,17 @@ def t_migrate_hetero(QEMU, cpus, log):
         run(a, "sleep 1", 20)
         out = run(b, "vmm migrate h1 10.7.0.1:9000", 300)
         assert "migrated to 10.7.0.1:9000" in out, out
-        a.expect(r"arrived as plic, this host gives imsic: \d+ line\(s\) still held", 120)
-        a.expect(r"arrived: 1 vcpu", 120)
-        a.expect(r"revision \d+ adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        if policy == "native":
+            a.expect(r"arrived as plic, this host gives imsic: \d+ line\(s\) still held", 120)
+            a.expect(r"arrived: 1 vcpu", 120)
+            a.expect(r"revision \d+ adopted \(0x[0-9a-f]+\) after \d+ us", 120)
+        else:
+            ma0 = a.mark()
+            a.expect(r"arrived: 1 vcpu", 120)
+            time.sleep(3)
+            a.send("\n")
+            a.expect(r"\$ ", 30)
+            assert not re.search(r"arrived as \w+, this host gives", a.output_since(ma0)), a.output_since(ma0)[-600:]
         a.send("\n")
         a.expect(r"\$ ", 30)
         out = run(a, "vmm info h1", 30)
@@ -585,7 +608,8 @@ def t_migrate_hetero(QEMU, cpus, log):
         assert "kernel is booting" not in a.output_since(ma), a.output_since(ma)
         g.detach(a)
         run(a, "vmm kill h1", 60)
-        print("    a machine crossed to a host of another shape, rebound, and came back")
+        print("    a machine crossed to a host of another shape, %s, and came back" %
+              ("rebound" if policy == "native" else "kept its controller (the cheapest policy)"))
     finally:
         if b:
             b.close()
@@ -1568,7 +1592,7 @@ def t_lx_migrate_vector(QEMU, cpus, log, lazy):
         a.send("\n"); a.expect(r"\$ ", 30)
         g.attach(a, "lv"); a.send("\n"); a.expect(r"linux# ", 60)
         out = lx.linux_cmd(a, "vecuser use 2; dmesg | grep -E 'machrev: (asked|vector)' | tail -2", 90)
-        assert "vecuser: ok" in out and "vector unit back" in out, out
+        assert "vecuser: ok" in out and "vector unit back" in out, out + "\n--- console:\n" + a.buf.decode(errors="replace")[-3000:]
         g.detach(a)
         run(a, "vmm kill lv", 60)
         print("    Linux's unit taken lazily; it crossed to a unit-less host unasked, a program's ask was refused there and granted back on the host that has one")
@@ -2190,7 +2214,8 @@ def tests(modes, cpus, log, QEMU):
         ("snap-migrate-busy", lambda: t_migrate_busy(QEMU, m, cpus, log)),
         # the heterogeneous one names no mode: the two hosts are
         # deliberately different, which is the whole point of it.
-        ("snap-migrate-hetero", lambda: t_migrate_hetero(QEMU, cpus, log)),
+        ("snap-migrate-hetero", lambda: t_migrate_hetero(QEMU, cpus, log, "native")),
+        ("snap-migrate-hetero-cheapest", lambda: t_migrate_hetero(QEMU, cpus, log, "cheapest")),
         # and one that is refused, for the right reason, and one that is not
         ("snap-migrate-refused", lambda: t_migrate_refused(QEMU, cpus, log, 0)),
         ("snap-migrate-negotiated", lambda: t_migrate_refused(QEMU, cpus, log, 1)),
