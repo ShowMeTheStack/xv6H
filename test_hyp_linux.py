@@ -188,7 +188,7 @@ def t_linux_with_xv6(QEMU, intc, cpus, log):
         m = q.mark()
         q.send("usertests -q\n")
         q.expect(r"ALL TESTS PASSED|FAILED|panic", 1500)
-        assert "ALL TESTS PASSED" in q.output_since(m)
+        assert "ALL TESTS PASSED" in q.output_since(m), q.output_since(m)[-3000:]
         q.expect(r"\$ ", 30)
         detach(q)
         attach(q, "linux")
@@ -340,6 +340,8 @@ def t_lx_revise_cpus(QEMU, intc, cpus, log):
         q.close()
 
 
+LAST_SLEEP_GUEST = -1.0
+
 def _lx_sleep_secs(q):
     """`sleep 1' timed from the HOST's wall clock (time.time() around the
     command), less the same command's overhead without the sleep. The
@@ -357,6 +359,8 @@ def _lx_sleep_secs(q):
     # a ten-times-slow clock says 1.0 for 10 s of wall; the load on the box
     # adds up to a second of turnaround (m8l: 1.6-1.7 s at four jobs a time)
     assert abs(guest - wall) < 1.0 + base, ("the guest's clock disagrees with the wall", guest, wall, base)
+    global LAST_SLEEP_GUEST
+    LAST_SLEEP_GUEST = guest      # the guest's own `real', for a failure's message
     return wall
 
 
@@ -378,7 +382,7 @@ def t_lx_revise_timer(QEMU, intc, cpus, log):
             out = linux_cmd(q, "dmesg | grep -E 'riscv-timer: timer via|machrev: timer'")
             assert "riscv-timer: timer via %s" % via in out and "machrev: timer via %s" % via in out, out
             t = _lx_sleep_secs(q)
-            assert 0.9 <= t <= 1.6, (want, t)
+            assert 0.9 <= t <= 1.6, (want, t, "guest real %.2f" % LAST_SLEEP_GUEST)
             detach(q)
             out = host_cmd(q, "vmm info %d" % vmid)
             assert "generation" in out, out

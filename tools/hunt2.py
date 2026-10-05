@@ -17,14 +17,17 @@ link = os.path.join(os.getcwd(), tag + ".sock")
 try: os.unlink(link)
 except OSError: pass
 LOGA = open("consoleA.log", "w"); LOGB = open("consoleB.log", "w")
+# every crossing exchanges the controller: the first arrival policy (guestpolicy=native). Under
+# the default since m9 a PLIC host keeps an arriving IMSIC guest on the software model and asks
+# nothing, so this loop would test no exchange (snap-migrate-hetero-cheapest covers that policy)
 a = th.QEMU(intc="imsic", cpus=3, log=LOGA, fsimg=tag+"-a.img",
-            extra_env={"LINK": link, "LINKSRV": "on"})
+            extra_env={"LINK": link, "LINKSRV": "on", "APPEND": "guestpolicy=native"})
 b = None
 lat, bad, n = [], [], 0
 try:
     a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
     b = th.QEMU(intc="plic", cpus=3, log=LOGB, fsimg=tag+"-b.img",
-                extra_env={"LINK": link, "LINKSRV": "off"})
+                extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestpolicy=native"})
     b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
     sn.run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
     sn.run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)

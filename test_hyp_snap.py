@@ -12,6 +12,20 @@ import re
 import time
 import test_hyp_guest as g
 
+def wait_listening(q, mark, timeout=90):
+    """the destination's `vmm accept' is listening (it prints this after listen()): wait for it
+    rather than a fixed second -- under load the background accept had not run within `sleep 1',
+    and the migration that followed was refused (snap-migrate-multi8-legacy, night 21)"""
+    end = time.time() + timeout
+    while time.time() < end:
+        if re.search(r"waiting for a machine on port \d+", q.output_since(mark)):
+            return
+        q.send("\n")
+        q.expect(r"\$ ", 30)
+        time.sleep(0.5)
+    raise TimeoutError("vmm accept never said it was listening")
+
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 ATONCE = g.ATONCE
@@ -294,9 +308,10 @@ def t_migrate(QEMU, intc, cpus, log):
         g.detach(a)
 
         # B waits for it; A sends it
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate m1 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         # the memory went over while the guest was running, and the guest
@@ -400,9 +415,10 @@ def t_migrate_busy(QEMU, intc, cpus, log):
         assert "10.7.0.2" in out and "(static)" in out, out
         out = run(a, "ping 10.7.0.2 2", 60)
         assert "2 packets transmitted, 2 received" in out, out
+        _mk = b.mark()
         b.send("vmm accept 9000 -n m2 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
 
         # a guest that has finished booting, so that its disk is quiet,
         # and is then told to fill sixteen megabytes of its tmpfs: that is
@@ -511,9 +527,10 @@ def t_migrate_hetero(QEMU, cpus, log, policy="native"):
         # compatibility answer would be that it may not move at all
         assert re.search(r"observed:.*\bintc@", out), out
 
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate h1 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
 
@@ -575,9 +592,10 @@ def t_migrate_hetero(QEMU, cpus, log, policy="native"):
         # the guest is given a controller that is *more* capable than the one it
         # is bound to, and has to take up hardware guest interrupt files it was
         # not using a moment ago.
+        _mk = a.mark()
         a.send("vmm accept 9000 -d &\n")
         a.expect(r"\$ ", 30)
-        run(a, "sleep 1", 20)
+        wait_listening(a, _mk)
         out = run(b, "vmm migrate h1 10.7.0.1:9000", 300)
         assert "migrated to 10.7.0.1:9000" in out, out
         if policy == "native":
@@ -673,9 +691,10 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
         g.detach(a)
 
         def try_move():
+            _mk = b.mark()
             b.send("vmm accept 9000 -d &\n")
             b.expect(r"\$ ", 30)
-            run(b, "sleep 1", 20)
+            wait_listening(b, _mk)
             o = run(a, "vmm migrate r1 10.7.0.2:9000", 300)
             return "migrated to" in o, o
 
@@ -788,9 +807,10 @@ def t_migrate_legacy(QEMU, cpus, log):
         assert "intc aplic-msi+imsic (hardware guest files)" in out, out
         assert "guest does not speak it" in out, out
 
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate old 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         # B says what it decided, and why
@@ -865,9 +885,10 @@ def t_lazy_vector(QEMU, cpus, log):
         run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
 
         def move(name):
+            _mk = b.mark()
             b.send("vmm accept 9000 -d &\n")
             b.expect(r"\$ ", 30)
-            run(b, "sleep 1", 20)
+            wait_listening(b, _mk)
             o = run(a, "vmm migrate %s 10.7.0.2:9000" % name, 300)
             assert "migrated to" in o, o
             b.expect(r"arrived: 1 vcpu", 120)
@@ -986,9 +1007,10 @@ def t_migrate_layout(QEMU, cpus, log, legacy):
         a.send("echo before-the-move > /keep; sync\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate mv 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         if legacy:
@@ -1065,9 +1087,10 @@ def t_migrate_intc_addr(QEMU, cpus, log, legacy):
         a.send("echo before-the-move > /keep; sync\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate ic 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         if legacy:
@@ -1147,9 +1170,10 @@ def t_migrate_irq(QEMU, cpus, log, legacy):
         a.send("echo before-the-move > /keep; sync\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate iq 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         if legacy:
@@ -1220,9 +1244,10 @@ def t_migrate_axis(QEMU, cpus, log, axis, legacy):
         a.send("echo before-the-move > /keep; sync\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate ax 10.7.0.2:9000", 300)
         if "migrated to 10.7.0.2:9000" not in out:
             # B's side of the story into the log before failing
@@ -1357,9 +1382,10 @@ def t_migrate_vlen(QEMU, cpus, log):
         a.expect(r"vecbench: ok \(vlen 128 bits", 90)
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate vl 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         assert "cede 0x4" in out or "cede" in a.buf.decode(errors="replace")[-4000:], out
@@ -1422,9 +1448,10 @@ def t_migrate_cboz(QEMU, cpus, log, legacy, hazard=0):
         a.expect(r"zerocheck: 256 pages clean", 120)
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate cz 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
         if legacy:
@@ -1535,9 +1562,10 @@ def t_lx_migrate_vector(QEMU, cpus, log, lazy):
         g.detach(a)
 
         def try_move(src, dst, name):
+            _mk = dst.mark()
             dst.send("vmm accept 9000 -d &\n")
             dst.expect(r"\$ ", 30)
-            run(dst, "sleep 1", 20)
+            wait_listening(dst, _mk)
             o = run(src, "vmm migrate %s 10.7.0.2:9000" % name if dst is b else "vmm migrate %s 10.7.0.1:9000" % name, 600)
             return "migrated to" in o, o
 
@@ -1591,8 +1619,13 @@ def t_lx_migrate_vector(QEMU, cpus, log, lazy):
         a.expect(r"arrived: 2 vcpu", 120)
         a.send("\n"); a.expect(r"\$ ", 30)
         g.attach(a, "lv"); a.send("\n"); a.expect(r"linux# ", 60)
+        mk = a.mark()
         out = lx.linux_cmd(a, "vecuser use 2; dmesg | grep -E 'machrev: (asked|vector)' | tail -2", 90)
-        assert "vecuser: ok" in out and "vector unit back" in out, out + "\n--- console:\n" + a.buf.decode(errors="replace")[-3000:]
+        # the guest's line can land inside a host line on the shared console (`... ack from vcpu
+        # vecuser: ok, 2 rounds'), and linux_cmd drops host lines whole: look at the raw console
+        # too (snap-lx-migrate-lazy's misses, nights 20 and 21)
+        raw = a.output_since(mk)
+        assert ("vecuser: ok" in out or "vecuser: ok" in raw) and "vector unit back" in out, out + "\n--- console:\n" + a.buf.decode(errors="replace")[-3000:]
         g.detach(a)
         run(a, "vmm kill lv", 60)
         print("    Linux's unit taken lazily; it crossed to a unit-less host unasked, a program's ask was refused there and granted back on the host that has one")
@@ -1649,9 +1682,10 @@ def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
         spoke = m and int(m.group(1)) > 0
         assert bool(spoke) == (not legacy), (legacy, out)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate lm 10.7.0.2:9000", 600)
         assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
         if axis == "cboz":
@@ -1778,7 +1812,7 @@ def t_migrate_multi(QEMU, cpus, log, names, legacy):
         g.start_guest(a, "-n ax -m 32 -c 2" + (" -a norevise" if legacy else ""), 120)
         a.send("echo before-the-move > /keep; sync\n"); a.expect(r"\$ ", ATONCE)
         g.detach(a)
-        b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); run(b, "sleep 1", 20)
+        _mk = b.mark(); b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); wait_listening(b, _mk)
         mb0 = b.mark()
         out = run(a, "vmm migrate ax 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
@@ -1848,7 +1882,7 @@ def t_lx_migrate_multi(QEMU, cpus, log, names):
         out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
         assert re.search(r"\n1\r?\n", out), out
         g.detach(a)
-        b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); run(b, "sleep 1", 20)
+        _mk = b.mark(); b.send("vmm accept 9000 -d &\n"); b.expect(r"\$ ", 30); wait_listening(b, _mk)
         mb0 = b.mark()
         out = run(a, "vmm migrate la 10.7.0.2:9000", 600)
         assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
@@ -1941,9 +1975,10 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
         out = lx.linux_cmd(a, "for i in $(seq 40); do grep -q 'crossck:' /tmp/ck.log && break; sleep 1; done; tail -1 /tmp/ck.log", 60)
         assert "crossck:" in out, out
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate la 10.7.0.2:9000", 600)
         assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]
         b.expect(host_msg, 120)
@@ -2072,9 +2107,10 @@ def t_migrate_disk_grow(QEMU, cpus, log):
         a.send("echo before-the-move > /keep; sync\n")
         a.expect(r"\$ ", ATONCE)
         g.detach(a)
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate dg 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         b.expect(r"arrived with a 32768-sector disk, this host's image has 49152: told through the device", 120)
@@ -2148,9 +2184,10 @@ def t_migrate_memory(QEMU, cpus, log, mode):
         out = run(a, "vmm info mm", 30)
         m = re.search(r"\((\d+) MB resident\)", out)
         assert m and int(m.group(1)) >= 20, out          # the point: it is resident in more than B has
+        _mk = b.mark()
         b.send("vmm accept 9000 -d &\n")
         b.expect(r"\$ ", 30)
-        run(b, "sleep 1", 20)
+        wait_listening(b, _mk)
         out = run(a, "vmm migrate mm 10.7.0.2:9000", 600)
         if mode == "cede":
             assert "migrated to 10.7.0.2:9000" in out, out + "\n--- B:\n" + b.buf.decode(errors="replace")[-2500:]

@@ -923,12 +923,21 @@ rq_tasks(int cpu)
   return n;
 }
 
+// is c a vcpu of the machine whose vcpu is running on src? A heuristic for stealing, read
+// without the tasks' locks: cur runs on another hart, and a vcpu thread clears its p->vcpu when
+// its machine is torn down (every migration's source). Defect 55: this read cur->vcpu twice, the
+// field went to 0 between the test and the use, and vcpu_machine(0) faulted at 0x178 -- a host
+// panic on a crossing's destination (hunt3, crossing 302). Each pointer is read once; a stale one
+// is still mapped (a vcpu lives inside its struct vm, in the kernel's direct map), and a wrong
+// answer only changes which task is stolen.
 static int
 sibling_of_curr(struct rq *src, struct proc *c)
 {
-  struct proc *cur = src->curr;
+  struct proc *cur = __atomic_load_n(&src->curr, __ATOMIC_RELAXED);
+  void *cv = __atomic_load_n(&c->vcpu, __ATOMIC_RELAXED);
+  void *uv = cur ? __atomic_load_n(&cur->vcpu, __ATOMIC_RELAXED) : 0;
 
-  return c->vcpu && cur && cur->vcpu && vcpu_machine(c->vcpu) == vcpu_machine(cur->vcpu);
+  return cv && uv && vcpu_machine(cv) == vcpu_machine(uv);
 }
 
 // the task on `src' that would run last there and may run on `to':
