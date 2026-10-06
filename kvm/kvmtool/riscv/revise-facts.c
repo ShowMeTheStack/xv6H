@@ -437,6 +437,38 @@ static void facts_ack(struct kvm *kvm, u32 what, u32 adopted)
 
 
 
+/*
+ * the in-kernel AIA reconfigured under a running guest. Every vCPU's
+ * IMSIC moves from its hardware guest file to KVM's software file ("sw") or back ("hw"), by KVM
+ * patch 4 (KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW). Nothing is asked of the guest: like F23 under
+ * xv6H, the description does not change, only what backs it, so no revision is made.
+ */
+#ifndef KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW
+#define KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW 1
+#endif
+static int imsicfile(const char *value, char *reply, int len)
+{
+	u32 sw = !strcmp(value, "sw");
+	struct kvm_device_attr a = {
+		.group = KVM_DEV_RISCV_AIA_GRP_CTRL,
+		.attr = KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW,
+		.addr = (u64)(unsigned long)&sw,
+	};
+
+	if (!sw && strcmp(value, "hw")) {
+		snprintf(reply, len, "revise: imsicfile hw|sw");
+		return -1;
+	}
+	if (aia__fd() < 0 || ioctl(aia__fd(), KVM_SET_DEVICE_ATTR, &a) < 0) {
+		snprintf(reply, len, "revise: imsicfile %s: refused by KVM: %s", value,
+			 aia__fd() < 0 ? "no in-kernel AIA" : strerror(errno));
+		return -1;
+	}
+	snprintf(reply, len, "revise: imsicfile %s: every vCPU's IMSIC now on %s files; nothing asked of the guest",
+		 value, sw ? "software" : "hardware");
+	return 0;
+}
+
 int revise__apply(struct kvm *kvm, const char *req, char *reply, int len)
 {
 	char name[64] = "", value[128] = "";
@@ -446,6 +478,8 @@ int revise__apply(struct kvm *kvm, const char *req, char *reply, int len)
 		snprintf(reply, len, "revise: usage: <fact> [value]");
 		return -1;
 	}
+	if (!strcmp(name, "imsicfile"))
+		return imsicfile(value, reply, len);
 	for (unsigned i = 0; i < sizeof(facts) / sizeof(facts[0]); i++)
 		if (!strcmp(facts[i].name, name)) {
 			if (facts[i].unlocked) {

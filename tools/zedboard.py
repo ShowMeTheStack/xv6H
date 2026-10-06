@@ -270,9 +270,16 @@ try:
         # controller is a PLIC cannot present the AIA's honestly): asked once, the refusal recorded
         q.send("vmm revise %d aplic\n" % q.vmid); q.expect(r"\$ ", 120)
         print("B3 aplic: " + q.output_since(q.mark() - 300)[-160:].replace("\n", " ")); sys.stdout.flush()
-        for fact in ["intcmap alt", "intcmap default", "map alt", "map default",
+        # rounds=N: each round revises the four facts this host can present there and
+        # back, so N=10 gives n=20 per fact; without it, the first round's list of B.3
+        if "rounds" in opts:
+            FACTS = ["intcmap alt", "intcmap default", "map alt", "map default",
+                     "timebase 1000000", "timebase 400000", "sbi rfence", "sbi none"] * int(opts["rounds"])
+        else:
+            FACTS = ["intcmap alt", "intcmap default", "map alt", "map default",
                      "timebase 1000000", "timebase 400000", "sbi rfence", "sbi none",
-                     "map alt", "map default", "timebase 100000", "timebase 400000"]:
+                     "map alt", "map default", "timebase 100000", "timebase 400000"]
+        for fact in FACTS:
             def one(fact=fact):
                 mv = q.mark()
                 q.send("vmm revise %d %s\n" % (q.vmid, fact))
@@ -291,6 +298,14 @@ try:
             except Exception:
                 results.append((fact, "FAILED", 0))   # the next fact is still asked
         print("B3 SUMMARY", results)
+        import statistics
+        for name, key in (("F2 controller window", "intcmap"), ("F15 device map", "map"),
+                          ("F6 timebase", "timebase"), ("F22 SBI set", "sbi")):
+            v = sorted(us / 1000.0 for f, a, us in results if f.split()[0] == key and a != "FAILED")
+            nf = sum(1 for f, a, us in results if f.split()[0] == key)
+            if v:
+                print("B3 %-22s n=%d ok=%d min %.1f median %.1f p90 %.1f max %.1f ms" % (
+                    name, nf, len(v), v[0], statistics.median(v), v[min(len(v) - 1, int(0.9 * len(v)))], v[-1]))
 finally:
     print("SUMMARY", ok, "total %.0fs" % (time.time() - t0))
     tail = q.buf[-3000:].decode(errors="replace")

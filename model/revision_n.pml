@@ -16,6 +16,14 @@
  *   no_owed   every fact asked for is eventually in an acknowledged revision;
  *   caught_up every hart eventually reaches the host's generation.
  *
+ * The rate. Fact 0 is the counter's rate, which cannot be aliased: the host
+ * serves one rate at a time (`served'), and every time read must be converted with the rate the
+ * guest is using (served == belief[0]). The protocol as fixed serves the new rate from the
+ * guest's re-base, which calls MACH call 7 (rate_now) in the same step (Linux re-bases every CPU
+ * inside stop_machine, with no time read in between), or from the ack if the guest never calls
+ * it. Variants: -DRATE_AT_ASK serves it from the ask (defect 49, before its fix); -DNO_CALL7
+ * serves it only from the ack. Both must fail SAFETY.
+ *
  *   spin -a -DNH=3 -DNF=2 revision_n.pml; gcc -O2 -DSAFETY -o pan pan.c; ./pan
  *   gcc -O2 -DNFAIR=6 -o pan pan.c; ./pan -a -f -N adopted     (and no_owed, caught_up)
  */
@@ -33,6 +41,7 @@
 byte gen = 0;
 byte fact[NF];          /* the host's value of each fact */
 byte oldfact[NF];       /* served through the alias while that fact is in the pending revision */
+byte served = 0;        /* the counter's rate the host serves now (fact 0) */
 byte nextval = 1;
 byte what = 0;          /* bits of the pending revision */
 byte owed = 0;          /* bits asked while a revision was pending */
@@ -64,6 +73,9 @@ inline revise(w)
     :: i < NF -> if :: (w >> i) & 1 -> oldfact[i] = fact[i]; fact[i] = nextval; nextval++ :: else -> skip fi; i++
     :: i >= NF -> break
     od;
+#ifdef RATE_AT_ASK
+    if :: w & 1 -> served = fact[0] :: else -> skip fi;
+#endif
     what = w; pending = true; described = false; gen++;
     announce_all()
 }
@@ -106,7 +118,7 @@ end_c:
 inline ack(g)
 {
     if
-    :: g == gen -> acked = g; pending = false; what = 0
+    :: g == gen -> acked = g; pending = false; what = 0; served = fact[0]   /* at the ack, at the latest */
     :: else -> skip                 /* a stale generation is refused */
     fi
 }
@@ -119,7 +131,8 @@ inline serve_all()
         assert(belief[i] == fact[i] || (pending && ((what >> i) & 1) && belief[i] == oldfact[i]));
         i++
     :: i >= NF -> break
-    od
+    od;
+    assert(served == belief[0])       /* a time read converted with the rate it is counted at */
 }
 
 proctype Hart(byte me)
@@ -138,6 +151,9 @@ end_g:
                 :: i < NF -> belief[i] = fact[i]; i++
                 :: i >= NF -> break
                 od;
+#ifndef NO_CALL7
+                served = fact[0];          /* the re-base calls rate_now (MACH call 7) */
+#endif
                 gen_hart[me] = seen; g = seen; mine = true
             :: else -> gen_hart[me] = seen; mine = false
             fi

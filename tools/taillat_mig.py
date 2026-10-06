@@ -21,11 +21,18 @@ import test_hyp_guest as G, test_hyp_linux as L, test_hyp_snap as S
 AXIS = sys.argv[1] if len(sys.argv) > 1 else "same"
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 append = "" if AXIS == "same" else S.LX_AXES[AXIS][0]
+# the controller axis: A is a PLIC host and B an IMSIC host. Both use guestpolicy=native, so the
+# guest's controller is exchanged on every arrival, both ways (under the default policy a guest
+# arriving on the PLIC host would keep its IMSIC on the software model and be asked nothing).
+A_INTC = "plic" if AXIS == "intc" else "imsic"
+if AXIS == "intc":
+    append = "guestpolicy=native"
 link = os.path.join(HERE, "tmig%d.sock" % os.getpid())
 try: os.unlink(link)
 except OSError: pass
 log = open("tmig-console.log", "w")
-a = T.QEMU(intc="imsic", cpus=3, log=log, fsimg="tmig-a.img", extra_env={"LINK": link, "LINKSRV": "on"})
+a = T.QEMU(intc=A_INTC, cpus=3, log=log, fsimg="tmig-a.img",
+           extra_env=dict({"LINK": link, "LINKSRV": "on"}, **({"APPEND": append} if AXIS == "intc" else {})))
 b = None
 rows = []
 said = set()

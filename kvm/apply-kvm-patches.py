@@ -3,7 +3,7 @@
 # ~/xv6h-kvm/linux-6.18.54 idempotently. Each change is one function below; `git diff` against
 # the pristine tree (kept in ~/xv6h-kvm/linux-6.18.54.orig) is the patch series we report.
 import os, re, sys
-T = os.path.expanduser("~/xv6h-kvm/linux-6.18.54")
+T = os.path.expanduser(os.environ.get("KT", "~/xv6h-kvm/linux-6.18.54"))   # KT: another tree
 def sub(rel, pairs):
     p = os.path.join(T, rel); s = open(p).read(); o = s
     for a, b in pairs:
@@ -152,3 +152,23 @@ sub("arch/riscv/kvm/vcpu_onereg.c", [
 ])
 
 print("kvm patches applied")
+
+# 4. the in-kernel AIA reconfigured under a running guest: the VMM may
+#    move every vCPU's IMSIC from its hardware guest file to the software file and back, with
+#    nothing told to the guest (as F23 under xv6H). KVM already moves a vCPU's IMSIC state between
+#    a hardware file and the software one when no hardware file is free (AUTO mode); this lets
+#    the VMM ask for it. Only in AUTO mode: HWACCEL has no software file, EMUL no hardware one.
+sub("arch/riscv/include/uapi/asm/kvm.h", [(
+"#define KVM_DEV_RISCV_AIA_CTRL_INIT\t\t0\n",
+"#define KVM_DEV_RISCV_AIA_CTRL_INIT\t\t0\n#define KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW\t\t1\t/* u32: 1 software files, 0 hardware */\n")])
+sub("arch/riscv/include/asm/kvm_aia.h", [(
+"\t/* Internal state of APLIC */\n\tvoid\t\t*aplic_state;\n};",
+"\t/* Internal state of APLIC */\n\tvoid\t\t*aplic_state;\n\n\t/* The VMM asked for software IMSIC files (KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW) */\n\tbool\t\timsic_sw;\n};")])
+sub("arch/riscv/kvm/aia_imsic.c", [(
+"\t/* Do nothing if we are continuing on same CPU */\n\tif (old_vsfile_cpu == vcpu->cpu)\n\t\treturn 1;",
+"\t/*\n\t * The VMM asked for the software file: give the hardware file back,\n\t * its state moved to the software file, and run without one. When it\n\t * asks for hardware again, the code below allocates a file as it does\n\t * when a vCPU moves to another CPU.\n\t */\n\tif (READ_ONCE(kvm->arch.aia.imsic_sw)) {\n\t\tif (old_vsfile_cpu >= 0)\n\t\t\tkvm_riscv_vcpu_aia_imsic_release(vcpu);\n\t\tgoto done;\n\t}\n\n\t/* Do nothing if we are continuing on same CPU */\n\tif (old_vsfile_cpu == vcpu->cpu)\n\t\treturn 1;")])
+sub("arch/riscv/kvm/aia_device.c", [(
+"\tcase KVM_DEV_RISCV_AIA_GRP_CTRL:\n\t\tswitch (type) {\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_INIT:\n\t\t\tmutex_lock(&dev->kvm->lock);\n\t\t\tr = aia_init(dev->kvm);\n\t\t\tmutex_unlock(&dev->kvm->lock);\n\t\t\tbreak;\n\t\t}",
+"\tcase KVM_DEV_RISCV_AIA_GRP_CTRL:\n\t\tswitch (type) {\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_INIT:\n\t\t\tmutex_lock(&dev->kvm->lock);\n\t\t\tr = aia_init(dev->kvm);\n\t\t\tmutex_unlock(&dev->kvm->lock);\n\t\t\tbreak;\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW: {\n\t\t\tstruct kvm_vcpu *vcpu;\n\t\t\tunsigned long i;\n\n\t\t\tif (copy_from_user(&nr, uaddr, sizeof(nr)))\n\t\t\t\treturn -EFAULT;\n\t\t\tif (!dev->kvm->arch.aia.initialized ||\n\t\t\t    dev->kvm->arch.aia.mode != KVM_DEV_RISCV_AIA_MODE_AUTO) {\n\t\t\t\tr = -EINVAL;\n\t\t\t\tbreak;\n\t\t\t}\n\t\t\tWRITE_ONCE(dev->kvm->arch.aia.imsic_sw, !!nr);\n\t\t\t/* every vCPU re-evaluates its file before it next enters */\n\t\t\tkvm_for_each_vcpu(i, vcpu, dev->kvm)\n\t\t\t\tkvm_vcpu_kick(vcpu);\n\t\t\tr = 0;\n\t\t\tbreak;\n\t\t}\n\t\t}"),
+("\tcase KVM_DEV_RISCV_AIA_GRP_CTRL:\n\t\tswitch (attr->attr) {\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_INIT:\n\t\t\treturn 0;\n\t\t}",
+ "\tcase KVM_DEV_RISCV_AIA_GRP_CTRL:\n\t\tswitch (attr->attr) {\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_INIT:\n\t\tcase KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW:\n\t\t\treturn 0;\n\t\t}")])
