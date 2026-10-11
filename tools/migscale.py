@@ -32,7 +32,10 @@ def crossing(mem, rate):
     b = None
     try:
         a.expect(r"init: starting sh", 120); a.expect(r"\$ ", 30)
-        b = th.QEMU(intc="plic", cpus=3, mem=hostmem, log=LOG, fsimg=tag + "-b.img", extra_env={"LINK": link, "LINKSRV": "off"})
+        # guestpolicy=native: the destination revises the arriving guest to its own PLIC, as the
+        # first version did by default (the cheapest-controller policy would keep the IMSIC and
+        # there would be no revision to time)
+        b = th.QEMU(intc="plic", cpus=3, mem=hostmem, log=LOG, fsimg=tag + "-b.img", extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestpolicy=native"})
         b.expect(r"init: starting sh", 120); b.expect(r"\$ ", 30)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30); run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
         assert "2 received" in run(a, "ping 10.7.0.2 2", 60)

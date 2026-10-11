@@ -172,6 +172,9 @@ try:
         step("xv6 guest", xv6_guest)
         m = q.mark(); q.cmd_("echo hi from the guest; sleep 1; echo done", timeout=300); print(q.output_since(m))
         G.detach(q)
+        # the board has one core: the Linux guest boots alone, as it did on 3 Oct (vm 0), not beside
+        # this one (night 24's first boot, with g1 still running, took 2.7 times as long)
+        q.cmd_("vmm kill g1", timeout=300)
     if "linux" in steps:
         def linux_guest():
             # the command is in /lx (fpga/zedboard/lx): typed whole it is longer than the line

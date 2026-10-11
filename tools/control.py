@@ -27,9 +27,12 @@ def crossing(control):
     b = None
     try:
         a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
-        env = {"LINK": link, "LINKSRV": "off"}
+        # the destination imposes its own controller (guestpolicy=native), as the first version's
+        # did by default: under the cheapest-controller policy it would keep the guest's IMSIC
+        # and a guest told nothing would be fine, which is not the question asked here
+        env = {"LINK": link, "LINKSRV": "off", "APPEND": "guestpolicy=native"}
         if control:
-            env["APPEND"] = "norevise=1"
+            env["APPEND"] = "guestpolicy=native norevise=1"
         b = th.QEMU(intc="plic", cpus=3, log=LOG, fsimg=tag + "-b.img", extra_env=env)
         b.expect(r"init: starting sh", 90); b.expect(r"\$ ", 30)
         run(a, "ip addr add 10.7.0.1/24 dev eth0", 30); run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
