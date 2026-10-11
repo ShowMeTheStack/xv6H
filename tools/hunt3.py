@@ -46,6 +46,8 @@ def dump_harts(tag_):
         out = monitor(path, "info registers -a")
         pcs = re.findall(r"pc\s+([0-9a-f]+)", out)
         print("---- %s host %s: harts' pc: %s" % (tag_, who, " ".join(pcs)))
+        if not pcs:                      # n24-hunt3 printed an empty list: show what the monitor said
+            print("     (monitor said: %r)" % out[:300])
         for l in out.splitlines():
             if re.search(r"^\s*(pc|ra|sp|scause|sepc|stval|mcause|mepc|mstatus|sstatus|hstatus|sip|sie)\s", l):
                 print("     " + l.strip()[:120])
@@ -80,6 +82,17 @@ try:
             bad.append("crossing %d: migrate hung: %s" % (i, str(e)[:100]))
             print("---- crossing %d: the migration hung; both hosts from the monitor ----" % i)
             dump_harts("stall"); time.sleep(2); dump_harts("2 s later")
+            # the wire as the destination sees it (the source's shell is held by the
+            # hung migrate: interrupt it, then ask it too)
+            for who, h in (("dst", dst), ("src", src)):
+                try:
+                    if who == "src":
+                        h.send("\x03"); time.sleep(2); h.send("\n")
+                    print("---- %s at the hung migration (crossing %d) ----" % (who, i))
+                    print(sn.run(h, "cat /proc/net/tcp; ifconfig; vmm ls", 30))
+                except Exception as e:
+                    print("  (%s did not answer: %s)" % (who, e))
+            sys.stdout.flush()
             return False
         if "migrated to" not in out:
             # A failure the protocol handled -- the source kept its machine, the
