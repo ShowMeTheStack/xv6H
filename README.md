@@ -69,10 +69,10 @@ running guest, provided it tells the guest, lets it refuse what it cannot
 give up, and keeps the old values working until the guest acknowledges the
 new ones. Section 3 describes this in detail.
 
-The build measured in the paper is commit `808f863` of the private
-development tree. This repository's last commit is that build plus the
-harness changes used for the follow-up runs and a tidying of comments; the
-kernel and the other binaries it builds are unchanged.
+The build measured in the paper is commit `013e86c`, tagged `paper-build`.
+The later commits add the scripts of the follow-up runs, this README, the
+licences and tidied comments; they build the same hypervisor and guest
+kernels byte for byte.
 
 ## RISC-V virtualisation with the H extension
 
@@ -872,7 +872,8 @@ A run directory holds the tree and these results:
 
 ## Reproducing the paper's results
 
-All results in the paper come from one build, commit `808f863`, run on one
+All results in the paper come from one build, commit `013e86c` (tag
+`paper-build`), run on one
 32-core Linux machine with QEMU 10.2.1. Every QEMU-based number is an
 emulated time; absolute timings depend on the host and on its load, which is
 why every run records `load.log`. Compare ratios and shapes rather than
@@ -1038,14 +1039,13 @@ setting shown before a KVM script is exported for that run.
 - The survey of device trees: `python3 kvm/dtsurvey.py OUT.md DTB_DIR...`
   over the device trees (`*.dtb`) built from Linux 6.18.54's RISC-V
   sources.
-- The kernel's size by subsystem: `tools/ksizes.py`. The paper's table was
-  taken at `808f863` in the development tree; this repository's history
-  does not contain that commit, and the reworded comments can shift the
-  counts slightly.
+- The kernel's size by subsystem: `tools/ksizes.py 013e86c`, which
+  reproduces the paper's table exactly.
 
 The Spin models and the device-tree survey do not depend on the build. The
-defects discussed in the paper were fixed in the private development
-history, which is not part of this repository.
+defects discussed in the paper were fixed before `013e86c`; this
+repository's history condenses that work into one or a few commits per
+working day.
 
 ## Licence
 
@@ -1066,14 +1066,14 @@ BearSSL in `tls/bearssl` keeps its own MIT licence
 
 If you use xv6H, please cite:
 
-J. Mishra, S. K. Sahay, L. K. Vashishtha, S. Mishra, A. Pathak, *Revisable
+J. Mishra, A. Pathak, S. K. Sahay, S. Mishra, L. K. Vashishtha, *Revisable
 Machine Descriptions: Twenty-Four Facts a Running Guest Can Be Told Again*
 (under review).
 
 ```bibtex
 @unpublished{mishra-revisable,
-  author = {Jyotiprakash Mishra and Sanjay K. Sahay and Lalit K. Vashishtha
-            and Swati Mishra and Aman Pathak},
+  author = {Jyotiprakash Mishra and Aman Pathak and Sanjay K. Sahay
+            and Swati Mishra and Lalit K. Vashishtha},
   title  = {Revisable Machine Descriptions: Twenty-Four Facts a Running
             Guest Can Be Told Again},
   note   = {Under review}
