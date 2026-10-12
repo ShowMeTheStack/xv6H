@@ -1,7 +1,7 @@
 #ifndef XV6_VMSTATE_H
 #define XV6_VMSTATE_H
 //
-// what a machine is, written down (kernel/vmstate.c, §9).
+// what a machine is, written down (kernel/vmstate.c).
 //
 // A saved machine is a header and a list of named sections. Nothing in
 // the file is a host address: a section holds the guest's own registers,
@@ -28,7 +28,7 @@
 #define MIG_REFUSE_PAGING 2    // the guest's paging mode is deeper than this host's
 #define MIG_REFUSE_MEMORY 3    // the guest holds more memory than this host has
 
-#define VMSTATE_HDR_MAC 0x100   // M12: the stream is authenticated (HMAC-SHA256 after END)
+#define VMSTATE_HDR_MAC 0x100   // the stream is authenticated (HMAC-SHA256 after END)
 struct vmstate_hdr {
   char magic[8];
   uint32 version;

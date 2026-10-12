@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.4: F6 under KVM. The guest's timebase revised under a running Linux guest, host's rate
+# F6 under KVM. The guest's timebase revised under a running Linux guest, host's rate
 # (QEMU virt: 10 MHz) -> 1 MHz -> 25 MHz -> back, N rounds. After each: the guest adopted the
 # timer (0x10) and says what it took; three seconds of `sleep` are three seconds by the
 # guest's own clock and three seconds of the host's wall clock (a counter at the wrong rate is

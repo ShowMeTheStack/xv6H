@@ -1,5 +1,5 @@
 #
-# the `snap' suite: saving a machine, and starting it again (§9).
+# the `snap' suite: saving a machine, and starting it again.
 #
 # What a save has to be is boring: a machine written down, and the same
 # machine again afterwards. So every test here proves continuity rather
@@ -15,7 +15,7 @@ import test_hyp_guest as g
 def wait_listening(q, mark, timeout=90):
     """the destination's `vmm accept' is listening (it prints this after listen()): wait for it
     rather than a fixed second -- under load the background accept had not run within `sleep 1',
-    and the migration that followed was refused (snap-migrate-multi8-legacy, night 21)"""
+    and the migration that followed was refused (seen in snap-migrate-multi8-legacy)"""
     end = time.time() + timeout
     while time.time() < end:
         if re.search(r"waiting for a machine on port \d+", q.output_since(mark)):
@@ -263,10 +263,10 @@ def t_snap_clone(QEMU, intc, cpus, log):
 
 
 def t_migrate(QEMU, intc, cpus, log):
-    """a machine moved from one host to another over a connection (§9).
+    """a machine moved from one host to another over a connection.
 
     The two hosts are joined to each other by a unix-socket wire on the
-    laptop's file system -- not a port: nothing listens on the network, and
+    host's file system -- not a port: nothing listens on the network, and
     the only thing at the other end is the other emulated machine. Neither
     host has a way out to anywhere else, which is why they configure their
     addresses by hand."""
@@ -315,7 +315,7 @@ def t_migrate(QEMU, intc, cpus, log):
         out = run(a, "vmm migrate m1 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         # the memory went over while the guest was running, and the guest
-        # was stopped only for what it wrote during the last round (§9)
+        # was stopped only for what it wrote during the last round
         assert re.search(r"pre-copy round 1: \d+ KB", out), out
         assert re.search(r"stopped for \d+ page", out), out
         # and it is gone from A. Destroying a machine is not instant -- its
@@ -368,14 +368,14 @@ def t_migrate_busy(QEMU, intc, cpus, log):
     A guest filling a file in its tmpfs is writing megabytes of its own
     memory a second, which is what makes a pre-copy take round after
     round: what the first round sent is out of date before it has
-    finished. §9 asks for as few rounds as it takes and for the guest to
-    be stopped only at the end, and both are what this checks.
+    finished. A pre-copy should take as few rounds as it needs and stop
+    the guest only at the end, and both are what this checks.
 
     What it does *not* do is write to its disk. A migration carries the
     machine's memory and the name of its image, not the image: the two
     hosts here have identical copies, and a guest that had written to one
     of them would arrive beside a disk that did not have those writes.
-    Carrying the disk as well is not done and is named in §15."""
+    Carrying the disk as well is not done."""
     import os
     # names of this run's own: the two migration tests run side by side on
     # the build box, and one wire and one pair of disks between four
@@ -403,8 +403,8 @@ def t_migrate_busy(QEMU, intc, cpus, log):
         # host whose `ip addr add' did not take refuses its own migration
         # with "Permission denied" and says nothing about why. Asserting on
         # ifconfig names it, and the ping is the barrier that makes the
-        # wire real before the migration needs it. Without these this test
-        # went from start to a refused connect in four seconds.
+        # wire real before the migration needs it. Without them a missing
+        # address shows up only as a refused connect.
         out = run(a, "ip addr add 10.7.0.1/24 dev eth0", 30)
         assert "error" not in out.lower(), out
         out = run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
@@ -430,7 +430,7 @@ def t_migrate_busy(QEMU, intc, cpus, log):
         out = run(a, "vmm migrate m2 10.7.0.2:9000", 300)
         assert "migrated to 10.7.0.2:9000" in out, out
         # the memory crossed while the guest ran, and what it was stopped
-        # for is a fraction of that -- which is the whole point of §9's
+        # for is a fraction of that -- which is the point of pre-copy
         # rounds. How many rounds it takes depends on how fast the guest
         # dirties memory against how fast the wire carries it, so the test
         # asks for a short outage rather than a particular number.
@@ -486,7 +486,7 @@ def t_migrate_hetero(QEMU, cpus, log, policy="native"):
     import os
     tag = "het%d" % os.getpid()
     # native: both hosts revise an arriving guest to their own controller (`guestpolicy=native',
-    # the first policy). cheapest (the default since m9): a PLIC host has nothing cheaper than the
+    # the first policy). cheapest (the default): a PLIC host has nothing cheaper than the
     # IMSIC the guest arrives with, so it keeps it on the software model and asks nothing.
     ap = "guestpolicy=native" if policy == "native" else ""
     link = os.path.join(HERE, tag + ".sock")
@@ -513,7 +513,7 @@ def t_migrate_hetero(QEMU, cpus, log, policy="native"):
 
         # a machine on A, on A's controller, with something of its own on disk
         vm = g.start_guest(a, "-n h1 -m 32 -c 1", 120)
-        # L17: the guest verifies 8 MB of its memory and its clock every second, across the crossing (user/memck.c)
+        # the guest verifies 8 MB of its memory and its clock every second, across the crossing (user/memck.c)
         a.send("memck 2 600 &\n")                # 2 MB: under emulation the guest verifies about a megabyte a second
         a.expect(r"memck: 2 MB written", 60)   # the prompt came back before this line: a background job
         a.send("\n")
@@ -574,7 +574,7 @@ def t_migrate_hetero(QEMU, cpus, log, policy="native"):
         b.expect(r"disk-ok", 60)
         b.expect(r"\$ ", ATONCE)
         assert "kernel is booting" not in b.output_since(m), b.output_since(m)
-        # L17: two more rounds of the in-guest check after the move (sleep is in ticks of 100 ms)
+        # two more rounds of the in-guest check after the move (sleep is in ticks of 100 ms)
         b.send("sleep 6; echo memck-look\n")             # the sleep command takes seconds; two of memck's rounds
         b.expect(r"memck-look", 60)
         b.expect(r"\$ ", ATONCE)
@@ -679,11 +679,11 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
         a.expect(r"\$ ", ATONCE)
         if give_up:
             # a task that holds vector state for a while. Rounds are not a
-            # duration: 400 rounds were over before the move began (fam7), and
-            # the guest rightly ceded a unit nobody was using.
+            # duration: a fixed count can finish before the move begins, and
+            # the guest then rightly cedes a unit nobody is using.
             # vhold touches the registers every 10 ms for the whole time, so the
-            # ask finds state held whenever it comes (vecbench's rounds were over
-            # before the move began twice in twenty: 18/20 in m7x)
+            # ask finds state held whenever it comes (vecbench's rounds sometimes
+            # finished before the move began)
             a.send("vhold 25 &\n")
             a.expect(r"\$ ", ATONCE)
             a.send("sleep 1\n")
@@ -701,8 +701,8 @@ def t_migrate_refused(QEMU, cpus, log, give_up):
         moved, out = try_move()
         assert not moved, out
         # B's console is only read when something waits on it: drain it before
-        # asserting on what it said (fam7 failed on a stale buffer, not a
-        # missing message)
+        # asserting on what it said (otherwise the check reads a stale
+        # buffer)
         b.send("\n")
         b.expect(r"\$ ", 30)
         # the handshake: nothing was sent
@@ -778,7 +778,7 @@ def t_migrate_legacy(QEMU, cpus, log):
     tell it anything, so it must not change anything -- the machine keeps the
     controller it left with, as a software model on B. Correct on any host, at the
     price of emulation exits; the participating tier (snap-migrate-hetero) is the
-    same crossing without that price, which is the whole argument."""
+    same crossing without that price."""
     import os
     tag = "leg%d" % os.getpid()
     link = os.path.join(HERE, tag + ".sock")
@@ -854,10 +854,10 @@ def t_migrate_legacy(QEMU, cpus, log):
 
 
 def t_lazy_vector(QEMU, cpus, log):
-    """L5: a unit revealed by use. `vmm start -L' presents the machine without
+    """a unit revealed by use. `vmm start -L' presents the machine without
     a vector unit; the guest's first vector instruction traps to the host, which
-    is the one exact observation of *use* there is (Proposition 4 says sampling
-    cannot give it). The host grants the unit and the instruction re-executes.
+    is the one exact observation of *use* there is (sampling cannot
+    give it). The host grants the unit and the instruction re-executes.
 
     Two guests on a host with a unit, moved to a host without one:
       lz  never touches vectors: it is accepted without a word, because its
@@ -1505,9 +1505,9 @@ def t_migrate_cboz(QEMU, cpus, log, legacy, hazard=0):
 
 
 # a crossing test asks the timer to work after the move, not to be precise: on a box
-# running eight hosts (the n=100 batches) `sleep 1` has taken 1.65-1.83 s of the guest's
+# running eight hosts `sleep 1` has taken 1.65-1.83 s of the guest's
 # own clock ("hrtimer: interrupt took 498 ms" beside it), and a 1.6 s bound counted the
-# box's load as a failure of the mechanism (12 of 1 013). The precise claims are the
+# box's load as a failure of the mechanism. The precise claims are the
 # host-timed timer tests, run alone.
 SLEEP_BOUND = 2.5
 
@@ -1515,7 +1515,7 @@ LX_START = "-k /Image -r 0x80200000 -m 128 -a console=ttyS0 earlycon=sbi -f /lin
 
 
 def t_lx_migrate_vector(QEMU, cpus, log, lazy):
-    """L9: the negotiated tier on a production kernel. Host A has a vector
+    """the negotiated tier on a production kernel. Host A has a vector
     unit, host B was built without one; the Linux guest carries patch 0004 and
     machrev.
     lazy=0 (snap-lx-migrate-negotiated): a task holds vector state, so the
@@ -1623,7 +1623,7 @@ def t_lx_migrate_vector(QEMU, cpus, log, lazy):
         out = lx.linux_cmd(a, "vecuser use 2; dmesg | grep -E 'machrev: (asked|vector)' | tail -2", 90)
         # the guest's line can land inside a host line on the shared console (`... ack from vcpu
         # vecuser: ok, 2 rounds'), and linux_cmd drops host lines whole: look at the raw console
-        # too (snap-lx-migrate-lazy's misses, nights 20 and 21)
+        # too (snap-lx-migrate-lazy missed it otherwise)
         raw = a.output_since(mk)
         assert ("vecuser: ok" in out or "vecuser: ok" in raw) and "vector unit back" in out, out + "\n--- console:\n" + a.buf.decode(errors="replace")[-3000:]
         g.detach(a)
@@ -1641,7 +1641,7 @@ def t_lx_migrate_vector(QEMU, cpus, log, lazy):
 
 
 def t_lx_migrate(QEMU, cpus, log, axis, legacy=0):
-    """M5: a Linux guest crosses hosts. AXIS "same": two hosts alike, the
+    """a Linux guest crosses hosts. AXIS "same": two hosts alike, the
     machine simply goes on (uptime continues, its disk is there). AXIS
     "cboz": host A has 128-byte cache blocks, B 64: a Linux with machrev.ko
     is told on arrival and re-rates clear_page; a stock Linux (machrev=off,
@@ -1761,7 +1761,7 @@ LX_AXES = {
 LX_AXES["ipi"] = ("guestipi=sbi", r"arrived with clint ipis, this host has no clint",
                   "machrev: revision",
                   # the two loops in a subshell of their own: a bare `wait' waits for every job of the
-                  # shell, and since L17 that shell also owns crossck, for 600 s (n6-timeline: 0/20)
+                  # shell, and that shell also owns crossck, for 600 s
                   "( (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & (i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done) & wait ); grep -c 'IPI1' /proc/interrupts; echo PAR-OK", r"PAR-OK")
 LX_AXES["disk"] = ("", r"arrived with a 32768-sector disk, this host's image has 49152: told through the device",
                    "new size: 49152",
@@ -1789,10 +1789,10 @@ LX_LEGACY_MSG = {   # what the host says of a Linux that cannot be told, per axi
 
 
 def t_migrate_multi(QEMU, cpus, log, names, legacy):
-    """L30: host B differs from A in several facts at once (the axes' boot words
+    """host B differs from A in several facts at once (the axes' boot words
     joined); a participating guest is told every one on arrival and adopts them
     all, a legacy guest keeps what it left with; both keep working. Two aliases
-    pending at once is the hard case of Invariant 4."""
+    pending at once is the hard case: each old window answers until its ack."""
     import os
     axes = [AXES[n] for n in names]
     append = " ".join(a[1] for a in axes)
@@ -1857,7 +1857,7 @@ def t_migrate_multi(QEMU, cpus, log, names, legacy):
 
 
 def t_lx_migrate_multi(QEMU, cpus, log, names):
-    """L30 for Linux: host B differs in several facts at once; the module takes
+    """the same for Linux: host B differs in several facts at once; the module takes
     every one on arrival and the guest's own view agrees on each."""
     import os
     import test_hyp_linux as lx
@@ -1927,7 +1927,7 @@ def t_lx_migrate_multi(QEMU, cpus, log, names):
 
 
 def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
-    """M5 across a move, one fact at a time: host B differs from A on one axis
+    """Linux across a move, one fact at a time: host B differs from A on one axis
     (a boot word); a Linux with machrev.ko is told on arrival and takes it;
     the guest's own view (nproc, /proc/interrupts, sysfs, meminfo) agrees.
     LEGACY: the same image with machrev=off -- the host keeps the guest's
@@ -1968,7 +1968,7 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
         a.expect(r"linux# ", 120)
         out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
         assert re.search(r"\n%d\r?\n" % (0 if legacy else 1), out), out
-        # L17: the guest verifies 64 MB of its memory, its monotonic clock and its vector
+        # the guest verifies 64 MB of its memory, its monotonic clock and its vector
         # register file every second, across the crossing (linux/crossck.c)
         lx.linux_cmd(a, "crossck 64 600 > /tmp/ck.log 2>&1 &", 20)
         # writing 64 MB takes the guest a few seconds under emulation; wait for its first line
@@ -1989,8 +1989,8 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
             try:
                 b.expect(r"revision \d+ adopted \(0x[0-9a-f]+\)", 180)
             except Exception as e:
-                # the guest's own view before giving up (n3-lx100: 2 of 42 controller
-                # crossings "described no" for 20 s, nothing else on the host side)
+                # the guest's own view before giving up (a controller crossing can
+                # show "described no" for 20 s with nothing else on the host side)
                 info = run(b, "vmm info la", 30)
                 g.attach(b, "la"); b.send("\n")
                 try:
@@ -2035,11 +2035,11 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
             out = lx.linux_cmd(b, "time sleep 1", 60)
             m = re.search(r"real\s+0m\s*([\d.]+)s", out)
             assert m and 0.9 <= float(m.group(1)) <= SLEEP_BOUND, out
-            # L17: two more rounds of the in-guest check after the move, and not one complaint
+            # two more rounds of the in-guest check after the move, and not one complaint
             out = lx.linux_cmd(b, "sleep 2; tail -2 /tmp/ck.log; grep -E 'wrong|went back|changed|FAILED|advanced' /tmp/ck.log || echo crossck-clean", 60)
             assert "crossck-clean" in out and re.search(r"crossck: round \d+ ok=yes", out), out
             # defect 26: the guest's printk clock must not have jumped (it read 8 793 s after
-            # every timebase arrival, unread until eight facts at once made it matter)
+            # every timebase arrival)
             out = lx.linux_cmd(b, "dmesg | tail -1", 30)
             m = re.search(r"\[\s*(\d+)\.\d+\]", out)
             assert m and int(m.group(1)) < 900, "the guest's printk clock: " + out[-200:]
@@ -2057,7 +2057,7 @@ def t_lx_migrate_axis(QEMU, cpus, log, name, legacy=0, host_intc="plic"):
             raise
         g.detach(b)
         if disk != "none":
-            # L17: the disk that crossed, looked over by the host once the guest let go of it
+            # the disk that crossed, looked over by the host once the guest let go of it
             out = run(b, "fsck.ext4 -n /linux.img", 120)
             assert "clean" in out, out
         run(b, "vmm kill la", 60)
@@ -2258,9 +2258,9 @@ def tests(modes, cpus, log, QEMU):
         ("snap-migrate-negotiated", lambda: t_migrate_refused(QEMU, cpus, log, 1)),
         # and a guest that cannot be told anything, kept as it was
         ("snap-migrate-legacy", lambda: t_migrate_legacy(QEMU, cpus, log)),
-        # L5: the unit is revealed by use, and a guest that never used it needs no negotiation
+        # the unit is revealed by use, and a guest that never used it needs no negotiation
         ("snap-migrate-lazy", lambda: t_lazy_vector(QEMU, cpus, log)),
-        # L9: the same two, with Linux (patch 0004 + machrev) as the guest
+        # the same two, with Linux (patch 0004 + machrev) as the guest
         ("snap-lx-migrate-negotiated", lambda: t_lx_migrate_vector(QEMU, cpus, log, 0)),
         ("snap-lx-migrate-lazy", lambda: t_lx_migrate_vector(QEMU, cpus, log, 1)),
         # the layout axis: devices somewhere else on the destination

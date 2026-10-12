@@ -29,7 +29,7 @@
 +	 * a device that is armed (oneshot, with an event ahead) is touched:
 +	 * a cpu whose tick is stopped (nohz idle) has nothing due, and an
 +	 * event forced on it would arrive with no hrtimer expired -- the
-+	 * tick code then reprograms for "now" again and again (lxp6: 40k
++	 * tick code then reprograms for "now" again and again (some 40k
 +	 * ecalls a second on the idle cpu).
 +	 */
 +	if (clockevent_state_oneshot(ce) && ce->next_event != KTIME_MAX) {
@@ -40,8 +40,8 @@
 +		 * A deadline that passed while the rate changed is re-armed at
 +		 * once. min_delta_ns is u64: compared unsigned, a negative ns
 +		 * is never below it, and the product is a delta of 2^34 ticks
-+		 * (adopt_linux2: cpu 1 armed 1700 s out, RCU stalled, no hart
-+		 * could be parked after a timebase round trip).
++		 * (a deadline 1700 s out: RCU stalls, and no hart can
++		 * be parked after a timebase round trip).
 +		 */
 +		if (ns < (s64)ce->min_delta_ns)
 +			ns = ce->min_delta_ns;
@@ -56,7 +56,7 @@
 +/* inside the stop_machine of timekeeping_rerate(), on every cpu: its clock event device takes the
 + * new rate before any cpu runs again. Done afterwards by cross-call, a cpu converted its deadlines
 + * at the old rate meanwhile: from 1 MHz to 10 MHz every timer it armed fired ten times early and
-+ * was armed again, and the cross-call waited behind that (E5: a service stalled for seconds). */
++ * was armed again, and the cross-call waited behind that (a service stalled for seconds). */
 +struct riscv_rerate {
 +	u32 hz;
 +	void (*now)(void);
@@ -71,7 +71,7 @@
 + * at the old rate up to this instant and takes the new one, and only then does the counter's new
 + * rate begin (now(): the hypervisor is told). Done after the stop_machine, sched_clock converted
 + * the new counter with the old rate until then -- ten times fast from 1 to 10 MHz -- and leapt by
-+ * the error at its re-anchor, and the watchdogs it feeds reported lockups (E5). */
++ * the error at its re-anchor, and the watchdogs it feeds reported lockups. */
 +static void riscv_timer_rerate_first(void *arg)
 +{
 +	struct riscv_rerate *r = arg;

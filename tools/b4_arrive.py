@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.4, the QEMU half: a machine saved on the ZedBoard (Rocket + H at 40 MHz: PLIC, 400 kHz, no
+# Board -> QEMU, the QEMU half: a machine saved on the ZedBoard (Rocket + H at 40 MHz: PLIC, 400 kHz, no
 # vector unit, no Zicboz, no Sstc, one hart) is started again on a QEMU host of another shape
 # (APLIC+IMSIC, 10 MHz, vector, Zicboz, Sstc, three harts). The file came out of the board's
 # RAM disk over JTAG (tools/zedboard.py save). On arrival xv6H tells the guest what it has

@@ -43,9 +43,9 @@ module uart16550_axil #(
 
   // ---- FIFOs ----
   // 5-bit pointers, and every comparison of them made in 5 bits: `txr + 1' is a 32-bit sum in
-  // Verilog, so at txr = 31 it was 32, never equal to the wrapped txw -- the transmitter-empty
-  // interrupt was lost once every 32 bytes and a writer waiting for it slept for ever (the first
-  // boot on the board stopped at "rcS: startin"); the full tests had the same fault at the wrap
+  // Verilog, so at txr = 31 it would be 32, never equal to the wrapped txw, and the
+  // transmitter-empty interrupt would be lost once every 32 bytes (a writer waiting for it
+  // would sleep for ever); the full tests are computed in 5 bits for the same reason
   reg [7:0] txf [0:15]; reg [4:0] txw, txr; wire [4:0] tx_count = txw - txr, txr_next = txr + 5'd1;
   wire tx_empty = txw == txr; wire tx_full = tx_count == 5'd16;
   reg [7:0] rxf [0:15]; reg [4:0] rxw, rxr; wire [4:0] rx_count = rxw - rxr;

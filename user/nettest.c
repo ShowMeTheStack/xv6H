@@ -2,7 +2,7 @@
 // the machine.
 //
 // everything here goes over 127.0.0.1, over the machine's own address
-// or over a socket in the file system, so it works on a laptop whose
+// or over a socket in the file system, so it works on a workstation whose
 // network blocks ICMP, behind a firewall, and on a build box with no
 // route out at all. what needs the internet is in the network suite
 // instead.

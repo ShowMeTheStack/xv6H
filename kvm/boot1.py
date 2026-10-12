@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.0 smoke test (runs on the build box): boot the KVM host under QEMU (AIA with guest interrupt files,
+# Smoke test: boot the KVM host under QEMU (AIA with guest interrupt files,
 # H, Sstc, V, Zicboz), start the unchanged xv6H Linux guest under lkvm, and check it comes up.
 import os, subprocess, sys, time, select
 K = os.path.expanduser("~/xv6h-kvm")

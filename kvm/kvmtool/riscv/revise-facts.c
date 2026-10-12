@@ -2,8 +2,8 @@
  * The facts kvmtool can revise, one function each. A fact function runs under revise.lock,
  * changes the machine (and sets up its alias: the old value keeps answering until the ack),
  * and returns the REV_* bits the guest must look at; the ack hook ends the aliases.
- * Facts are added here as the port proceeds (A.2: device map, interrupt numbering; A.3:
- * controller; A.4: timebase; A.5: vector).
+ * Facts: device map (F15), interrupt numbering (F3), controller (F1), timebase (F6),
+ * vector (F10).
  */
 #include "kvm/kvm.h"
 #include "kvm/util.h"
@@ -184,9 +184,9 @@ static int fact_intc(struct kvm *kvm, const char *value, char *reply, int len)
 /* the guest took the new controller: the lines follow, and what is owed is raised again */
 static void intc_switch(struct kvm *kvm)
 {
-	/* lines are 1 .. irq__get_nr_allocated_lines(): the count is the last line's number (the
-	 * first version stopped one short, and the last line allocated -- the disk -- kept its level
-	 * on the old PLIC: an interrupt storm when the guest came back to it) */
+	/* lines are 1 .. irq__get_nr_allocated_lines(): the count is the last line's number (one
+	 * short, the last line allocated -- the disk -- would keep its level on the old PLIC: an
+	 * interrupt storm when the guest comes back to it) */
 	int old = intc_live, nlines = irq__get_nr_allocated_lines(), lv = 0, vio;
 
 	if (intc_live == intc_desc)
@@ -236,9 +236,9 @@ static void isa_sstc(char *isa, size_t len, bool on)
 
 /*
  * The rate is described at the ask and served from the guest's read of the description
- * (facts_describe), as in xv6H: changing KVM's rate at the ask ran the guest's clock at the new
- * rate while its code still converted with the old, so every timer it armed was already past,
- * and a guest slow to read the announcement could not get to it (E5 found this under xv6H).
+ * (facts_describe), as in xv6H: changing KVM's rate at the ask would run the guest's clock at the
+ * new rate while its code still converts with the old, so every timer it arms is already past,
+ * and a guest slow to read the announcement could not get to it.
  */
 static u64 tb_owed;
 static struct kvm *tb_kvm;
@@ -438,7 +438,7 @@ static void facts_ack(struct kvm *kvm, u32 what, u32 adopted)
 
 
 /*
- * the in-kernel AIA reconfigured under a running guest. Every vCPU's
+ * The in-kernel AIA reconfigured under a running guest. Every vCPU's
  * IMSIC moves from its hardware guest file to KVM's software file ("sw") or back ("hw"), by KVM
  * patch 4 (KVM_DEV_RISCV_AIA_CTRL_IMSIC_SW). Nothing is asked of the guest: like F23 under
  * xv6H, the description does not change, only what backs it, so no revision is made.
@@ -528,7 +528,7 @@ int revise_facts__init(struct kvm *kvm)
 	return 0;
 }
 
-/* A.6: the facts' state across a migration (what the description says now; the windows and
+/* The facts' state across a migration (what the description says now; the windows and
  * lines themselves travel with the devices) */
 struct facts_mig {
 	int devmap_alt, irqmap_alt, intc_desc, intc_live;

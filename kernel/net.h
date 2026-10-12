@@ -186,7 +186,7 @@ struct dhcpstate {
 // ---- interfaces and routes ----
 //
 // an interface is a place a frame can leave by and arrive at: the
-// physical NIC, the loopback, and (E8) one end of the wire into a
+// physical NIC, the loopback, and one end of the wire into a
 // container. It knows its own addresses, so that a namespace with two
 // of them can answer on both, and it knows how to send, so that the
 // stack does not care whether the other end is a driver, the switch or

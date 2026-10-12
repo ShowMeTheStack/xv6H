@@ -112,7 +112,7 @@ ipi_handle(void)
   // it *is* how the hypervisor tells us the machine description changed, on
   // any controller (trap.c: "nobody asked for this one"). Left set on an IMSIC
   // guest, that one notification re-trapped forever: a revision of anything
-  // but the controller itself (irqmap, m2a) spun the guest in cause-1 traps,
+  // but the controller itself (irqmap) spun the guest in cause-1 traps,
   // one MACH_PENDING ecall each (11 661 of them in the probe).
   c_sip(SIP_SSIP);
   uint64 reasons = __atomic_exchange_n(&ipi_pending[hart], 0, __ATOMIC_SEQ_CST);

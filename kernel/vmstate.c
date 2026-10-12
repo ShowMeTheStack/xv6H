@@ -1,5 +1,5 @@
 //
-// save and restore a machine (§9).
+// save and restore a machine.
 //
 // A saved machine is a file the *user* opened: `vmm save' creates it and
 // hands the descriptor over, and the kernel fills it. That way the file
@@ -178,11 +178,11 @@ struct sink {
   struct inode *ip;
   struct file *f;
   uint off;
-  int mac_on;              // M12: every byte written, authenticated (a connection with a key)
+  int mac_on;              // every byte written, authenticated (a connection with a key)
   struct hmac mac;
 };
 
-// M12: the key two hosts share for their migration streams (`migkey=' on both command lines),
+// the key two hosts share for their migration streams (`migkey=' on both command lines),
 // into k; its length, or 0 for none. The MAC is HMAC-SHA256 (sha256.c), checked against RFC
 // 4231 once; a host whose implementation fails the check authenticates nothing and says so.
 static int
@@ -201,7 +201,7 @@ mig_key(uint8 *k)
   return ok ? n : 0;
 }
 
-// M12, replay: a destination opens every connection with 16 bytes of its own randomness, and a
+// replay: a destination opens every connection with 16 bytes of its own randomness, and a
 // source with a key MACs them ahead of the header -- so a stream recorded once and sent again
 // does not authenticate at a destination that asked with a different nonce. Every connection
 // exchanges one, key or not, so a mismatch of keys is still refused at the header.
@@ -267,7 +267,7 @@ pcs(const char *p)
 // looks like a page-table entry: for every 8-byte word whose bit 0 (V) is set,
 // bits 6 (A) and 7 (D) are cleared before hashing.
 //
-// This exists to answer one question and it is the question the whole paper
+// This exists to answer one question and it is the question the dirty tracking
 // turns on. A page whose raw checksum has changed but whose masked checksum has
 // not changed *only in the A/D bits of PTE-shaped words* -- which is the
 // signature of the MMU maintaining the guest's page tables behind the
@@ -608,7 +608,7 @@ struct lastround {
   int nsent;        // pages the comparison sent
   int nunmarked;    // of those, pages nobody had marked
   int nadonly;      // of those, pages differing only in PTE A/D bits
-  int nunmarked_adonly;  // and both at once -- the number the paper turns on
+  int nunmarked_adonly;  // and both at once -- the number that matters
 };
 
 static int
@@ -746,7 +746,7 @@ drain(struct vm *vm)
 // nowhere else.
 static int save_to(struct vm *vm, struct sink *s);
 
-// ---- pre-copy (§9) ----
+// ---- pre-copy ----
 //
 // A stop-and-copy stops the guest for as long as its memory takes to
 // cross. Pre-copy sends the memory while the guest runs: every page in
@@ -950,7 +950,7 @@ save_to(struct vm *vm, struct sink *s)
   memmove(hdr.magic, VMSTATE_MAGIC, 8);
   hdr.version = VMSTATE_VERSION;
   hdr.saved_time = r_time();
-  // M12: over a connection, with a key, the whole stream is authenticated from this header on;
+  // over a connection, with a key, the whole stream is authenticated from this header on;
   // the tag follows END, and the destination runs nothing before it has checked it
   uint8 key[64], nonce[MIG_NONCE];
   if (s->f) {
@@ -971,7 +971,7 @@ save_to(struct vm *vm, struct sink *s)
   if ((r = put(s, &hdr, sizeof(hdr))) < 0)
     goto out;
 
-  // defect 22 (found by the model, L22): a machine crosses only between
+  // defect 22 (found by the Spin model): a machine crosses only between
   // revisions. The stream carries the description the machine is on, not the
   // alias of a revision the guest has not yet read: a machine stopped between
   // the announcement and the guest's read would arrive believing the old
@@ -1030,7 +1030,7 @@ save_to(struct vm *vm, struct sink *s)
   }
 
   // and now, if this is a migration of a machine that is running, the
-  // memory goes over while it keeps running (§9). A save to a file does
+  // memory goes over while it keeps running. A save to a file does
   // not do this: the file is written once, and a page written twice into
   // it would only make it longer.
   if (s->f && vm->state == VM_RUNNING && precopy_begin(vm, &pc) == 0) {
@@ -1047,7 +1047,7 @@ save_to(struct vm *vm, struct sink *s)
         // (vm_unshare: one fault per page per round). Writable, it would take
         // every later write of this round unrecorded while its copy went
         // over stale -- which is what `6 page(s) nobody had marked' was
-        // (busy2). Protected again here, its next write faults into the new
+        // Protected again here, its next write faults into the new
         // set. Cheap: a pass over the PTEs.
         vm_snap_protect(vm, 0, pc.dirty, pc.npages);
       }
@@ -1077,7 +1077,7 @@ save_to(struct vm *vm, struct sink *s)
   was_running = (vm->state == VM_RUNNING);
   if (was_running)
     vm_pause(vm);
-  vm->t_stop = r_time();          // L15: the outage begins here
+  vm->t_stop = r_time();          // timeline: the outage begins here
   if ((r = drain(vm)) < 0)
     goto out;
 
@@ -1149,7 +1149,7 @@ save_to(struct vm *vm, struct sink *s)
     // costs four bytes a page and one hash per page, and it is what found
     // that bug when six migration tests could not. A dirty set that is
     // wrong is indistinguishable from one that is right until something
-    // checks it. See journal.md and `admeasure=1' for the measurements.
+    // checks it. `admeasure=1' turns the measurement on.
     struct lastround lr;
     memset(&lr, 0, sizeof(lr));
     lr.marked = pc.dirty;     // everything anyone remembered, not yet sent
@@ -1391,7 +1391,7 @@ cede(struct vm *vm, uint32 arg)
         // The guest gives *free* pages, and a free page it never touched was
         // never backed: giving it up frees nothing here. So when the guest
         // has reached what it was asked and the machine is still too big, it
-        // is asked for the rest again (f14a: 6 MB asked, 4 MB of backing
+        // is asked for the rest again (6 MB asked, 4 MB of backing
         // came back). It ends when the balloon holds what the host needs or
         // the guest runs out of free pages, and then the clock above ends it.
         if (now_ticks() >= nudge) {
@@ -1491,7 +1491,7 @@ vm_save(struct vm *vm, char *path)
   // a machine given a whole block device cannot be saved: what a save
   // names is the image file it will be restored beside, and a device is
   // not one. Saying so is better than writing a file that cannot be
-  // restored (§9).
+  // restored.
   if (vm->disk && vm->disk_ip == 0) {
     iput(ip);
     return -ENOTSUP;
@@ -1503,7 +1503,7 @@ vm_save(struct vm *vm, char *path)
   return r;
 }
 
-// ---- a snapshot, with the machine running (§9) ----
+// ---- a snapshot, with the machine running ----
 //
 // The difference between this and a save is where the guest is while it
 // happens. A save stops it; a snapshot lets it run, and the file still
@@ -1610,7 +1610,7 @@ vm_snapshot(struct vm *vm, char *path)
     return -EINVAL;
   }
   if (vm->disk && vm->disk_ip == 0) {
-    // §9: a machine given a raw device cannot be snapshotted until the
+    // a machine given a raw device cannot be snapshotted until the
     // device is an overlay, and saying so is the answer
     iput(ip);
     return -ENOTSUP;
@@ -1846,7 +1846,7 @@ out:
   return r;
 }
 
-// ---- cloning (§9) ----
+// ---- cloning ----
 //
 // The same machine twice, without a copy of its memory and without a file
 // in between: the clone's state is the original's state, written into the
@@ -1956,7 +1956,7 @@ struct src {
   struct file *f;
   uint off;
   uint len;
-  int mac_on;              // M12: every byte read, authenticated
+  int mac_on;              // every byte read, authenticated
   struct hmac mac;
 };
 
@@ -2052,7 +2052,7 @@ restore_from(struct src *s, const char *name, int *idp)
   uint8 key[64], nonce[MIG_NONCE];
   int kl = 0;
   if (s->f) {
-    // M12, replay: this connection's nonce, before anything is read
+    // replay: this connection's nonce, before anything is read
     random_bytes(nonce, sizeof(nonce));
     if (s->f->type != FD_SOCK || s->f->sock == 0 ||
         sockwrite(s->f->sock, 0, (uint64)nonce, sizeof(nonce)) != sizeof(nonce)) {
@@ -2065,7 +2065,7 @@ restore_from(struct src *s, const char *name, int *idp)
     r = -EINVAL;
     goto out;
   }
-  // M12: a stream between hosts with a key is authenticated, and one without is not taken by
+  // a stream between hosts with a key is authenticated, and one without is not taken by
   // a host that has a key (nor an authenticated one by a host that has none to check it with)
   kl = s->f ? mig_key(key) : 0;
   if (s->f && (hdr.flags & VMSTATE_HDR_MAC) && !kl) {
@@ -2112,7 +2112,7 @@ restore_from(struct src *s, const char *name, int *idp)
       goto out;
     // a section's length is the other host's word: it must fit what is left of a file (and of
     // the 32-bit offset), and a known section has exactly its own size (below). It was cut to
-    // uint and trusted, so a length of -16 in a file read the same header for ever (M12).
+    // uint and trusted, so a length of -16 in a file read the same header for ever.
     if (sec.len > (uint64)(end - s->off) || sec.len > 0x7fffffffULL) {
       r = -EINVAL;
       goto out;
@@ -2171,7 +2171,7 @@ restore_from(struct src *s, const char *name, int *idp)
       // built for it. A host whose hardware does not walk that mode cannot take the machine.
       // This compared Sv48 only, and with the host's G-stage depth; a Linux saved on a QEMU host
       // (Sv57) arrived on the ZedBoard's Rocket (Sv39 only), its vsatp write fell back to Bare,
-      // and it fetched its trap vector's virtual address as a guest-physical one for ever (B.4).
+      // and it fetched its trap vector's virtual address as a guest-physical one for ever.
       {
         int need = w->cfg.paging_mode == 8 ? 39 : w->cfg.paging_mode == 9 ? 48 :
                    w->cfg.paging_mode == 10 ? 57 : 0;
@@ -2188,7 +2188,7 @@ restore_from(struct src *s, const char *name, int *idp)
         uint64 room = hyp_guest_room_bytes();
         // A host that keeps its guests small backs them a page at a time: with
         // 2 MB blocks the pages that arrive pull whole blocks in behind them
-        // (f14e: 16 MB negotiated, 24 MB resident on arrival), and the room
+        // (16 MB negotiated, 24 MB resident on arrival), and the room
         // agreed on would mean nothing.
         if (plat_bootarg_num("guestmem"))
           w->cfg.cfg.flags |= VMF_NOHUGE;
@@ -2243,9 +2243,9 @@ restore_from(struct src *s, const char *name, int *idp)
       // files, where an interrupt costs no exit. On a host without them a
       // software IMSIC and a PLIC cost the same, so the policy keeps whatever
       // the guest arrived with and asks for no revision. This is the default
-      // `guestpolicy=native' revises to the host's own
-      // controller always, the policy the endurance and correctness runs of the
-      // first submission exercised.
+      // (a choice of cost); `guestpolicy=native' revises to the host's own
+      // controller always, the policy the earlier endurance and correctness
+      // runs exercised.
       int target = native;
       if (!plat_bootarg("guestpolicy=native") &&
           !(plat.intc_kind == INTC_IMSIC && vimsic_geilen() > 0))
@@ -2374,7 +2374,7 @@ restore_from(struct src *s, const char *name, int *idp)
       // at the guest's boot (Linux patches clear_page with it), and a guest told "block 0" still
       // executes it. So it keeps its block, told or not, and the instruction -- illegal on this
       // hardware -- is done in software (hyp_illegal). Found when a Linux saved on QEMU arrived
-      // on the ZedBoard's Rocket and took an illegal instruction in clear_page (B.4).
+      // on the ZedBoard's Rocket and took an illegal instruction in clear_page.
       if (w->cfg.cboz_block && plat.cboz_block == 0 && (w->cfg.flags2 & VMSTATE_F_CAPABLE)) {
         w->cfg.cfg.flags |= VMF_CBOZ_SET;
         w->cfg.cfg.cboz_block = w->cfg.cboz_block;
@@ -2526,7 +2526,7 @@ restore_from(struct src *s, const char *name, int *idp)
     } else if (strncmp(sec.name, "END", sizeof(sec.name)) == 0) {
       // the sections are over. A file says in its header as well; a
       // connection has only this.
-      vm->t_stream_end = r_time();     // L15: the destination's clock starts here
+      vm->t_stream_end = r_time();     // timeline: the destination's clock starts here
       vm->arrival_timeline = (s->f != 0);
       break;
     }
@@ -2544,7 +2544,7 @@ restore_from(struct src *s, const char *name, int *idp)
     s->off = next;
   }
 
-  // M12: the tag, before anything of this machine runs or is answered
+  // the tag, before anything of this machine runs or is answered
   if (s->mac_on) {
     uint8 want[32], got[32];
     hmac_final(&s->mac, want);
@@ -2606,7 +2606,7 @@ restore_from(struct src *s, const char *name, int *idp)
     // where it was until it has taken the new description; xv6 never needed
     // this (it adopts in the trap before it touches the controller), Linux's
     // driver claimed the anchor's interrupt at the old window, found no window,
-    // and died of the access fault in its interrupt handler (lxintcs3:
+    // and died of the access fault in its interrupt handler (
     // "described no" for 20 s). The old window answers until the ack, as
     // for a live move (vm_revise_intc_addr).
     vm->intc_alias_on = 1;
@@ -2709,7 +2709,7 @@ restore_from(struct src *s, const char *name, int *idp)
     // device: its handler found nothing, returned, was brought again -- an
     // exit storm with the module's threaded handler starved behind it and the
     // arrival never acknowledged (hunt4b crossing 13, hunt4d crossing 384;
-    // m7lx irq.10, 865 s; on the same evidence the first version's 1 in 814).
+    // 865 s in one Linux run; on the same evidence, 1 arrival in 814).
     acquire(&vm->lock);
     vm->irq_alias_on = 1;
     vm->irq_alias_alt = src_irq_alt;

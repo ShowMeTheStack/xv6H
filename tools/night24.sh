@@ -1,22 +1,23 @@
 #!/bin/bash
-# night 24: every result in the paper and the supplement, on the one frozen build freeze24
-# (commit 808f863: d5cc446's hypervisor, defect 55 fixed). Resumable as night 21 was.
+# The first pass of the measurement runs: every result of the evaluation, on one frozen build
+# (the seed named by SEED below, commit 808f863: the hypervisor with defect 55 fixed).
 # Runs ON THE BUILD BOX as the user service xv6h-night24 (enabled: it starts again at boot, and
-# systemd restarts it if it dies; a cron watchdog starts it if it is not running). Every stage is idempotent: ~/xv6h-runs/night24.state lists the
-# stages finished; after a reboot a finished stage is skipped, a queue that died is resumed where
-# it stopped (qrun --resume), and a script that died is started again. Nothing here needs the
-# laptop.
+# systemd restarts it if it dies; a cron watchdog starts it if it is not running). Every stage is
+# idempotent: ~/xv6h-runs/night24.state lists the stages finished; after a reboot a finished
+# stage is skipped, a queue that died is resumed where it stopped (qrun --resume), and a script
+# that died is started again. Nothing here needs the workstation.
 #
-# Lane A (the latency tables, on as quiet a box as it gets within 30 min; each run's load.log
-# says what it was), then two lanes at once: lane 1 the matrix, the Linux suite x20 and the Linux
-# crossings x100; lane 2 the endurance loops two at a time.
+# First the timing stages, one at a time on as quiet a box as it gets within 30 min (each run's
+# load.log records the load); then two chains at once: one runs the pass/fail matrix, the Linux
+# suite x20 and the Linux crossings x100, the other the endurance loops two at a time; last the
+# KVM stages, one at a time.
 set -u
 cd "$(dirname "$0")/.."
 export H=local SEED=freeze24 QUIET=5.0 LXTAG=-freeze21 HOST=local
 . tools/nightlib.sh
 ST=$(eval echo $R)/night24.state
 touch "$ST"
-log "night 24 on $(head -1 BUILDSTAMP 2>/dev/null) ($(sed -n 2p BUILDSTAMP 2>/dev/null))"
+log "measurement pass on $(head -1 BUILDSTAMP 2>/dev/null) ($(sed -n 2p BUILDSTAMP 2>/dev/null))"
 
 # a quiet box if it comes within 30 minutes; otherwise go on (the load is recorded)
 waitquiet30() {
@@ -82,7 +83,7 @@ kstage() {
   log "$name: failed three times; going on without it"; echo "$name FAILED" >> "$ST"
 }
 
-# ---- lane A, one stage at a time on a quiet box: every measurement whose number depends on it ----
+# ---- one stage at a time on a quiet box: every measurement whose number depends on the load ----
 QWAIT=1 istage n24-zed-boot script tools/zedboard.py host guest linux
 QWAIT=1 istage n24-zed-revise script tools/zedboard.py revise rounds=10
 QWAIT=1 istage n24-mask script tools/maskfloor.py 5
@@ -125,7 +126,7 @@ QWAIT=1 istage n24-migmac script tools/migmac.py 64 20
 QWAIT=1 istage n24-migreplay script tools/migreplay.py keyed,plain 16
 QWAIT=1 istage n24-disksmp queue -t linux-disk-smp -r 20 --slots 1
 
-# ---- lanes B and C at once: the pass/fail queues, and the endurance loops two at a time ----
+# ---- two chains at once: the pass/fail queues, and the endurance loops two at a time ----
 (
   istage n24-timeline queue --repeat 20 -t migrate --slots 6
   istage n24-matrix queue --slots 6
@@ -172,5 +173,5 @@ QWAIT=1 kstage n24-k-cross-alt "" t_cross.py alt 300
 QWAIT=1 kstage n24-k-imsicfile "" t_imsicfile.py 20
 QWAIT=1 kstage n24-k-idle "IDLETAG=-n24" t_idle.py 10
 QWAIT=1 kstage n24-k-mask "" t_mask.py 5
-log "night 24 done"
+log "measurement pass done"
 touch "$(eval echo $R)/night24.done"

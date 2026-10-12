@@ -34,7 +34,7 @@ def linux_cmd(q, cmd, timeout=30):
     terminal may wrap it). The command is followed by a marker printed on its
     own line, and that is what is waited for: a prompt alone was ambiguous
     right after an attach or a kernel message, when a stale one sat in the
-    buffer and the call returned before the command had run (lx9)."""
+    buffer and the call returned before the command had run."""
     _lx_seq[0] += 1
     mark = q.mark()
     tag = "_ok%d_" % _lx_seq[0]
@@ -44,7 +44,7 @@ def linux_cmd(q, cmd, timeout=30):
     q.expect(r"linux# ", 10)
     # a host line that landed inside the guest's output is not the guest's answer;
     # one that landed in the middle of a guest line split it, and the two halves are
-    # rejoined once the host's line is taken out (n3-lx100: "virtio device at 0hyp: vm 0: ...")
+    # rejoined once the host's line is taken out (e.g. "virtio device at 0hyp: vm 0: ...")
     out = q.output_since(mark)
     out = re.sub(r"(?<!\n)hyp: [^\n]*\r?\n", "", out)
     return re.sub(r"^hyp: [^\n]*\n?", "", out, flags=re.M)
@@ -70,7 +70,7 @@ def t_linux_boot(QEMU, intc, cpus, log):
         start_linux(q)
         print("    booted to a shell in %.0fs" % (time.time() - t0))
         out = linux_cmd(q, "uname -a")
-        assert re.search(r"Linux \S+ 6\.(12|18)\.", out) and "riscv64" in out, out   # the two LTS kernels the patches are proven on (L5)
+        assert re.search(r"Linux \S+ 6\.(12|18)\.", out) and "riscv64" in out, out   # the two LTS kernels the patches are tested on
         out = linux_cmd(q, "cat /etc/marker")
         assert "marker-in-initramfs" in out, out
         out = linux_cmd(q, "cat /proc/cpuinfo")
@@ -156,7 +156,7 @@ def t_linux_disk_smp(QEMU, intc, cpus, log, extra=""):
             r = t / o
             if best is None or r < best:
                 best, one, two = r, o, t
-        # L6: how often the host actually had both vcpus on harts while both were busy
+        # how often the host actually had both vcpus on harts while both were busy
         detach(q)
         info = host_cmd(q, "vmm info %d" % vmid)
         cr = re.search(r"co-run: both vcpus on harts in (\d+)% of the (\d+) ticks", info)
@@ -217,7 +217,7 @@ def host_cmd(q, line, timeout=30):
 
 
 def t_lx_participating(QEMU, intc, cpus, log):
-    """M5: a stock Linux 6.12 with machrev.ko speaks the revision protocol.
+    """a stock Linux 6.12 with machrev.ko speaks the revision protocol.
     The driver binds to the anchor device, announces itself (SBI MACH
     version), and the host stops treating the guest as legacy."""
     q = boot_host(QEMU, intc, cpus, log)
@@ -346,8 +346,8 @@ def _lx_sleep_secs(q):
     """`sleep 1' timed from the HOST's wall clock (time.time() around the
     command), less the same command's overhead without the sleep. The
     guest's own `time' output cannot be the judge: a timekeeper running ten
-    times slow reports a ten-second sleep as one second (lxtb3: sleep 2 took
-    20 s of wall time at 1 MHz while the guest said 2.00)."""
+    times slow reports a ten-second sleep as one second (sleep 2 can take
+    20 s of wall time at 1 MHz while the guest says 2.00)."""
     bases = []
     for _ in range(3):
         t0 = time.time(); linux_cmd(q, "true", 60); bases.append(time.time() - t0)
@@ -357,7 +357,7 @@ def _lx_sleep_secs(q):
     assert m, out
     guest = float(m.group(1))
     # a ten-times-slow clock says 1.0 for 10 s of wall; the load on the box
-    # adds up to a second of turnaround (m8l: 1.6-1.7 s at four jobs a time)
+    # adds up to a second of turnaround (1.6-1.7 s seen at four jobs a time)
     assert abs(guest - wall) < 1.0 + base, ("the guest's clock disagrees with the wall", guest, wall, base)
     global LAST_SLEEP_GUEST
     LAST_SLEEP_GUEST = guest      # the guest's own `real', for a failure's message
@@ -415,7 +415,7 @@ def t_lx_revise_timebase(QEMU, intc, cpus, log):
         out = linux_cmd(q, "date +%s; sleep 2; date +%s")
         secs = [int(x) for x in re.findall(r"^(\d{9,})\r?$", out, re.M)]
         assert len(secs) == 2 and 1 <= secs[1] - secs[0] <= 3, out
-        # L4: the scheduler's clock (what dmesg stamps with) re-rates too: two
+        # the scheduler's clock (what dmesg stamps with) re-rates too: two
         # marks two seconds apart are two seconds apart in dmesg
         out = linux_cmd(q, "echo tb-a > /dev/kmsg; sleep 2; echo tb-b > /dev/kmsg; dmesg | grep -E 'tb-[ab]$'", 30)
         ts = sorted(set(float(x) for x in re.findall(r"^\[\s*(\d+\.\d+)\] tb-[ab]", out, re.M)))   # kmsg shows each mark twice
@@ -562,7 +562,7 @@ def t_lx_revise_console(QEMU, intc, cpus, log):
 
 
 def t_lx_revise_vector(QEMU, intc, cpus, log):
-    """F10/F11/F12 for Linux (patch 0004 + machrev, L9): the vector unit taken
+    """F10/F11/F12 for Linux (patch 0004 + machrev): the vector unit taken
     from a running Linux when no task holds vector state -- withdrawn, no
     program may start on it (hwprobe says none, the first vector instruction
     is an illegal instruction) -- refused with the count while a task holds
@@ -623,7 +623,7 @@ def t_lx_revise_vector(QEMU, intc, cpus, log):
         # 4. taken with `lazyvector': the first program that uses it asks, and gets it
         revise("lazyvector", True)
         # the first vector instruction traps to the host, which grants the unit on
-        # the spot (Proposition 4's exact observation); the kernel's own ask, a
+        # the spot (so the host sees the first use exactly); the kernel's own ask, a
         # moment later, is answered "yours already" and waits for the revision
         out = linux_cmd(q, "vecuser probe; vecuser use 1; dmesg | grep -E 'machrev: (asked|vector)' | tail -2", 90)
         assert "vecuser: no vector unit" in out and "vecuser: ok" in out, out
@@ -641,7 +641,7 @@ def t_lx_revise_vector(QEMU, intc, cpus, log):
 
 
 def t_lx_revise_intc(QEMU, intc, cpus, log):
-    """F1 for Linux (L2, patch 0005): the interrupt controller exchanged under
+    """F1 for Linux (patch 0005): the interrupt controller exchanged under
     a running Linux -- PLIC to APLIC to APLIC-MSI+IMSIC and back -- the guest
     described with one xv6h,vic node (`vmm start -V') whose driver re-binds its
     backend on each revision. The disk keeps working through each controller
@@ -678,7 +678,7 @@ def t_lx_revise_intc(QEMU, intc, cpus, log):
 
 
 def t_lx_revise_intc_addr(QEMU, intc, cpus, log):
-    """F2 for Linux (L2): the controller's registers moved 256 MB up and back
+    """F2 for Linux: the controller's registers moved 256 MB up and back
     under a running Linux with the description-bound driver."""
     q = boot_host(QEMU, intc, cpus, log)
     try:
@@ -736,7 +736,7 @@ def tests(modes, cpus, log, QEMU):
     return t
 
 
-# ---- L31: the cells the table marked "stock" or "---" for Linux, as tests ----
+# ---- facts for which Linux needs no patch ("stock") or has nothing to adopt, as tests ----
 
 def _lx_info(q, vmid):
     out = host_cmd(q, "vmm info %d" % vmid)

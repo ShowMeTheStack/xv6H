@@ -180,7 +180,7 @@ notify(struct vm *vm)
 // a line the guest will never hear of again. In MSI mode a level source pends only on a rising
 // edge, and a held line has none to give. The source's MSI may have gone out on the far host
 // after the vcpus' interrupt files were written into the stream, before the device and the
-// controller were. Theorem 1 asks for every held line to be raised again on the controller the
+// controller were. The delivery guarantee asks for every held line to be raised again on the controller the
 // machine arrives at; until now that was done only when the controller's kind changed. Re-pend
 // every held level source and let it be delivered. An MSI the guest already holds is the same
 // bit set again, and one it is servicing is a spurious interrupt its handler finds nothing in.

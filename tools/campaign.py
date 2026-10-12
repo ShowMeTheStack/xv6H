@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
 the campaign: the same tests, over and over, on machines of different
-shapes, with the benchmarks at the end (§11.3).
+shapes, with the benchmarks at the end.
 
     tools/remote.sh script campaign tools/campaign.py
 
-§11.1 lists the axes -- interrupt controller, harts, RAM, paging,
+The axes -- interrupt controller, harts, RAM, paging,
 hypervisor, vector, network, disks, journal mode, guest pages, tick,
 linking. Their product is thousands of runs and most of it says nothing:
 the interrupt controller and the hart count interact, the paging mode and
 the RAM size interact, and the rest are independent of one another. What
 this runs instead is one combination per thing that can differ, against a
-baseline that fixes everything else -- which is the restriction §11.3
-asks for, and is why the list below is hand-written and commented rather
-than generated.
+baseline that fixes everything else -- which is why the list below is
+hand-written and commented rather than generated.
 
 Each row is a machine; each machine gets the quick tier (thirty-six
 tests, one of each kind of thing), and the baseline machine also gets the
@@ -70,9 +69,25 @@ def run(cmd, **kw):
 EMU = "qemu-system-riscv6[4]"
 
 
+def mine():
+    """the emulators started from this tree. Matching the command line alone
+    would also match every other run's emulators on the box, and wait_quiet's
+    pkill would then kill them (a concurrent migration run lost both of its
+    hosts that way). An emulator is this tree's if its working directory is
+    HERE."""
+    r = subprocess.run(["pgrep", "-f", EMU], capture_output=True, text=True)
+    pids = []
+    for p in r.stdout.split():
+        try:
+            if os.path.realpath("/proc/%s/cwd" % p).startswith(os.path.realpath(HERE)):
+                pids.append(p)
+        except OSError:
+            pass
+    return pids
+
+
 def quiet():
-    return subprocess.run(["pgrep", "-f", EMU],
-                          stdout=subprocess.DEVNULL).returncode != 0
+    return not mine()
 
 
 def wait_quiet(limit=90):
@@ -80,19 +95,15 @@ def wait_quiet(limit=90):
 
     Every row uses the same disk images (q0-fs.img and its friends), and
     an emulator that has been told to stop is not an emulator that has
-    stopped: the next row's first jobs opened images the last row's
-    stragglers still had, and failed with "Failed to get write lock"
-    -- four tests red for a reason that had nothing to do with them.
+    stopped: the next row's first jobs can open images the last row's
+    stragglers still hold, and fail with "Failed to get write lock".
 
-    Waiting politely is not enough. An emulator whose harness was killed
+    Waiting is not enough. An emulator whose harness was killed
     on the clock was never told to stop at all, and waits for a console
     that will never be read again; it is still there after any limit. So
     the limit is where asking ends and killing begins: between two rows
     nothing in this tree is meant to be running, so anything that is, is
-    a straggler, and the row that comes next is entitled to a clean
-    tree. (Without this the whole full-matrix row came back red: the
-    first job of 140 failed on an image the row before had left open,
-    and sixty-six of the failures were that same lock.)"""
+    a straggler, and the row that comes next gets a clean tree."""
     for _ in range(limit):
         if quiet():
             return True
@@ -100,8 +111,10 @@ def wait_quiet(limit=90):
     print("  (emulators still running after %ds; killing them)" % limit,
           flush=True)
     for sig in ("-TERM", "-KILL"):
-        subprocess.run(["pkill", sig, "-f", EMU],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pids = mine()
+        if pids:
+            subprocess.run(["kill", sig] + pids,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(10):
             if quiet():
                 return True
@@ -113,14 +126,12 @@ def wait_quiet(limit=90):
 def finished(path, resume):
     """the numbers of a row that has already run, or None.
 
-    The build box this campaign runs on resets itself under load -- six
-    rows of ten, and then the machine was gone -- and a row costs four
-    minutes that nobody should pay twice. Each row writes its JSON as it
+    The build box this campaign runs on can reset under load, and a row
+    costs about four minutes. Each row writes its JSON as it
     finishes, so the ones already there are the ones already done.
 
     Believing them is opt-in (--resume) on purpose: a JSON left over from
-    an older tree would otherwise walk into a published table and read as
-    a result of this one."""
+    an older tree would otherwise be reported as a result of this one."""
     if not resume:
         return None
     try:
@@ -177,7 +188,7 @@ def campaign(args):
         run(cmd)
         # each row's console logs kept under its own name: they are
         # written to qlogs/NAME.0.out, and the next row writes over them,
-        # so a failure three rows back had nothing left to look at.
+        # so an earlier row's failure would leave nothing to look at.
         keep = os.path.join(HERE, "qlogs-%s" % name)
         subprocess.run(["rm", "-rf", keep])
         subprocess.run(["cp", "-a", os.path.join(HERE, "qlogs"), keep])

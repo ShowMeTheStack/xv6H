@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# scenario (L29): the mechanism in the service of a fleet decision, end to end.
+# scenario: the mechanism in the service of a fleet decision, end to end.
 #
 #   python3 tools/scenario.py upgrade
 #     Four guests (two xv6, two Linux) run on a host whose interrupt controller is a
@@ -176,6 +176,20 @@ def consolidate():
             print("        " + l[:160])
         if ok:
             print("        (the guest had memory to spare after all: the scenario wanted it in use)")
+            # an earlier run went this way with 13 MB free before the ask: did the program that
+            # held the memory survive, and what did the guest's kernel say (OOM, balloon)?
+            try:
+                g.attach(b, "lc"); b.send("\n"); b.expect(r"linux# ", 120)
+                out = lx.linux_cmd(b, "pidof crossck || echo 'crossck: not running'; tail -3 /tmp/ck.log; "
+                                      "grep -E 'MemTotal|MemFree|MemAvailable' /proc/meminfo; "
+                                      "dmesg | grep -iE 'oom|killed process|out of memory|balloon|virtio_balloon' | tail -12", 120)
+                print("        after the move, on the destination:")
+                for l in out.splitlines():
+                    if l.strip():
+                        print("          " + l.strip()[:200])
+                g.detach(b)
+            except Exception as e:
+                print("        (could not look inside the guest: %s)" % e)
             return
         # the guest is still running on A, and says so
         g.attach(a, "lc"); a.send("\n"); a.expect(r"linux# ", 120)

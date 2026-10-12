@@ -1,5 +1,5 @@
 #!/bin/bash
-# B.2 (runs on the build box): the board from nothing, with the ILA watching Rocket's first moves.
+# The board from nothing, with the ILA watching Rocket's first moves.
 #   bash debug.sh <images dir> <build dir>   -> <build dir>/ila.csv and the console in zedb-console.log
 # One container, one hw_server: xsdb (the load, the release) and Vivado (the ILA) share it.
 set -e

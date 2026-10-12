@@ -81,7 +81,7 @@ vmachrev_notify(struct vm *vm)
   // guest told only by this line -- a Linux bound to its IMSIC, which never enables the
   // software interrupt -- was never told. Found when a Linux saved on QEMU was restored on the
   // ZedBoard and on its QEMU stand-in: the revision on arrival was "described no, repeated 10
-  // times" with the anchor's level held (B.4).
+  // times" with the anchor's level held.
   if (vm->machrev_line)
     vic_set_level(vm, G_MACHREV_IRQ, 0);
   vm->machrev_line = 1;

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# scale (L14): the mechanism's cost along an axis, each a curve for the paper's
-# scaling subsection. Adoption latency is the host's "revision G adopted (0xM) after
+# scale: the mechanism's cost along an axis, one curve per axis. Adoption latency is the host's "revision G adopted (0xM) after
 # T us" line, N revisions there and N back per point; the same measure as
 # adoptprobe.py, on one axis at a time.
 #
@@ -81,7 +80,7 @@ if axis == "vcpus":
 
 elif axis == "ram":
     # a fresh guest per point: F13 only grows, and N additions of 2 GB would carry the
-    # guest's memory node far past the host's (the first run reached 34 GB, unbacked)
+    # guest's memory node far past the host's (34 GB, unbacked, when one guest was reused)
     base = 64 if kind == "xv6" else 256
     for add in (64, 256, 1024, 2048):
         q = th.QEMU(intc="imsic" if kind == "xv6" else "plic", cpus=3, mem="8G", log=LOG)

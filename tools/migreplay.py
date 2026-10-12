@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# M12, replay: a migration stream recorded once and sent again. Two xv6H hosts on the link,
+# migreplay: a migration stream recorded once and sent again. Two xv6H hosts on the link,
 # KEYED (the same migkey= on both) or not. On A, `nc' poses as a destination: it hands the source
 # a nonce of its own choosing and records everything the source sends (the source then finds no
 # destination's answer and keeps its guest). The recording is then sent to B's real `vmm accept'.

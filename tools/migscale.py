@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# migscale (L14d): migration downtime and total time against guest RAM and dirtying
+# migscale: migration downtime and total time against guest RAM and dirtying
 # rate -- the standard live-migration curves. An xv6 guest crosses from an IMSIC host to
 # a PLIC host (the heterogeneous crossing, revised on arrival) while `dirty' rewrites
 # half its memory at RATE MB/s. What is read: the migrate command's wall time on the
@@ -32,8 +32,8 @@ def crossing(mem, rate):
     b = None
     try:
         a.expect(r"init: starting sh", 120); a.expect(r"\$ ", 30)
-        # guestpolicy=native: the destination revises the arriving guest to its own PLIC, as the
-        # first version did by default (the cheapest-controller policy would keep the IMSIC and
+        # guestpolicy=native: the destination revises the arriving guest to its own PLIC, the
+        # earlier default (the cheapest-controller policy would keep the IMSIC and
         # there would be no revision to time)
         b = th.QEMU(intc="plic", cpus=3, mem=hostmem, log=LOG, fsimg=tag + "-b.img", extra_env={"LINK": link, "LINKSRV": "off", "APPEND": "guestpolicy=native"})
         b.expect(r"init: starting sh", 120); b.expect(r"\$ ", 30)

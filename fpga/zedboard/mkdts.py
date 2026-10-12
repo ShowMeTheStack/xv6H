@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.2: the device tree xv6H boots with on the ZedBoard (the ARM loader puts it at Rocket's
+# The device tree xv6H boots with on the ZedBoard (the ARM loader puts it at Rocket's
 # 0x8fe0_0000, where the boot ROM's a1 points), and its QEMU stand-in with the board's ISA
 # profile. Two address cells and two size cells (xv6H's parser; Rocket's own generated tree
 # has one). Rocket's map: CLINT 0x0200_0000, PLIC 0x0c00_0000 (contexts M then S of hart 0,

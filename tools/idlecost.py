@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# idlecost (R17): what the protocol costs a host when nothing is revised, on one build. The same xv6
+# idlecost: what the protocol costs a host when nothing is revised, on one build. The same xv6
 # guest (1 vcpu, 32 MB) idles on one IMSIC host, either taking part in the protocol (the default:
 # it asks the version at boot, the host keeps its revision state, the guest compares a word at its
 # tick) or as a legacy guest (`-a norevise': it never asks, the host treats it as a machine that

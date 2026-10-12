@@ -153,7 +153,7 @@ vimsic_send(struct vcpu *v, int eiid)
   if (eiid <= 0 || eiid >= VIMSIC_NIDS)
     return;
   {
-    // E5: what this send found (the stale-interrupt report prints the last 32)
+    // what this send found (the stale-interrupt report prints the last 32)
     struct vm *vm = v->vm;
     struct msirec *r = &vm->msiring[vm->msiring_n++ % 32];
     r->t = r_time(); r->vcpu = v->id; r->eiid = eiid; r->running = v->running_hart;

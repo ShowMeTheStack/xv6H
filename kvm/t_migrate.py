@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.6: a running Linux guest moved between two KVM hosts (two QEMU machines joined by a private
+# A running Linux guest moved between two KVM hosts (two QEMU machines joined by a private
 # unix-socket link, nothing else on it), by kvmtool's new migration. Then the guest's oracle on
 # the destination: the disk it was using (a file written before the move read back after, and
 # a new write read back), its clock (uptime continues), and its kernel quiet. With ARRIVE set

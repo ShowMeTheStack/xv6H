@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# R17 under KVM: what a guest that speaks the protocol costs its host
+# The idle cost under KVM: what a guest that speaks the protocol costs its host
 # when nothing is revised, against the same guest without it. A: kvmtool with --revise (the anchor
 # exists; the module binds and the guest announces itself). B: without (no anchor; the module finds
 # nothing). Interleaved A, B, A, B ... N rounds each. Each round: boot, wait for the shell, settle

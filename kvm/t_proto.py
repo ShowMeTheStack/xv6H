@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.1 test: the protocol round trip under KVM with the unchanged guest (no fact changes).
+# Test: the protocol round trip under KVM with the unchanged guest (no fact changes).
 import sys, re, time
 sys.path.insert(0, __import__("os").path.dirname(__file__))
 from kvmh import *

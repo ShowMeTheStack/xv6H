@@ -1,5 +1,5 @@
 //
-// The guest's side of machine revision (see mutable.md).
+// The guest's side of machine revision.
 //
 // A hypervisor tells a guest what machine it is on exactly once, and every
 // painful thing about heterogeneous virtualization follows from that: fleets
@@ -225,7 +225,7 @@ reread(uint64 dtb_gpa, struct platform *out)
   // description while this one reads the new one. It used to parse into
   // `plat' with a save and a restore around it, and a hart that read the
   // description in that window -- a tick, an IPI -- found a machine with
-  // nothing in it: with two harts, a hang on one arrival in two (tmr3/tmr4).
+  // nothing in it: with two harts, a hang on one arrival in two.
   memset(out, 0, sizeof(*out));
   out->is_guest = live.is_guest;    // not in the tree; known from boot
   platform_parse_into(out, dtb_gpa);
@@ -325,7 +325,7 @@ map_device(uint64 base, uint64 size, int wanted)
 // does not describe it, so the host says so through MACH fid 6. Exposed as
 // /sys/machine/sbi; consulted by whatever picks between an SBI service and a
 // device (the timer and the IPIs, when a machine is revised to lack Sstc or a
-// CLINT: M2).
+// CLINT).
 static const uint64 sbi_ext_ids[] = {0x54494D45, 0x735049, 0x52464E43, 0x48534D, 0x53525354, 0x4442434E};
 static const char *sbi_ext_names[] = {"time", "ipi", "rfence", "hsm", "srst", "dbcn"};
 static uint32 sbi_present;      // SBIH_* bits, present

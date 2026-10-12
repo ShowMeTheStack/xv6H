@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.2 test: F15 (devmap) and F3 (irqmap) revised under a running Linux guest under KVM,
+# Test: F15 (devmap) and F3 (irqmap) revised under a running Linux guest under KVM,
 # there and back N times each, with the guest's own oracle after every revision: the disk
 # it booted with still mounted, a write read back through the moved window, the interrupt
 # counts moving on the new lines, and the module's line for the revision.

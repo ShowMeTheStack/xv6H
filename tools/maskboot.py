@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# is a guest revised down to the masking floor representative of one booted
+# maskboot: is a guest revised down to the masking floor representative of one booted
 # there? Two cells, in one run on the same box:
 #   booted   a PLIC host with no vector unit whose guests get a 400 kHz timebase
 #            (guesttimebase=400000): the Linux guest boots at the floor and is never revised;

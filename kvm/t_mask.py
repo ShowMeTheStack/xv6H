@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# C under KVM: the masking baseline. One Linux guest (2 vcpus, its disk) on a KVM host (in-kernel
+# The masking baseline under KVM. One Linux guest (2 vcpus, its disk) on a KVM host (in-kernel
 # AIA, 10 MHz, the V extension): measured at its native description, then revised to the fleet's
 # common floor (kvmtool's PLIC, the FPGA's 400 kHz -- a scaled counter, so `time' traps -- and no
 # vector unit), measured, revised back, measured again. maskbench in each cell: scalar and vector

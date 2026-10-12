@@ -1,5 +1,5 @@
 #!/bin/bash
-# B: elaborate a config (arg 1) with ExampleRocketSystem as top, emit Vivado-safe SystemVerilog
+# Elaborate a config (arg 1) with ExampleRocketSystem as top, emit Vivado-safe SystemVerilog
 # with the memories as external macros, and generate block-RAM implementations for them.
 set -e
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 PATH=$HOME/xv6h-fpga/bin:$JAVA_HOME/bin:$PATH

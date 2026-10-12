@@ -273,8 +273,8 @@ int revise__ask(struct kvm *kvm, u32 what)
 		}
 	}
 	/* a revision asked while another is still owed carries both: the guest sees only the
-	 * newest generation, and its tree has both changes in it (the KVM port's first arrival rule:
-	 * "intc plic" then "timebase", and only the timebase adopted) */
+	 * newest generation, and its tree has both changes in it (otherwise an arrival that asks
+	 * "intc plic" then "timebase" would see only the timebase adopted) */
 	owed = revise.acked != revise.gen ? revise.what : 0;
 	what |= owed;
 	slot = revise.next_slot;
@@ -347,7 +347,7 @@ static int revise__init(struct kvm *kvm)
 }
 dev_base_init(revise__init);
 
-/* A.6: the revision state across a migration: the generation and what was acknowledged, the
+/* The revision state across a migration: the generation and what was acknowledged, the
  * slots (their contents are guest RAM, copied with it), what the description says of each cpu,
  * and the facts' own state. A revision in flight is not migrated: one is asked only when none
  * is owed, and lkvm migrate is the asker's to time. */

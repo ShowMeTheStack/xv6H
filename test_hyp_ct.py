@@ -1,6 +1,6 @@
 #
 # the `ct' suite: a container's network, and what it may and may not
-# reach (hypervisor_extension.md §8.2, §11.2).
+# reach.
 #
 # The other half of the suite -- namespaces, control groups, the root a
 # container pivots into, the syscall filter -- is in test-hyp.py, which
@@ -12,7 +12,7 @@
 #
 # The standing assertions of the harness apply to every machine these
 # tests start: qemu's user-mode NAT and nothing else, no listening
-# socket on the laptop, and nothing on the emulated network able to open
+# socket on the workstation, and nothing on the emulated network able to open
 # a connection to it. A container is one more thing behind all of that,
 # and the tests below check that it did not become an exception.
 #
@@ -47,7 +47,7 @@ def script(q, run, path, lines):
 
 def t_ct_net(QEMU, intc, cpus, log, run_cmd):
     """a container's network: its own namespace, its own interface behind a
-    gateway, the world through one address -- and the laptop still out of
+    gateway, the world through one address -- and the workstation still out of
     reach from inside it."""
     q = QEMU(intc=intc, cpus=cpus, log=log)
     try:
@@ -79,20 +79,20 @@ def t_ct_net(QEMU, intc, cpus, log, run_cmd):
         assert "ip 10.9.0.5 mask 255.255.255.0 gateway 10.9.0.1" in out, out
         # the gateway answers for itself -- it is ours, so all of it -- and
         # the world answers through it, for which one reply is the proof and
-        # four would only be a statement about the wifi (see ping_counts in
+        # four would only be a statement about the uplink (see ping_counts in
         # test_hyp_net.py).
         import test_hyp_net as netmod
         c = netmod.ping_counts(out, "10.9.0.1")
         assert c == (2, 2), out
         c = netmod.ping_counts(out, "1.1.1.1")
         assert c and c[0] == 2 and c[1] >= 1, out
-        # the laptop is not reachable from inside a container, as it is not
+        # the workstation is not reachable from inside a container, as it is not
         # reachable from the machine or from a guest
         assert out.count("blocked by the network policy") == 1, out
         # the machine itself is, and deliberately: a container's packets
         # leave the gateway onto the same switch a guest's do, and what a
         # guest may reach a container may reach. What is on the far side
-        # of the laptop is what neither of them may reach.
+        # of the workstation is what neither of them may reach.
         assert "1 packets transmitted, 1 received" in out, out
         # its counters are its own interface's, not the machine's
         assert re.search(r"(?m)^\s*eth0:", out), out
@@ -114,7 +114,7 @@ def t_ct_net(QEMU, intc, cpus, log, run_cmd):
                       120)
         assert "10.0.2.15" in out, out
         print("    a container is behind its own gateway, and nowhere near "
-              "the laptop")
+              "the workstation")
     finally:
         q.close()
 
@@ -158,7 +158,7 @@ def t_ct_ports(QEMU, intc, cpus, log, run_cmd):
         assert "refused" not in out.lower(), out
 
         # and from a *virtual machine* on the same switch, which is the
-        # other side §11.2 asks about: a guest is not the host, and what
+        # other side that matters: a guest is not the host, and what
         # it can reach is what the gateway publishes and nothing else.
         import test_hyp_guest as g
         g.start_guest(q, "-n v1 -m 64 -c 1 -i 10.0.2.50/24", 120)
@@ -290,7 +290,7 @@ def t_ct_exec(QEMU, intc, cpus, log, run_cmd):
 
 
 def t_ct_mount(QEMU, intc, cpus, log, run_cmd):
-    """what a container may mount (§8.2): the file systems that are made
+    """what a container may mount: the file systems that are made
     out of nothing, a second name for a directory it can already reach,
     and nothing that is a disk."""
     q = QEMU(intc=intc, cpus=cpus, log=log)

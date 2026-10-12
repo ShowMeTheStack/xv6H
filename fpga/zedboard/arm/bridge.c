@@ -1,5 +1,5 @@
 /*
- * xv6H on the ZedBoard (B.1): the ARM's only job once Rocket runs. PS UART0 is wired over
+ * xv6H on the ZedBoard: the ARM's only job once Rocket runs. PS UART0 is wired over
  * EMIO to the PL 16550 that Rocket's console is; PS UART1 is the board's USB-UART
  * (/dev/ttyACM0 on the build box). Bytes are copied both ways, nothing else. Bare metal, MMU and
  * caches off, from DDR below Rocket's quarter.

@@ -2,7 +2,7 @@
 #
 # run the test harness on the build box (32 cores), in a named copy of
 # this tree, so that several versions can be tested at the same time
-# while the laptop keeps working:
+# while the workstation keeps working:
 #
 #   tools/remote.sh run NAME SUITE [test-hyp.py args...]   # sync, build, start in tmux
 #   tools/remote.sh queue NAME [tools/qrun.py args...]      # sync, build, the whole matrix as a queue
@@ -29,7 +29,7 @@ RUNS='~/xv6h-runs'
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 cmd=$1; shift || true
 # HOST=local: this is the build box itself (a chain run there, so that nothing waits on the
-# laptop: night 19's chain died with the laptop's session). Commands run here by bash.
+# workstation or dies with its session). Commands run here by bash.
 rsh() { if [ "$HOST" = local ]; then bash -c "$*"; else ssh -o BatchMode=yes $HOST "$@"; fi; }
 
 # the link to the build box is a few hundred kilobytes a second, so a
@@ -40,8 +40,8 @@ rsh() { if [ "$HOST" = local ]; then bash -c "$*"; else ssh -o BatchMode=yes $HO
 sync_tree() { # NAME
   local name=$1
   # SEED=OTHER: copy that run's tree instead of syncing the working tree, so a
-  # script that queues stages over a night cannot pick up an edit made
-  # between them (night 4 lost five stages to a half-made edit that way)
+  # script that queues stages for hours cannot pick up an edit made
+  # between them (a half-made edit would break every later stage)
   if [ -n "${SEED:-}" ]; then
     rsh "rm -rf $RUNS/$name && cp -a $RUNS/$SEED $RUNS/$name && cd $RUNS/$name && \
       rm -rf qlogs qresults.txt results.out done build.out run_script.py && \
@@ -50,23 +50,21 @@ sync_tree() { # NAME
   fi
   rsh "mkdir -p $RUNS/.seed"
   # --delete-excluded as well as --delete: a file that becomes
-  # excluded (a host binary built for the laptop, say) must go from
+  # excluded (a host binary built for the workstation, say) must go from
   # the remote tree too, or make will find it, decide it is current
   # and try to run it.
   # '*.d' below is the dependency files -- but it matches a directory
   # called init.d or rc.d just as happily, so directories ending in .d
   # are included first: a trailing slash makes a pattern match only
-  # those. that cost a whole matrix run once.
+  # those.
   #
   # and '*.img' is excluded wholesale rather than by a list of the names
-  # images have had. The list was fs.img, *-fs.img, test-*.img, mig*.img,
-  # guest[0-9]*.img, guest/*.img, ext4check.img -- and a scratch script
-  # that named its disks ad<pid>-a.img matched none of them, so a sync
-  # spent a slow link pushing 2.3 GB of them to the build box. Nothing
+  # images have had: a list of names misses the next scratch script's
+  # disks, and a slow link then pushes gigabytes of them. Nothing
   # tracked in this tree is a .img (.gitignore excludes them all) and the
   # box builds its own file system image, so there is nothing to lose by
   # excluding the extension.
-  # M9: every run says which build it is -- the commit, and how many files differ from it
+  # every run says which build it is -- the commit, and how many files differ from it
   ( git -C "$HERE" rev-parse HEAD; echo "uncommitted: $(git -C "$HERE" status --porcelain --untracked-files=no | wc -l | tr -d ' ')"; date ) > "$HERE/BUILDSTAMP" 2>/dev/null || true
   rsync -a --delete --delete-excluded \
     --include '*.d/' --exclude '*.o' --exclude '*.d' --exclude '*.asm' --exclude '*.sym' \
@@ -123,10 +121,9 @@ build)
   ;;
 clean)
   # strip finished (or dead) runs on the box to their results and logs: a run is a
-  # copy of the tree plus disk images, and 487 of them filled the box's disk (30 Sep).
+  # copy of the tree plus disk images, and a few hundred of them fill the box's disk.
   # Every log stays (q*.log per slot, console*.log of the probes) and bench/ (the campaign's
-  # per-machine JSON): the guest's view when a job hangs -- defect 24 was read from a slot
-  # log; night 10's grand tour and campaign details were lost to a narrower keep list
+  # per-machine JSON): the guest's view when a job hangs -- defect 24 was read from a slot log
   rsh "cd $RUNS; active=\$(systemctl --user list-units 'xv6h-*' --no-legend | awk '{print \$1}' | sed 's/xv6h-//; s/.service//'); n=0; \
     for d in */; do d=\${d%/}; [ \"\$d\" = .seed ] && continue; echo \"\$active\" | grep -qx \"\$d\" && continue; \
     find \"\$d\" -mindepth 1 -maxdepth 1 ! -name results.out ! -name qresults.txt ! -name qlogs ! -name done ! -name build.out ! -name console.log ! -name test-hyp.log ! -name run_script.py ! -name '*.json' ! -name '*.md' ! -name '*.txt' ! -name '*.log' ! -name bench -exec rm -rf {} + 2>/dev/null; n=\$((n+1)); done; \
@@ -134,7 +131,7 @@ clean)
   ;;
 resume)
   # continue a queue in its existing copy (qrun --resume believes qresults.txt):
-  # no sync, no rm -- the copy is the run (n3-lx100 died at 1 013 of 2 400)
+  # no sync, no rm -- the copy is the run
   name=$1; shift || true
   [ -n "$name" ] || { echo "usage: remote.sh resume NAME [qrun args...]"; exit 1; }
   rsh "cd $RUNS/$name && rm -f done && systemctl --user stop xv6h-$name 2>/dev/null; systemctl --user reset-failed xv6h-$name 2>/dev/null; \

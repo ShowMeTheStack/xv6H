@@ -606,7 +606,7 @@ vm_share_page(struct vm *vm, uint64 gpa, uint64 frame)
   return 0;
 }
 
-// ---- cloning: one machine's pages in two machines (§9) ----
+// ---- cloning: one machine's pages in two machines ----
 //
 // A clone has the memory its original had, and neither of them has a copy
 // of it: every page is mapped into both, read-only, and the first write
@@ -833,7 +833,7 @@ vm_revise(struct vm *vm, uint32 what)
                  vm->state != VM_PAUSED))
     return -1;
 
-  // One thing at a time (L22: the model's host asks one revision and waits
+  // One thing at a time (the Spin model's host asks one revision and waits
   // for its ack; this one did not, and its ack handler took any ack as the
   // current generation's, defect 20). A revision asked over an unacknowledged
   // one would end the earlier alias with the guest's ack of the earlier
@@ -858,7 +858,7 @@ vm_revise(struct vm *vm, uint32 what)
   // guest booted from: Linux's live device tree keeps pointers into that
   // blob (property values are not copied at unflatten), and rewriting it in
   // place turned every `reg' in the running kernel's tree into whatever the
-  // new blob had at that offset (lxp3: cpu@0 with reg 3). Two slots below the
+  // new blob had at that offset (cpu@0 with reg 3). Two slots below the
   // boot blob, used alternately, so the one the guest may still be reading
   // is not the one being written. `describe' answers the current slot.
   uint64 slot1 = vm->dtb_gpa - VM_DTB_MAX, slot2 = vm->dtb_gpa - 2 * VM_DTB_MAX;
@@ -1293,7 +1293,7 @@ vm_revise_console(struct vm *vm, int kind)
   } else if (kind != CON_VIRTIO && vm->con.present) {
     // the device leaves the description now and the machine at the ack: a
     // guest's driver tears down against a device that still answers (Linux's
-    // virtio-console remove path read a window that was gone: fx7)
+    // virtio-console remove path read a window that was gone)
     vm->con_going = 1;
   }
   release(&vm->lock);
@@ -1393,7 +1393,7 @@ vm_revise_mac(struct vm *vm, int alt)
 // The *value* of the clock is continuous across a change of rate: what changes
 // is how fast it advances from here. A kernel that computes elapsed ticks from
 // two readings cannot survive its counter jumping to a tenth or ten times of
-// itself (m2c: the guest never acknowledged). So guest time is
+// itself (the guest never acknowledged). So guest time is
 // tb_g0 + scale(X - tb_x0), with X = host time + htimedelta and (tb_x0, tb_g0)
 // the moment and the value at the last change; and a machine described as
 // 1 MHz from birth simply has tb_x0 = tb_g0 = 0.
@@ -1418,7 +1418,7 @@ vm_guest_time(struct vm *vm)
 // (host time + htimedelta): after a migration the two differ, and the guest was told of a timer
 // interrupt before it was due (a guest behind its host: it took the interrupt, found nothing
 // expired, and read stopi 470 000 times in ten seconds) or not told of one that was raised (a
-// guest ahead: it trapped, read 0, returned and trapped again). Found by B.4 on the ZedBoard.
+// guest ahead: it trapped, read 0, returned and trapped again). Seen on the ZedBoard.
 int
 vcpu_soft_timer_due(struct vcpu *v);
 
@@ -1475,7 +1475,7 @@ vm_revise_timebase(struct vm *vm, uint32 hz)
   // clock then ran at the new rate while its code still converted with the old, every timer it
   // armed was already past, and a guest slow to read the announcement -- under load, or busy
   // with exactly those timers -- reprogrammed its timer in a loop and could not get to the read
-  // (E5: a key-value service stalled for seconds on four of ten timebase revisions; one vcpu
+  // (a key-value service stalled for seconds on four of ten timebase revisions; one vcpu
   // in sbi_set_timer, 29 of 30 samples). The old description holds until the guest acts on the
   // new one, as for every other fact.
   acquire(&vm->lock);
@@ -1671,7 +1671,7 @@ vm_irq(struct vm *vm, int irq)
   // F3 for a guest that boots its own harts (Linux): the console's line stays
   // where it was. Linux's serial core has no way to move a port's interrupt
   // under a running console, and a console whose line has moved is a machine
-  // nobody can talk to (lxmig2: irq axis, no prompt for 480 s). The virtio
+  // nobody can talk to (no prompt for 480 s). The virtio
   // and RTC lines follow (machrev.ko); this one is the second anchor.
   if (irq == G_UART_IRQ && VM_FOREIGN(vm))
     return irq;
@@ -1758,7 +1758,7 @@ vm_revise_irqmap(struct vm *vm, int alt)
   // and what they hold moves to the new numbers at the acknowledgement
   // (vm_irq_alias_end). *Not* vic_levels_restore(): that rebuilds the model
   // from nothing, and on an IMSIC host with a hardware guest file loaded on a
-  // running vcpu it zeroes the per-vcpu file bookkeeping underneath it (m2a).
+  // running vcpu it zeroes the per-vcpu file bookkeeping underneath it.
   vm->irq_alias_on = 1;
   vm->irq_alias_alt = old;
   vm->irq_alt = alt;
@@ -1834,7 +1834,7 @@ vm_revise_intc_addr(struct vm *vm, uint64 shift)
 // the same mechanism -- the windows move, the old ones answer through the alias
 // until the guest has taken the new map (hypmmio.c find_dev), the guest is
 // told -- works under a running guest, and gives the alias window something
-// to be stressed with (L33) and its cost something to be measured on (L20).
+// to be stressed with and its cost something to be measured on.
 int
 vm_revise_map(struct vm *vm, uint64 shift)
 {
@@ -1888,7 +1888,7 @@ vm_revise_map(struct vm *vm, uint64 shift)
 // and forcing vsstatus.VS to Off so that a vector instruction traps rather than
 // quietly using registers the description says are absent. The guest checks
 // whether any task is holding vector state and refuses if so -- which is the
-// paper's argument in one exchange: what a machine may become depends on what
+// design's premise in one exchange: what a machine may become depends on what
 // its guest is relying on at that moment, not on what the fleet can offer.
 int
 vm_revise_vector(struct vm *vm, int on)
@@ -1913,7 +1913,7 @@ vm_revise_vector(struct vm *vm, int on)
   // written either: a guest turns VS on itself when a task first uses the
   // unit (xv6 trap.c, Linux riscv_v_first_use_handler); VS=Initial written by
   // the host told Linux a task had live state and no save area -- an Oops on
-  // the return to user (lxvs4).
+  // the return to user.
   release(&vm->lock);
 
   printk("hyp: vm %d: vector unit %s\n", vm->id, on ? "granted" : "revoked");
@@ -1987,7 +1987,7 @@ vm_unshare(struct vm *vm, uint64 gpa)
       // that brought us here covers every later write until the next round.
       // Leaving the page read-only made every store a trap for the rest of
       // the round: a guest running `dd' under the copy took 3.8 million
-      // faults and 249 s to move 48 MB (fam8, snap-migrate-busy), and the
+      // faults and 249 s to move 48 MB (snap-migrate-busy), and the
       // destination gave up waiting. `nobody had marked' stays the check.
       //
       // The mark and the write-enable have to be one step. The caller marked
@@ -1995,7 +1995,7 @@ vm_unshare(struct vm *vm, uint64 gpa)
       // its re-protect (under memlock) can both run in between, and then the
       // mark sits in the set being sent while the page is handed back writable
       // *after* the re-protect made it read-only -- every later write of the
-      // round unrecorded (busy3: `2 page(s) nobody had marked'). Marking again
+      // round unrecorded (`2 page(s) nobody had marked'). Marking again
       // here, under the lock the re-protect takes, puts the mark in the set
       // that the re-protect follows, whichever order the three ran in.
       pg->flags &= ~(uint16)PG_KSM;
@@ -2096,8 +2096,8 @@ copy_step(struct vm *vm, uint64 gpa, uint64 *hpa, uint64 *len)
 // reports it "not backed" to the sweep, which records zeroes for it; the guest
 // writes it moments later without a fault (dd filling fresh tmpfs pages), and
 // the page reaches the far end as zeroes. Found as `0x805f9000 changed under
-// the copy and nobody had marked it (content)' (busy10c), by the verifying
-// round. Older than everything in this file's journal.
+// the copy and nobody had marked it (content)', by the verifying
+// round.
 int
 vm_peek(struct vm *vm, void *dst, uint64 gpa, uint64 n)
 {
@@ -2153,7 +2153,7 @@ vm_copyout(struct vm *vm, uint64 gpa, void *src, uint64 n)
   // taken into a pre-copy round's send set and the page copied over, and
   // only then the memmove land: content changed, mark consumed, nobody the
   // wiser. That was `page 0x80139000 changed under the copy and nobody had
-  // marked it' (busy6a) -- the virtio-blk used ring, written by the disk
+  // marked it' -- the virtio-blk used ring, written by the disk
   // thread. Marked after, the mark either follows the round's take (next
   // round's set) or precedes it, in which case the copy, which follows the
   // take, sees the write. Older than the one-fault-per-round change; found
@@ -3152,7 +3152,7 @@ vm_resume(struct vm *vm)
   }
   vm->state = VM_RUNNING;
   if (vm->arrival_timeline && !vm->t_resumed)
-    vm->t_resumed = r_time();       // L15: the commit was read and the machine let go
+    vm->t_resumed = r_time();       // timeline: the commit was read and the machine let go
   struct sched_group *sg = vm->sg;
   release(&vm->lock);
   sched_group_freeze(sg, 0);
@@ -3307,7 +3307,7 @@ vcpu_enter(struct vcpu *v)
   }
   v->running_hart = cpuid();
   if (vm->arrival_timeline && !vm->t_first_entry) {
-    vm->t_first_entry = r_time();   // L15: the guest's first instruction on this host
+    vm->t_first_entry = r_time();   // timeline: the guest's first instruction on this host
     uint64 t0 = vm->t_stream_end;
     if (!vm->t_resumed)
       vm->t_resumed = vm->t_first_entry;   // an arrival is started by its first entry, not through vm_resume
@@ -3368,7 +3368,7 @@ vcpu_enter(struct vcpu *v)
   // software model wrote hvictl at every entry; the PLIC and APLIC models
   // never did -- xv6 reads scause and never noticed -- so a Linux booted with
   // Smaia/Ssaia in its ISA string and then given a PLIC or an APLIC took
-  // cause-9 traps with topi 0 forever (vicprobe5: the model's state was right
+  // cause-9 traps with topi 0 forever (the model's state was right
   // and the guest never claimed). Named here for every model; the IMSIC path's
   // own write agrees with it, and a guest file (vgein != 0) reports itself.
   if (plat.has_aia_csrs && v->vgein == 0)
@@ -3630,13 +3630,13 @@ hyp_tick(void)
       if (v->running_hart >= 0)
         on++;
     }
-    // L6: how often a machine's busy vcpus are actually on harts together
+    // how often a machine's busy vcpus are actually on harts together
     if (busy >= 2) {
       vm->corun_busy++;
       if (on >= 2)
         vm->corun_both++;
     }
-    // L1: an announcement is at-least-once. The SSIP that carries it can be
+    // an announcement is at-least-once. The SSIP that carries it can be
     // consumed by the guest's IPI handler in the same trap as a real IPI, and
     // a guest asked on arrival may be asked before its first instruction has
     // run; a repeat is harmless (the guest compares generations) and cheap
@@ -3645,7 +3645,7 @@ hyp_tick(void)
     // the fix or, counted, the evidence.
     // ... and only while the guest has not started on it: a guest that has
     // read describe() is inside its own handler, and a second SSIP there is
-    // a re-entry into its lock (m8x: snap-migrate-vlen stuck at the acquire,
+    // a re-entry into its lock (snap-migrate-vlen stuck at the acquire,
     // "described yes, repeated 10 times").
     if (vm->revise_capable && vm->revise_acked != vm->revise_gen &&
         vm->revise_described != vm->revise_gen &&
@@ -3699,7 +3699,7 @@ hyp_next_deadline(uint64 dflt)
       // that found it woke or kicked the vcpu, and VSTIP goes in on its
       // entry. Re-arming for it set the host's timer 10 us out, again and
       // again, until the guest's handler had written a new deadline -- and
-      // the guest, interrupted every 10 us, took seconds to get there (tb1:
+      // the guest, interrupted every 10 us, took seconds to get there (
       // `sleep 1' = 2.9 s, then 4.6 s, on a 1 MHz machine; Linux on an
       // SBI-timer host crawling through its boot).
       if ((long)(d - now) <= 0)

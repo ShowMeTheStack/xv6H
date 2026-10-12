@@ -165,7 +165,7 @@ prop_reg(struct fdtw *w, uint64 base, uint64 size)
 // The structure block and the strings block are built in two static
 // buffers under a lock and copied out in three pieces, so no contiguous
 // host buffer is needed. One page each was the first version's, and a
-// guest of eight vcpus did not fit (L14: "guest device tree will not fit
+// guest of eight vcpus did not fit ("guest device tree will not fit
 // (error 1, 4664 bytes)" -- the error was the structure block's page, not
 // the blob's 64 KB); NVCPU is 64. returns the blob's size, or -1.
 #define FDT_STMAX (4 * PGSIZE)
@@ -250,11 +250,11 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   if (vm->gw) {
     // what is on the far side of its gateway: the switch's own subnet,
     // and the two addresses on it that are not ours -- qemu's router,
-    // which is the laptop, and qemu's name forwarder. A machine cannot
+    // which is the workstation, and qemu's name forwarder. A machine cannot
     // work this out: 10.0.2.15 is the host it may talk to and 10.0.2.2
-    // is the laptop it may not, and they differ by one number. With
+    // is the workstation it may not, and they differ by one number. With
     // this it may reach the switch through its gateway and still refuse
-    // the two, and its own gateway stops looking like the laptop.
+    // the two, and its own gateway stops looking like the workstation.
     uint32 outer[4] = {netcfg.ip & netcfg.mask, netcfg.mask, netcfg.gw,
                        netcfg.dns};
     prop_cells(&w, "xv6h,outer", outer, 4);
@@ -301,7 +301,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
       char isa[96], ext[128];
       int n = 0, e = 0;
       // the vector unit may have been revoked from this machine even though
-      // the host has one (mutable.md): the description must agree with the
+      // the host has one: the description must agree with the
       // misa this guest is told about, or it would read V in one place and
       // not the other.
       int vec = plat.has_v && !vm->vec_revoked;
@@ -393,7 +393,7 @@ hyp_make_dtb(struct vm *vm, uint64 gpa, int max)
   }
 
   if (VM_VICSHIM(vm)) {
-    // L2: one node, whatever the controller. A guest with the description-bound
+    // one node, whatever the controller. A guest with the description-bound
     // driver (Linux patch 0005) hangs every device line from it and re-binds
     // its backend when the kind or the window changes; the stock drivers never
     // see a compatible they know, so nothing else claims the controller.

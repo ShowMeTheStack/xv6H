@@ -9,7 +9,7 @@
 //   = > >= < <= != !=   comparison, numeric when both sides are numbers
 //   + -
 //   * / %
-// the left side matched against a basic regular expression
+//   :   the left side matched against a basic regular expression
 //
 // the exit status is 0 when the result is neither empty nor zero, 1
 // when it is, 2 when the expression is malformed and 3 on an error.

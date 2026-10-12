@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# control (R8, re-taken for L13): without the revision the guest is deaf.
+# control: without the revision the guest is deaf.
 #
 # The same crossing twice -- an xv6 guest on an IMSIC host moved to a PLIC host --
 # once with the destination told `norevise=1' (it takes the machine and says nothing)
@@ -27,8 +27,8 @@ def crossing(control):
     b = None
     try:
         a.expect(r"init: starting sh", 90); a.expect(r"\$ ", 30)
-        # the destination imposes its own controller (guestpolicy=native), as the first version's
-        # did by default: under the cheapest-controller policy it would keep the guest's IMSIC
+        # the destination imposes its own controller (guestpolicy=native), the earlier
+        # default: under the cheapest-controller policy it would keep the guest's IMSIC
         # and a guest told nothing would be fine, which is not the question asked here
         env = {"LINK": link, "LINKSRV": "off", "APPEND": "guestpolicy=native"}
         if control:

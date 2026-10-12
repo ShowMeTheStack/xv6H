@@ -37,7 +37,7 @@
 // so a machine is given this device when its configuration asks for it.
 #define VMF_CONQUEUE 16
 // present a plain PLIC to this machine even when the host has the AIA. Needed
-// to set up the *source* shape for a controller revision (mutable.md): a guest
+// to set up the *source* shape for a controller revision: a guest
 // that starts as a PLIC guest and is given an IMSIC while it runs.
 #define VMF_WANT_PLIC 32
 // and the other two kinds, as software models wherever the host is. These are
@@ -70,7 +70,7 @@
 // delivered only when it belongs to a conversation the machine itself
 // started, or when it is for a port the machine has published. A
 // published port is named by the port outside and the port inside,
-// which at E7 are on the same address and so are usually the same
+// which are on the same address and so are usually the same
 // number; a gateway is what makes them differ.
 #define NPPORT 8
 
@@ -155,7 +155,7 @@ struct vmentry {
   (((unsigned long)(proto) << 32) | ((unsigned)(hport) << 16) | (unsigned)(gport))
 
 // vm_ctl(id, VMCTL_REVISE, what): tell the guest its machine description has
-// changed and it should look again (mutable.md). `what' is the REV_* mask of
+// changed and it should look again. `what' is the REV_* mask of
 // what the host intends to change; a guest that does not speak the revision
 // protocol ignores the notification and keeps the description it booted with.
 #define VMCTL_REVISE 9
@@ -201,12 +201,12 @@ struct vmentry {
 struct vminfo {
   int id, state, nvcpu, mem_mb, intc, imsic_hw;
   int revise_capable, revise_gen;  // speaks the revision protocol; generation
-  uint32 revise_repeats;           // L1: announcements repeated (a lost one, counted)
+  uint32 revise_repeats;           // announcements repeated (a lost one, counted)
   uint32 revise_stale;             // acks refused as stale (defect 20)
   uint32 irq_quiet_held;           // F3: device interrupts held in the quiet window and raised on the new numbers at the ack
   uint32 aplic_ie, aplic_idel0, aplic_idel1, aplic_tgt10; uint64 aplic_en, aplic_pend, aplic_lvl;   // the APLIC model, for a guest that is not answering
-  uint64 corun_busy, corun_both;   // L6: ticks with two vcpus busy; of those, both on harts
-  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // L20
+  uint64 corun_busy, corun_both;   // ticks with two vcpus busy; of those, both on harts
+  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // device lookups and their cost
   int resident_mb;        // guest RAM actually backed by host memory
   int split_chunks;       // 2 MB chunks backed a page at a time
   int table_pages;        // G-stage page table pages below the root

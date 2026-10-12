@@ -1,4 +1,4 @@
-# revcost (R9, re-taken for L13): controller MMIO accesses per interrupt for the same
+# revcost: controller MMIO accesses per interrupt for the same
 # guest on a PLIC and on an IMSIC -- the number that pays for the participating tier.
 # One IMSIC host; one xv6 guest (1 vcpu, 64 MB) whose controller is exchanged in place
 # (no reboot); a 6 MB write-and-sync workload (fsbench) and a read workload per
@@ -32,8 +32,8 @@ res = {"plic": {"write": [], "read": []}, "imsic": {"write": [], "read": []}}
 try:
     q.expect(r"init: starting sh", 90); q.expect(r"\$ ", 30)
     vmid = g.start_guest(q, "-c 1 -m 64", 120)
-    # fsbench takes -s MB -n FILES now (the first version's "fsbench 6" is a usage error,
-    # which "> /dev/null 2>&1" hid: n4b-revcost measured 0 disk interrupts per round)
+    # fsbench takes -s MB -n FILES (a bare "fsbench 6" is a usage error, and with its
+    # output discarded it does no disk work: 0 disk interrupts per round)
     guest("rm -rf /bench; fsbench -q -s 6 -n 20; sync")   # warm: the files exist, the cache is primed
     g.detach(q)
     kind = "imsic"

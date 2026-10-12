@@ -1,4 +1,4 @@
-# obstime (R1, re-taken for L13; L28 for Linux): what a guest observes, and when. The
+# obstime: what a guest observes, and when. The
 # host stamps the first observation of every fact class (vmm info: "observed:
 # name@Nms"); the guest is sampled after boot, then idle, after disk work, after a
 # vector program, after fork-heavy work. Runs xv6 or Linux.

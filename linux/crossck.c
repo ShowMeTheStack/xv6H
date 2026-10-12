@@ -1,4 +1,4 @@
-// crossck: what a crossing must not disturb, checked from inside the guest (L17).
+// crossck: what a crossing must not disturb, checked from inside the guest.
 //   crossck [MB] [seconds]
 // Fills MB (default 64) of memory with a pattern keyed by the address, then once a
 // second: verifies the whole region, reads CLOCK_MONOTONIC (must not go back, and
@@ -27,8 +27,8 @@ static void on_sigill(int s) { have_v = 0; siglongjmp(jb, 1); }
  * The vector file is held by a thread that makes no system call once it has
  * loaded the registers: Linux discards a task's vector registers on every
  * system call by design (riscv_v_vstate_discard fills them with ones; the
- * psABI makes them caller-saved across syscalls), which is what the first
- * version of this program saw as "vector file changed" after its first
+ * psABI makes them caller-saved across syscalls), so a thread that made one
+ * between checks would report "vector file changed" after its first
  * printf. The thread spins on rdtime and re-checks the file once a second,
  * leaving its verdicts in shared memory for the main thread to report.
  */

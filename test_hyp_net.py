@@ -1,7 +1,7 @@
 #
 # networking tests for test-hyp.py: the host's own stack, xv6 and Linux
 # guests behind the software switch, TLS, and the egress policy that
-# keeps everything away from the laptop and its networks.
+# keeps everything away from the workstation and its networks.
 #
 # they need qemu's user-mode network (NET=1, the default) and an
 # internet connection. the Linux tests need linux/Image built with
@@ -12,7 +12,7 @@ import re, time
 import test_hyp_guest as g
 import test_hyp_linux as L
 
-# addresses that must never be reachable: the laptop (qemu's gateway),
+# addresses that must never be reachable: the workstation (qemu's gateway),
 # a typical home router, a LAN host, a corporate range, link-local.
 FORBIDDEN = ["10.0.2.2", "192.168.1.1", "192.168.0.10", "172.16.0.1", "169.254.1.1"]
 
@@ -42,13 +42,12 @@ def ping_counts(out, dst):
     Which matters because of what the assertion below is allowed to require.
     A destination inside this system -- the host, a guest, a gateway -- is
     ours, and every packet to it must come back; losing one is a defect. But
-    8.8.8.8 is not ours and neither is the wifi in between: this laptop's
-    link has run at 44-72 ms with 9 ms of jitter and has lost 16-62% of its
-    pings for stretches, and `net-host', `net-tools', `net-conntrack',
-    `net-gateway', `net-published' and `ct-net' have all gone red for it.
-    What the test is for is that the translation path works, and one reply
-    proves that as well as four do. Requiring four proves the internet was
-    well, which is not this system's doing either way."""
+    8.8.8.8 is not ours and neither is the link in between, which can lose
+    a large share of its pings for stretches and would fail `net-host',
+    `net-tools', `net-conntrack', `net-gateway', `net-published' and
+    `ct-net' for reasons outside this system. What the test is for is that
+    the translation path works, and one reply proves that as well as four
+    do. Requiring four proves only that the internet was well."""
     i = out.find("PING %s " % dst)
     if i < 0:
         return None
@@ -77,7 +76,7 @@ def xv6_internet(q, https=True):
 
 
 def xv6_policy(q):
-    """the xv6 stack refuses to talk to the laptop or any private network,
+    """the xv6 stack refuses to talk to the workstation or any private network,
     and TLS refuses bad certificates."""
     for ip in FORBIDDEN:
         out = run(q, "ping " + ip, 20)
@@ -620,7 +619,7 @@ def t_host_net(QEMU, intc, cpus, log):
 
 def t_guest_net_dhcp(QEMU, intc, cpus, log):
     """an xv6 guest gets its own DHCP lease through the switch and reaches
-    the internet, including TLS; its policy blocks the laptop too."""
+    the internet, including TLS; its policy blocks the workstation too."""
     q = g.boot_host(QEMU, intc, cpus, log)
     try:
         g.start_guest(q, "-n g1 -c 2 -i dhcp", 90)
@@ -679,8 +678,8 @@ def linux_internet(q, https=True):
     out = L.linux_cmd(q, "ping -c 2 -W 5 8.8.8.8", 40)
     # as everywhere else in this file: it must send what it was told to, and
     # the world must answer at least once. Requiring both replies is a
-    # statement about the wifi (see ping_counts above), and this laptop's has
-    # failed this test twice in an afternoon for one lost packet.
+    # statement about the uplink (see ping_counts above), where one lost
+    # packet would fail the test.
     # busybox says "1 packets received" where xv6's own ping says "1
     # received", and a regex that knows only one of the two reads a lost
     # packet as a lost test.
@@ -700,7 +699,7 @@ def linux_internet(q, https=True):
 
 def linux_blocked(q):
     """Linux has no policy of its own: the switch drops what it sends to
-    the laptop and private networks."""
+    the workstation and private networks."""
     for ip in FORBIDDEN:
         out = L.linux_cmd(q, "ping -c 1 -W 3 " + ip, 30)
         assert "100% packet loss" in out, (ip, out)

@@ -4,8 +4,8 @@
 # rate can be changed while the machine runs.
 #
 # the numbers come from user/schedbench.c, which also builds and runs
-# on Linux (tools/linuxbench.sh), so the targets below are the ones
-# section 6 of the plan sets against Linux on the same QEMU: fairness
+# on Linux (tools/linuxbench.sh), so the targets below are set against
+# Linux on the same QEMU: fairness
 # within five per cent, latency within twice, throughput within twice.
 #
 import re, time
@@ -46,7 +46,7 @@ def t_sched_latency(QEMU, intc, cpus, log):
     """message passing, wakeup latency, yields and fork: the numbers,
     and a floor under each so that a regression is a failure and not a
     line in a log nobody reads. The floors are generous -- this is a
-    software-emulated machine and the laptop it runs on is not idle --
+    software-emulated machine and the host it runs on is not idle --
     but a factor of two would not pass them."""
     q = g.boot_host(QEMU, intc, cpus, log)
     try:

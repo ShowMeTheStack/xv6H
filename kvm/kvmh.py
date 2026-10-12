@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# The KVM harness (runs on the build box): a KVM host booted under QEMU, driven over its console.
+# The KVM harness: a KVM host booted under QEMU, driven over its console.
 # Guests run under lkvm in the background with their consoles in files; the host shell runs
-# `lkvm revise` and reads the guests' logs. Used by every workstream-A test.
+# `lkvm revise` and reads the guests' logs. Used by every KVM test (t_*.py).
 import os, re, subprocess, sys, time, select
 K = os.path.expanduser("~/xv6h-kvm")
 

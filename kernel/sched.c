@@ -168,7 +168,7 @@ static struct rq rqs[NCPU];
 // what is used would mean taking the group's lock on every tick; this
 // is a slice taken once and spent locally.
 #define BANDWIDTH_SLICE_MS 5
-// and the default period of cpu.max, which the plan sets at a tenth
+// and the default period of cpu.max, which is a tenth
 // of a second: short enough that a limit is felt, long enough that
 // the pool is not taken apart on every tick.
 #define BANDWIDTH_PERIOD_MS 100
@@ -901,13 +901,13 @@ task_hot(struct proc *p, uint64 now)
 // other is spinning for. Kept together because each had "only just run", the two vcpus of a
 // Linux guest shared one hart while the other two harts of the host idled, and every hand-over
 // of a contended guest lock cost a host tick: a key-value service in the guest stalled for
-// seconds (E5; worst at a scaled timebase, where every clock read in a critical section traps;
+// seconds (worst at a scaled timebase, where every clock read in a critical section traps;
 // gone with one vcpu). A waiting sibling is taken by an idle hart however recently it ran.
 // the tasks a hart has to run, counted for balancing. rq->nr_running counts the entities at its
 // root, and a group is one entity however many of its tasks are runnable here: a machine whose
 // two vcpus were both on one hart -- one running, one waiting -- counted as one task, so neither
 // the tick's balance (two wanted) nor an idle hart's steal (more than one wanted) ever looked at
-// it, and the waiting vcpu waited while another hart was idle (E5: the guest's lock convoys).
+// it, and the waiting vcpu waited while another hart was idle (the guest's lock convoys).
 // Unlocked, like every other reading the balance makes of another hart.
 static int
 rq_tasks(int cpu)
@@ -1024,7 +1024,7 @@ sched_tickless_ok(void)
   // nr_running counts the task on the processor too (see the note above
   // ent_count), so one means this task and nobody else -- counted as tasks, not root entities: a
   // vcpu with its sibling waiting in the same group is not alone, and its hart must keep ticking
-  // to balance the sibling away (E5)
+  // to balance the sibling away
   if (p == 0 || rq_tasks(cpuid()) > 1 || p->vcpu == 0)
     return 0;
   struct gq *q = rq->curr_gq;
@@ -1730,7 +1730,7 @@ sched_stats(uint64 *out, int n)
   }
 }
 
-// E5: the scheduler's view of a task left waiting (the stale-interrupt report in vvnet.c): the
+// the scheduler's view of a task left waiting (the stale-interrupt report in vvnet.c): the
 // task, its group's queue on its hart, and every hart. Read without locks: a diagnostic, racy
 // by design, printed at most once in ten seconds.
 void

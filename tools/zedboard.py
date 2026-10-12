@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.2 on the board: xv6H on Rocket + H on the ZedBoard, from nothing, over JTAG and the USB-UART.
+# zedboard: xv6H on Rocket + H on the ZedBoard, from nothing, over JTAG and the USB-UART.
 #   tools/remote.sh script zedb tools/zedboard.py [steps]     steps: host (default), guest, linux
 #
 # What it does, in order:
@@ -47,7 +47,7 @@ sh("rm -f fs.img && make -s fs.img HOSTFS_MB=90 GUESTDISKS=1 HOSTFILES='%s' && c
 sh("riscv64-unknown-elf-objcopy -O binary --set-section-flags .bss=alloc,load,contents kernel/kernel %s/kernel.bin" % IMG)
 sh("python3 fpga/zedboard/mkdts.py board > %s/zed.dts && dtc -q -I dts -O dtb -o %s/zed.dtb %s/zed.dts" % (IMG, IMG, IMG))
 if "restore" in steps:
-    # B.4, QEMU -> board: the machine saved on a QEMU host (tools/b4_depart.py) into the board's root
+    # QEMU -> board: the machine saved on a QEMU host (tools/b4_depart.py) into the board's root
     sh("debugfs -w -R 'write %s/q.vst /q.vst' %s/fs.img" % (IMG, IMG))
 sh("make -s -C fpga/zedboard/arm && cp fpga/zedboard/arm/bridge.elf %s/" % IMG)
 sh("cd %s && rm -rf xsa && mkdir xsa && cd xsa && unzip -q -o %s/xv6hzed.xsa && ls" % (IMG, BUILD))
@@ -172,8 +172,8 @@ try:
         step("xv6 guest", xv6_guest)
         m = q.mark(); q.cmd_("echo hi from the guest; sleep 1; echo done", timeout=300); print(q.output_since(m))
         G.detach(q)
-        # the board has one core: the Linux guest boots alone, as it did on 3 Oct (vm 0), not beside
-        # this one (night 24's first boot, with g1 still running, took 2.7 times as long)
+        # the board has one core: the Linux guest boots alone (vm 0), not beside
+        # this one (a boot with g1 still running took 2.7 times as long)
         q.cmd_("vmm kill g1", timeout=300)
     if "linux" in steps:
         def linux_guest():
@@ -189,7 +189,7 @@ try:
         print(L.linux_cmd(q, "uname -a; cat /proc/cpuinfo | head -8; sleep 1; date", 600))
         L.poweroff(q)
     if "save" in steps:
-        # B.4, the board's half: a running Linux guest (no disk: initramfs only) is saved to a file
+        # board -> QEMU, the board's half: a running Linux guest (no disk: initramfs only) is saved to a file
         # on the RAM disk, the RAM disk read out of DDR over JTAG, and the file taken out of it
         def lx_save():
             q.send("sh /lx\n")
@@ -256,7 +256,7 @@ try:
             assert marker in out, out
         step("restore on the board", lx_restore)
     if "revise" in steps:
-        # B.3: facts revised under a running Linux on the hardware, each followed by the guest's
+        # facts revised under a running Linux on the hardware, each followed by the guest's
         # own oracle (its disk, written and read back); the adoption time is xv6H's own line
         def lx_start():
             q.send("sh /lxv\n")
@@ -274,7 +274,7 @@ try:
         q.send("vmm revise %d aplic\n" % q.vmid); q.expect(r"\$ ", 120)
         print("B3 aplic: " + q.output_since(q.mark() - 300)[-160:].replace("\n", " ")); sys.stdout.flush()
         # rounds=N: each round revises the four facts this host can present there and
-        # back, so N=10 gives n=20 per fact; without it, the first round's list of B.3
+        # back, so N=10 gives n=20 per fact; without it, the original fixed list
         if "rounds" in opts:
             FACTS = ["intcmap alt", "intcmap default", "map alt", "map default",
                      "timebase 1000000", "timebase 400000", "sbi rfence", "sbi none"] * int(opts["rounds"])

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# schedbench on Linux, on the same QEMU, from the laptop:
+# schedbench on Linux, on the same QEMU, from the workstation:
 #
 #   tools/linuxbench.sh [-t secs] [-c cpus] [test ...]
 #

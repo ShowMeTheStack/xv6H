@@ -943,7 +943,7 @@ spawn_vcpus(int id, int nvcpu)
   return 0;
 }
 
-// vmm save NAME FILE: the machine, written down (§9).
+// vmm save NAME FILE: the machine, written down.
 //
 // The file is made here rather than in the kernel: it then belongs to
 // whoever ran this, with their umask, and the kernel needs no second
@@ -1064,7 +1064,7 @@ cmd_clone(int argc, char *argv[])
 }
 
 // vmm migrate VM HOST:PORT: the machine, over a connection, to another
-// xv6H host (§9).
+// xv6H host.
 //
 // The connection is made here, in a program, with the ordinary socket
 // calls; the kernel writes the machine into it. What crosses is the same
@@ -1073,8 +1073,8 @@ cmd_clone(int argc, char *argv[])
 //
 // It is a stop-and-copy: the guest is paused for as long as its memory
 // takes to cross. Iterative pre-copy -- sending the memory while the guest
-// runs and then only what it dirtied -- is what §9 asks for and is not
-// here; the snapshot machinery from E9 is what it would be built on.
+// runs and then only what it dirtied -- is not implemented; it would be
+// built on the snapshot machinery.
 static void wait_freed(int id);
 
 static int
@@ -1746,18 +1746,18 @@ stats(void)
 }
 
 // how long to wait for a machine to be gone. A tick is 1/TICK_HZ of a second
-// and TICK_HZ is 100, so the old count of 100 was one second -- which was
-// calibrated on guests whose RAM is backed by megapages, where there are
-// sixty-four blocks to give back and it takes a few hundred milliseconds.
+// and TICK_HZ is 100. A guest whose RAM is backed by megapages has
+// sixty-four blocks to give back, which takes a few hundred milliseconds,
+// so one second would do for it.
 //
 // A guest started with -4 has a frame per page: 32768 of them for a 128 MB
 // machine, each one walked and freed, and a guest that has touched all its
-// memory has all of them. On a loaded laptop that crosses a second often
-// enough to matter -- measured at 0.4 s when the machine was quiet and past
-// the deadline when it was not, with the machine reliably gone a moment
-// later. `guest-pages' then failed for a reason that was nothing to do with
-// what it tests: `vmm kill' gave up and exited without printing, and the
-// test sat waiting for a line nobody was going to write.
+// memory has all of them. On a loaded host that takes more than a second:
+// about 0.4 s when the host is quiet, longer when it is not. Too short a
+// wait makes `vmm kill' give up and exit without printing while the machine
+// is still being freed, and a test such as `guest-pages' then waits for a
+// line that never comes.
+//
 //
 // Thirty seconds is not a real wait -- nothing takes it -- it is long enough
 // that reaching it means something is actually wrong.

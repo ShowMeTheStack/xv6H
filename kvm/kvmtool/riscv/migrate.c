@@ -1,5 +1,5 @@
 /*
- * Migration for kvmtool on RISC-V (A.6): kvmtool has none. A running VM is moved to another
+ * Migration for kvmtool on RISC-V: kvmtool has none. A running VM is moved to another
  * kvmtool on another KVM host:
  *
  *   destination:  lkvm run ... --revise --incoming PORT       (same disk, memory and cpus)
@@ -85,7 +85,7 @@ static int xfer_all(int fd, void *buf, size_t n, bool out)
 }
 
 /*
- * A test of the receiver (M12): XV6H_MIG_CORRUPT="TAG:OFF:VAL" writes the 32-bit VAL at byte OFF
+ * A test of the receiver: XV6H_MIG_CORRUPT="TAG:OFF:VAL" writes the 32-bit VAL at byte OFF
  * of the first record with that tag, and "TAG:len:N" sends that record N bytes short. The
  * destination must refuse the machine, and the machine must run on here. The case is read
  * afresh at each migration, from the variable or from the file XV6H_MIG_CORRUPT_FILE names.
@@ -215,7 +215,7 @@ static int send_vcpu(int fd, struct kvm_cpu *vcpu, int *nregs)
 
 /*
  * Everything below reads a record the other host sent. The stream is trusted to come from a host
- * of the fleet (the threat model of the paper's security section), but a record is never read
+ * of the fleet (the threat model assumed here), but a record is never read
  * past its own length, and an index in it is never used before it is checked: a corrupt or
  * hostile stream ends the arrival, it does not reach this process's memory.
  */

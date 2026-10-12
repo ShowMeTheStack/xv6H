@@ -95,7 +95,7 @@ sys_vm_save(void)
 // vm_restore(path, name): a machine made from a file, stopped, with the
 // new name if one was given. Its id is the answer.
 // vm_snapshot(id, path): the same file as a save, written while the
-// machine runs (§9).
+// machine runs.
 uint64
 sys_vm_snapshot(void)
 {
@@ -134,7 +134,7 @@ sys_vm_clone(void)
 }
 
 // vm_migrate(id, fd): the machine, down a connection somebody else has
-// already made (§9, E11). The machine is paused for the length of the
+// already made. The machine is paused for the length of the
 // transfer -- a stop-and-copy -- and destroyed here once the other end
 // has it, because two of the same machine running is one too many.
 uint64
@@ -178,7 +178,7 @@ sys_vm_migrate(void)
     return r;
   }
   vm->t_committed = r_time();
-  // L15: the source's half of the outage, from the moment the vcpus stopped
+  // timeline: the source's half of the outage, from the moment the vcpus stopped
   if (vm->t_stop)
     printk("hyp: vm %d: crossing, this side: stopped +0, last page +%ld us, taken by the far end +%ld us, committed +%ld us\n",
            vm->id, (long)((vm->t_lastpage - vm->t_stop) / 10), (long)((vm->t_acked - vm->t_stop) / 10),
@@ -255,7 +255,7 @@ sys_vm_ctl(void)
   struct vm *vm = vm_arg(vmid, &err);
   if (err)
     return err;
-  // a word of the guest's memory, read from outside (E7: which cpu holds the lock both vcpus
+  // a word of the guest's memory, read from outside (e.g. which cpu holds the lock both vcpus
   // spin on). Before the hold below: reading is not a revision.
   if (op == VMCTL_PEEK) {
     uint32 w;

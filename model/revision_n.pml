@@ -16,7 +16,7 @@
  *   no_owed   every fact asked for is eventually in an acknowledged revision;
  *   caught_up every hart eventually reaches the host's generation.
  *
- * The rate. Fact 0 is the counter's rate, which cannot be aliased: the host
+ * The rate (MACH call 7). Fact 0 is the counter's rate, which cannot be aliased: the host
  * serves one rate at a time (`served'), and every time read must be converted with the rate the
  * guest is using (served == belief[0]). The protocol as fixed serves the new rate from the
  * guest's re-base, which calls MACH call 7 (rate_now) in the same step (Linux re-bases every CPU

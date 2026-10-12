@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# M12: the migration stream authenticated (HMAC-SHA256, `migkey=' on both hosts' command lines).
+# migmac: the migration stream authenticated (HMAC-SHA256, `migkey=' on both hosts' command lines).
 # Two xv6H hosts on the private link; an xv6 guest of MB megabytes crosses A -> B in each case:
 #   none   no key on either side                       moves (the baseline time)
 #   same   the same key on both                        moves (the cost of the MAC)

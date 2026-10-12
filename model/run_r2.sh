@@ -1,8 +1,8 @@
 #!/bin/sh
-# the model with MACH call 7 (rate_now). Resumable: a property whose output already
+# The model with MACH call 7 (rate_now). Resumable: a property whose output already
 # has its final statistics is not run again, so a reboot costs only the search in progress.
 # Runs in ~/xv6h-spin/r2 on the build box.
-#   2x2: SAFETY and the three liveness properties, exhaustive (as Table 7's first rows)
+#   2x2: SAFETY and the three liveness properties, exhaustive
 #   2x2: the two variants that must fail SAFETY (-DRATE_AT_ASK: defect 49; -DNO_CALL7)
 #   3x2: SAFETY exhaustive under COLLAPSE (60 GB); then the three liveness properties by bitstate
 export PATH=$HOME/spin/Spin-master/Src:$PATH

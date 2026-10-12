@@ -1,5 +1,5 @@
 #!/bin/bash
-# B.1 (runs on the build box): the ZedBoard bitstream for one generated config, in the Vivado container.
+# The ZedBoard bitstream for one generated config, in the Vivado container.
 #   bash build.sh [XV6HZedSoCConfig]
 set -e
 CFG=${1:-XV6HZedSoCConfig}

@@ -19,7 +19,7 @@ uint ticks;
 // journal timers, the processor time a process is charged -- is in
 // units of one of these, so changing the rate changes what an already
 // counted tick meant. It is a thing to set at boot and leave alone;
-// it is settable because the plan asks for it and because the way to
+// it is settable because the way to
 // find out what a hundred hertz costs is to be able to try ten.
 int tick_hz = TICK_HZ;
 uint64 tick_interval;

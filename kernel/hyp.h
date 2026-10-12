@@ -216,8 +216,8 @@ struct vvnet {
   struct vq_state q[2];     // 0: receive, 1: transmit
   uint32 intr_status, status;
   uint64 rx_frames, tx_frames, rx_dropped, tx_dropped;
-  int nobuf_said;           // E5: the first no-buffer drop since arrival has been reported
-  uint64 raised_at;         // E5: when intr_status last went from 0 to 1 (host time), 0 if clear
+  int nobuf_said;           // the first no-buffer drop since arrival has been reported
+  uint64 raised_at;         // when intr_status last went from 0 to 1 (host time), 0 if clear
   uint64 stale_said;        // and when a stale interrupt was last reported
 };
 
@@ -518,7 +518,7 @@ struct vm {
   struct vdev dev[VM_MAXDEV];
   // rising edges per interrupt line, by irq number (see vic_set_level)
   uint64 irq_raised[VPLIC_NIRQ];
-  // ---- machine revision (mutable.md) ----
+  // ---- machine revision ----
   //
   // The description a guest was given is not final. `revise_gen' counts
   // revisions; the guest learns of one through a supervisor software interrupt
@@ -527,7 +527,7 @@ struct vm {
   // be changing. `revise_acked' is the generation the guest has adopted, and
   // `revise_adopted' is the bitmask of what it managed (REV_* below).
   // the vector unit can be taken away from a running guest and given back
-  // (mutable.md Phase 3). Revoking is masking V out of the misa this guest is
+  // (a revision of the machine). Revoking is masking V out of the misa this guest is
   // told about and out of its device tree, and forcing vsstatus.VS to Off so
   // that any vector instruction traps. A guest with live vector state in a task
   // refuses, which is the whole argument: what a machine may become depends on
@@ -600,18 +600,18 @@ struct vm {
   uint64 t_first_tx, t_last_tx; int tx_vcpu; // revision trace: the guest's console writes after the ask, and who wrote last
   uint32 revise_what;     // what the last revision said had changed (REV_*), for MACH fid 6
   uint64 revise_done;     // host tick when the ack came back
-  uint64 revise_repeat_at; // L1: when the announcement was last repeated
+  uint64 revise_repeat_at; // when the announcement was last repeated
   uint32 revise_repeats;   // how many times it had to be (a lost announcement, explained)
   uint32 revise_stale;     // acks refused for naming an older generation (defect 20)
   uint32 revise_described; // the generation the guest last asked describe() for
   int revise_wd_printed;   // the watchdog's line, once per generation
-  uint64 corun_busy, corun_both; // L6: ticks with >=2 vcpus busy; of those, >=2 on a hart together
-  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // L20: device lookups and their cost
-  uint64 request_at, requests_refused;  // L21: fid 5 rate limit
+  uint64 corun_busy, corun_both; // ticks with >=2 vcpus busy; of those, >=2 on a hart together
+  uint64 lookup_direct, lookup_direct_cyc, lookup_alias, lookup_alias_cyc; // device lookups and their cost
+  uint64 request_at, requests_refused;  // fid 5 rate limit
   int irq_alias_on, irq_alias_alt;      // F3 alias: devices raise on the numbering the guest still has, until the ack
   int irq_quiet; uint64 quiet_set; uint64 irq_quiet_held;
   volatile uint32 map_seq;
-  // L15: the crossing's timeline, in host ticks (r_time, 10 MHz). Source: when the
+  // the crossing's timeline, in host ticks (r_time, 10 MHz). Source: when the
   // vcpus stopped for the last round, when the last page went, when the far end
   // said it had the machine, when the commit went. Destination: when the stream
   // ended, when the commit was read and the machine resumed, when a vcpu first
@@ -651,7 +651,7 @@ struct vm {
   // to, so that the guest's clock goes on from where it stopped rather
   // than jumping forward by however long the file sat on a disk.
   uint64 htimedelta;
-  // E5's lost interrupts, this host only (not migrated): MSIs the APLIC model sent per source
+  // lost-interrupt evidence, this host only (not migrated): MSIs the APLIC model sent per source
   // and the last MSIs sent to its vcpus' files, newest at msiring_n - 1 (mod 32)
   struct msirec { uint64 t; short vcpu, eiid, running, hwfile, hwhart, idle; uint8 path; } msiring[32];
   uint32 msiring_n;
@@ -723,8 +723,8 @@ int vm_irq_described(struct vm *vm, int irq);   // the number in the description
 // windows, the controller window, the interrupt numbering, the hart numbers,
 // the cache block) asks this, never the generation alone: the facts change
 // before the generation is bumped, and in that gap a check of the generation
-// said "nothing pending" while the guest still had the old fact (alias1: 38
-// wrong reads through the old map; alias2/3: 8 half-zeroed pages in 2 253,
+// said "nothing pending" while the guest still had the old fact (38
+// wrong reads through the old map; 8 half-zeroed pages in 2 253,
 // cbo.zero run in hardware at 64 bytes against a guest striding 128).
 static inline int vm_revising(struct vm *vm) { return vm->revise_hold || vm->revise_acked != vm->revise_gen; }              // F3: the ack (hyp.c), vm->lock held
 void cons_set_attached(struct vm *vm, int on);   // vuart.c: console ownership
@@ -812,7 +812,7 @@ static inline int vm_vcpu_of_hart(struct vm *vm, long hart) {
   // then the guest's IPI masks, and the interrupt-controller context its
   // anchor line is enabled in, still carry the old numbers -- a Linux guest
   // renumbered on arrival never heard of the revision, because the line
-  // announcing it was enabled in a context that had just moved (lxf9).
+  // announcing it was enabled in a context that had just moved.
   if (vm->hart_alias_on && vm->revise_acked != vm->revise_gen) {
     i = hart - vm->hart_alias_shift;
     if (i >= 0 && i < vm->nvcpu)

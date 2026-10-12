@@ -1,4 +1,4 @@
-# xv6H on the ZedBoard (B.1): bring the board up from nothing, over JTAG.
+# xv6H on the ZedBoard: bring the board up from nothing, over JTAG.
 #   xsdb load.tcl <dir with xv6hzed.bit and ps7_init.tcl> <bridge.elf> <image> <addr> [<image> <addr> ...]
 # Addresses are DDR addresses as the ARM sees them; Rocket's 0x8xxx_xxxx is DDR 0x1xxx_xxxx.
 # Order: the PS first (clocks, DDR, MIO), the PL programmed, the images loaded with Rocket

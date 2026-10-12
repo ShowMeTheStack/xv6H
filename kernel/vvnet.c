@@ -47,7 +47,7 @@ wr16(struct vm *vm, uint64 gpa, uint16 v)
   return vm_copyout(vm, gpa, &v, 2);
 }
 
-// E5: an interrupt raised more than half a second ago and never acknowledged, with frames still
+// an interrupt raised more than half a second ago and never acknowledged, with frames still
 // arriving (delivered or dropped for want of a buffer): the guest is not servicing its NIC. Say
 // what the controller and the target's interrupt file hold, at most once in ten seconds: a lost
 // MSI, or a guest that has it and does not take it? caller holds vm->lock.
@@ -111,7 +111,7 @@ raise_irq(struct vm *vm)
   vic_set_level(vm, vm_irq(vm, G_VNET_IRQ), 1);
 }
 
-// frames the guest NICs of this host dropped, by reason (E5: where a crossing's lost segments
+// frames the guest NICs of this host dropped, by reason (where a crossing's lost segments
 // go): 0 the machine was stopped, 1 no buffer posted, 2 anything else. /proc/net/sockstat.
 uint64 vnet_drops[3];
 
@@ -127,7 +127,7 @@ vvnet_rx(struct vm *vm, struct mbuf *m)
     goto drop;
   // A machine that is not running receives nothing: a frame written into a
   // paused guest's buffer during a migration's final round arrives at the
-  // far end stale or not at all (busy8a: `0x805f5000 changed under the copy
+  // far end stale or not at all (`0x805f5000 changed under the copy
   // and nobody had marked it'). vm_pause takes this lock, so once it has
   // returned no delivery is in flight. A NIC on a stopped machine drops.
   if (vm->state != VM_RUNNING) {
@@ -137,7 +137,7 @@ vvnet_rx(struct vm *vm, struct mbuf *m)
   uint16 avail_idx, head;
   if (rd16(vm, q->avail + 2, &avail_idx) < 0 || avail_idx == q->last_avail) {
     why = 1;
-    // E5: a crossing's lost requests went here. Once per arrival, what the device and the
+    // a crossing's lost requests went here. Once per arrival, what the device and the
     // controller hold: is the guest not refilling because it never heard the last interrupt?
     if (!n->nobuf_said) {
       uint16 used_idx = 0;

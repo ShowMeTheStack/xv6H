@@ -1,6 +1,6 @@
 # hunt4: a Linux participating guest crossing between two hosts that differ in
-# interrupt numbering (the axis that once went unacknowledged: m7lx irq.10,
-# 865 s), with the at-least-once announcement and the revision watchdog on the
+# interrupt numbering (the axis on which a revision once went unacknowledged
+# for 865 s), with the at-least-once announcement and the revision watchdog on the
 # host. Every arrival: the host's "adopted" line, then the guest itself (the
 # disk it left with mounted, a write, /proc/interrupts naming the virtio lines).
 #   python3 tools/hunt4.py [cycles]      # one cycle = A->B->A
@@ -33,7 +33,7 @@ try:
     out = lx.linux_cmd(a, "dmesg | grep -c 'machrev: speaking'")
     assert re.search(r"\n1\r?\n", out), out
     lx.linux_cmd(a, "mount /dev/vda /mnt && echo gen0 > /mnt/keep && sync && echo written")
-    # L17: memory, clock and vector file verified from inside the guest every second, for the whole hunt
+    # memory, clock and vector file verified from inside the guest every second, for the whole hunt
     lx.linux_cmd(a, "crossck 64 100000 > /tmp/ck.log 2>&1 &", 20)
     g.detach(a)
     def cross(src, dst, dstip, want, i):
@@ -78,7 +78,7 @@ try:
             dst.expect(r"linux# ", 60)
             out = lx.linux_cmd(dst, "cat /mnt/keep; echo c%d > /mnt/c; sync; cat /mnt/c; grep -c virtio /proc/interrupts; "
                                     "sleep 1; tail -1 /tmp/ck.log; grep -E 'wrong|went back|changed|FAILED|advanced' /tmp/ck.log || echo crossck-clean" % i, 90)
-            # a kernel line may land between the answers (hunt4e stopped at crossing 58 on
+            # a kernel line may land between the answers (e.g.
             # "hrtimer: interrupt took 401347500 ns", printed for the time the machine stood still)
             out = "\n".join(l for l in out.splitlines() if not re.match(r"\[ *\d+\.\d+\] ", l.strip()))
             if not re.search(r"\ngen0\r?\nc%d\r?\n[1-9]" % i, out) or "crossck-clean" not in out or not re.search(r"crossck: round \d+ ok=yes", out):

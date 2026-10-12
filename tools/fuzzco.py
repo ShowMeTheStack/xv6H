@@ -1,5 +1,5 @@
 # fuzzco: a well-behaved machine's adoption latency while a fuzz guest hammers the
-# host's emulation and the MACH extension beside it (L21 b). One host, an xv6
+# host's emulation and the MACH extension beside it. One host, an xv6
 # guest revised N times before the fuzz starts and N times while it runs.
 #   python3 tools/fuzzco.py [N] [fuzz rounds]
 import os, re, sys, time, random, statistics
@@ -37,7 +37,7 @@ try:
     seed = random.randrange(1, 2 ** 31)
     q.send('vmm start -k /fuzzguest -f none -m 32 -c 2 -a "seed=%d rounds=%d"\n' % (seed, ROUNDS))
     q.expect(r"fuzzguest: seed", 60)
-    g.detach(q)                           # `vmm start' attaches; the host shell is wanted (fuzzco2 typed at the fuzz guest)
+    g.detach(q)                           # `vmm start' attaches; the host shell is wanted, not the fuzz guest's console
     print("fuzz guest running: seed %d, %d rounds" % (seed, ROUNDS))
     time.sleep(2)
     q.send("\n"); q.expect(r"\$ ", 30)

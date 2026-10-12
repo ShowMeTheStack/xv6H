@@ -29,7 +29,7 @@
 #define MS_TICKS(ms)  (((ms) * tick_hz + 999) / 1000)
 #define SEC_TICKS(s)  ((s) * tick_hz)
 
-// what recovery cost, for /proc/net/sockstat (E5: a crossing's stall after the move): timeouts
+// what recovery cost, for /proc/net/sockstat (a crossing's stall after the move): timeouts
 // that fired, the largest timeout armed when one fired (ms), fast and partial-ack retransmits
 uint64 tcp_nrto, tcp_maxrto_ms, tcp_nfast, tcp_npartial;
 

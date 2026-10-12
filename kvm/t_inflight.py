@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.3, Theorem 1 under KVM: the controller exchanged (imsic <-> plic) N times while the guest
+# Theorem 1 under KVM: the controller exchanged (imsic <-> plic) N times while the guest
 # keeps its disk busy. A line owed at an exchange that is not raised again on the new
 # controller loses a completion: the reader stops, and the kernel says so (a blocked task,
 # a virtio timeout). After every exchange: did the reader move on, is the kernel quiet;

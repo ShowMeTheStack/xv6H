@@ -1,9 +1,9 @@
 #!/bin/bash
-# The final KVM stack (runs on the build box), built from this repository's kvm/ alone into ~/xv6h-kvm-final,
-# so that every KVM result in the paper comes from one build: Linux 6.18.54 from the pristine tree
+# The release KVM stack, built from this repository's kvm/ alone into ~/xv6h-kvm-final, so
+# that every KVM result comes from one build: Linux 6.18.54 from the pristine tree
 # with KVM patches 1-4 (apply-kvm-patches.py), kvmtool upstream f67bc0b with this repository's
-# changes (apply-kvmtool.py's edits, on the files in kvm/kvmtool), and the frozen Linux guest
-# (~/xv6h-linux/out-freeze21). The repository's kvm/ is copied to ~/xv6h-kvm-final/src first.
+# changes (apply-kvmtool.py's edits, on the files in kvm/kvmtool), and the release build of
+# the Linux guest (~/xv6h-linux/out-freeze21). The repository's kvm/ is copied to ~/xv6h-kvm-final/src first.
 #   kvm/build-final.sh            (on the build box, after: rsync -a kvm/ buildbox:xv6h-kvm-final/src/)
 set -ex
 set -o pipefail
@@ -32,7 +32,7 @@ cd $F/kvmtool && rm -f lkvm-static && make -s ARCH=riscv CROSS_COMPILE=riscv64-l
   -j24 lkvm-static 2>&1 | tail -5
 [ "$(strings $F/kvmtool/lkvm-static | grep -c "imsicfile hw|sw")" -gt 0 ]
 ls -la $F/kvmtool/lkvm-static
-# the host's initramfs, as mkhost.sh, with this lkvm and the frozen guest
+# the host's initramfs, as mkhost.sh, with this lkvm and the release guest
 R=$F/hostroot; rm -rf $R; mkdir -p $R
 cp -a $HOME/xv6h-linux/bb-hf/_install/. $R/
 mkdir -p $R/proc $R/sys $R/dev $R/tmp $R/guest $R/etc $R/mnt $R/root $R/var/run

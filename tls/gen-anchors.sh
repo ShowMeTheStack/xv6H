@@ -1,6 +1,6 @@
 #!/bin/bash
 # regenerate tls/trust_anchors.c from tls/roots.pem with BearSSL's brssl tool
-# (build it on the laptop: cd BearSSL && make build/brssl).
+# (build it on the workstation: cd BearSSL && make build/brssl).
 set -e
 cd "$(dirname "$0")"
 BRSSL=${BRSSL:-../../BearSSL/build/brssl}

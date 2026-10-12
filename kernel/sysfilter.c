@@ -10,7 +10,7 @@
 // to hand the bitmap to a program that is about to exec something it
 // does not trust.
 //
-// The default profile for a container (§8.2) denies what a container has
+// The default profile for a container denies what a container has
 // no business doing even as root inside it:
 //
 //   the hypervisor        vm_*: a container does not run machines

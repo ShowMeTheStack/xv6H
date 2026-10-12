@@ -139,7 +139,7 @@ clock_reanchor(void)
 //
 // ChaCha20 over a key stirred from the cycle counter, the real-time
 // clock and interrupt timing. The virtio-rng device, when qemu offers
-// one, mixes in the laptop's own generator at boot.
+// one, mixes in the workstation's own generator at boot.
 //
 static struct spinlock randlock;
 static uint32 rand_state[16];

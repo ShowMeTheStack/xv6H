@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# M12: the receiver against streams that do not fit. The source's kvmtool damages one record of
+# The migration receiver against streams that do not fit. The source's kvmtool damages one record of
 # each migration (XV6H_MIG_CORRUPT, migrate.c's test hook); the destination must refuse the
 # machine with its reason, the migration must report failure, and the guest must run on at the
 # source (it wrote a file before; it reads it and writes another after each refusal). A clean

@@ -1,4 +1,4 @@
-# revload (L16): every fact revised there and back, N times, while the guest is busy --
+# revload: every fact revised there and back, N times, while the guest is busy --
 # fsbench writing and re-reading files and schedbench forking and switching on both
 # vcpus -- on one IMSIC host with an xv6 guest (2 vcpus, 64 MB). Pass for a fact: every
 # revision adopted, the workloads still running and their own checks passing at the end.

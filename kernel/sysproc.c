@@ -1182,7 +1182,7 @@ sys_getcpu(void)
 // sched_group(op, id, a, b): the scheduler's groups from user space.
 //
 // this is what `cgrun' uses and what the cgroup file system of
-// section 8 will sit on: a group is made, a process joins it, and
+// this kernel sits on: a group is made, a process joins it, and
 // from then on the group's share of the processor is divided among
 // whatever is in it rather than each of them competing separately.
 //

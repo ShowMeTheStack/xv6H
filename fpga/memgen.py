@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.0: block-RAM implementations for the memories firtool leaves as external macros
+# Block-RAM implementations for the memories firtool leaves as external macros
 # (--repl-seq-mem). One read-write port (mrw), synchronous read, a write mask of mask_gran bits
 # per lane: written in the per-lane form Vivado infers as a byte/lane-write block RAM.
 #   memgen.py mems.conf > mems.v

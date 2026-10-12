@@ -46,7 +46,7 @@ def dump_harts(tag_):
         out = monitor(path, "info registers -a")
         pcs = re.findall(r"pc\s+([0-9a-f]+)", out)
         print("---- %s host %s: harts' pc: %s" % (tag_, who, " ".join(pcs)))
-        if not pcs:                      # n24-hunt3 printed an empty list: show what the monitor said
+        if not pcs:                      # an empty list: show what the monitor said
             print("     (monitor said: %r)" % out[:300])
         for l in out.splitlines():
             if re.search(r"^\s*(pc|ra|sp|scause|sepc|stval|mcause|mepc|mstatus|sstatus|hstatus|sip|sie)\s", l):
@@ -64,7 +64,7 @@ try:
     sn.run(b, "ip addr add 10.7.0.2/24 dev eth0", 30)
     # the wire, both ends, headers only: what A sent and what B received when a
     # crossing stalls. Not on a long run: the capture grows without bound and
-    # reading it back takes longer than the harness waits (hunt3_1000).
+    # reading it back takes longer than the harness waits (seen at 1000 cycles).
     if CYCLES <= 60:
         sn.run(a, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)
         sn.run(b, "tcpdump -n -q -s 80 -w /tmp/wire.pcap port 9000 &", 20)

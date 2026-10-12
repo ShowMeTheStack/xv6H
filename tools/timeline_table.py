@@ -1,4 +1,4 @@
-# timeline_table (L15): the crossing's outage decomposed, from the host lines the two sides
+# timeline_table: the crossing's outage decomposed, from the host lines the two sides
 # print ("crossing, this side: stopped +0, last page +A us, taken by the far end +B us,
 # committed +C us" on the source; "arrival timeline: stream done +0, resumed +D us, first
 # instruction +E us" and "revision asked +F us, adopted +G us" on the destination), per

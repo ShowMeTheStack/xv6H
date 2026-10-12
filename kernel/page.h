@@ -19,7 +19,7 @@
 #define PG_FREE     0x0002 // head of a free block of `order`
 #define PG_HEAD     0x0004 // head of an allocated block of `order`
 #define PG_RESERVED 0x0008
-#define PG_ANON     0x0010 // reserved for later milestones
+#define PG_ANON     0x0010 // reserved, unused
 #define PG_FILE     0x0020
 #define PG_GUEST    0x0040
 #define PG_COW      0x0080

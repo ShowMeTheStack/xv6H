@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.5: F10 under KVM (KVM patch 3, kvmtool's `vector' fact). The vector unit taken away from a
+# F10 under KVM (KVM patch 3, kvmtool's `vector' fact). The vector unit taken away from a
 # running Linux guest and given back, N rounds. Each time: the guest's own view (hwprobe), and a
 # vector instruction actually executed -- after `off' it must be illegal in the guest, not merely
 # undescribed; after `on' it must compute the right answer again. The disk answers throughout.

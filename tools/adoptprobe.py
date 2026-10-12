@@ -27,7 +27,7 @@ FACTS = [
 if kind == "xv6":
     FACTS = [("F1 intc", "plic", "imsic"), ("F2 intc-addr", "intcmap alt", "intcmap default"),
              ("F3 irqmap", "irqmap alt", "irqmap default"), ("F4 ipi", "ipi sbi", "ipi clint")] + FACTS
-# the facts the first probes left out: the device map for both guests, and
+# further facts: the device map for both guests, and
 # the controller and its address for Linux, which takes them live only through patch 0005's
 # description-bound controller (vmm -V) on a host that offers all three controllers
 if kind == "linuxvic":
@@ -68,8 +68,8 @@ try:
                 # the host's `adopted' line and the shell's next prompt come in
                 # either order (the guest adopts in milliseconds; the prompt is
                 # printed when the command returns): wait for the line, then
-                # resync on a fresh prompt -- waiting for the prompt first ate
-                # the line half the time and cost 40 s per miss
+                # resync on a fresh prompt -- waiting for the prompt first loses
+                # the line about half the time, at 40 s per miss
                 try:
                     mm = q.expect(r"revision \d+ adopted \(0x([0-9a-f]+)\) after (\d+) us", 40)
                     lat.append(int(mm.group(2)) / 1000.0); masks.add(mm.group(1).decode() if isinstance(mm.group(1), bytes) else mm.group(1))

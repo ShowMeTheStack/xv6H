@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# (runs on the build box): integrate the revise files (copied in beside this script by the
-# deploy step) into ~/xv6h-kvm/kvmtool. Idempotent; `git diff` in kvmtool is the patch we report.
+# Integrate the revise files (copied in beside this script by the deploy step) into
+# ~/xv6h-kvm/kvmtool. Idempotent; `git diff` in kvmtool is the resulting patch.
 import os, shutil, subprocess
 T = os.path.expanduser("~/xv6h-kvm/kvmtool")
 S = os.path.expanduser("~/xv6h-kvm/kvmtool-src")
@@ -46,14 +46,14 @@ sub("riscv/fdt.c", [('#include "kvm/kvm-cpu.h"\n', '#include "kvm/kvm-cpu.h"\n#i
  ("\t/* CPUs */\n\tgenerate_cpu_nodes(fdt, kvm);", "\t/* the description slots (revisable machine descriptions) */\n\trevise__generate_reserved_memory(fdt, kvm);\n\n\t/* CPUs */\n\tgenerate_cpu_nodes(fdt, kvm);"),
  ("\t/* PCI host controller */\n\tpci__generate_fdt_nodes(fdt);", "\t/* the anchor */\n\trevise__generate_fdt_nodes(fdt, kvm, riscv__generate_irq_prop);\n\n\t/* PCI host controller */\n\tpci__generate_fdt_nodes(fdt);"),
  # packed in this process's memory and copied out whole: fdt_pack on the slot itself parsed
- # guest RAM that a running vcpu can write (M12)
+ # guest RAM that a running vcpu can write
  ("\t_FDT(fdt_open_into(fdt, fdt_dest, FDT_MAX_SIZE));\n\t_FDT(fdt_pack(fdt_dest));",
   "\t{\n\t\tvoid *packed = malloc(FDT_MAX_SIZE);\n\n\t\tif (!packed)\n\t\t\tdie(\"fdt: no memory to pack the tree\");\n\t\t_FDT(fdt_open_into(fdt, packed, FDT_MAX_SIZE));\n\t\t_FDT(fdt_pack(packed));\n\t\tmemcpy(fdt_dest, packed, fdt_totalsize(packed));\n\t\tfree(packed);\n\t}"),
  ("\tif (kvm->cfg.arch.dump_dtb_filename)\n\t\tdump_fdt(kvm->cfg.arch.dump_dtb_filename, fdt_dest);\n\treturn 0;\n}\nlate_init(setup_fdt);",
   "\tif (kvm->cfg.arch.dump_dtb_filename && dest_gpa == kvm->arch.dtb_guest_start)\n\t\tdump_fdt(kvm->cfg.arch.dump_dtb_filename, fdt_dest);\n\treturn 0;\n}\n\nstatic int setup_fdt(struct kvm *kvm)\n{\n\treturn riscv__fdt_build(kvm, kvm->arch.dtb_guest_start);\n}\nlate_init(setup_fdt);")])
 # the CPU nodes come from a per-vcpu record taken at the first build (boot, before any vcpu
 # runs): KVM_GET_ONE_REG on a vcpu waits for that vcpu to leave KVM_RUN, so a description
-# rebuilt at run time cannot ask KVM again (it hung in the first revision). Facts edit the
+# rebuilt at run time cannot ask KVM again (it would hang). Facts edit the
 # record (vector unit, cache block, hart IDs) instead.
 sub("riscv/fdt.c", [
  ("#define CPU_NAME_MAX_LEN 15\nstatic void generate_cpu_nodes(void *fdt, struct kvm *kvm)\n{",
@@ -66,7 +66,7 @@ sub("riscv/fdt.c", [
   "\t\t_FDT(fdt_end_node(fdt));\n\n\t\t_FDT(fdt_end_node(fdt));\n\t\t}\n\t}\n\trevise_cpu_cached = 1;\n\n\t_FDT(fdt_end_node(fdt));\n}"),
 ])
 print("cpu record integrated")
-# ---- A.2: F15 (device map) and F3 (interrupt numbering) for virtio-mmio ----
+# ---- F15 (device map) and F3 (interrupt numbering) for virtio-mmio ----
 # ioeventfd: the same eventfd at a second address while the old one still answers, then the
 # old address dropped at the ack (vhost polls the eventfd in the kernel, so it must be the same fd)
 sub("include/kvm/ioeventfd.h", [("int ioeventfd__del_event(u64 addr, u64 datamatch);",
@@ -281,13 +281,13 @@ sub("term.c", [("\t\tkvm__arch_read_term(kvm);\n\t}\n\n\tdie(",
  "\t\tkvm__arch_read_term(kvm);\n\t\t/* the 8250 takes input only into an empty FIFO: while the guest drains it, a\n\t\t   readable input would spin this thread on the device mutex and starve the vcpu */\n\t\tusleep(1000);\n\t}\n\n\tdie("), ("\tif (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))\n\t\treturn 0;\n",
  "\tif (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {\n\t\tif (pthread_create(&term_poll_thread, NULL, term_poll_thread_loop, kvm))\n\t\t\tdie(\"Unable to create console input poll thread\\n\");\n\t\treturn 0;\n\t}\n")])
 # harness (an upstream bug): every 8250 port reads the same stdin unless given its own tty, so
-# once ttyS0's FIFO is full the next bytes go to ttyS1..3, which nothing reads -- a typed line
-# longer than 64 bytes lost its tail. A port whose input is the first port's leaves it alone.
+# once ttyS0's FIFO is full the next bytes go to ttyS1..3, which nothing reads, and a typed line
+# longer than 64 bytes loses its tail. A port whose input is the first port's leaves it alone.
 sub("include/kvm/term.h", [("bool term_readable(int term);", "bool term_readable(int term);\nbool term_shares_input(int term);")])
 sub("term.c", [("bool term_readable(int term)\n{", "bool term_shares_input(int term)\n{\n\treturn term && term_fds[term][TERM_FD_IN] == term_fds[0][TERM_FD_IN];\n}\n\nbool term_readable(int term)\n{")])
 sub("hw/serial.c", [("\tif (kvm->cfg.active_console != CONSOLE_8250)\n\t\treturn;\n\n\twhile (term_readable(dev->id)",
  "\tif (kvm->cfg.active_console != CONSOLE_8250)\n\t\treturn;\n\n\tif (term_shares_input(dev->id))\n\t\treturn;\n\n\twhile (term_readable(dev->id)")])
-# ---- A.3: F1, the controller's kind, between kvmtool's PLIC and KVM's in-kernel AIA ----
+# ---- F1, the controller's kind, between kvmtool's PLIC and KVM's in-kernel AIA ----
 # Both are resident from boot (nothing is created or torn down under a running VM); the
 # description names one through an xv6h,vic node, the lines are raised on the one described
 # from the ack on, and every line still owed is raised again there (Theorem 1).
@@ -314,9 +314,9 @@ if "plic_resident" not in s:
         "\t/* Setup default IRQ routing (the AIA's, when resident beside it) */\n\tif (!plic_resident)\n\t\tplic__irq_routing_init(kvm);\n\n\tplic.ready = true;", 1)
     s = s.replace("static int plic__exit(struct kvm *kvm)\n{\n\tif (riscv_irqchip != IRQCHIP_PLIC)\n",
                   "static int plic__exit(struct kvm *kvm)\n{\n\tif (riscv_irqchip != IRQCHIP_PLIC && !plic_resident)\n", 1)
-    # an edge is not a held level: latched in irq_level it was never cleared (a claim clears only
+    # an edge is not a held level: latched in irq_level it is never cleared (a claim clears only
     # the pending bit), and the next enable of the line (a guest's mask/unmask, or a controller
-    # taken again) made a pending interrupt nothing could acknowledge -- an interrupt storm
+    # taken again) makes a pending interrupt nothing can acknowledge: an interrupt storm
     s = s.replace("\tif (level)\n\t\ts->irq_level[irq_word] |= irq_mask;\n\telse\n\t\ts->irq_level[irq_word] &= ~irq_mask;",
                   "\tif (level && !edge)\n\t\ts->irq_level[irq_word] |= irq_mask;\n\telse\n\t\ts->irq_level[irq_word] &= ~irq_mask;", 1)
     assert "if (level && !edge)" in s, "plic edge latch"
@@ -373,7 +373,7 @@ int virtio_mmio_reraise_all(struct kvm *kvm)
 
 int virtio_mmio_reset(struct kvm *kvm, struct virtio_device *vdev)
 {""")])
-# ---- A.6: migration (riscv/migrate.c): each device's state out and in ----
+# ---- Migration (riscv/migrate.c): each device's state out and in ----
 sub("Makefile", [("\tOBJS\t\t+= riscv/revise-facts.o\n", "\tOBJS\t\t+= riscv/revise-facts.o\n\tOBJS\t\t+= riscv/migrate.o\n"),
                  ("OBJS\t+= builtin-revise.o\n", "OBJS\t+= builtin-revise.o\nOBJS\t+= builtin-migrate.o\n")])
 sub("include/kvm/kvm-ipc.h", [("\tKVM_IPC_REVISE\t= 9,\n", "\tKVM_IPC_REVISE\t= 9,\n\tKVM_IPC_MIGRATE\t= 10,\n")])

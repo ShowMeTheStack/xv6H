@@ -1,4 +1,4 @@
-# aliasstress: the alias window under fire (L33) and its cost (L20). One host,
+# aliasstress: the alias window under fire and its cost. One host,
 # the aliasguest payload (2 vcpus; hart 1 hammers the disk's old and new
 # windows and zeroes pages with cbo.zero; hart 0 keeps every revision's window
 # open for 2 ms before acknowledging). N revisions of the device map, every
@@ -39,7 +39,7 @@ try:
     q.expect(r"aliasguest: revisions", 30)      # the periodic reports replayed from the backlog first...
     mk = q.mark(); q.send("s"); time.sleep(1)     # ... then the one for the keypress
     q.expect(r"aliasguest: revisions (\d+) reads cur (\d+) old (\d+) errors (\d+)([^\n]*)cboz rounds (\d+) errors (\d+)", 30)
-    time.sleep(1)                                 # the keypress report is the last one; the backlog replays the periodic ones first (alias1000 reported "revisions 100")
+    time.sleep(1)                                 # the keypress report is the last one; the backlog replays the periodic ones first
     mm = list(re.finditer(r"aliasguest: revisions (\d+) reads cur (\d+) old (\d+) errors (\d+)([^\n]*)cboz rounds (\d+) errors (\d+)", q.buf.decode(errors="replace")))[-1]
     first = mm.group(5).decode(errors="replace") if isinstance(mm.group(5), bytes) else mm.group(5)
     g.detach(q)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.2 on QEMU first: xv6H on a machine with the ZedBoard Rocket's ISA profile -- no Sstc, no
+# zedqemu: the board run on QEMU first: xv6H on a machine with the ZedBoard Rocket's ISA profile -- no Sstc, no
 # `time' CSR, no hardware A/D updating, Sv39 only, no vector, no Zicbo*, PLIC, one hart, 256 MB
 # with a RAM disk where the ARM will load it -- booted from the board's device tree (its QEMU
 # variant: the UART's line and the timebase are QEMU's). Then an xv6 guest and a Linux guest.
@@ -20,7 +20,7 @@ def sh(c):
     subprocess.run(c, shell=True, check=True)
 
 # the board's root: 90 MB (the RAM disk is 94), one xv6 guest disk, the Linux guest's kernel and disk
-RESTORE = len(sys.argv) > 1 and sys.argv[1] == "restore"   # B.4 on the stand-in: the QEMU-saved guest
+RESTORE = len(sys.argv) > 1 and sys.argv[1] == "restore"   # board -> QEMU on the stand-in: the QEMU-saved guest
 IMG = os.path.expanduser("~/xv6h-fpga/zed-images")
 sh("rm -f fs.img && make -s fs.img HOSTFS_MB=90 GUESTDISKS=1 HOSTFILES='%s' && mv fs.img zed-fs.img" %
    ("linux/Image" if RESTORE else "linux/Image linux/linux.img"))

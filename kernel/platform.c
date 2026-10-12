@@ -28,7 +28,7 @@ uint64 clint_msip_base;
 // It used to parse into `plat' itself -- zeroed first, restored after -- and a
 // second hart reading `plat' in those microseconds saw a description with no
 // controller base, no timer kind, no hart ids: the two-hart arrival hang
-// (tmr3/tmr4, snap-migrate-console-legacy on the laptop).
+// (snap-migrate-console-legacy).
 static struct platform *pt = &plat;
 static int cpu_dropped;   // the cpu node being parsed is `disabled' (F7/F8)
 

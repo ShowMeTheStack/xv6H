@@ -446,10 +446,10 @@ l4_checksum(uint32 src, uint32 dst, uint8 proto, void *data, int len)
 
 // ---- egress policy ----
 //
-// the emulated network (qemu user-mode NAT) can reach the laptop (the
-// gateway) and, through it, every network the laptop is on. this policy
+// the emulated network (qemu user-mode NAT) can reach the workstation (the
+// gateway) and, through it, every network the workstation is on. this policy
 // lets packets out only to public internet addresses, plus DHCP and the
-// DNS forwarder; the laptop itself and any private network are off
+// DNS forwarder; the workstation itself and any private network are off
 // limits for the host and for every guest.
 //
 // other addresses on the emulated subnet are the host and the guests:
@@ -458,7 +458,7 @@ l4_checksum(uint32 src, uint32 dst, uint8 proto, void *data, int len)
 // be reached through the uplink), and it is allowed.
 
 // is this machine's gateway a router inside the host rather than the
-// door to the laptop? The hypervisor says so in the device tree
+// door to the workstation? The hypervisor says so in the device tree
 // (xv6h,outer), because a machine cannot tell from an address.
 static int gw_local;
 
@@ -467,7 +467,7 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
 {
   // this machine talking to itself. 127.0.0.0/8 is not routable
   // anywhere by definition and the stack never puts such a packet on
-  // the wire, so allowing it cannot reach the laptop or the network
+  // the wire, so allowing it cannot reach the workstation or the network
   // beyond it -- and a machine that cannot talk to itself cannot run
   // a service and test it.
   if ((dst >> 24) == 127)
@@ -492,14 +492,14 @@ net_policy_ok(uint32 dst, uint8 proto, uint16 dport, int from_guest)
     return 1;
   uint8 a = dst >> 24, b = (dst >> 16) & 0xff;
   if ((dst == netcfg.gw && !gw_local) || dst == netcfg.dns)
-    return 0; // the laptop, and qemu's forwarder
+    return 0; // the workstation, and qemu's forwarder
   if (netcfg.up && netcfg.mask && (dst & netcfg.mask) == (netcfg.ip & netcfg.mask) &&
       dst != (netcfg.ip | ~netcfg.mask))
     return 1; // a guest or the host: never leaves the switch
   // a machine behind a gateway: the switch is on the far side of it, and
   // the host and the other machines on it are reachable through the
   // gateway. The two addresses that are qemu's -- its router, which is
-  // the laptop, and its name forwarder -- are not.
+  // the workstation, and its name forwarder -- are not.
   if (plat.outer_mask && (dst & plat.outer_mask) == plat.outer_net) {
     if (dst == plat.outer_gw || dst == plat.outer_dns)
       return 0;

@@ -495,7 +495,7 @@ pidns_put(struct pidns *ns)
 // What a process sees mounted is a set of the machine's mounts and a
 // root. A copy takes a snapshot -- what is mounted afterwards in one
 // namespace does not appear in the other, which is the "private"
-// propagation of §8.3 and the only one this has -- and pivot_root makes
+// propagation, and the only one this has -- and pivot_root makes
 // the set a single mount, which is how the host's mounts stop being
 // visible inside a container.
 
@@ -807,7 +807,7 @@ ns_kind_name(int kind)
   case NSK_PID: return "pid";
   case NSK_MNT: return "mnt";
   case NSK_USER: return "user";
-  default: return 0;       // ipc is not provided in this revision (§8.3)
+  default: return 0;       // ipc is not provided in this kernel
   }
 }
 
@@ -849,7 +849,7 @@ ns_id_of(int pid, int kind)
   return id;
 }
 
-// the init of a pid namespace has gone (§8.3): nothing new may enter it,
+// the init of a pid namespace has gone: nothing new may enter it,
 // and everything in it goes too. A container is its init -- when that
 // process ends, what it was running ends with it, rather than being
 // reparented to the machine's init and left running with no way to name

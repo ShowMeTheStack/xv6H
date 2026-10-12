@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# E5: what an application sees while its machine is revised (xv6H/QEMU).
+# taillat: what an application sees while its machine is revised (xv6H/QEMU).
 #
 # A Linux guest (2 vcpus, the description-bound controller, its disk, an address on the host's
 # switch) runs `kvlat serve'; the xv6H host runs `kvlat load' against it, open loop, RATE requests
@@ -85,7 +85,7 @@ def summarise(bins, ask=5.0):
 
 # SPLIT (a fourth argument "split"): the guest on host B and the load generator on host A, joined by
 # the private link, so that the client does not take the guest's host's harts (at 500 requests a
-# second its poll timeout is 0-1 ms). Otherwise both on one host, as in the first passes.
+# second its poll timeout is 0-1 ms). Otherwise both on one host.
 SPLIT = len(sys.argv) > 4 and sys.argv[4] == "split"
 rows = []
 if SPLIT:

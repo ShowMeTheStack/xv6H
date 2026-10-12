@@ -119,7 +119,7 @@ vm_add_dev(struct vm *vm, const char *name, int irq, uint32 obs, uint64 base, ui
 // Take a device model out of the table.
 //
 // Needed because an interrupt controller can be *replaced* under a running
-// guest (mutable.md), and the models alias each other: a PLIC lives at
+// guest, and the models alias each other: a PLIC lives at
 // 0x0c000000 and so does the APLIC's M domain. Adding the new one without
 // removing the old leaves two models claiming one address, find_dev() returns
 // whichever was registered first, and the guest keeps talking to the controller
@@ -144,9 +144,9 @@ vm_del_dev(struct vm *vm, const char *name)
 // another controller kind completes the interrupt on the controller it was
 // bound to, which is gone: hunt2c crossing 570, an xv6 guest at
 // aplic_complete() storing to 0xd002000 on a PLIC host, a store access fault,
-// a panic, and the arrival never acknowledged -- Theorem 1's excluded case,
+// a panic, and the arrival never acknowledged -- the case the delivery guarantee excludes,
 // met at a migration stop rather than a live exchange, and on the same
-// evidence the first version's one arrival in 814. The old names keep
+// evidence, one arrival in 814. The old names keep
 // answering: a ghost reads as zero and takes writes without effect, and the
 // interrupt the guest was completing is re-delivered through the new
 // controller when it re-enables the line, which a level-triggered handler
@@ -183,7 +183,7 @@ vm_ghost_dev(struct vm *vm, const char *name)
 // vm_ghost_dev() ghosts what is in the table, and the source's PLIC never
 // was; a Linux completing an interrupt on arrival stored to 0xc201004,
 // "store to unmapped gpa", oops in vic_irq_eoi, the description never read
-// -- the ~5 %% of controller crossings, n3-lx100 and n7-lxintc60).
+// -- the ~5 %% of Linux controller crossings).
 void
 vm_add_ghost(struct vm *vm, const char *name, uint64 base, uint64 size)
 {
@@ -210,7 +210,7 @@ vm_del_ghosts(struct vm *vm)
 
 static struct vdev *find_dev_(struct vm *vm, uint64 gpa, int *aliased, uint64 *tgpa);
 
-// L20: the alias invariant's cost is a second lookup on a miss; count both
+// the alias invariant's cost is a second lookup on a miss; count both
 // kinds and their cycles so `vmm info' can say what it is
 static struct vdev *
 find_dev(struct vm *vm, uint64 gpa, uint64 *tgpa)
@@ -218,7 +218,7 @@ find_dev(struct vm *vm, uint64 gpa, uint64 *tgpa)
   // One map, not half of two. A revision moves the windows on another hart
   // while this one looks a device up without the lock (every MMIO exit comes
   // through here); a lookup that saw a base moved and a shift not yet moved
-  // found no window, or the wrong register (alias1000 under two kernel builds:
+  // found no window, or the wrong register (under two kernel builds:
   // 13 wrong reads in 1 250 revisions, 4 of them "load to unmapped gpa" on a
   // window that was there). So the lookup, and the translation of an aliased
   // address, are one snapshot: retried while the map is being moved or has

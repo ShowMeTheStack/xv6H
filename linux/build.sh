@@ -10,7 +10,7 @@ set -euo pipefail
 WORK=${WORK:-$HOME/xv6h-linux}
 KVER=${KVER:-6.12.41}
 # a second kernel version builds beside the first: TAG=-618 KVER=6.18.54 puts its
-# objects in obj-hf-618 and its artifacts in out-618 (L5: the patches proven on two LTS kernels)
+# objects in obj-hf-618 and its artifacts in out-618 (the patches on two LTS kernels)
 TAG=${TAG:-}
 OUT=$WORK/out$TAG
 BBVER=${BBVER:-1.37.0}
@@ -58,9 +58,8 @@ if [ -d $WORK/src/patches ]; then
       log "$(basename $p): already applied"
     else
       # a patch that does not apply must stop the build: the kernel would go
-      # out without it, and the module against it would not build -- and the
-      # image would then carry the previous module (lxbuild10/11: a malformed
-      # hunk shipped two stale kernels before anyone noticed)
+      # out without it, the module against it would not build, and the image
+      # would then carry the previous module
       log "$(basename $p) DOES NOT APPLY"; patch -d linux-$KVER -p1 -N --dry-run < "$p" 2>&1 | tail -5; exit 1
     fi
   done
@@ -109,16 +108,16 @@ make_initramfs() { # $1 = busybox dir, $2 = output cpio.gz
   if [ -f $WORK/src/vecuser.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecuser $WORK/src/vecuser.c || log "vecuser did not build"
   fi
-  # maskbench: what a description costs a program (the masking baseline, C): vector and scalar
+  # maskbench: what a description costs a program (the masking baseline): vector and scalar
   # bandwidth, the clock's read, a page's first touch, direct disk reads
   if [ -f $WORK/src/maskbench.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/maskbench $WORK/src/maskbench.c || log "maskbench did not build"
   fi
-  # kvlat: a key-value service and an open-loop load generator (E5: what an application sees)
+  # kvlat: a key-value service and an open-loop load generator (what an application sees)
   if [ -f $WORK/src/kvlat.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/kvlat $WORK/src/kvlat.c || log "kvlat did not build"
   fi
-  # crossck: memory, clock and vector file verified from inside the guest across a crossing (L17)
+  # crossck: memory, clock and vector file verified from inside the guest across a crossing
   [ -f $WORK/src/vecprobe.c ] && ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/vecprobe $WORK/src/vecprobe.c
   if [ -f $WORK/src/crossck.c ]; then
     ${MUSL}gcc -O2 -static -march=rv64gc -mabi=lp64d -o $root/bin/crossck $WORK/src/crossck.c || log "crossck did not build"
@@ -258,8 +257,8 @@ CFG
 }
 build_kernel hf $OUT/initramfs-hf.cpio.gz "CONFIG_FPU=y"
 # a diagnostic kernel with lockdep (LOCKDEP=1): the same guest, reporting a lock taken both in
-# interrupt context and with interrupts on at its first inconsistent use (E7: the two vcpus found
-# spinning in do_raw_spin_lock in interrupt context, which no watchdog can report)
+# interrupt context and with interrupts on at its first inconsistent use (a vcpu spinning in
+# do_raw_spin_lock in interrupt context is something no watchdog can report)
 if [ -n "${LOCKDEP:-}" ]; then
   build_kernel hfld $OUT/initramfs-hf.cpio.gz "CONFIG_FPU=y
 CONFIG_PROVE_LOCKING=y

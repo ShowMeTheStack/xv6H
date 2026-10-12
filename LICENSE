@@ -1,7 +1,21 @@
-The xv6 software is:
+xv6H is distributed under two licences.
+
+The hypervisor, its guests, the user programs, the test harness, the
+measurement scripts, the Spin models and the FPGA files are under the
+MIT licence (LICENSES/MIT.txt). xv6H grew out of MIT's xv6-riscv, whose
+notice is kept:
 
 Copyright (c) 2006-2024 Frans Kaashoek, Robert Morris, Russ Cox,
                         Massachusetts Institute of Technology
+Copyright (c) 2026 Jyotiprakash Mishra
+
+The Linux module, drivers and kernel patches under linux/, and the KVM
+kernel patches and kvmtool changes under kvm/, are derived from Linux
+and kvmtool and are under the GNU General Public License, version 2 only
+(LICENSES/GPL-2.0-only.txt).
+
+tls/bearssl is BearSSL and keeps its own MIT licence
+(tls/bearssl/LICENSE.txt).
 
 Permission is hereby granted, free of charge, to any person obtaining
 a copy of this software and associated documentation files (the

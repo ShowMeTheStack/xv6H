@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# heldline (R4b, the re-assertion arm of Theorem 1): a line asserted when the interrupt controller is
+# heldline: a line asserted when the interrupt controller is
 # exchanged is delivered by the new controller. In normal running the asserted set is empty at the
 # exchange, so the one device the host drives itself is used: the balloon raises a configuration-
 # change interrupt when it is asked for memory, and the level stays up until the guest services the

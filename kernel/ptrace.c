@@ -1,7 +1,7 @@
 //
 // ptrace: watching a process from its parent.
 //
-// what is here is the subset section 14 of the plan asks for --
+// what is here is a subset --
 // TRACEME, SYSCALL, GETREGS, SETREGS, PEEKDATA, POKEDATA, CONT, KILL
 // and DETACH -- which together are enough for strace to run a command
 // and print every call it makes, and for a debugger to read and change

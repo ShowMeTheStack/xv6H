@@ -222,9 +222,9 @@ static void read_facts(struct device_node *root, struct facts *f)
 	/*
 	 * the devices live on a bus node, and the interrupt controllers on the bus or at the
 	 * root: xv6H and QEMU's virt put them all under /soc, kvmtool puts the devices under /smb
-	 * and the controllers at the root. The module first looked for /soc by name and, under
-	 * kvmtool, found no devices (the KVM port's first device-map revision was "adopted 0x0")
-	 * and no controller; a bus is a "simple-bus", whatever it is called.
+	 * and the controllers at the root. Looking for /soc by name finds, under kvmtool,
+	 * no devices (a device-map revision is then "adopted 0x0") and no controller;
+	 * a bus is a "simple-bus", whatever it is called.
 	 */
 	for_each_child_of_node(root, n) {
 		struct device_node *c;
@@ -242,10 +242,10 @@ static void read_facts(struct device_node *root, struct facts *f)
  * the logical cpu that is hart `hart' (cpu numbering is Linux's own). The
  * map is the module's: the live tree's cpu nodes keep the reg they booted
  * with, so after a renumbering a lookup by the tree finds the old numbers
- * only -- a renumbering *back* to them was then "no cpu of this kernel" and
- * silently not applied, and every SBI call the kernel made afterwards named
- * harts the machine no longer had (lxsbi: -EINVAL on each, IPIs lost, the
- * SBI-set revision four seconds).
+ * only -- a renumbering *back* to them would be "no cpu of this kernel" and
+ * silently not applied, and every SBI call the kernel made afterwards would
+ * name harts the machine no longer has (-EINVAL on each, IPIs lost, the
+ * SBI-set revision taking seconds).
  */
 static u32 hart_of_cpu[NR_CPUS];
 static bool hart_map_ready;
@@ -335,8 +335,8 @@ static int map_line_type(u32 hwirq, u32 type)
 	int virq;
 
 	/* the description-bound controller first (patch 0005): when the tree has one, every
-	 * device line hangs from it, whatever the backend (KVM's first vic tree: every move
-	 * "not moved", because only the PLIC and APLIC compatibles were looked for) */
+	 * device line hangs from it, whatever the backend (looking only for the PLIC and
+	 * APLIC compatibles, every move on a vic tree would be "not moved") */
 	ic = of_find_compatible_node(NULL, NULL, "xv6h,vic");
 	if (!ic)
 		ic = of_find_compatible_node(NULL, NULL, "riscv,plic0");
@@ -353,8 +353,8 @@ static int map_line_type(u32 hwirq, u32 type)
 	/*
 	 * A line already mapped is taken as it is mapped. Asking for it again with
 	 * another trigger is refused ("type mismatch, failed to map hwirq"): kvmtool
-	 * describes its virtio lines as edge-rising, and every move under KVM was
-	 * "not moved" until this. A line not yet mapped is asked for level-high (a
+	 * describes its virtio lines as edge-rising, so every move under KVM would be
+	 * "not moved". A line not yet mapped is asked for level-high (a
 	 * virtio-mmio device holds its line until the status is acknowledged, so a
 	 * level is right whatever the tree said; an edge source raised as a level
 	 * is seen once per edge).
@@ -382,8 +382,8 @@ static int map_line(u32 hwirq)
 /*
  * a virtio-mmio device is one whose node says so or that the virtio-mmio driver
  * holds, not one whose name has "virtio_mmio" in it: the name is the boot node's,
- * "virtio_mmio@" under xv6H and QEMU but "virtio@" under kvmtool, where every
- * move was "no virtio_mmio platform device" (the KVM port's first device map)
+ * "virtio_mmio@" under xv6H and QEMU but "virtio@" under kvmtool, where a
+ * match by name finds "no virtio_mmio platform device"
  */
 static bool is_virtio_mmio(struct device *dev)
 {
@@ -406,8 +406,8 @@ static int virtio_moved(u64 old_base, u64 new_base, u32 new_irq, u32 type)
 
 	/* by where the device is now, not by its boot name: a device moved once
 	 * keeps the name of its boot window (relocate updates the resource, the
-	 * platform bus does not rename), so a second move by name found nothing
-	 * and Linux then read the vanished window (d2e: Oops at 0x10103060) */
+	 * platform bus does not rename), so a second move by name would find nothing
+	 * and Linux would then read the vanished window (an Oops) */
 	dev = bus_find_device(&platform_bus_type, NULL, &old_base, virtio_at);
 	if (!dev) {
 		pr_info("machrev: no virtio_mmio platform device at 0x%llx to move\n", old_base);
@@ -589,14 +589,14 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	u32 adopted = 0;
 	int i;
 
-	/* The order matters (defect 25, found by eight facts at once): first the two
+	/* The order matters (defect 25): first the two
 	 * facts that change how every later step waits and flushes. The SBI set,
 	 * because add_memory and cpu_down flush TLBs, and a flush through an
 	 * extension this host withholds fails (-ENOTSUPP) until the key follows;
 	 * the timer and timebase, because a delay or a timeout runs at the rate the
 	 * kernel believes, and a hart parking that waits at a tenth of the rate
-	 * waits ten times (the crossing adopted after 72-114 s, alone each fact
-	 * in under 100 ms). Then everything else. */
+	 * waits ten times (in another order a crossing adopts in 72-114 s, against
+	 * under 100 ms for each fact alone). Then everything else. */
 	/* F22: the SBI extension set. Linux keeps one decision from its boot-time
 	 * probe: remote fences through SBI RFENCE (a static key) or through IPIs.
 	 * The key is exported; the probe is repeated and the key follows. */
@@ -614,8 +614,8 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	}
 	/* ... then the harts' numbers (F9), before anything sends an IPI by hart id: the
 	 * timer's re-rate cross-calls every cpu, and a cross-call addressed to the old
-	 * numbers never returns (the grand tour's hop C->A: "__sbi_rfence_v02_call:
-	 * hbase = [4] ... failed (error [-22])", a soft lockup in riscv_timer_revise) */
+	 * numbers never returns ("__sbi_rfence_v02_call: hbase = [4] ... failed
+	 * (error [-22])", then a soft lockup in riscv_timer_revise) */
 	/* F9: the harts were renumbered. cpu i was hart old[i]; it is hart new[i] now. */
 	for (i = 0; i < new->ncpu && i < old->ncpu; i++)
 		if (new->hartid[i] != old->hartid[i]) {
@@ -639,11 +639,11 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	/*
 	 * The RTC leaves before the virtio devices move and comes back after
 	 * them: on a renumbering the line it leaves may be the one a virtio
-	 * device moves to (lxirq), and the line it moves to may be the one a
+	 * device moves to, and the line it moves to may be the one a
 	 * virtio device is still on -- registering it there fails with
 	 * "genirq: Flags mismatch irq 16 (goldfish_rtc) vs (virtio0)" and the
-	 * machine has no clock until the next revision (hunt4c, every arrival
-	 * on the default-numbered host from crossing ~160 on).
+	 * machine has no clock until the next revision (seen on arrivals at
+	 * a default-numbered host).
 	 */
 	bool rtc_returns = false;
 
@@ -736,8 +736,8 @@ static u32 apply(struct machrev *m, struct facts *new, u32 what)
 	/*
 	 * The same number of devices, in the tree's order: differences are moves
 	 * (F3/F15 -- a new map moves every window, so no new address is in the
-	 * old set; treating that as "all went, all appeared" unregistered the
-	 * disk under the running system: m7lx layout 0/20). A different number:
+	 * old set; treating that as "all went, all appeared" would unregister the
+	 * disk under the running system). A different number:
 	 * devices came or went (F18), matched by address below.
 	 */
 	if (new->nvirtio == old->nvirtio) {
@@ -875,8 +875,8 @@ static void take_revision(struct machrev *m)
  * F1's channel problem. Every revision is announced on the anchor's line,
  * which is a device line through the interrupt controller -- and the one
  * revision that exchanges the controller cannot be announced by a line that
- * goes through it (lxintc4: "described no", both vcpus idle, the line raised
- * on a controller the guest's driver had not yet bound). Theorem 2 asks for a
+ * goes through it (with both vcpus idle, the line would be raised
+ * on a controller the guest's driver has not yet bound). Theorem 2 asks for a
  * channel independent of what the revision changes; for the controller
  * itself that channel is the generation counter, which the guest reads with
  * one SBI call. With the description-bound controller in use, the driver

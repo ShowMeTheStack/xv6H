@@ -28,7 +28,7 @@ static struct {
 // Console ownership. While a terminal is attached to a machine (`vmm
 // attach') the console is the guest's: a host line written in the middle
 // of the guest's output landed inside it ("real 0hyp: vm 0: ... m 1.01s",
-// m7lq2 layout.10) and the reader on the other end could not tell whose
+// a guest `time' line) and the reader on the other end could not tell whose
 // line it was reading. The host's lines are held in a ring while anybody
 // is attached and written out, each on a line of its own, when the last
 // terminal detaches (or by the next printk after that). They still go to
@@ -92,7 +92,7 @@ static int
 hold_due(void)
 {
   return hold.w != hold.r &&
-         (cons_owned == 0 || cons_last_nl || (uint)(ticks - cons_last_write) >= 30);   // 300 ms: under a loaded box a guest's line stalled longer than 100 ms and a host line landed inside it (n3-lx100, 9 of 37)
+         (cons_owned == 0 || cons_last_nl || (uint)(ticks - cons_last_write) >= 30);   // 300 ms: under a loaded box a guest's line stalled longer than 100 ms and a host line landed inside it (9 of 37)
 }
 
 void

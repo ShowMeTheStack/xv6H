@@ -40,7 +40,7 @@
 #define SBI_EXT_HSM    0x48534D
 #define SBI_EXT_SRST   0x53525354
 #define SBI_EXT_DBCN   0x4442434E
-// "MACH" -- machine revision (mutable.md). Not a registered SBI extension id;
+// "MACH" -- machine revision. Not a registered SBI extension id;
 // it sits in the experimental space until it is one.
 #define SBI_EXT_MACHINE 0x4D414348
 
@@ -174,13 +174,13 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // register, which the caller reads as sbiret.val after a second call --
     // simpler to hand back the address here and the length on fid 4.
     r.val = vm->desc_gpa;   // the current slot (hyp.h)
-    vm->revise_described = vm->revise_gen;   // L1: the watchdog's evidence
+    vm->revise_described = vm->revise_gen;   // the watchdog's evidence
     if (vm->irq_alias_on && vm->revise_acked != vm->revise_gen)
       vm->irq_quiet = 1;    // a renumbering is being taken: device lines held until the ack (vic.c)
     break;
   case 3:
     acquire(&vm->lock);
-    // defect 20 (found by the model, L22): an ack names the generation it
+    // defect 20 (found by the Spin model): an ack names the generation it
     // acknowledges (a1; 0 from a guest that predates this). Without it the ack
     // of an older revision ended a newer one: the guest read generation g, the
     // machine crossed mid-revision, the destination asked g+1 and re-announced,
@@ -211,7 +211,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       // A revocation the guest declined is not a revocation: the description
       // must say what the guest is actually holding, or the next move carries a
       // machine "without a unit" to a host without one while a task inside is
-      // using it (busy2: the guest arrived and executed nothing but faults).
+      // using it (the guest arrived and executed nothing but faults).
       vm->vec_pending = 0;
       if (!(a0 & REV_VLEN)) {
         vm->vec_revoked = !vm->vec_revoked;     // the description goes back to what the guest holds; VS untouched
@@ -273,7 +273,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
     // would never fire for a well-behaved program; the question is the
     // observation. Granted iff this host has a unit and it was only hidden.
     // a request is a revision of the machine, which is not free: one every
-    // tenth of a second per machine, and the rest are refused (L21: a guest
+    // tenth of a second per machine, and the rest are refused (a guest
     // asking by the thousand is a guest asking the host to spend its time)
     if (r_time() - vm->request_at < HOST_TIMEBASE / 10) {
       vm->requests_refused++;
@@ -285,7 +285,7 @@ sbi_machine(struct vcpu *v, uint64 fid, uint64 a0, uint64 a1, uint64 a2)
       // already granted -- the guest's first vector instruction trapped here
       // and the unit was given on the spot (hypcsr.c), and the guest's own
       // handler asks a moment later, before its revision thread has taken the
-      // grant (lxvs4: "refused (-2)", SIGILL, on a unit that was on its way).
+      // grant ("refused (-2)", SIGILL, on a unit that was on its way).
       // The request is idempotent: yes, it is yours; the revision is coming.
       r.val = REV_VLEN;
       break;
@@ -438,7 +438,7 @@ hyp_ecall(struct vcpu *v)
       // and the host's timer to it: a guest without Sstc gets its VSTIP from
       // this hypervisor, at the deadline -- not at the next host tick, which
       // is up to ten milliseconds later and made a Linux boot with its
-      // thousands of millisecond sleeps take over ninety seconds (lx8)
+      // thousands of millisecond sleeps take over ninety seconds
       timer_rearm();
     } else
       r.err = SBI_ERR_NOT_SUPPORTED;

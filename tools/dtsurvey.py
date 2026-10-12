@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# dtsurvey: which of the paper's facts differ across real RISC-V platforms.
+# dtsurvey: which of the revisable facts differ across real RISC-V platforms.
 #
 # Reads compiled device trees (*.dtb) under the directories given, decompiles each with dtc,
 # and extracts, per board: model and compatible, timebase-frequency (F6), interrupt controller

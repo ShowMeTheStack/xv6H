@@ -1,6 +1,6 @@
 // unstest: a user namespace from inside one.
 //
-// What it proves is the model of §8.2: a container's root is an ordinary
+// What it proves is the container model: a container's root is an ordinary
 // user of the machine. Inside its namespace it is root -- it may own its
 // files, signal its processes, mount in its own mount namespace -- and
 // outside it is whoever it was, with no more claim on the machine than

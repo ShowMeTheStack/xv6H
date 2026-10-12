@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# factcover (L12): every node and property kernel/fdtgen.c emits into a guest's device tree,
-# from the source, so that Table tab:coverage can be checked against it: a property the
-# table does not name is a fact the paper has not thought about.
+# factcover: every node and property kernel/fdtgen.c emits into a guest's device tree,
+# from the source, checked against the coverage table (paper/sections/tab-coverage.tex):
+# a property the table does not name is a fact the table does not cover.
 #   python3 tools/factcover.py
 import os, re
 src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kernel", "fdtgen.c")).read()

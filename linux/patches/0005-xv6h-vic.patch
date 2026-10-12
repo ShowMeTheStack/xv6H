@@ -43,14 +43,14 @@ Sstc or SBI, so the channel a revision arrives on is independent of the controll
 @@ -0,0 +1,554 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * xv6H: a description-bound root interrupt controller (L2, patch 0005).
++ * xv6H: a description-bound root interrupt controller (patch 0005).
 + *
 + * A Linux guest of xv6H is told, through its machine description, which
 + * interrupt controller it has -- a PLIC, an APLIC in direct mode, or an APLIC
 + * in MSI mode with an IMSIC per hart -- and where. The kernel's own drivers
 + * bind one of them at boot and cannot be replaced under running drivers;
-+ * that is why the paper's F1 (the controller's kind) and F2 (its address)
-+ * were "two facts Linux cannot take". This driver takes them. It is one flat
++ * so F1 (the controller's kind) and F2 (its address) are facts the stock
++ * kernel cannot take. This driver takes them. It is one flat
 + * irq domain, the parent of every device line the machine has, with a backend
 + * chosen from the description and re-chosen when the description changes:
 + * the machrev driver calls xv6h_vic_rebind() with the new kind and window,

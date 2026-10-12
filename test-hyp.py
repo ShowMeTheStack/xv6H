@@ -30,7 +30,7 @@ MODES = ["plic", "aplic", "imsic"]
 TIMEOUT_SCALE = float(os.environ.get("TEST_TIMEOUT_SCALE", "1"))
 
 
-# The axis this run is on (§11.1): what machine every test gets, unless
+# The axis this run is on: what machine every test gets, unless
 # the test asks for something else on purpose. `--axis mem=16G,sv=39'
 # runs the same tests on a different machine, which is what a campaign
 # is made of. Empty means the defaults below.
@@ -64,7 +64,7 @@ class QEMU(object):
         # (TEST_FSIMG names the copy, so that two runs can go in
         # parallel). keep_fs starts from the copy the last run left,
         # which is what a test of what survives a reboot needs.
-        # one image per machine: a test that starts two of them (E11's
+        # one image per machine: a test that starts two of them (a
         # migration) says which, because one image opened twice is one
         # file system with two kernels writing it.
         fsimg = fsimg or os.environ.get("TEST_FSIMG", "test-fs.img")
@@ -91,17 +91,17 @@ class QEMU(object):
         #     hostfwd, no guestfwd, no tap, no bridge, no vde, no socket
         #     and no -net.
         #   - so nothing on the emulated network can open a connection to
-        #     this laptop or to anything on its network: outbound through
+        #     the workstation or to anything on its network: outbound through
         #     the NAT is all there is.
         #   - and a port a machine publishes exists on the emulated
-        #     network only. Nothing listens on the laptop for it, which
+        #     network only. Nothing listens on the workstation for it, which
         #     is checked after the boot (assert_no_listeners).
         for bad in ("hostfwd", "guestfwd", "-net ", "type=tap", "ifname=",
                     "type=bridge", "type=vde", "type=socket", "type=dgram"):
             assert bad not in cmd, "qemu: %s in %s" % (bad, cmd)
         # one exception, and it is the whole of it: two hosts joined to
-        # each other for a migration (E11) are joined by a *unix* socket
-        # on this laptop's file system -- a path, not a port. Nothing
+        # each other for a migration are joined by a *unix* socket
+        # on the workstation's file system -- a path, not a port. Nothing
         # listens on the network, nothing outside the two emulated
         # machines can reach either end, and a TCP form of the same
         # option would be refused here like everything else above.
@@ -117,14 +117,14 @@ class QEMU(object):
         self.consumed = 0
         self.gone = False   # the machine's console has closed
 
-    # what the emulator has open, from the laptop's point of view: no
-    # listening socket at all. A published port lives on the emulated
-    # network; if one ever appeared here, it would be on the laptop.
+    # what the emulator has open, from the workstation's point of view:
+    # no listening socket at all. A published port lives on the emulated
+    # network; if one ever appeared here, it would be on the workstation.
     def assert_no_listeners(self):
         try:
             # -a, or lsof takes the selectors as alternatives and reports
-            # every listening socket on the laptop rather than this
-            # process's (which is how this check first "failed")
+            # every listening socket on the workstation rather than this
+            # process's
             out = subprocess.run(["lsof", "-nP", "-a", "-p", str(self.proc.pid),
                                   "-iTCP", "-sTCP:LISTEN"], stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, encoding="utf8",
@@ -132,7 +132,7 @@ class QEMU(object):
         except (OSError, subprocess.SubprocessError):
             return          # no lsof: the command line check above still holds
         listening = [l for l in out.splitlines() if "LISTEN" in l]
-        assert not listening, "qemu is listening on the laptop: %s" % listening
+        assert not listening, "qemu is listening on the workstation: %s" % listening
 
     def _pump(self, timeout):
         r, _, _ = select.select([self.proc.stdout], [], [], timeout)
@@ -1679,11 +1679,10 @@ def t_aslr(log):
     # below. It allocates every page the machine has, one page at a time,
     # touching each, and does that fifteen times over -- so its cost is
     # proportional to RAM and has nothing to do with what this test is about.
-    # Measured on an idle 32-core box with a gigabyte: **214 seconds**, against
+    # Measured on an idle 32-core box with a gigabyte: 214 seconds, against
     # the 300-second allowance the loop below gives it. That is no headroom at
-    # all, which is why this test failed on a busy laptop, failed twelve times
-    # out of twelve when run in parallel, and looked like a regression at three
-    # different commits. Half the memory is half the work and the coverage is
+    # all: on a busy machine, or with tests run in parallel, it times out
+    # and looks like a regression. Half the memory is half the work and the coverage is
     # identical: execout still exhausts the machine and still execs with nothing
     # left, just with less to exhaust. (It skips itself only above 4 GB, so
     # going down does not lose the test.)
@@ -1744,7 +1743,7 @@ def t_aslr(log):
         # and the randomised stack is still a working stack: a program
         # that recurses and a program that maps still run.
         # three hundred seconds rather than a hundred and eighty: these
-        # three take about a hundred together on a quiet laptop and twice
+        # three take about a hundred together on a quiet machine and twice
         # that on a warm one, and what is being tested is that a
         # randomised stack works, not how fast.
         for t in ("bigargtest", "stacktest", "execout"):
@@ -1929,7 +1928,7 @@ def t_tty(log):
 
 
 def t_clock(log, have_linux):
-    """the host, an xv6 guest and a Linux guest all read the laptop's clock
+    """the host, an xv6 guest and a Linux guest all read the workstation's clock
     through the (virtual) goldfish RTC."""
     import test_hyp_guest as g
     q = g.boot_host(QEMU, "aplic", 3, log)
@@ -1997,7 +1996,7 @@ def t_hostfiles(log):
 TIMELINE = re.compile(rb"hyp: vm \d+: ((?:crossing, this side|arrival timeline): [^\r\n]*)")
 
 def timeline_report():
-    """L15: the crossing's timeline as the two hosts printed it -- the source's
+    """the crossing's timeline as the two hosts printed it -- the source's
     "crossing, this side: stopped +0, last page +A us, ..." and the destination's
     "arrival timeline: ..." -- kept with the test's own output, because a queue's
     logs keep no consoles (tools/timeline_table.py reads them from either)."""
@@ -2019,7 +2018,7 @@ def main():
     ap.add_argument("--tier", default=None, choices=["quick", "full"],
                     help="quick: thirty-six tests, one of each kind of thing, "
                          "for every commit (minutes through tools/qrun.py). "
-                         "full: everything, which is what a milestone gets. "
+                         "full: everything, for a release. "
                          "(the campaign is tools/campaign.py: this, over and "
                          "over, on different machines)")
     ap.add_argument("--axis", default=None, metavar="K=V,...",
@@ -2080,8 +2079,7 @@ def main():
         # has, so they are registered once whatever it is -- which is
         # what makes `--axis intc=imsic' run the same thirty-six tests as
         # the baseline rather than the handful whose names carry a
-        # controller. (They used to be registered only for plic, and an
-        # axis of another controller quietly lost ten of them.)
+        # controller.
         if True:
             tests.append(("native-no-hypervisor", lambda: t_native("plic", args.cpus, log, hyp=0)))
             tests.append(("native-no-vector", lambda: t_native("plic", args.cpus, log, vec=0)))
@@ -2123,7 +2121,7 @@ def main():
         import test_hyp_ct
         tests += test_hyp_ct.tests(modes, args.cpus, log, QEMU, run_cmd)
     if args.suite in ("guest", "all"):
-        import test_hyp_guest  # milestone 2+
+        import test_hyp_guest  # guests
         tests += test_hyp_guest.tests(modes, args.cpus, log, QEMU, usertests_ok)
     if args.suite in ("linux", "all") and have_linux:
         tests += test_hyp_linux.tests(modes, args.cpus, log, QEMU)
@@ -2158,8 +2156,8 @@ def main():
                   "tests that start a guest)" % (len(tests) - len(keep)))
         tests = keep
     if args.tier == "quick":
-        # the set for every commit: one of each kind of thing, and
-        # §11.3's quarter of an hour is met -- ten minutes on a laptop,
+        # the set for every commit: one of each kind of thing, within a
+        # quarter of an hour -- ten minutes on one workstation,
         # one test after another, and a couple through tools/qrun.py.
         # What it leaves out is the long ones -- the 16 GB and 512 GB
         # memory tests, a hundred thousand processes, the Linux guests,

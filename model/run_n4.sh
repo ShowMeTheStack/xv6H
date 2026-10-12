@@ -1,5 +1,5 @@
 #!/bin/sh
-# E9, resumable (night 21): NH=3 NF=3 bitstate liveness where it is missing, then NH=4 NF=2
+# Resumable model-checking runs: NH=3 NF=3 bitstate liveness where it is missing, then NH=4 NF=2
 # (exhaustive safety under COLLAPSE with 40 GB, bitstate safety if that cannot finish, bitstate
 # liveness). A property whose output already ends with an elapsed time is not run again, so a
 # reboot costs only the search in progress. Runs in ~/xv6h-spin as the user service xv6h-spin4.

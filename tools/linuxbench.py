@@ -4,7 +4,7 @@
 # numbers have something to be next to.
 #
 # this runs on the build box (it needs the kernel, the musl cross
-# compiler and qemu): tools/linuxbench.sh drives it from the laptop.
+# compiler and qemu): tools/linuxbench.sh drives it from the workstation.
 #
 #   linuxbench.py [-t secs] [-c cpus] [test ...]
 #

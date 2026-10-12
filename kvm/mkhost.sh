@@ -1,9 +1,9 @@
 #!/bin/bash
-# A.0 (runs on the build box): the KVM host's initramfs: busybox, lkvm, and the xv6H Linux guest exactly
+# The KVM host's initramfs: busybox, lkvm, and the xv6H Linux guest exactly
 # as the xv6H runs use it (Image-hf with machrev.ko in its own initramfs, and the disk linux.img).
 set -e
 K=$HOME/xv6h-kvm; R=$K/hostroot
-case "$K" in $HOME/*) ;; *) echo "refusing: not on the build box ($K)"; exit 1;; esac
+case "$K" in "$HOME"/*) ;; *) echo "refusing: $K is not under $HOME"; exit 1;; esac
 rm -rf $R; mkdir -p $R
 cp -a $HOME/xv6h-linux/bb-hf/_install/. $R/
 mkdir -p $R/proc $R/sys $R/dev $R/tmp $R/guest $R/etc $R/mnt $R/root $R/var/run

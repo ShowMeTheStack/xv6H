@@ -99,7 +99,7 @@ void blk_scan_partitions(struct gendisk *disk);
 // writeback path must leave such a block alone, because writing it to
 // its home location is exactly the write the journal exists to order.
 // jbd2 sets it before the block is marked dirty and clears it after the
-// block is home; see jbd2_is_journaled() and kernel/jbd2.md.
+// block is home; see jbd2_is_journaled().
 #define BLK_JBD2_JOURNALED 0x0001
 
 struct blkbuf {

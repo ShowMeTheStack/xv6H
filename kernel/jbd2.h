@@ -199,7 +199,7 @@ void jbd2_stats(struct jbd2 *j, uint64 *transactions, uint64 *blocks_written, in
 
 // whether this block is in a transaction that is not yet on the log, and
 // so must not be written to its home location. the writeback path asks
-// this without holding any journal lock; see jbd2.md.
+// this without holding any journal lock.
 int jbd2_is_journaled(struct jbd2 *j, struct blkbuf *b);
 
 // whether file data is written to its home blocks before each commit

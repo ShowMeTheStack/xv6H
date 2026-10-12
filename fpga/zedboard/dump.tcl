@@ -1,4 +1,4 @@
-# B.4: the RAM disk read out of DDR over JTAG, Rocket left running (the read goes through A9 #1)
+# The RAM disk read out of DDR over JTAG, Rocket left running (the read goes through A9 #1)
 #   xsdb dump.tcl <out file> <DDR address> <bytes>
 set out [lindex $argv 0]
 set addr [lindex $argv 1]

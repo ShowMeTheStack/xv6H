@@ -16,7 +16,7 @@ enum irq_type;
 #define REVISE_DTB_MAX		0x10000		/* one description slot (= FDT_MAX_SIZE) */
 
 /* what a revision changed (the module's REV_* bits, linux/machrev/machrev.c) */
-/* the bits are xv6H's (kernel/hyp.h); the first port had INTC and DEVICES swapped */
+/* the bits are xv6H's (kernel/hyp.h), bit for bit */
 #define REV_DEVICES	0x01
 #define REV_INTC	0x02
 #define REV_VLEN	0x04
@@ -39,7 +39,7 @@ struct revise_state {
 	long (*request_hook)(struct kvm *kvm, unsigned long what, long *val);
 };
 extern struct revise_state revise;
-extern struct kvm *revise_kvm;	/* the machine, for the state hooks (A.6) */
+extern struct kvm *revise_kvm;	/* the machine, for the state hooks (migration) */
 
 /* what the description says of each cpu, recorded from KVM at boot and edited by facts */
 struct revise_cpu_desc {

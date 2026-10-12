@@ -58,8 +58,8 @@
 // the log, then writes every block to its home location and moves the
 // log's start past it. this is simpler than Linux, which keeps frozen
 // copies of the blocks so that a new transaction can run while the old
-// one is written; jbd2.md says what that costs and why it is still
-// correct.
+// one is written; new handles wait while a commit is written, and
+// that is the cost.
 //
 // A COMMIT THREAD (kjournald) commits every five seconds when there is
 // anything to commit, and sooner when jbd2_commit asks or the running
@@ -68,7 +68,7 @@
 // THE BLOCK CACHE must not write a journalled block to its home location
 // on its own: that is exactly the write the log exists to order. the
 // writeback path asks jbd2_is_journaled() and skips the block if it says
-// yes. jbd2.md states the contract.
+// yes. that is the whole contract.
 //
 // NOTHING READ FROM THE LOG IS TRUSTED. every block number out of a tag
 // or a revoke record is checked against the size of the device before

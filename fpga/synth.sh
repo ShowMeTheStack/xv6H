@@ -1,5 +1,5 @@
 #!/bin/bash
-# B.0 (runs on the build box): run synth_ooc.tcl for one generated config in the Vivado container.
+# Run synth_ooc.tcl for one generated config in the Vivado container.
 set -e
 CFG=${1:-XV6HZedConfig}
 F=$HOME/xv6h-fpga

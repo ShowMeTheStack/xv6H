@@ -1,4 +1,4 @@
-# B.0 (runs in the Vivado 2020.1 container on the build box): out-of-context synthesis of a generated
+# Runs in the Vivado 2020.1 container on the build box: out-of-context synthesis of a generated
 # Rocket system for the ZedBoard's xc7z020 -- does it fit, and how fast is it.
 #   vivado -mode batch -source synth_ooc.tcl -tclargs <rtl dir> <out dir>
 set rtl [lindex $argv 0]

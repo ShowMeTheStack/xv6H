@@ -128,7 +128,7 @@ process_queue(struct vm *vm, int qi)
   // once made Linux's driver -- which posts the next buffer as soon as one
   // is taken -- run round the queue at the speed of its workqueue: 11,000
   // interrupts a second, a Linux guest crawling, and a spinlock touched
-  // before its probe had initialised it (tm1: `spinlock bad magic' in
+  // before its probe had initialised it (`spinlock bad magic' in
   // stats_request). The poller (policy_once, once a second) takes one.
   if (qi == 2 && !b->stats_go)
     return;
@@ -466,7 +466,7 @@ vballoon_write(struct vm *vm, struct vdev *d, uint64 off, int size, uint64 val)
 // F14: a machine arriving with a balloon the source inflated for this host's
 // sake keeps it: the policy thread's floor is set to what the guest holds, or
 // it would hand the memory back within seconds and the room this host had for
-// the machine would be gone (f14d: 16 MB negotiated, 24 MB resident a moment
+// the machine would be gone (16 MB negotiated, 24 MB resident a moment
 // after arrival).
 void
 vballoon_pin(struct vm *vm)

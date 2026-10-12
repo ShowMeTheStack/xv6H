@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# (runs on the build box): the KVM changes for revisable machine descriptions, applied to
+# The KVM changes for revisable machine descriptions, applied to
 # ~/xv6h-kvm/linux-6.18.54 idempotently. Each change is one function below; `git diff` against
-# the pristine tree (kept in ~/xv6h-kvm/linux-6.18.54.orig) is the patch series we report.
+# the pristine tree (kept in ~/xv6h-kvm/linux-6.18.54.orig) is the patch series.
 import os, re, sys
-T = os.path.expanduser(os.environ.get("KT", "~/xv6h-kvm/linux-6.18.54"))   # KT: another tree
+T = os.path.expanduser(os.environ.get("KT", "~/xv6h-kvm/linux-6.18.54"))   # KT: another tree (e.g. ~/xv6h-kvm-d5)
 def sub(rel, pairs):
     p = os.path.join(T, rel); s = open(p).read(); o = s
     for a, b in pairs:

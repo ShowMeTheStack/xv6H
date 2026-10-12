@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# tiercross (R18): the two tiers on the same crossing. An xv6 guest (1 vcpu, 64 MB) on an IMSIC
+# tiercross: the two tiers on the same crossing. An xv6 guest (1 vcpu, 64 MB) on an IMSIC
 # host crosses to a PLIC host, either as a legacy guest (`-a norevise': it keeps its controller,
 # served by the destination's software IMSIC) or as a participating one revised to the
 # destination's native PLIC (the destination booted with guestpolicy=native, so that it revises

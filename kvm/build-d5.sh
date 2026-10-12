@@ -1,5 +1,5 @@
 #!/bin/bash
-# (runs on the build box): a separate KVM host with patch 4 (the IMSIC's file backing switched
+# A separate KVM host with patch 4 (the IMSIC's file backing switched
 # under a running guest), so the runs using ~/xv6h-kvm are not disturbed. Everything goes in
 # ~/xv6h-kvm-d5: the kernel tree (patches 1-3 as in ~/xv6h-kvm, plus 4), its build, kvmtool with
 # the imsicfile command, and the host's initramfs.

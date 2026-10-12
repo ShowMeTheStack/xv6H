@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# grandtour (L30): a Linux participating guest crossing a ring of shapes, A -> B -> C -> A ...,
+# grandtour: a Linux participating guest crossing a ring of shapes, A -> B -> C -> A ...,
 # where every hop changes a different set of facts (A: the defaults; B: interrupt numbering
 # and timer source; C: hart numbering and timebase), for CYCLES cycles of three hops.
 #

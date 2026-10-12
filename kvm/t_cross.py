@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# a running Linux guest crossing back and forth between two KVM hosts, revised on
+# A running Linux guest crossing back and forth between two KVM hosts, revised on
 # every arrival, as a host of another shape would. Two KVM hosts (QEMU, joined by a private
 # unix-socket link) are booted once; the guest is moved A -> B -> A ... N times by kvmtool's
 # stop-and-copy migration (`lkvm migrate`), and the destination asks, on arrival, for its own

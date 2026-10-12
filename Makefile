@@ -678,9 +678,8 @@ build/rescue/%: $U/static/_%
 STRIPPED = $(patsubst $U/_%,build/bin/_%,$(UPROGS))
 
 # the programs live in /bin, and init in /sbin, the way they do on any
-# unix. keeping them at the root meant a new tool could take the name a
-# program wanted for a file: `dd` arrived and usertests could no longer
-# make a directory called dd.
+# unix. at the root a new tool could take a name a program wants for a
+# file (a `dd` program stops usertests making a directory called dd).
 UPROGNAMES = $(patsubst $U/_%,%,$(UPROGS))
 BINFILES = $(foreach p,$(filter-out su passwd sudo useradd getty shutdown service telinit start-stop-daemon,$(UPROGNAMES)),bin/$(p):build/bin/_$(p)) \
 	   bin/fdisk:build/bin/_sfdisk \
@@ -807,12 +806,12 @@ build/man.db: tools/mkman.py $(MANPAGES)
 	@mkdir -p build
 	python3 tools/mkman.py $@ $(MANPAGES)
 
-FSFILES = README usr/share/man/man.db:build/man.db $(GUESTBINS) $(GUESTDISKIMGS) \
+FSFILES = README:user/README usr/share/man/man.db:build/man.db $(GUESTBINS) $(GUESTDISKIMGS) \
 	  $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest user/texttest user/archtest user/filetest user/calctest \
 	  user/systest \
 	  $(HOSTFILES) \
 	  $(ARCHREFS) $(ETCSPEC) $(SETUIDFILES) $(INITSCRIPTS)
-FSDEPS = README build/man.db user/shtest user/texttest user/archtest user/filetest user/calctest user/systest $(ARCHREFDEPS) $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) \
+FSDEPS = user/README build/man.db user/shtest user/texttest user/archtest user/filetest user/calctest user/systest $(ARCHREFDEPS) $(STRIPPED) $(DYNDEPS) $(RESCUEBINS) $(GUESTBINS) $(GUESTDISKIMGS) \
 	 $(HOSTFILES) $(ETCFILES) build/etc/shadow build/bin/_nologin \
 	 etc/init.d/rcS etc/init.d/syslogd etc/init.d/klogd etc/init.d/crond etc/rc.d/rc \
 	 etc/cron.d/rotate-logs etc/init.d/networking etc/network/interfaces lib/init/functions \
@@ -821,12 +820,10 @@ FSDEPS = README build/man.db user/shtest user/texttest user/archtest user/filete
 # the guest's file system image. This rule has to come after STRIPPED,
 # DYNDEPS and RESCUEBINS are defined: make expands a rule's
 # prerequisites when it reads the rule, so with the rule above those
-# definitions the list was `mkfs/mkext4 README user/shtest' and the
-# guest image was never rebuilt when a program in it changed. That is
-# how a guest came to run a loader from an hour earlier while the host
-# ran the new one.
-GUESTFILES = README usr/share/man/man.db:build/man.db $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest
-GUESTDEPS = mkfs/mkext4 README build/man.db user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS)
+# definitions the list would be `mkfs/mkext4 README user/shtest' and the
+# guest image would not be rebuilt when a program in it changed.
+GUESTFILES = README:user/README usr/share/man/man.db:build/man.db $(BINFILES) $(SBINFILES) $(DYNFILES) $(RESCUEFILES) user/shtest
+GUESTDEPS = mkfs/mkext4 user/README build/man.db user/shtest $(STRIPPED) $(DYNDEPS) $(RESCUEBINS)
 
 guest/disk.img: $(GUESTDEPS)
 	mkfs/mkext4 -b $(GUESTFS_EXT4_BLOCKS) -j 1024 guest/disk.img $(GUESTFILES)
@@ -839,18 +836,16 @@ fs.img: mkfs/mkext4 $(FSDEPS)
 
 # every directory this build puts object files in. the two lines below
 # both depend on it, so a directory added to one is never missing from
-# the other -- which is how user/sh went for a milestone without
-# dependency tracking, and how a change to struct stat left the shell
-# compiled against the old one.
+# the other (a directory missing from one loses dependency tracking,
+# and a changed header then leaves stale objects).
 OBJDIRS = kernel user user/sh user/ldso user/libc user/libc/math user/libc/pic \
 	  user/libc/pic/math tls/obj tls/obj/*
 
 # an object file with no dependency file beside it is a hazard: make
 # has no idea which headers it was compiled from, so a change to one of
 # them leaves it stale and the program gets linked from two different
-# views of the same structure. that is not a theory -- kernel/vvnet.o
-# survived a change to struct vm that way, and the guest read a pointer
-# out of the middle of another field. any such object is removed here,
+# views of the same structure (kernel/vvnet.o once survived a change to
+# struct vm that way). any such object is removed here,
 # before anything is built, so it is compiled again.
 STALECAND := $(foreach o,$(wildcard $(foreach d,$(OBJDIRS),$(d)/*.o)),\
                $(if $(wildcard $(o:.o=.d)),,$(o)))
@@ -858,14 +853,13 @@ STALECAND := $(foreach o,$(wildcard $(foreach d,$(OBJDIRS),$(d)/*.o)),\
 # just compiled, with its dependency file still on the way -- make writes
 # the two in that order, and re-reads this file after updating any of the
 # .d files it includes. Removing one of those turns a parallel build into
-# a failed link, which it did, twice. Only the settled ones are removed.
+# a failed link. Only the settled ones are removed.
 #
-# -maxdepth 0 is not decoration. Without it, a find that ends up with no
+# -maxdepth 0 is required. Without it, a GNU find that ends up with no
 # path argument (an empty list, a name that has just gone) walks the
 # current directory instead and prints every file in the tree older than
-# a minute -- and the rm below then deleted the whole source tree on the
-# build box. It never happened on the laptop, because BSD find refuses a
-# missing path where GNU find helpfully assumes one. With -maxdepth 0 the
+# a minute, and the rm below would delete the whole source tree (BSD
+# find refuses a missing path instead). With -maxdepth 0 the
 # worst that can be named is the directory itself, which rm -f will not
 # remove.
 STALEOBJS := $(if $(STALECAND),\
@@ -974,18 +968,17 @@ endif
 # public addresses (plus DHCP and the DNS forwarder). NET=0 removes it.
 NET ?= 1
 ifneq ($(strip $(LINK)),)
-# two hosts, joined to each other and to nothing else (E11: migration).
-# The link is a *unix* socket on the laptop's file system, not a port: no
-# TCP socket is opened anywhere, so there is nothing for the laptop or its
+# two hosts, joined to each other and to nothing else (for migration).
+# The link is a *unix* socket on the workstation's file system, not a port: no
+# TCP socket is opened anywhere, so there is nothing for the workstation or its
 # network to reach, and the only thing at the other end of the wire is the
 # other emulated machine. LINKSRV=on is the end that makes the socket.
 LINKSRV ?= off
 # the client side reconnects if the server host is restarted in another shape (the
 # grand tour, tools/grandtour.py: two slots, the destination freshly booted per hop)
-# The two ends have their own hardware addresses: with QEMU's default on both, a guest that had
-# crossed to the second host answered the first with a frame addressed to its own host's MAC,
-# which that host's switch kept (E5's crossings: the service unreachable for 15-34 s). Tests that
-# only looked at the guest on its console never saw it.
+# The two ends have their own hardware addresses: with QEMU's default on both, a guest that has
+# crossed to the second host answers the first with a frame addressed to its own host's MAC,
+# which that host's switch keeps (a service in it was unreachable for 15-34 s after a crossing).
 ifeq ($(LINKSRV),off)
 QEMUOPTS += -netdev stream,id=n0,server=off,addr.type=unix,addr.path=$(LINK),reconnect-ms=1000
 LINKMAC ?= 52:54:00:12:34:57

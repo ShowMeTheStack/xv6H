@@ -3,7 +3,7 @@
 #
 # Masking gives every guest the fleet's common floor, so it can go anywhere without being told
 # anything; revision gives it the host's own description and tells it when that changes. The
-# floor is taken from the fleet this work has: QEMU virt (10 MHz, APLIC+IMSIC, vector, Zicboz)
+# floor is taken from the fleet used here: QEMU virt (10 MHz, APLIC+IMSIC, vector, Zicboz)
 # and the ZedBoard's Rocket (400 kHz, PLIC, no vector, no Zicboz). Masking cannot change a
 # counter's rate, so on the QEMU host the floor's 400 kHz is a scaled counter, read by trap.
 #

@@ -97,13 +97,11 @@ def enumerate_tests(suites, extra=()):
 
 # Every job's disk image carries this run's name as well as its slot.
 #
-# It used to be just the slot -- q0-fs.img -- and the slot is also how a finished
-# job's leftover emulators are cleaned up: pkill -f "file=q0-fs.img". That pattern
-# is a *command line* match, and it is identical in every copy of this tree, so two
-# qrun runs on the same box silently killed each other's machines. The victim dies
-# instantly with "qemu exited while waiting for 'xv6 kernel is booting'", which
-# reads exactly like a broken build and is what made a repeat-run of one test fail
-# twenty times out of twenty while the tree was fine.
+# The image name is also how a finished job's leftover emulators are cleaned up:
+# pkill -f "file=q0-fs.img". That pattern is a *command line* match; with the slot
+# alone it is identical in every copy of this tree, so two qrun runs on the same box
+# would kill each other's machines. The victim dies at once with "qemu exited while
+# waiting for 'xv6 kernel is booting'", which reads like a broken build.
 #
 # The run directory's name is unique per run and stable across --resume, so it is
 # the tag.
@@ -211,9 +209,8 @@ def main():
     print("%d jobs on %d cores: %d in parallel (capacity %d harts), %d one at a time"
           % (len(queue), cores, len(parallel), capacity, len(serial)), flush=True)
 
-    # the build box this runs on resets itself, and a matrix of 140 tests
-    # takes longer than it stays up: 95 of them had passed when it went
-    # down, and without this every one of the 95 would be run again. Each
+    # the build box this runs on can reset in the middle of a matrix, and
+    # without this every test already passed would be run again. Each
     # result is written the moment it is known, so the file on disk is
     # always what is already true; --resume believes it and runs the rest.
     # Without --resume the file is started afresh, so a plain run never
@@ -227,9 +224,8 @@ def main():
         # than fatal. The machine this runs on resets itself, and a reset
         # while this file is being appended to leaves NUL bytes in it: the
         # last line is then neither a result nor absent. Losing that one line
-        # costs a test; refusing to read the file costs every test in it, and
-        # once nearly did -- five hours of a matrix went because a `grep -v'
-        # treated the file as binary and wrote nothing back.
+        # costs a test; refusing to read the file costs every test in it (a
+        # `grep -v' over such a file treats it as binary and writes nothing).
         try:
             for line in open(done_path, errors="replace"):
                 f = line.replace("\0", "").split()
@@ -290,8 +286,7 @@ def main():
                 # or ended by itself. A harness killed with a signal never
                 # runs QEMU.close(), so its machines keep this slot's disk
                 # image open -- and the next job in the slot dies at once
-                # with "Failed to get write lock", which is how mm-16g came
-                # to fail in one second having never booted. A job that
+                # with "Failed to get write lock", before it has booted. A job that
                 # ended by itself is meant to have closed its machines, so
                 # this costs it a signal sent to nobody; the slot is only
                 # safe to hand on if that is checked rather than assumed.

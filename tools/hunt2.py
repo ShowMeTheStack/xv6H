@@ -2,7 +2,7 @@
 # correctness check on every arrival. Each crossing exchanges its interrupt
 # controller, so this is N controller rebinds with real disk work between them.
 #
-#   python3 migloop.py [cycles]      # one cycle = A->B->A
+#   python3 tools/hunt2.py [cycles]      # one cycle = A->B->A
 import os, re, sys, time
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 from importlib.machinery import SourceFileLoader
@@ -18,7 +18,7 @@ try: os.unlink(link)
 except OSError: pass
 LOGA = open("consoleA.log", "w"); LOGB = open("consoleB.log", "w")
 # every crossing exchanges the controller: the first arrival policy (guestpolicy=native). Under
-# the default since m9 a PLIC host keeps an arriving IMSIC guest on the software model and asks
+# the current default a PLIC host keeps an arriving IMSIC guest on the software model and asks
 # nothing, so this loop would test no exchange (snap-migrate-hetero-cheapest covers that policy)
 a = th.QEMU(intc="imsic", cpus=3, log=LOGA, fsimg=tag+"-a.img",
             extra_env={"LINK": link, "LINKSRV": "on", "APPEND": "guestpolicy=native"})

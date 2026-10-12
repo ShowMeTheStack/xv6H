@@ -4,7 +4,7 @@ the hypervisor's own numbers, and the system's around them.
 
     tools/remote.sh script benchhyp bench/hyp.py      (or run it here)
 
-Four things, each measured where it can be measured honestly:
+Four things, each measured where it can be measured directly:
 
   exits     guest/vmbench.c, a bare S-mode payload. What an exit costs can
             only be seen from inside the guest: the host's own clock cannot
@@ -14,8 +14,7 @@ Four things, each measured where it can be measured honestly:
             context switch and a wakeup cost with a hypervisor underneath.
   migration a 48 MB guest dirtying memory as fast as the emulator will go,
             moved to another host: how much crossed while it ran and how
-            much with it stopped, which is the only number a migration is
-            judged by.
+            much with it stopped.
   files     user/fsbench.c on the host's own root (bench/run.py is the one
             that compares it with Linux on the same image).
 
@@ -83,13 +82,13 @@ def sched():
 def net():
     """what the network costs: the stack alone, and across a guest's NIC.
 
-    Two numbers, and the pair is the point. On the host over the loopback
+    Two numbers. On the host over the loopback
     address there is no device at all and nothing is emulated: that is the
     stack's own cost. Between a guest and its host the same bytes cross the
     software switch and the guest's virtio-net, and the difference is what a
     guest pays for its network.
 
-    The guest is the one that connects, and that is not an accident. A frame
+    The guest is the one that connects, on purpose. A frame
     arriving at a guest is delivered only if it is the guest's DHCP lease, an
     answer to a name it asked about, a reply to something it said, or destined
     for a port published with `vmm port' -- otherwise the bridge drops it and

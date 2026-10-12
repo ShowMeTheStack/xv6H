@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# E5/M11, crossings: what a service sees when its machine moves to another host, of the same
+# taillat_mig: what a service sees when its machine moves to another host, of the same
 # shape or of another (revised on arrival). Two xv6H hosts on QEMU joined by a private link
 # (10.7.0.1, 10.7.0.2); a Linux guest (2 vcpus, its disk, 10.7.0.50 on the link, port 6379
 # published) runs `kvlat serve'; host A runs `kvlat load' at 500 requests a second against it.
@@ -87,7 +87,7 @@ try:
     G.detach(a)
     SOFT = os.environ.get("SOFTIMSIC") or (len(sys.argv) > 3 and sys.argv[3] == "soft")   # (a unit gets no environment)
     if SOFT:
-        # the software IMSIC model, whose claims the host sees (E5's lost interrupts)
+        # the software IMSIC model, whose claims the host sees (to look for lost interrupts)
         print("  software IMSIC: %s" % run(a, "vmm imsichw lm off", 30).strip().splitlines()[-1:]); sys.stdout.flush()
     here, there = a, b
     for k in range(2 * ROUNDS):

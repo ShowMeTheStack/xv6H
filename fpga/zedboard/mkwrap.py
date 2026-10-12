@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.1: generate rocket_wrap.v around the generated ExampleRocketSystem (port list read from the
+# Generate rocket_wrap.v around the generated ExampleRocketSystem (port list read from the
 # generated .sv, nothing typed by hand). The wrapper:
 #   - renames the AXI4 master ports to Vivado's interface naming (m_mem_axi_*, m_mmio_axi_*), so
 #     the block design infers two AXI4 masters;
@@ -53,10 +53,9 @@ for d, w, n in ports:
     elif n.startswith("mmio_axi4_0_"):
         nn = axi_name("mmio_axi4_0_", n, "m_mmio_axi")
         decl.append("  %s wire %s %s," % (d, w, nn)); conn.append("    .%s(%s)," % (n, nn))
-    # whole names only: a prefix match took debug_clock for debug_clockeddmi_dmi_req_ready and
-    # the other DMI ports, tied Rocket's clock to its own outputs, and Vivado resolved the
-    # multi-driven net to a constant -- the whole core swept away in implementation (B.1, first
-    # bitstream: 1 932 LUTs)
+    # whole names only: a prefix match takes debug_clock for debug_clockeddmi_dmi_req_ready and
+    # the other DMI ports, ties Rocket's clock to its own outputs, and Vivado resolves the
+    # multi-driven net to a constant, sweeping the whole core away in implementation
     elif re.fullmatch(r"io_aggregator_\d+_clock|debug_clock|debug_clockeddmi_dmiClock", n):
         conn.append("    .%s(clk)," % n)
     elif re.fullmatch(r"io_aggregator_\d+_reset|debug_reset|debug_clockeddmi_dmiReset|resetctrl_hartIsInReset_\d+", n):

@@ -1,6 +1,6 @@
 //
 // SHA-256 (FIPS 180-4) and HMAC-SHA256 (RFC 2104), for authenticating the migration stream
-// Checked at boot against RFC 4231's test cases
+// (vmstate.c). Checked at boot against RFC 4231's test cases
 // (sha256_selftest); a mismatch is printed and the stream is never authenticated with it.
 //
 

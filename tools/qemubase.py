@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# qemubase (L19): what today's hypervisor does on the same move. The same Linux guest
+# qemubase: what an existing hypervisor does on the same move. The same Linux guest
 # (the Image xv6H's tests boot, with its initramfs) under bare QEMU, migrated by QEMU's
 # own live migration between two QEMU instances on this box: once between machines of
 # the same shape (downtime and total time from QMP's query-migrate), then between

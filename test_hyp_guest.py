@@ -13,8 +13,8 @@ def boot_host(QEMU, intc, cpus, log, **kw):
     # extension says so and carries on, and the tests that boot a host
     # without starting a guest -- the network, the processes, the
     # namespaces, the containers -- are exactly the ones worth running on
-    # a machine that has none. Waiting only for "present" made four of
-    # them sit through six minutes of a banner that was never coming.
+    # a machine that has none. Waiting only for "present" would make
+    # them sit out the whole timeout for a banner that never comes.
     q.expect(r"hyp: (hypervisor extension present|no hypervisor extension)", 90)
     q.expect(r"init: starting sh", 90)
     q.expect(r"\$ ", 30)
@@ -33,7 +33,7 @@ def start_guest(q, args="", timeout=90):
 
 
 # how long to wait for the machine to answer something it should answer
-# at once. On an idle laptop every one of these takes well under a
+# at once. On an idle workstation every one of these takes well under a
 # second; on a build box running six other suites it does not, and a
 # test that fails because the machine it is on is busy says nothing
 # about the machine it is testing. Deliberate negatives -- a paused
@@ -81,8 +81,8 @@ def wait_free(q, free0, timeout=20):
     halfway through the wait the host is told to sync: a dirty block is
     not leaked memory, it is memory that cannot be given back until the
     disk has it, and how long that takes depends on how much the guest
-    and the log daemons wrote. asking is more honest than waiting
-    longer and hoping."""
+    and the log daemons wrote. asking for it is more reliable than a
+    longer wait."""
     end = time.time() + timeout
     synced = False
     while True:
@@ -127,7 +127,7 @@ def t_guest_boot(QEMU, intc, cpus, log):
         q.send("echo guest-says-hi\n")
         q.expect(r"\nguest-says-hi", 10)
         q.expect(r"\$ ", 5)
-        q.send("ls /bin\n")   # the programs live in /bin now
+        q.send("ls /bin\n")   # the programs live in /bin
         q.expect(r"usertests", 10)
         q.expect(r"\$ ", 5)
         detach(q)
@@ -465,7 +465,7 @@ def t_parallel(QEMU, intc, cpus, log, nguests=3, vcpus=2):
         for i, vmid in enumerate(ids):
             # the mark before the attach: the guest's backlog is replayed on
             # attach, and a verdict already in it was matched by the expect
-            # and missing from `out' (m8x: 14 of 60 guest-parallel jobs)
+            # and missing from `out'
             m = q.mark()
             attach(q, "g%d" % i)
             q.expect(r"ALL TESTS PASSED|FAILED|panic", 1500)
@@ -631,8 +631,8 @@ def t_lifecycle(QEMU, intc, cpus, log):
     """names, pause/resume, restart, ps, kill --all.
 
     the waits here are generous on purpose. Everything this test asks
-    for should happen at once, and on an idle machine it does -- five
-    seconds each was enough for a year. On a build box running six
+    for should happen at once, and on an idle machine it does, within
+    five seconds each. On a build box running six
     suites at a load average of fifteen it is not, and a test that
     fails because the machine it is on is busy says nothing about the
     machine it is testing."""
@@ -672,8 +672,8 @@ def t_lifecycle(QEMU, intc, cpus, log):
         # everything it has said since is still in its console ring and
         # `vmm ps' prints that before the list: attaching once drains the
         # ring and proves it has finished booting, and then the list is
-        # the only thing that arrives. (Without this the assertion raced
-        # the boot -- on eight harts it lost.)
+        # the only thing that arrives. (Without this the assertion races
+        # the boot, and on eight harts it loses.)
         attach(q, "db")
         q.send("\n")
         q.expect(r"\$ ", 60)
@@ -1045,8 +1045,7 @@ def t_revise_intc(QEMU, intc, cpus, log):
     """the interrupt controller exchanged under a running guest, twice, and once
     while it is paused.
 
-    This is the mechanism the revisable-machine work is built on and it had no
-    test: it was demonstrated by hand and then left to the honour system. What is
+    This is the mechanism the revisable-machine work is built on. What is
     checked is not that the host said it did something -- it is that the guest
     went on working afterwards, on a controller it was not booted with, with its
     file and its disk intact, and that it says itself what it adopted. A guest
@@ -1231,9 +1230,9 @@ def _blk(q, vmid):
 def _churn(q, n=800):
     """interrupts inside the attached guest: a sequential read of the disk in
     4 KB blocks, one completion interrupt per block. Each call reads a part of
-    the disk no earlier call has, so the block cache serves none of it (inv5:
-    the second pass over the same blocks took 971 exits to the first's 14435)."""
-    skip = 2000 + _churn_pass[0] * n      # past what booting left in the cache (inv6, m2a)
+    the disk no earlier call has, so the block cache serves none of it (one
+    measurement: the second pass over the same blocks took 971 exits to the first's 14435)."""
+    skip = 2000 + _churn_pass[0] * n      # past what booting left in the cache
     _churn_pass[0] += 1
     q.send("dd if=/dev/vda of=/dev/null bs=4096 count=%d skip=%d 2>/dev/null; echo CHURNED\n" % (n, skip))
     q.expect(r"CHURNED", 180)
@@ -1282,21 +1281,21 @@ def t_invisible_imsic(QEMU, intc, cpus, log):
         assert "revision" not in q.buf.decode(errors="replace")[-20000:].replace("revision: guest", ""), q.buf[-3000:]
         # and the switch itself showed the guest nothing new. The workload may:
         # the guest's libc uses the vector unit for memmove, so `vector' can
-        # join the observed set while dd runs, switch or no switch (inv3).
+        # join the observed set while dd runs, switch or no switch.
         grown = (set(obs3.split()) - set(obs1.split())) | (set(obs2.split()) - set(obs1.split()))
         assert grown <= {"vector"}, (obs1, obs2, obs3)
         hw, sw, hw2 = e1 - e0, e2 - e1, e3 - e2
         # the delivery path shows up as CSR exits per interrupt: the model's
         # claim and MSI traffic trap (vstopei, vsireg), the file's do not. MMIO
-        # exits are the disk's own traffic and the same either way (inv6).
+        # exits are the disk's own traffic and the same either way.
         def per(c, i):
             return (c / i) if i > 0 else float("nan")
         p1, p2, p3 = per(c1 - c0, i1 - i0), per(c2 - c1, i2 - i1), per(c3 - c2, i3 - i2)
         print("    invisible: %d/%d/%d interrupts took %.2f/%.2f/%.2f csr exits each on file/model/file (%d/%d/%d exits in all)"
               % (i1 - i0, i2 - i1, i3 - i2, p1, p2, p3, hw, sw, hw2))
         # the file phases see fewer interrupts as exits (that is the point); on a
-        # loaded box the first window counted 47 (regg2) -- enough to divide by
-        # (m7x saw 20 and 6 in the first window at load 50: the file phase is the one where interrupts are not exits)
+        # loaded box the first window counted 47 -- enough to divide by
+        # (one run saw 20 and 6 in the first window at load 50: the file phase is the one where interrupts are not exits)
         assert i1 - i0 >= 5 and i2 - i1 > 50 and i3 - i2 >= 5, (i1 - i0, i2 - i1, i3 - i2)
         assert p2 > p1 + 1 and p2 > p3 + 1, (p1, p2, p3)
         kill_vm(q, vmid)

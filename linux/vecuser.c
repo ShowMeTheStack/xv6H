@@ -1,4 +1,4 @@
-// vecuser: the vector unit as a Linux program sees it (xv6H F10-F12, L9).
+// vecuser: the vector unit as a Linux program sees it (xv6H F10-F12).
 //
 //   vecuser probe       what the kernel says: the hwprobe syscall and AT_HWCAP
 //   vecuser use [N]     N rounds (default 1) of a checked vector add; an illegal
@@ -10,8 +10,8 @@
 // instructions are hand-encoded (.word), because musl's gcc 11 assembler has no
 // V and the GNU toolchain's glibc must not be used: Ubuntu 26.04's riscv64
 // baseline is RVA23, whose glibc runs `vsetivli' in __memset_generic -- every
-// program linked against it uses the vector unit before main (lxvs2: SIGILL in
-// memset, no handler installed yet). Here the only vector instructions are the
+// program linked against it uses the vector unit before main (SIGILL in memset,
+// before any handler is installed). Here the only vector instructions are the
 // ones written below, so "use" is the first use.
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +55,7 @@ static int vadd_round(void)
 	for (int i = 0; i < 256; i++) { a[i] = i; b[i] = 2 * i; c[i] = -1; }
 	/* the operands are moved into a0-a3 inside the asm: a local register
 	 * variable is not kept across the memset the compiler makes of the loop
-	 * above (lxv3: a2 clobbered, SIGSEGV on the first load) */
+	 * above (a2 would be clobbered: SIGSEGV on the first load) */
 	asm volatile(
 		"mv a0, %0\n\t"
 		"mv a1, %1\n\t"

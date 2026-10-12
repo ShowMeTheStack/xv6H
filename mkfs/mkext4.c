@@ -1,7 +1,7 @@
 // mkext4 -- write an ext4 file system image on the build host, and read
 // one back.
 //
-// the format is the one section 3.2 of hypervisor_extension.md asks for:
+// the format is the one the kernel's ext4 driver expects:
 // 4096-byte blocks, 256-byte inodes with the extra fields, 64-byte group
 // descriptors, extent-mapped files, an internal jbd2 journal at inode 8,
 // and crc32c checksums on every metadata structure, so that Linux's

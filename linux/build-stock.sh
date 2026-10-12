@@ -2,7 +2,7 @@
 # A stock Linux 6.12.41 for the legacy-tier runs that need a kernel with neither the module nor
 # the patches (runs on the build box). The source is extracted afresh from the tarball into its own tree
 # (build.sh patches linux-6.12.41 in place), no patch is applied, and the kernel is configured from
-# the frozen guest's own .config and built with the frozen guest's initramfs, whose machrev.ko does
+# the release guest's own .config and built with the release guest's initramfs, whose machrev.ko does
 # not load on a kernel without the patches' symbols. Output: ~/xv6h-linux/out-stock/Image-hf,
 # with linux.img beside it, so that LXTAG=-stock selects it in tools/remote.sh.
 set -ex

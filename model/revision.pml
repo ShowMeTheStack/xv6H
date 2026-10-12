@@ -1,5 +1,5 @@
 /*
- * The revision protocol of xv6H, as a Promela model (L22).
+ * The revision protocol of xv6H, as a Promela model.
  *
  * One machine of two harts, a fact f that the host revises (a fresh value
  * each time), two hosts A and B between which the machine may cross, an
@@ -54,7 +54,7 @@
 #define REVS 3          /* revisions the host makes (crossings count) */
 #define MAXLOSS 2       /* announcements the channel may lose */
 
-byte  gen = 0;          /* the host's generation (Theorem 3: the host's alone) */
+byte  gen = 0;          /* the host's generation (the host's alone) */
 byte  fact = 0;         /* the fact's value the host now has */
 byte  oldfact = 0;      /* the value served through the alias until the ack */
 byte  nextval = 1;      /* the next fresh value of the fact */

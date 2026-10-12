@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# A.2 debug: one device-map revision, what kvmtool moved and what the module saw
+# Debug: one device-map revision, what kvmtool moved and what the module saw
 import sys, os, time
 sys.path.insert(0, os.path.dirname(__file__))
 from kvmh import *

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# The kernel by subsystem, for the paper's size table (tab:sizes).
+# The kernel's size by subsystem, as a table.
 #   tools/ksizes.py [COMMIT]     (default HEAD)
 # Counts every line (wc -l) of kernel/*.c, *.h and *.S at COMMIT and sums them by the map below.
 # A file not in the map is reported, so the map cannot silently miss one.

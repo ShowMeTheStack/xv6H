@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# B.4, QEMU -> board, the QEMU half: a running Linux guest (no disk, 64 MB, one vcpu) is saved on
+# QEMU -> board, the QEMU half: a running Linux guest (no disk, 64 MB, one vcpu) is saved on
 # a QEMU host (APLIC+IMSIC, 10 MHz, Sstc, Zicboz; VEC=0|1 for the vector unit) and the file left
 # for the board (tools/zedboard.py restore puts it in the board's root and restores it there).
 #   tools/remote.sh script b4d tools/b4_depart.py [vec]

@@ -1,4 +1,4 @@
-// maskbench: what a description costs a Linux program.
+// maskbench: what a description costs a Linux program (the masking baseline).
 //
 //   maskbench vec MB ROUNDS    an add over arrays of MB megabytes, scalar and (when the kernel
 //                              says there is a vector unit) vector: MB/s each

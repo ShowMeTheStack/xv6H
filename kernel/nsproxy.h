@@ -7,7 +7,7 @@
 //
 //   uts    the machine's name
 //   ipc    what /dev/shm and the named semaphores are
-//   net    the network stack (kernel/net.h, E7)
+//   net    the network stack (kernel/net.h)
 //   pid    what a process's number is
 //   mnt    what is mounted where, and what "/" means
 //   user   who a uid is
@@ -84,7 +84,7 @@ struct nsproxy {
   struct pidns *pid;
   struct mntns *mnt;
   struct userns *user;
-  // mnt, user and ipc arrive with the rest of E8; a null one means the
+  // mnt, user and ipc may be null; a null one means the
   // root namespace of that kind, which is what every process had before
   // there was a choice.
 };

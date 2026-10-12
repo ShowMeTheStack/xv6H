@@ -47,7 +47,7 @@ rd_submit(struct gendisk *disk, struct bio *bio)
 }
 
 // A flush makes what was written visible in DDR to whoever reads it from outside -- the
-// ZedBoard's ARM over JTAG, which is how a machine saved on the board leaves it (B.4). Rocket's
+// ZedBoard's ARM over JTAG, which is how a machine saved on the board leaves it. Rocket's
 // data cache is write-back and has no flush instruction a supervisor may use (no Zicbom), so
 // the lines are pushed out by reading 256 KB of other memory, sixteen times the cache.
 static volatile uint64 rd_evict_sink;

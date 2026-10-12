@@ -5,7 +5,7 @@
 //
 // what leaves through the uplink is subject to net_policy_ok(): guests
 // (and the host) reach DHCP, the DNS forwarder and the public internet,
-// nothing on the laptop or any private network. traffic between guests
+// nothing on the workstation or any private network. traffic between guests
 // and the host stays inside the switch.
 //
 
@@ -25,7 +25,7 @@
 static struct spinlock bridgelock;
 uint64 bridge_guest_blocked;
 // frames for a guest MAC (52:54:00:78|79:76:xx) with no running guest here: from the link, and
-// from this host's own stack (/proc/net/sockstat; E5, a crossing's lost segments)
+// from this host's own stack (/proc/net/sockstat: where a crossing's lost segments go)
 uint64 bridge_orphan_in, bridge_orphan_host;
 
 static int
