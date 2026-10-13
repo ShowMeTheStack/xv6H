@@ -1066,14 +1066,14 @@ BearSSL in `tls/bearssl` keeps its own MIT licence
 
 If you use xv6H, please cite:
 
-J. Mishra, A. Pathak, S. K. Sahay, S. Mishra, L. K. Vashishtha, *Revisable
+J. Mishra, A. Pathak, S. K. Sahay, L. K. Vashishtha, S. Mishra, *Revisable
 Machine Descriptions: Twenty-Four Facts a Running Guest Can Be Told Again*
 (under review).
 
 ```bibtex
 @unpublished{mishra-revisable,
   author = {Jyotiprakash Mishra and Aman Pathak and Sanjay K. Sahay
-            and Swati Mishra and Lalit K. Vashishtha},
+            and Lalit K. Vashishtha and Swati Mishra},
   title  = {Revisable Machine Descriptions: Twenty-Four Facts a Running
             Guest Can Be Told Again},
   note   = {Under review}
